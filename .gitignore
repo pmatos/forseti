@@ -10,6 +10,9 @@
 *.cex
 *.trace
 
+# Forseti per-project store (machine-generated artifact, not source)
+.forseti/
+
 # Python
 __pycache__/
 *.pyc

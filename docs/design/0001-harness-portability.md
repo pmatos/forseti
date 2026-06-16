@@ -136,25 +136,35 @@ Three jobs, usually lumped together:
 2. **Spec registry (intent across edits).** Key = unit id (`path::symbol`) → the properties we
    *intend* to hold + their grades. **Survives edits:** when the agent rewrites `rb_push` we
    re-check the same intent instead of regenerating it (slow + non-deterministic) every turn.
-3. **Evidence record (shipping).** Serialized `unit → properties + latest verdict + provenance
-   (ESBMC version, flags, k, code-hash)`. **Not a proof** — a *reproducible-verification* record:
-   enough to re-run and get the same verdict. The honest form of the deck's "ship code with its
-   guarantees" question.
+3. **Evidence record (optional, for shipping).** `unit → properties + latest verdict + provenance
+   (ESBMC version, flags, k, code-hash)`. **Not a proof** — a *reproducible-verification* record.
+   This is an **opt-in export**, not the storage layer: `forseti export` emits a committable bundle
+   only when you actually want to publish guarantees (the deck's packaging open question).
 
 Keyed two ways: cache by content-hash, registry by unit-id.
 
-**Low-regret path (recommended) — no DB yet:**
-- **Registry + evidence record** = in-repo files keyed by unit id (`.forseti/<unit>.yaml`):
-  versioned, diffable, portable.
-- **Result cache** = local content-hash store (dir or tiny SQLite), *ephemeral*, not committed;
-  **ESBMC version in the key**.
-- **Analytics DB** = deferred to **GEPA (P2/P3)**; rebuild a derived index from the files when
-  corpus-wide kill-rate queries are actually needed. Measure before building.
+**Where it lives — per-project, *not* committed.** The store is local to each project under
+`.forseti/` and is **gitignored by default.** It's machine-generated and churns every loop turn —
+an artifact, not source. (*"Per-project"* and *"in git"* are different axes: we want per-project,
+**not** committed.)
+
+**Recommended storage — one per-project SQLite DB:** because it's not committed, the
+files-vs-DB tradeoff flips (no PR-diff benefit to win), so prefer a single
+**`.forseti/forseti.db`**:
+- holds the **result cache** + the **spec registry** (+ latest verdicts) — one file, queryable,
+  simplest thing that serves all three jobs;
+- **GEPA analytics** = add tables/queries to the same DB when needed — no second store;
+- the committable **evidence bundle** is produced on demand by `forseti export`, fully decoupled.
+
+**Open:** cache **scope** — per-project (default, simplest, trustworthy) vs a shared cross-project
+cache later (the ESBMC version is already in the key, but a shared cache adds a poisoning-trust
+question).
 
 ## Still open (then these become ADRs)
 
 - **Stop-gate strictness** — block hard on VERIFIED, or allow "VERIFIED-up-to-k with a flagged
   residual" so an UNKNOWN doesn't deadlock the agent.
-- **Cache scope** — per-repo only vs a shared cross-project cache (and trusting a shared cache
-  across ESBMC versions — hence the version in the key).
-- ~~Unit granularity~~ — **decided: function/symbol level (`path::symbol`)**.
+- **Cache scope** — per-project (default) vs a shared cross-project cache later (see store section).
+
+**Decided:** unit granularity = function/symbol level (`path::symbol`); store = one per-project
+`.forseti/forseti.db`, gitignored; "evidence" = opt-in `forseti export`, not the storage layer.
