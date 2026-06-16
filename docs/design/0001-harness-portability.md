@@ -112,30 +112,44 @@ event log**. Every step in the sequence diagram emits a JSONL event to a per-ses
 `fix.attempt`, `stopgate.decision`, `property.proposed` / `property.graded`. One trace = one
 replayable story of what the system did and why, across any harness. (Roadmap **W10**.)
 
-## The property store — what it's actually *for*
+## What ESBMC actually returns (terminology — read this first)
 
-Three different jobs get lumped together here. Pulled apart:
+ESBMC emits **no proof object.** For a unit + property it returns a **verdict**:
+- **VERIFIED** — no violation found *up to bound k*, under the harness's assumptions;
+- **VIOLATED** — plus a **counterexample** (concrete input + path);
+- **UNKNOWN** — timeout / bound too small.
 
-1. **Verdict cache (speed).** Key = `hash(unit text + property + esbmc-version + config)` → verdict.
-   ESBMC is deterministic for fixed input, so if the *exact* pair recurs we skip the expensive run.
-   **This is the "the agent sent the same code twice" case** — pure optimization, auto-invalidated
-   when the code or property changes (different hash).
-2. **Spec registry (intent across edits).** Key = stable **unit id** (`path::symbol`) → the set of
-   properties we *intend* to hold + their grades. This **survives edits**: when the agent rewrites
-   `rb_push`, we re-check the same intended properties rather than regenerating them (slow +
-   non-deterministic) every turn.
-3. **Proof-carrying record (shipping).** Serialized `unit → properties + last verdict + provenance`
-   — the artifact that travels *with* the code (the deck's packaging open question).
+Trust in a VERIFIED is therefore *reproducible* ("re-run the same ESBMC version/flags/k → same
+answer"), or at most backed by an SV-COMP-style **correctness witness** a *separate validator*
+re-checks. A genuine, independently kernel-checkable **proof** is the **Lean branch's** job
+([ADR-0007](../adr/0007-lean-off-critical-path.md)) — not ESBMC's. **Never write "proof" in this
+repo where we mean "reproducible verdict."**
 
-They share storage but are keyed differently (cache by content-hash, registry by unit-id).
+## The store — what it's actually *for*
 
-**Low-regret path (recommended) — don't build a DB yet:**
-- **Spec registry + proof-carrying** = in-repo files keyed by unit id (`.forseti/<unit>.yaml`):
-  versioned, diffable, portable, proof-carrying by construction.
-- **Verdict cache** = a local content-hash store (a dir or a tiny SQLite), *derived/ephemeral*,
-  not committed; its key **must include the ESBMC version**.
-- **Analytics DB** = deferred until **GEPA (P2/P3)** actually needs corpus-wide kill-rate queries;
-  then add a derived index rebuilt from the files. Measure before building.
+Three jobs, usually lumped together:
+
+1. **Result cache (speed).** Key = `hash(unit text + property + ESBMC version + flags + k)` → the
+   stored **verdict** (good / bad+counterexample / unknown). ESBMC is deterministic for fixed
+   input, so an identical query skips the expensive re-run. **This is the "asked the same thing
+   twice" case** — auto-invalidated when anything in the key changes.
+2. **Spec registry (intent across edits).** Key = unit id (`path::symbol`) → the properties we
+   *intend* to hold + their grades. **Survives edits:** when the agent rewrites `rb_push` we
+   re-check the same intent instead of regenerating it (slow + non-deterministic) every turn.
+3. **Evidence record (shipping).** Serialized `unit → properties + latest verdict + provenance
+   (ESBMC version, flags, k, code-hash)`. **Not a proof** — a *reproducible-verification* record:
+   enough to re-run and get the same verdict. The honest form of the deck's "ship code with its
+   guarantees" question.
+
+Keyed two ways: cache by content-hash, registry by unit-id.
+
+**Low-regret path (recommended) — no DB yet:**
+- **Registry + evidence record** = in-repo files keyed by unit id (`.forseti/<unit>.yaml`):
+  versioned, diffable, portable.
+- **Result cache** = local content-hash store (dir or tiny SQLite), *ephemeral*, not committed;
+  **ESBMC version in the key**.
+- **Analytics DB** = deferred to **GEPA (P2/P3)**; rebuild a derived index from the files when
+  corpus-wide kill-rate queries are actually needed. Measure before building.
 
 ## Still open (then these become ADRs)
 

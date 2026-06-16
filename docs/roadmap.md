@@ -118,6 +118,8 @@ Make it solid and tell the story.
 
 ## Open questions (from the deck — research, not committed deliverables)
 
-- **Proof-carrying packaging:** ship agent-written code *with* the properties it satisfies.
+- **Evidence packaging:** ship agent-written code *with* the properties it satisfies + the
+  (reproducible) ESBMC verdicts and provenance. NB: ESBMC gives a reproducible *verdict*, not a
+  proof object — a genuine checkable proof is the Lean branch, not ESBMC.
 - **Provability gaps:** aim generated tests at exactly where bounded proof runs out (past k).
 - **PBT crossover:** turn generated properties into property-based-testing generators + oracles.
