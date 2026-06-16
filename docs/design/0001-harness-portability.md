@@ -13,7 +13,7 @@ model:
 |---|---|---|
 | **Claude Code** | hooks (PreToolUse/PostToolUse/Stop), subagents, skills, slash commands, plugins | MCP, CLI |
 | **Codex** | `AGENTS.md`, `notify` hook (limited) | MCP, CLI |
-| **opencode** | plugin API + event hooks, custom commands, agents/modes | MCP, CLI |
+| **opencode** | plugin API, custom commands, agents/modes — **no tool-use hooks** | MCP, CLI |
 
 Hooks differ everywhere; the one substrate **all three share is MCP (+ a plain CLI).**
 
@@ -28,7 +28,9 @@ Push *all logic* into a **harness-neutral Forseti Core**, and keep each harness'
     fork): a `PostToolUse` hook that verifies after edits, a `Stop` hook that gates "done" on a
     proof, a **property-generation subagent**, and a skill/slash-command. All call Core.
   - **Codex** — `AGENTS.md` instructions + Core registered as an MCP server + a `notify` hook.
-  - **opencode** — an opencode plugin (its event hooks) + Core as an MCP server.
+  - **opencode** — **no tool-use hooks**, so it uses the *prompt+tools fallback*: a custom
+    command / subagent drives Core via MCP and emulates the Stop-gate in its own instructions.
+    Same Core, weaker enforcement.
 
 > **The hook is just the *trigger/gate*. The agent is the *worker*. The Core is the *tool*.**
 > Where a harness lacks a given hook, it degrades gracefully to the agent calling Core tools
@@ -91,30 +93,54 @@ sequenceDiagram
     end
 ```
 
-## The property store
+## Loop control (decided direction)
 
-Properties describe **intent** for a unit of code, so they must **persist across edits** (the
-loop keeps rewriting the code; the property is the fixed target). That argues for a store rather
-than regenerating every turn — and the store is also what enables **proof-carrying packaging**
-(the deck's open question): *the store is "the code + its proofs."*
+Control flow is **hook-triggered, agent-as-worker**, with a fallback where hooks don't exist:
+- Where tool-use hooks exist (**Claude Code**; **Codex** via its limited hooks/notify), a hook
+  auto-runs `verify` after edits and a **Stop-gate** blocks "done" until the unit is VERIFIED.
+- **opencode has no tool-use hooks** → **prompt+tools fallback**: a custom command / subagent
+  tells the model to call `verify` after writing and keep fixing until it passes. Weaker
+  *enforcement*, identical *Core*.
 
-**Keying.** A property attaches to a stable **unit id** (e.g. `path::symbol`), while each *verdict*
-records the **content hash** it was checked against — so we can tell "this proof is stale, the code
-changed under it" from "this property still holds."
+The Core is the same everywhere; only the trigger differs.
 
-**Form factor — the open fork:**
-- **In-repo files** (e.g. `.forseti/<unit>.yaml`): versioned with the code → naturally
-  proof-carrying, diffable in PRs, zero infra, trivially portable across harnesses. Weaker at
-  cross-corpus queries.
-- **SQLite DB**: great for the grading/GEPA analytics (aggregate kill-rates across the corpus),
-  single file, portable. Not human-diffable; doesn't "ship with the code" on its own.
-- **Hybrid (leaning here):** in-repo files are the **source of truth** (proof-carrying, versioned);
-  a **derived SQLite index** is rebuilt from them for grading/GEPA analytics. Mirrors the thesis —
-  the proof travels *with* the code.
+## Observability (required from day one)
 
-## Open questions to resolve (then these become ADRs)
+A loop spanning hooks, an agent, the Core, and ESBMC is undebuggable without a **structured
+event log**. Every step in the sequence diagram emits a JSONL event to a per-session trace:
+`trigger.fired`, `core.verify.start`, `esbmc.invoke` / `esbmc.verdict`, `counterexample`,
+`fix.attempt`, `stopgate.decision`, `property.proposed` / `property.graded`. One trace = one
+replayable story of what the system did and why, across any harness. (Roadmap **W10**.)
 
-1. **Loop control model** — hook/Stop-gate trigger + agent-as-worker + Core-as-tool, vs a
-   Core-driven orchestrator that calls the model, vs pure prompt+tools (no hooks).
-2. **Store form factor** — hybrid (files + derived index) vs DB-only vs files-only.
-3. **Unit granularity** — function-level vs file/module-level units for properties & keying.
+## The property store — what it's actually *for*
+
+Three different jobs get lumped together here. Pulled apart:
+
+1. **Verdict cache (speed).** Key = `hash(unit text + property + esbmc-version + config)` → verdict.
+   ESBMC is deterministic for fixed input, so if the *exact* pair recurs we skip the expensive run.
+   **This is the "the agent sent the same code twice" case** — pure optimization, auto-invalidated
+   when the code or property changes (different hash).
+2. **Spec registry (intent across edits).** Key = stable **unit id** (`path::symbol`) → the set of
+   properties we *intend* to hold + their grades. This **survives edits**: when the agent rewrites
+   `rb_push`, we re-check the same intended properties rather than regenerating them (slow +
+   non-deterministic) every turn.
+3. **Proof-carrying record (shipping).** Serialized `unit → properties + last verdict + provenance`
+   — the artifact that travels *with* the code (the deck's packaging open question).
+
+They share storage but are keyed differently (cache by content-hash, registry by unit-id).
+
+**Low-regret path (recommended) — don't build a DB yet:**
+- **Spec registry + proof-carrying** = in-repo files keyed by unit id (`.forseti/<unit>.yaml`):
+  versioned, diffable, portable, proof-carrying by construction.
+- **Verdict cache** = a local content-hash store (a dir or a tiny SQLite), *derived/ephemeral*,
+  not committed; its key **must include the ESBMC version**.
+- **Analytics DB** = deferred until **GEPA (P2/P3)** actually needs corpus-wide kill-rate queries;
+  then add a derived index rebuilt from the files. Measure before building.
+
+## Still open (then these become ADRs)
+
+- **Stop-gate strictness** — block hard on VERIFIED, or allow "VERIFIED-up-to-k with a flagged
+  residual" so an UNKNOWN doesn't deadlock the agent.
+- **Cache scope** — per-repo only vs a shared cross-project cache (and trusting a shared cache
+  across ESBMC versions — hence the version in the key).
+- ~~Unit granularity~~ — **decided: function/symbol level (`path::symbol`)**.

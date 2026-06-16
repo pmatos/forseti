@@ -39,6 +39,7 @@ ESBMC fixes and a Lean backend are *supporting*, not the bar
 | W7 | **Writeup / evangelism** | `docs/writeup/` | Blog → paper/talk; the public half of the bar |
 | W8 | **Lean stretch** | TBD | Unbounded 2nd backend; off critical path ([ADR-0007](adr/0007-lean-off-critical-path.md)) |
 | W9 | **Harness integration** | Core + adapters | Neutral Forseti Core (CLI + MCP) + Claude Code / Codex / opencode adapters; forked `esbmc-plugin`. See [RFC-0001](design/0001-harness-portability.md) |
+| W10 | **Observability** | Core | Structured JSONL event trace of the whole protocol (triggers, Core calls, ESBMC verdicts, counterexamples, fixes). Debuggability from day one. See [RFC-0001](design/0001-harness-portability.md#observability-required-from-day-one) |
 
 **Sequencing rule:** property-gen + GEPA (W2–W4) are de-risked **before** the real-code +
 ESBMC push (W5–W6) — lock the novel contribution on controllable kernels first
