@@ -1,0 +1,25 @@
+# Build / verification artifacts
+*.o
+*.out
+*.goto
+*.smt2
+/build/
+/out/
+
+# ESBMC / solver scratch
+*.cex
+*.trace
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
