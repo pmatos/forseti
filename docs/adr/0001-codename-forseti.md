@@ -15,7 +15,7 @@ and the technical thesis is *establishing truth about code via proof / judgment*
 The program is codenamed **Forseti** — the Norse god of justice and reconciliation who
 presides over every dispute in his hall Glitnir and hands down the fairest judgment.
 
-The repo (currently `dev/noname`) will be renamed `forseti`; the public GitHub repo is
+The working dir was renamed `dev/noname` → `dev/forseti` (2026-06-16); the public GitHub repo is
 `pmatos/forseti`.
 
 ## Consequences
