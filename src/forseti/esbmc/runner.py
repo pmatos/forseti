@@ -35,8 +35,20 @@ def _has_banner(text: str, banner: str) -> bool:
 
 
 def _counterexample(text: str) -> str:
-    """The trace text spanning `[Counterexample]` up to the FAILED banner."""
-    body = text[: text.find(_FAILED)] if _FAILED in text else text
+    """The trace text spanning `[Counterexample]` up to the terminal FAILED banner.
+
+    Slices at the *last* standalone FAILED line, not the first substring match —
+    so a `VERIFICATION FAILED` echoed inside the `Violated property:` block (e.g.
+    an `__ESBMC_assert` message) doesn't truncate the trace early. Callers only
+    invoke this once a standalone FAILED banner is known to exist.
+    """
+    lines = text.splitlines()
+    cut = len(lines)
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].strip() == _FAILED:
+            cut = i
+            break
+    body = "\n".join(lines[:cut])
     start = body.find(_CEX_START)
     return (body[start:] if start != -1 else body).strip()
 

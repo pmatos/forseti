@@ -167,3 +167,27 @@ def test_parse_error_with_echoed_failed_banner_is_error() -> None:
     result = classify(meta(stdout=out, exit_code=6))
     assert isinstance(result, Error)
     assert "parsing" in result.message.lower()
+
+
+def test_counterexample_not_truncated_by_echoed_failed_in_message() -> None:
+    # The __ESBMC_assert message inside `Violated property:` may itself contain
+    # the banner text; the trace must be sliced at the terminal banner, not the
+    # earlier echo, so the property details survive in raw_counterexample.
+    out = (
+        "[Counterexample]\n"
+        "State 1 file f.c line 3 function main thread 0\n"
+        "  x = 0\n"
+        "Violated property:\n"
+        "  file f.c line 3 function main\n"
+        "  VERIFICATION FAILED\n"  # the assert message, indented
+        "  x > 0\n"
+        "\n"
+        "VERIFICATION FAILED\n"  # the terminal banner
+        "ESBMC version 8.3.0 64-bit x86_64 linux\n"
+    )
+    result = classify(meta(stdout=out, exit_code=1))
+    assert isinstance(result, Violated)
+    assert "Violated property:" in result.raw_counterexample
+    assert "x > 0" in result.raw_counterexample  # not truncated at the echo
+    # the terminal banner is excluded from the slice
+    assert not result.raw_counterexample.rstrip().endswith("VERIFICATION FAILED")
