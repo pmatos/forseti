@@ -53,17 +53,17 @@ def classify(meta: RunMeta) -> EsbmcResult:
     """Map one finished ESBMC run to a verdict.
 
     Classification keys on stdout/stderr markers, never the exit code (a
-    timeout and a real violation both exit 1). The failure banner and known
-    invocation errors are checked before the success banner, and SUCCESSFUL is
-    matched only as a standalone line, so a broken invocation that merely
-    echoes the banner text is never read as VERIFIED. Unrecognised output
-    becomes `Error`, never a verdict.
+    timeout and a real violation both exit 1). Known invocation errors are
+    checked before any verdict banner, and the SUCCESSFUL/FAILED banners are
+    matched only as standalone lines — so a broken invocation that merely
+    echoes banner text (a parse diagnostic quoting source) is never read as a
+    verdict. Unrecognised output becomes `Error`, never a verdict.
     """
     text = meta.stdout + "\n" + meta.stderr
-    if _has_banner(text, _FAILED):
-        return Violated(meta, _counterexample(text))
     if meta.exit_code == 6 or "PARSING ERROR" in text or "failed to open input file" in text:
         return Error(meta, _error_message(text))
+    if _has_banner(text, _FAILED):
+        return Violated(meta, _counterexample(text))
     if _has_banner(text, _SUCCESSFUL):
         return Verified(meta)
     if "VERIFICATION UNKNOWN" in text:

@@ -154,3 +154,16 @@ def test_parse_error_with_echoed_success_banner_is_error() -> None:
     result = classify(meta(stdout=out, exit_code=6))
     assert isinstance(result, Error)
     assert "parsing" in result.message.lower()
+
+
+def test_parse_error_with_echoed_failed_banner_is_error() -> None:
+    # A parse diagnostic may echo an offending source line that is *exactly*
+    # the FAILED banner; the invocation error must still win over the verdict.
+    out = (
+        "broken.c:3:1: error: expected identifier\n"
+        "VERIFICATION FAILED\n"
+        "ERROR: PARSING ERROR\n"
+    )
+    result = classify(meta(stdout=out, exit_code=6))
+    assert isinstance(result, Error)
+    assert "parsing" in result.message.lower()
