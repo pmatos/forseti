@@ -19,7 +19,19 @@ from .result import (
 )
 
 _FAILED = "VERIFICATION FAILED"
+_SUCCESSFUL = "VERIFICATION SUCCESSFUL"
 _CEX_START = "[Counterexample]"
+
+
+def _has_banner(text: str, banner: str) -> bool:
+    """True only if `banner` appears as a standalone output line.
+
+    ESBMC prints its verdict on its own line. Requiring a line match keeps a
+    broken invocation that merely *echoes* the banner text (a frontend
+    diagnostic quoting source, a preprocessor error) from being read as a
+    verdict, per the "never silently pass" invariant.
+    """
+    return any(line.strip() == banner for line in text.splitlines())
 
 
 def _counterexample(text: str) -> str:
@@ -41,14 +53,18 @@ def classify(meta: RunMeta) -> EsbmcResult:
     """Map one finished ESBMC run to a verdict.
 
     Classification keys on stdout/stderr markers, never the exit code (a
-    timeout and a real violation both exit 1). The failure banner is checked
-    first, so a run is never read as VERIFIED while any failure marker is
-    present. Unrecognised output becomes `Error`, never a verdict.
+    timeout and a real violation both exit 1). The failure banner and known
+    invocation errors are checked before the success banner, and SUCCESSFUL is
+    matched only as a standalone line, so a broken invocation that merely
+    echoes the banner text is never read as VERIFIED. Unrecognised output
+    becomes `Error`, never a verdict.
     """
     text = meta.stdout + "\n" + meta.stderr
-    if _FAILED in text:
+    if _has_banner(text, _FAILED):
         return Violated(meta, _counterexample(text))
-    if "VERIFICATION SUCCESSFUL" in text:
+    if meta.exit_code == 6 or "PARSING ERROR" in text or "failed to open input file" in text:
+        return Error(meta, _error_message(text))
+    if _has_banner(text, _SUCCESSFUL):
         return Verified(meta)
     if "VERIFICATION UNKNOWN" in text:
         return Unknown(meta, UnknownReason.UNCLASSIFIED)
@@ -56,8 +72,6 @@ def classify(meta: RunMeta) -> EsbmcResult:
         return Unknown(meta, UnknownReason.TIMEOUT)
     if "Out of memory" in text:
         return Unknown(meta, UnknownReason.MEMOUT)
-    if meta.exit_code == 6 or "PARSING ERROR" in text or "failed to open input file" in text:
-        return Error(meta, _error_message(text))
     return Error(meta, "unclassified output")
 
 
@@ -114,8 +128,13 @@ def verify(
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=proc_timeout
         )
-    except FileNotFoundError:
-        # The binary never ran; record the intended argv for provenance.
+    except OSError as exc:
+        # The binary never ran (missing, non-executable, a directory, ...);
+        # record the intended argv for provenance. FileNotFoundError is an
+        # OSError subclass, so a missing binary keeps its specific message;
+        # PermissionError and other OSErrors become a typed Error too, never a
+        # leaked exception, per the wrapper's "invocation failures are Error"
+        # invariant.
         meta = RunMeta(
             esbmc_version="",
             argv=argv,
@@ -124,7 +143,12 @@ def verify(
             stdout="",
             stderr="",
         )
-        return Error(meta, f"esbmc binary not found: {esbmc_bin}")
+        message = (
+            f"esbmc binary not found: {esbmc_bin}"
+            if isinstance(exc, FileNotFoundError)
+            else f"esbmc invocation failed: {esbmc_bin}: {exc}"
+        )
+        return Error(meta, message)
     except subprocess.TimeoutExpired as exc:
         meta = RunMeta(
             esbmc_version="",

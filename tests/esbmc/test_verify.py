@@ -27,6 +27,20 @@ def test_missing_binary_returns_error(tmp_path: Path) -> None:
     assert "--no-unwinding-assertions" in result.meta.argv
 
 
+def test_non_executable_binary_returns_error(tmp_path: Path) -> None:
+    # A bad-but-existing esbmc_bin (here: a directory) makes subprocess.run
+    # raise an OSError other than FileNotFoundError; the wrapper must return a
+    # typed Error with provenance, never leak the exception.
+    src = tmp_path / "x.c"
+    src.write_text("int main(void){ return 0; }\n")
+    bad_bin = tmp_path / "not_a_binary_dir"
+    bad_bin.mkdir()
+    result = verify(src, unwind=4, esbmc_bin=str(bad_bin))
+    assert isinstance(result, Error)
+    assert result.meta.exit_code == -1
+    assert "--unwind" in result.meta.argv
+
+
 def test_subprocess_timeout_is_unknown_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -133,3 +133,24 @@ def test_unrecognised_output_is_error_never_a_verdict() -> None:
     result = classify(meta(stdout="Segmentation fault\n", stderr="", exit_code=139))
     assert isinstance(result, Error)
     assert "unclassified" in result.message.lower()
+
+
+def test_echoed_success_banner_in_diagnostic_is_not_verified() -> None:
+    # A frontend diagnostic that quotes source text containing the banner must
+    # not be read as a pass: SUCCESSFUL is only honoured as a standalone line.
+    out = 'broken.c:2:5: error: expected ; before "VERIFICATION SUCCESSFUL"\n'
+    result = classify(meta(stdout=out, exit_code=1))
+    assert not isinstance(result, Verified)
+    assert isinstance(result, Error)
+
+
+def test_parse_error_with_echoed_success_banner_is_error() -> None:
+    # A parse error wins over an inline-echoed success banner, even when the
+    # success substring precedes the error markers in the stream.
+    out = (
+        "note: in expansion 'VERIFICATION SUCCESSFUL'\n"
+        "ERROR: PARSING ERROR\n"
+    )
+    result = classify(meta(stdout=out, exit_code=6))
+    assert isinstance(result, Error)
+    assert "parsing" in result.message.lower()
