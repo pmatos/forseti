@@ -13,6 +13,10 @@
 # Forseti per-project store (machine-generated artifact, not source)
 .forseti/
 
+# Planning / agent scratch (not source)
+.ultraplan/
+.impeccable/
+
 # Python
 __pycache__/
 *.pyc
