@@ -1,0 +1,13 @@
+[Counterexample]
+
+
+State 1 file tests/esbmc/fixtures/counterexamples/null_deref.c line 4 column 3 function main thread 0
+----------------------------------------------------
+  p = (signed int *)0
+
+State 3 file tests/esbmc/fixtures/counterexamples/null_deref.c line 5 column 3 function main thread 0
+----------------------------------------------------
+Violated property:
+  file tests/esbmc/fixtures/counterexamples/null_deref.c line 5 column 3 function main
+  dereference failure: NULL pointer
+  CWE: CWE-476

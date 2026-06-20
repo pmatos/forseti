@@ -1,0 +1,14 @@
+[Counterexample]
+
+
+State 1 file tests/esbmc/fixtures/counterexamples/div_by_zero.c line 3 column 3 function main thread 0
+----------------------------------------------------
+  y = 0 (00000000 00000000 00000000 00000000)
+
+State 2 file tests/esbmc/fixtures/counterexamples/div_by_zero.c line 4 column 3 function main thread 0
+----------------------------------------------------
+Violated property:
+  file tests/esbmc/fixtures/counterexamples/div_by_zero.c line 4 column 3 function main
+  division by zero
+  CWE: CWE-369
+  y != 0

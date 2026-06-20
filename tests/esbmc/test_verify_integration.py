@@ -37,6 +37,13 @@ def test_int_min_abs_overflow_is_violated() -> None:
     )
     assert isinstance(result, Violated)
     assert "overflow" in result.raw_counterexample.lower()
+    # the raw trace is parsed end-to-end into the typed model
+    assert result.counterexample is not None
+    assert len(result.counterexample.steps) >= 1
+    vp = result.counterexample.violated_property
+    assert vp.description  # ESBMC's overflow message, whatever its wording
+    assert vp.loc.function is not None
+    assert vp.loc.file.endswith("overflow.c")
 
 
 def test_parse_error_is_error() -> None:

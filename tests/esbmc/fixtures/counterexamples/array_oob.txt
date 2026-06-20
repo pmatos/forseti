@@ -1,0 +1,14 @@
+[Counterexample]
+
+
+State 1 file tests/esbmc/fixtures/counterexamples/array_oob.c line 3 column 3 function main thread 0
+----------------------------------------------------
+  i = 8 (00000000 00000000 00000000 00001000)
+
+State 4 file tests/esbmc/fixtures/counterexamples/array_oob.c line 5 column 3 function main thread 0
+----------------------------------------------------
+Violated property:
+  file tests/esbmc/fixtures/counterexamples/array_oob.c line 5 column 3 function main
+  array bounds violated: array `a' upper bound
+  CWE: CWE-121, CWE-125, CWE-129, CWE-131, CWE-193, CWE-787
+  (signed long int)i < 4

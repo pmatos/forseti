@@ -8,6 +8,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
+from .cex_parser import Frontend, parse_counterexample
 from .result import (
     EsbmcResult,
     Error,
@@ -61,7 +62,7 @@ def _error_message(text: str) -> str:
     return "esbmc reported an error"
 
 
-def classify(meta: RunMeta) -> EsbmcResult:
+def classify(meta: RunMeta, frontend: Frontend = Frontend.C) -> EsbmcResult:
     """Map one finished ESBMC run to a verdict.
 
     Classification keys on stdout/stderr markers, never the exit code (a
@@ -69,13 +70,16 @@ def classify(meta: RunMeta) -> EsbmcResult:
     checked before any verdict banner, and the SUCCESSFUL/FAILED banners are
     matched only as standalone lines — so a broken invocation that merely
     echoes banner text (a parse diagnostic quoting source) is never read as a
-    verdict. Unrecognised output becomes `Error`, never a verdict.
+    verdict. Unrecognised output becomes `Error`, never a verdict. On VIOLATED
+    the raw trace is parsed into a typed `Counterexample` for `frontend`;
+    parsing returns `None` rather than disturbing the verdict on failure.
     """
     text = meta.stdout + "\n" + meta.stderr
     if meta.exit_code == 6 or "PARSING ERROR" in text or "failed to open input file" in text:
         return Error(meta, _error_message(text))
     if _has_banner(text, _FAILED):
-        return Violated(meta, _counterexample(text))
+        raw = _counterexample(text)
+        return Violated(meta, raw, parse_counterexample(raw, frontend))
     if _has_banner(text, _SUCCESSFUL):
         return Verified(meta)
     if "VERIFICATION UNKNOWN" in text:
@@ -113,14 +117,16 @@ def verify(
     timeout_s: float | None = None,
     extra_flags: Sequence[str] = (),
     esbmc_bin: str = "esbmc",
+    frontend: Frontend = Frontend.C,
 ) -> EsbmcResult:
-    """Run ESBMC on a C `source` and return the typed verdict.
+    """Run ESBMC on a `source` and return the typed verdict.
 
     Uses the recommended `--unwind N --no-unwinding-assertions` bound. `unwind`
     is required and recorded in the result's `argv`, so a VERIFIED stays
     qualified as "verified up to k". When `timeout_s` is set, esbmc's own
     `--timeout` is used (it yields a clean `Timed out`), with a wall-clock
-    backstop that maps a Python-level timeout to `Unknown(TIMEOUT)`.
+    backstop that maps a Python-level timeout to `Unknown(TIMEOUT)`. `frontend`
+    selects the counterexample parser (C only, for now).
     """
     cmd = [
         esbmc_bin,
@@ -180,4 +186,4 @@ def verify(
         stdout=proc.stdout,
         stderr=proc.stderr,
     )
-    return classify(meta)
+    return classify(meta, frontend)
