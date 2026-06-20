@@ -58,13 +58,19 @@ def _build_parser() -> argparse.ArgumentParser:
         default="esbmc",
         help="esbmc binary to invoke (default: esbmc on PATH)",
     )
+    # Passthrough lives after a `--` separator rather than behind a `-X` option:
+    # esbmc flags are almost always dashed (--overflow-check, ...), and argparse
+    # cannot bind a dashed token as the value of an optional, so `-X --overflow-check`
+    # would parse as a missing argument. After `--`, option parsing is off and the
+    # flags reach us verbatim.
     parser.add_argument(
-        "-X",
-        "--extra",
-        action="append",
-        default=[],
-        metavar="FLAG",
-        help="extra flag passed straight through to esbmc (repeatable)",
+        "esbmc_args",
+        nargs="*",
+        metavar="ESBMC_ARG",
+        help=(
+            "flags forwarded verbatim to esbmc; place them after a `--` separator, "
+            "e.g. `forseti-esbmc file.c -- --overflow-check --no-unwinding-assertions`"
+        ),
     )
     return parser
 
@@ -84,7 +90,7 @@ def _report(result: EsbmcResult, source: Path, unwind: int) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
 
-    extra = list(args.extra)
+    extra = list(args.esbmc_args)
     if args.function:
         extra += ["--function", args.function]
 
