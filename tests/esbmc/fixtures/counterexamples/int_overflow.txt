@@ -1,0 +1,17 @@
+[Counterexample]
+
+
+State 1 file tests/esbmc/fixtures/counterexamples/int_overflow.c line 6 column 3 function main thread 0
+----------------------------------------------------
+  x = -2147483648 (10000000 00000000 00000000 00000000)
+
+State 2 file tests/esbmc/fixtures/counterexamples/int_overflow.c line 8 column 5 function main thread 0
+----------------------------------------------------
+  r = -2147483648 (10000000 00000000 00000000 00000000)
+
+State 3 file tests/esbmc/fixtures/counterexamples/int_overflow.c line 9 column 5 function main thread 0
+----------------------------------------------------
+Violated property:
+  file tests/esbmc/fixtures/counterexamples/int_overflow.c line 9 column 5 function main
+  abs is non-negative
+  r >= 0

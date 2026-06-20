@@ -77,6 +77,17 @@ def test_verification_failed_is_violated_with_counterexample() -> None:
     assert "VERIFICATION FAILED" not in result.raw_counterexample
 
 
+def test_violated_carries_parsed_counterexample_model() -> None:
+    # classify enriches Violated with the typed model parsed from the raw trace,
+    # without disturbing the raw_counterexample fallback.
+    result = classify(meta(stdout=VIOLATED_OUT, exit_code=1))
+    assert isinstance(result, Violated)
+    assert result.counterexample is not None
+    assert result.counterexample.violated_property.description == "x must be five"
+    assert result.counterexample.violated_property.expression == "x == 5"
+    assert {a.lhs: a.value for a in result.counterexample.inputs} == {"x": "-1"}
+
+
 def test_failure_banner_wins_over_success_banner() -> None:
     # Defensive: never read VERIFIED while any failure marker is present.
     both = "VERIFICATION SUCCESSFUL\n...\nVERIFICATION FAILED\n"

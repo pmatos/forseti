@@ -15,6 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+from .counterexample import Counterexample
+
 
 class Verdict(Enum):
     """The four outcomes of an ESBMC run."""
@@ -63,14 +65,16 @@ class Verified:
 
 @dataclass(frozen=True)
 class Violated:
-    """A property was violated; `raw_counterexample` is ESBMC's trace text.
+    """A property was violated.
 
-    Issue #11 will parse `raw_counterexample` into a typed model and attach it
-    here without breaking this variant's callers.
+    `raw_counterexample` is ESBMC's trace text, kept as the lossless fallback.
+    `counterexample` is the typed model parsed from it (`None` when parsing
+    failed — a parse failure never downgrades the VIOLATED verdict).
     """
 
     meta: RunMeta
     raw_counterexample: str
+    counterexample: Counterexample | None = None
 
     @property
     def verdict(self) -> Verdict:

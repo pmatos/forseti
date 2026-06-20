@@ -1,0 +1,13 @@
+[Counterexample]
+
+
+State 1 file tests/esbmc/fixtures/counterexamples/assert_simple.c line 2 column 3 function main thread 0
+----------------------------------------------------
+  x = -1 (11111111 11111111 11111111 11111111)
+
+State 2 file tests/esbmc/fixtures/counterexamples/assert_simple.c line 3 column 3 function main thread 0
+----------------------------------------------------
+Violated property:
+  file tests/esbmc/fixtures/counterexamples/assert_simple.c line 3 column 3 function main
+  x must be five
+  x == 5
