@@ -172,6 +172,33 @@ def test_every_fixture_parses_to_a_counterexample(name: str) -> None:
     assert cex.violated_property.description  # an outcome description is always present
 
 
+def test_multiple_counterexample_blocks_return_none() -> None:
+    # Some flag combinations (e.g. --assertion-coverage) make ESBMC emit several
+    # [Counterexample] blocks before one terminal banner. Merging their states
+    # under the last block's property would be a synthetic, misleading trace, so
+    # the parser declines (None) and the caller keeps raw_counterexample.
+    raw = (
+        "[Counterexample]\n"
+        "State 1 file f.c line 1 column 1 function main thread 0\n"
+        "----------------------------------------------------\n"
+        "  x = 1 (00000001)\n"
+        "Violated property:\n"
+        "  file f.c line 1 column 1 function main\n"
+        "  first property\n"
+        "  x != 1\n"
+        "\n"
+        "[Counterexample]\n"
+        "State 2 file f.c line 2 column 1 function main thread 0\n"
+        "----------------------------------------------------\n"
+        "  y = 2 (00000010)\n"
+        "Violated property:\n"
+        "  file f.c line 2 column 1 function main\n"
+        "  second property\n"
+        "  y != 2\n"
+    )
+    assert parse_counterexample(raw) is None
+
+
 def test_div_by_zero_property() -> None:
     cex = parse_counterexample(load("div_by_zero"))
     assert cex is not None

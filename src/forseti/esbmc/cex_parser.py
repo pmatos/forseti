@@ -34,6 +34,7 @@ _LOC_RE = re.compile(
     r"^\s*file (.+?) line (\d+) column (\d+)(?: function (.+?))?$"
 )
 _VIOLATED = "Violated property:"
+_CEX_MARKER = "[Counterexample]"
 _BINARY_RE = re.compile(r"\s+\(([01]+(?: [01]+)*)\)$")
 
 
@@ -107,6 +108,13 @@ def _parse_violated(lines: list[str], i: int) -> tuple[ViolatedProperty | None, 
 
 def _parse_c(raw: str) -> Counterexample | None:
     lines = raw.splitlines()
+    # Some flag combinations (e.g. --assertion-coverage) emit several
+    # [Counterexample] blocks, each for a different violated property, before one
+    # terminal banner. Merging their states under a single property would be a
+    # synthetic trace mixing assertions — decline rather than mislead (the caller
+    # keeps the lossless raw_counterexample).
+    if sum(1 for line in lines if line.strip() == _CEX_MARKER) > 1:
+        return None
     steps: list[Step] = []
     prop: ViolatedProperty | None = None
     i = 0
