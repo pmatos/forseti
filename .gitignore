@@ -30,3 +30,5 @@ venv/
 *.swp
 .idea/
 .vscode/
+
+.claude/settings.local.json
