@@ -23,6 +23,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
+EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
+
+# INT64_MIN as the two's-complement bit string esbmc prints (top bit set, 63
+# zeros). We pin the counterexample input by this pattern, not the decimal
+# literal: esbmc 8.3.0 renders INT64_MIN as "-9223372036854775807 - 1", so a
+# decimal-string match would be brittle across versions.
+_INT64_MIN_BITS = "1" + "0" * 63
 
 
 def test_safe_program_verifies() -> None:
@@ -55,3 +62,26 @@ def test_hard_problem_times_out_to_unknown() -> None:
     result = verify(FIXTURES / "hard.c", unwind=1, timeout_s=2)
     assert isinstance(result, Unknown)
     assert result.reason is UnknownReason.TIMEOUT
+
+
+# The two worked examples behind the manual P0 loop turn
+# (docs/walkthroughs/0001-manual-loop-abs.md). These pin the *no-overflow-check*
+# default path the walkthrough documents — distinct from
+# test_int_min_abs_overflow_is_violated above, which drives fixtures/overflow.c
+# *with* --overflow-check (a different violated property).
+def test_example_abs_is_violated_at_int_min() -> None:
+    result = verify(EXAMPLES / "abs.c", unwind=1)
+    assert isinstance(result, Violated)
+    cex = result.counterexample
+    assert cex is not None
+    assert cex.violated_property.loc.file.endswith("abs.c")
+    # The breaking input is INT64_MIN, identified by its bit pattern.
+    assert any(
+        a.binary is not None and a.binary.replace(" ", "") == _INT64_MIN_BITS
+        for a in cex.inputs
+    )
+
+
+def test_example_abs_fixed_verifies() -> None:
+    result = verify(EXAMPLES / "abs_fixed.c", unwind=1)
+    assert isinstance(result, Verified)
