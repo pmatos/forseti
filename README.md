@@ -30,6 +30,7 @@ H2 2026 Igalia investment (Jul 2026 → Jan 2027). Currently: **P0 · Foundation
 | [`docs/roadmap.md`](docs/roadmap.md) | The 6-phase plan, exit criteria, and risk register |
 | [`docs/adr/`](docs/adr/) | Architecture Decision Records — the *why* behind each choice |
 | [`docs/design/`](docs/design/) | Design RFCs — strawmen (with diagrams) under discussion |
+| [`docs/walkthroughs/`](docs/walkthroughs/) | Worked end-to-end loop turns (the P0 manual `abs`/`INT_MIN` turn) |
 | `src/` | The orchestrator loop, property store, and grading harness (built P1+) |
 
 ## What it builds on
