@@ -25,13 +25,13 @@ _CLEAN = [
     ("ring_buffer.c", 6),
     ("merge_sort.c", 5),
     ("utf8_decode.c", 4),
-    ("murmurhash.c", 4),
+    ("murmurhash.c", 8),
 ]
 _BUGGY = [
     ("ring_buffer_bug.c", 6),
     ("merge_sort_bug.c", 5),
     ("utf8_decode_bug.c", 4),
-    ("murmurhash_bug.c", 4),
+    ("murmurhash_bug.c", 8),
 ]
 
 

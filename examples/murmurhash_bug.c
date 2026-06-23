@@ -1,12 +1,14 @@
 /* Staged-defect twin of examples/murmurhash.c — a MECHANISM demo. The single
  * change: the block count is computed as `len/4 + 1` instead of `len/4`, so the
  * block loop processes one 4-byte block too many and reads key bytes past
- * key[len-1]. For a full key (len == MAXLEN) that read runs off the end of the
- * buffer, and ESBMC's default array-bounds checking reports it.
+ * key[len-1]. Because the harness sizes the buffer to exactly `len`, that
+ * over-read is a genuine out-of-bounds read at every length (not only when a
+ * fixed-size buffer happens to be exceeded), and ESBMC's default array-bounds
+ * checking reports it.
  *
- * Verdict: VIOLATED at k=4 ("dereference failure: array bounds violated").
- * Counterexample: a maximal-length key, where the extra block reads past the end.
- *   forseti-esbmc examples/murmurhash_bug.c -k 4   # exit 1
+ * Verdict: VIOLATED at k=8 ("dereference failure: array bounds violated").
+ * Counterexample: any key whose extra block reads past the len-sized object.
+ *   forseti-esbmc examples/murmurhash_bug.c -k 8   # exit 1
  *
  * Deliberately introduced bug for the harness demo; the corpus TARGET is the
  * clean examples/murmurhash.c (docs/design/0002). */
@@ -50,13 +52,10 @@ static uint32_t murmur3_32(const uint8_t *key, size_t len, uint32_t seed) {
 }
 
 int main(void) {
-    uint8_t key[MAXLEN];
     unsigned len = nondet_uint();
-    __ESBMC_assume(len <= MAXLEN);
-    key[0] = nondet_uchar(); key[1] = nondet_uchar();
-    key[2] = nondet_uchar(); key[3] = nondet_uchar();
-    key[4] = nondet_uchar(); key[5] = nondet_uchar();
-    key[6] = nondet_uchar(); key[7] = nondet_uchar();
+    __ESBMC_assume(len >= 1 && len <= MAXLEN);
+    uint8_t key[len];
+    for (unsigned i = 0; i < len; i++) key[i] = nondet_uchar();
 
     uint32_t h = murmur3_32(key, len, 0);
     (void)h;

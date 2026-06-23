@@ -34,8 +34,8 @@ the staged defect. This is the *opposite* of the older `abs.c` (buggy) /
 | `merge_sort_bug.c` | `merge_sort.c::msort` | — (merge tail drain dropped) | VIOLATED (k=5) | `forseti-esbmc examples/merge_sort_bug.c -k 5` |
 | `utf8_decode.c` | `utf8_decode.c::utf8_decode` | memory-safe; valid scalar, no surrogate, consumed ≤ len | VERIFIED (k=4) | `forseti-esbmc examples/utf8_decode.c -k 4` |
 | `utf8_decode_bug.c` | `utf8_decode.c::utf8_decode` | — (`i<len` guard dropped) | VIOLATED (k=4) | `forseti-esbmc examples/utf8_decode_bug.c -k 4` |
-| `murmurhash.c` | `murmurhash.c::murmur3_32` | memory safety over a nondet key/len (block + tail reads in bounds) | VERIFIED (k=4) | `forseti-esbmc examples/murmurhash.c -k 4` |
-| `murmurhash_bug.c` | `murmurhash.c::murmur3_32` | — (`nblocks` off by one) | VIOLATED (k=4) | `forseti-esbmc examples/murmurhash_bug.c -k 4` |
+| `murmurhash.c` | `murmurhash.c::murmur3_32` | memory safety over a nondet key/len: block + tail reads stay within the `len`-sized key | VERIFIED (k=8) | `forseti-esbmc examples/murmurhash.c -k 8` |
+| `murmurhash_bug.c` | `murmurhash.c::murmur3_32` | — (`nblocks` off by one) | VIOLATED (k=8) | `forseti-esbmc examples/murmurhash_bug.c -k 8` |
 | `abs.c` | `abs.c::my_abs` | `my_abs(x) >= 0` for every `int64_t` | VIOLATED (k=1) | `forseti-esbmc examples/abs.c` |
 | `abs_fixed.c` | `abs_fixed.c::my_abs` | `my_abs(x) >= 0` for every `int64_t` | VERIFIED (k=1) | `forseti-esbmc examples/abs_fixed.c` |
 
@@ -68,7 +68,9 @@ Risk 1). Therefore, for every kernel whose property is checked after a loop:
   (multiset-equality) check over full-width `int` exhausts the bit-vector solver.
 - `murmurhash.c` checks **memory safety only**, not determinism: proving two full
   hashes bit-identical is intractable for bounded bit-vector solving, while the
-  out-of-bounds tail/block read is the real bug surface.
+  out-of-bounds tail/block read is the real bug surface. Its key buffer is sized
+  to exactly `len` (like `utf8_decode.c`) so the bound proven is `key[0..len-1]`,
+  not a looser `key[0..MAXLEN-1]` that would let an over-read into slack VERIFY.
 
 These verdicts are bounded — *verified up to k under esbmc 8.3.0* — not proofs for
 all inputs. They are pinned against ESBMC output drift by

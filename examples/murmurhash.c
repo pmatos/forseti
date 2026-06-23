@@ -2,23 +2,22 @@
  * ESBMC harness. All hash arithmetic is unsigned, so the wraparound is defined
  * (no signed-overflow UB).
  *
- * Property: MEMORY SAFETY over a nondet key of nondet length (<= MAXLEN). The
- * 4-byte block loop and the switch(len & 3) tail must never read past
- * key[len-1]; ESBMC's default array-bounds checking guards every key[] read, so
- * a memory-safe kernel verifies with no user assertion and a buggy tail/block
- * bound is reported. We deliberately do NOT assert determinism (f(x)==f(x)):
- * proving two full hash computations bit-identical forces the bit-vector solver
- * to blast the entire multiply/rotate chain twice and equate it, which exhausts
- * memory even for a 4-byte key. Memory safety is both tractable and the real bug
- * surface for a hash's tail handling.
+ * Property: MEMORY SAFETY over a nondet key of nondet length. The 4-byte block
+ * loop and the switch(len & 3) tail must never read past key[len-1]; ESBMC's
+ * default array-bounds checking guards every key[] read. The harness sizes the
+ * buffer to exactly `len` (a VLA), so a tail/block bug that over-reads the
+ * logical input is a genuine out-of-bounds error even when it lands in what
+ * would otherwise be slack bytes — the bound proven is key[0..len-1], not a
+ * looser key[0..MAXLEN-1]. This mirrors examples/utf8_decode.c. We deliberately
+ * do NOT assert determinism (f(x)==f(x)): proving two full hash computations
+ * bit-identical forces the bit-vector solver to blast the entire multiply/rotate
+ * chain twice and equate it, which exhausts memory. Memory safety is both
+ * tractable and the real bug surface for a hash's tail handling.
  *
- * The key is filled with eight unrolled nondet bytes (no fill loop), so the only
- * loop is the block loop (len/4 <= 2 iterations); a small k covers it and the
- * post-hash point stays reachable (confirmed non-vacuous with a temporary
- * assert(0), and the bug below is caught — which itself proves the reads run).
- *
- * Verdict: VERIFIED up to k=4.
- *   forseti-esbmc examples/murmurhash.c -k 4
+ * Verdict: VERIFIED up to k=8 (the fill loop runs len <= MAXLEN times, so k must
+ * cover it; non-vacuity confirmed with a temporary assert(0) at the post-hash
+ * point, and the bug below is caught — which itself proves the reads run).
+ *   forseti-esbmc examples/murmurhash.c -k 8
  *
  * Latent edge case: the switch(len & 3) tail with its intentional fallthrough is
  * easy to get wrong, and a block loop using `<=` (or nblocks off by one) reads
@@ -63,16 +62,14 @@ static uint32_t murmur3_32(const uint8_t *key, size_t len, uint32_t seed) {
 }
 
 int main(void) {
-    uint8_t key[MAXLEN];
     unsigned len = nondet_uint();
-    __ESBMC_assume(len <= MAXLEN);
-    key[0] = nondet_uchar(); key[1] = nondet_uchar();
-    key[2] = nondet_uchar(); key[3] = nondet_uchar();
-    key[4] = nondet_uchar(); key[5] = nondet_uchar();
-    key[6] = nondet_uchar(); key[7] = nondet_uchar();
+    __ESBMC_assume(len >= 1 && len <= MAXLEN);
+    uint8_t key[len];                       /* sized to the logical length */
+    for (unsigned i = 0; i < len; i++) key[i] = nondet_uchar();
 
-    /* Property is the memory safety of these reads (default array-bounds checks);
-     * (void)h keeps the call live so the reads are not sliced away. */
+    /* Property is the memory safety of murmur3_32's reads (default array-bounds
+     * checks against the len-sized object); (void)h keeps the call live so the
+     * reads are not sliced away. */
     uint32_t h = murmur3_32(key, len, 0);
     (void)h;
     return 0;
