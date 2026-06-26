@@ -22,7 +22,7 @@ from forseti.esbmc import (
     Verified,
     Violated,
 )
-from forseti.orchestrator import LoopState, run_loop
+from forseti.orchestrator import GiveUpReason, LoopState, run_loop
 
 if TYPE_CHECKING:
     from forseti.esbmc import verify
@@ -79,7 +79,9 @@ def test_verified_first_pass_is_done() -> None:
     fix = FakeFix()
     run = run_loop(SRC, verify=FakeVerify([Verified(meta())]), fix=fix, unwind=8)
     assert run.final_state is LoopState.DONE
+    assert run.give_up_reason is None
     assert len(run.iterations) == 1
+    assert run.iterations[0].source == SRC
     assert fix.calls == 0
 
 
@@ -97,6 +99,7 @@ def test_never_fixed_gives_up_at_budget() -> None:
     verify = FakeVerify([violated(), violated(), violated()])
     run = run_loop(SRC, verify=verify, fix=fix, unwind=8, max_iterations=3)
     assert run.final_state is LoopState.GIVE_UP
+    assert run.give_up_reason is GiveUpReason.MAX_ITERATIONS_EXCEEDED
     assert len(run.iterations) == 3
     assert fix.calls == 3
     # the last recorded pass is still a FIX; GIVE_UP comes from exhaustion.
@@ -109,6 +112,7 @@ def test_unknown_halts_without_fixing() -> None:
     verify = FakeVerify([Unknown(meta(), UnknownReason.TIMEOUT)])
     run = run_loop(SRC, verify=verify, fix=fix, unwind=8)
     assert run.final_state is LoopState.UNKNOWN
+    assert run.give_up_reason is None
     assert fix.calls == 0
 
 
@@ -117,6 +121,7 @@ def test_error_gives_up_without_fixing() -> None:
     verify = FakeVerify([Error(meta(), "esbmc binary not found")])
     run = run_loop(SRC, verify=verify, fix=fix, unwind=8)
     assert run.final_state is LoopState.GIVE_UP
+    assert run.give_up_reason is GiveUpReason.ESBMC_ERROR
     assert fix.calls == 0
 
 
