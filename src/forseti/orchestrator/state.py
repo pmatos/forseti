@@ -33,6 +33,19 @@ class LoopState(Enum):
     GIVE_UP = "give_up"
 
 
+class GiveUpReason(Enum):
+    """Why the loop reached `GIVE_UP` — refines the terminal state for a human.
+
+    The two ways `run_loop` reaches `GIVE_UP`: `MAX_ITERATIONS_EXCEEDED` (the
+    iteration budget ran out while still `Violated`) and `ESBMC_ERROR` (an
+    `Error` verdict — a tooling/invocation failure). `UNKNOWN` is a *separate*
+    `LoopState`, not a give-up, so it has no reason here.
+    """
+
+    MAX_ITERATIONS_EXCEEDED = "max_iterations_exceeded"
+    ESBMC_ERROR = "esbmc_error"
+
+
 def next_state(result: EsbmcResult) -> LoopState:
     """Map one ESBMC verdict to the loop state it leads to.
 

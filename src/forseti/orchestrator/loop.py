@@ -2,9 +2,11 @@
 
 The driver is deterministic and effect-free in itself — all I/O lives behind
 the `VerifyPort`/`FixPort` seams. It records every pass in an in-memory
-`LoopRun`. Termination *policy* (a rich give-up report, convergence over
-multiple properties) is #26; UNKNOWN escalation is #27; here UNKNOWN simply
-halts and an exhausted iteration budget gives up.
+`LoopRun`, tagging a `GIVE_UP` with the `GiveUpReason` that caused it. The
+human-facing report (last counterexample + per-iteration history + reason) is a
+pure projection over that record — `report_for` in `report.py` — so the driver
+stays effect-free. UNKNOWN escalation is #27; here UNKNOWN simply halts and an
+exhausted iteration budget gives up.
 """
 
 from __future__ import annotations
@@ -15,26 +17,37 @@ from pathlib import Path
 from forseti.esbmc import EsbmcResult, Violated
 
 from .ports import FixPort, VerifyPort
-from .state import LoopState, next_state
+from .state import GiveUpReason, LoopState, next_state
 
 DEFAULT_MAX_ITERATIONS = 10
 
 
 @dataclass(frozen=True)
 class Iteration:
-    """One verify pass: the verdict and the loop state it mapped to."""
+    """One verify pass: the source verified, the verdict, and the state it mapped to.
+
+    `source` is the path verified this pass — i.e. the output of the *previous*
+    iteration's fix. With the minimal `FixPort` it is the only fix handle the
+    loop has; a structured diff handle arrives with #28.
+    """
 
     index: int
+    source: Path
     result: EsbmcResult
     state: LoopState
 
 
 @dataclass(frozen=True)
 class LoopRun:
-    """The outcome of a `run_loop` call: where it ended and how it got there."""
+    """The outcome of a `run_loop` call: where it ended and how it got there.
+
+    `give_up_reason` is set only when `final_state` is `GIVE_UP` (which path
+    led there); `None` for `DONE`/`UNKNOWN`.
+    """
 
     final_state: LoopState
     iterations: tuple[Iteration, ...]
+    give_up_reason: GiveUpReason | None = None
 
 
 def run_loop(
@@ -60,10 +73,22 @@ def run_loop(
     for index in range(max_iterations):
         result = verify(current, unwind=unwind)
         state = next_state(result)
-        iterations.append(Iteration(index, result, state))
+        iterations.append(Iteration(index, current, result, state))
         match result:
             case Violated() as violation:
                 current = fix(current, violation)
             case _:
-                return LoopRun(state, tuple(iterations))
-    return LoopRun(LoopState.GIVE_UP, tuple(iterations))
+                # DONE/UNKNOWN have no give-up reason; the only way `state` is
+                # GIVE_UP here is an `Error` verdict (Verified->DONE,
+                # Unknown->UNKNOWN, Violated handled above).
+                reason = (
+                    GiveUpReason.ESBMC_ERROR
+                    if state is LoopState.GIVE_UP
+                    else None
+                )
+                return LoopRun(state, tuple(iterations), give_up_reason=reason)
+    return LoopRun(
+        LoopState.GIVE_UP,
+        tuple(iterations),
+        give_up_reason=GiveUpReason.MAX_ITERATIONS_EXCEEDED,
+    )

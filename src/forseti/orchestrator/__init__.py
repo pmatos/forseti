@@ -7,10 +7,12 @@ LLM, no network, no file I/O in the driver itself — the ports own all effects.
 
 from .loop import DEFAULT_MAX_ITERATIONS, Iteration, LoopRun, run_loop
 from .ports import FixPort, VerifyPort
-from .state import LoopState, next_state
+from .report import IterationReport, Report, report_for
+from .state import GiveUpReason, LoopState, next_state
 
 __all__ = [
     "LoopState",
+    "GiveUpReason",
     "next_state",
     "VerifyPort",
     "FixPort",
@@ -18,4 +20,7 @@ __all__ = [
     "LoopRun",
     "run_loop",
     "DEFAULT_MAX_ITERATIONS",
+    "Report",
+    "IterationReport",
+    "report_for",
 ]
