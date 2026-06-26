@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from forseti.esbmc import Counterexample, Violated
+from forseti.esbmc import Counterexample, Unknown, Violated
 
 from .loop import LoopRun
 from .state import GiveUpReason, LoopState
@@ -30,13 +30,16 @@ class IterationReport:
 
     `source` is the path verified that pass (the path-level fix handle; a
     structured diff ref arrives with #28). `k` is the unwind bound the pass
-    actually ran at, read back from the esbmc argv.
+    actually ran at, read back from the esbmc argv. `unknown_reason` is the
+    `UnknownReason` (e.g. `"timeout"`) when the pass was `Unknown`, else `None` —
+    so a human can tell *why* the loop escalated.
     """
 
     index: int
     verdict: str
     k: int | None
     source: str
+    unknown_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -103,6 +106,9 @@ def report_for(run: LoopRun) -> Report:
             verdict=it.result.verdict.value,
             k=_unwind_from_argv(it.result.meta.argv),
             source=str(it.source),
+            unknown_reason=(
+                it.result.reason.value if isinstance(it.result, Unknown) else None
+            ),
         )
         for it in run.iterations
     )

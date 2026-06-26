@@ -18,6 +18,8 @@ from forseti.esbmc import (
     RunMeta,
     SourceLoc,
     Step,
+    Unknown,
+    UnknownReason,
     Verified,
     ViolatedProperty,
     Violated,
@@ -147,3 +149,16 @@ def test_k_is_none_for_malformed_argv() -> None:
     ):
         report = report_for(_run_with_argv(argv))
         assert report.iterations[0].k is None
+
+
+def test_report_surfaces_unknown_reason() -> None:
+    # The per-iteration history distinguishes UNKNOWN reasons (e.g. timeout) so a
+    # human can see why the loop escalated; non-unknown passes carry None.
+    verify = FakeVerify([Unknown(meta(), UnknownReason.TIMEOUT), Verified(meta())])
+    run = run_loop(SRC, verify=verify, fix=FakeFix(), unwind=8, unwind_ladder=(16,))
+    report = report_for(run)
+    assert report.iterations[0].verdict == "unknown"
+    assert report.iterations[0].unknown_reason == "timeout"
+    assert report.iterations[1].unknown_reason is None
+    json.dumps(report.to_dict())  # still serializable with the new field
+    assert report.to_dict()["iterations"][0]["unknown_reason"] == "timeout"

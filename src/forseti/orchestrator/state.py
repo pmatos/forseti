@@ -9,9 +9,12 @@ State graph::
     WRITE -> VERIFY -> {DONE | FIX | UNKNOWN | GIVE_UP}
     FIX -> VERIFY
 
-WRITE/VERIFY/FIX are driver phases; DONE/UNKNOWN/GIVE_UP are terminal in this
-skeleton. UNKNOWN is a distinct, honest halt (never a silent pass); #27 will
-later turn it into a raise-k re-VERIFY rather than a stop.
+WRITE/VERIFY/FIX are driver phases; DONE/UNKNOWN/GIVE_UP are terminal. UNKNOWN is
+a distinct, honest halt (never a silent pass); `run_loop` first escalates the
+unwind bound `k` along a bounded ladder and only settles on UNKNOWN once that
+ladder is exhausted (#27). This mapper is unchanged by that policy — it still
+labels a single `Unknown` verdict UNKNOWN; the escalation decision lives in the
+driver, not here.
 """
 
 from __future__ import annotations

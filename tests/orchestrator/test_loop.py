@@ -57,10 +57,12 @@ class FakeVerify:
     def __init__(self, results: list[EsbmcResult]) -> None:
         self._results = list(results)
         self.calls = 0
+        self.unwinds: list[int] = []
 
     def __call__(self, source: Path, *, unwind: int) -> EsbmcResult:
         assert self._results, "FakeVerify over-popped: script exhausted"
         self.calls += 1
+        self.unwinds.append(unwind)
         return self._results.pop(0)
 
 
@@ -132,3 +134,62 @@ def test_non_positive_budget_is_rejected() -> None:
     verify = FakeVerify([Verified(meta())])
     with pytest.raises(ValueError):
         run_loop(SRC, verify=verify, fix=fix, unwind=8, max_iterations=0)
+
+
+def test_unknown_escalates_then_converges() -> None:
+    # UNKNOWN at the base bound, then VERIFIED at the next rung up -> DONE.
+    fix = FakeFix()
+    verify = FakeVerify([Unknown(meta(), UnknownReason.TIMEOUT), Verified(meta())])
+    run = run_loop(SRC, verify=verify, fix=fix, unwind=8, unwind_ladder=(16,))
+    assert run.final_state is LoopState.DONE
+    assert fix.calls == 0
+    assert verify.unwinds == [8, 16]
+    assert len(run.iterations) == 2
+
+
+def test_unknown_exhausts_ladder_then_reports() -> None:
+    # UNKNOWN at every rung -> terminal UNKNOWN once the ladder is exhausted;
+    # never a silent pass, and no fix attempted.
+    fix = FakeFix()
+    verify = FakeVerify(
+        [
+            Unknown(meta(), UnknownReason.TIMEOUT),
+            Unknown(meta(), UnknownReason.TIMEOUT),
+            Unknown(meta(), UnknownReason.TIMEOUT),
+        ]
+    )
+    run = run_loop(SRC, verify=verify, fix=fix, unwind=8, unwind_ladder=(16, 32))
+    assert run.final_state is LoopState.UNKNOWN
+    assert run.give_up_reason is None
+    assert fix.calls == 0
+    assert verify.unwinds == [8, 16, 32]
+    assert len(run.iterations) == 3
+
+
+def test_ladder_restarts_at_base_after_a_fix() -> None:
+    # A fresh candidate (post-fix) restarts the ladder at the base bound, then
+    # escalates again on its own UNKNOWN.
+    fix = FakeFix()
+    verify = FakeVerify(
+        [violated(), Unknown(meta(), UnknownReason.TIMEOUT), Verified(meta())]
+    )
+    run = run_loop(SRC, verify=verify, fix=fix, unwind=8, unwind_ladder=(16,))
+    assert run.final_state is LoopState.DONE
+    assert fix.calls == 1
+    assert verify.unwinds == [8, 8, 16]
+    assert len(run.iterations) == 3
+
+
+def test_invalid_unwind_ladder_is_rejected() -> None:
+    # The effective ladder (unwind, *unwind_ladder) must be strictly increasing
+    # positive ints: reject non-increasing, duplicate, and < 1 bounds loudly.
+    fix = FakeFix()
+    for bad_unwind, bad_ladder in [(8, (4,)), (8, (16, 16)), (0, (1,))]:
+        with pytest.raises(ValueError):
+            run_loop(
+                SRC,
+                verify=FakeVerify([Verified(meta())]),
+                fix=fix,
+                unwind=bad_unwind,
+                unwind_ladder=bad_ladder,
+            )
