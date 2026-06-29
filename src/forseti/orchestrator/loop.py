@@ -1,26 +1,31 @@
 """The `run_loop` driver: bounded write -> verify -> fix over injected ports.
 
 The driver is deterministic and effect-free in itself — all I/O lives behind
-the `VerifyPort`/`FixPort` seams. It records every pass in an in-memory
-`LoopRun`, tagging a `GIVE_UP` with the `GiveUpReason` that caused it. The
-human-facing report (last counterexample + per-iteration history + reason) is a
-pure projection over that record — `report_for` in `report.py` — so the driver
-stays effect-free. On `Unknown` the driver escalates the unwind bound `k` along
-a bounded ladder, re-verifying the same source until the verdict resolves or the
-ladder is exhausted (then a terminal `UNKNOWN` — never a silent pass); an
-exhausted iteration budget gives up.
+the `VerifyPort`/`FixPort`/`EventSink` seams. It records every pass in an
+in-memory `LoopRun`, tagging a `GIVE_UP` with the `GiveUpReason` that caused it,
+and emits a structured `Event` at each transition through the injected sink (the
+default `NullSink` makes emission a no-op, so the driver stays effect-free unless
+a sink is supplied). The human-facing report (last counterexample +
+per-iteration history + reason) is a pure projection over that record —
+`report_for` in `report.py`; the readable transcript is `transcript_for`. On
+`Unknown` the driver escalates the unwind bound `k` along a bounded ladder,
+re-verifying the same source until the verdict resolves or the ladder is
+exhausted (then a terminal `UNKNOWN` — never a silent pass); an exhausted
+iteration budget gives up.
 """
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
 from pathlib import Path
-from typing import assert_never
+from typing import Any, assert_never
 
 from forseti.esbmc import EsbmcResult, Error, Unknown, Verified, Violated
 
 from .ports import FixPort, VerifyPort
 from .state import GiveUpReason, LoopState, next_state
+from .telemetry import Event, EventSink, NullSink
 
 DEFAULT_MAX_ITERATIONS = 10
 
@@ -61,6 +66,7 @@ def run_loop(
     unwind: int,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     unwind_ladder: tuple[int, ...] = (),
+    sink: EventSink | None = None,
 ) -> LoopRun:
     """Drive write -> verify -> fix until a terminal verdict or a budget runs out.
 
@@ -81,10 +87,17 @@ def run_loop(
         raise ValueError(
             f"unwind ladder must be increasing positive ints, got {ladder}"
         )
+    out = sink or NullSink()
+    seq = itertools.count()
+
+    def emit(type: str, **kw: Any) -> None:
+        out.emit(Event(next(seq), type, **kw))
+
     iterations: list[Iteration] = []
     current = source
     index = 0
     rounds = 0
+    emit("trigger.fired", detail={"source": str(source), "base_k": unwind})
     while rounds < max_iterations:
         rounds += 1
         k_index = 0
@@ -92,19 +105,42 @@ def run_loop(
             result = verify(current, unwind=ladder[k_index])
             state = next_state(result)
             iterations.append(Iteration(index, current, result, state))
+            emit(
+                "verify.verdict",
+                index=index,
+                k=ladder[k_index],
+                verdict=result.verdict.value,
+            )
             index += 1
             if isinstance(result, Unknown) and k_index + 1 < len(ladder):
+                emit(
+                    "unknown.policy.decision",
+                    index=index - 1,
+                    detail={
+                        "decision": "escalate",
+                        "from_k": ladder[k_index],
+                        "to_k": ladder[k_index + 1],
+                    },
+                )
                 k_index += 1  # escalate: re-verify the same source at higher k
                 continue
             break
         match result:
             case Verified():
+                emit("converged", index=index - 1)
                 return LoopRun(state, tuple(iterations))
             case Violated() as violation:
+                emit("fix.attempt", index=index - 1)
                 current = fix(current, violation)  # fix every round, incl. the last
             case Unknown():
+                emit(
+                    "unknown.policy.decision",
+                    index=index - 1,
+                    detail={"decision": "exhausted"},
+                )
                 return LoopRun(state, tuple(iterations))  # ladder exhausted
             case Error():
+                emit("give_up", index=index - 1, detail={"reason": "esbmc_error"})
                 return LoopRun(
                     LoopState.GIVE_UP,
                     tuple(iterations),
@@ -112,6 +148,7 @@ def run_loop(
                 )
             case _:
                 assert_never(result)
+    emit("give_up", detail={"reason": "max_iterations_exceeded"})
     return LoopRun(
         LoopState.GIVE_UP,
         tuple(iterations),

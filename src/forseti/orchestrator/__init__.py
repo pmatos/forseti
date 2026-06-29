@@ -7,9 +7,12 @@ LLM, no network, no file I/O in the driver itself — the ports own all effects.
 
 from .fix import FixProvider, FixRequest, ProviderFixPort, RecordedFixProvider
 from .loop import DEFAULT_MAX_ITERATIONS, Iteration, LoopRun, run_loop
+from .persistence import persist_run
 from .ports import FixPort, VerifyPort
 from .report import IterationReport, Report, report_for
 from .state import GiveUpReason, LoopState, next_state
+from .telemetry import Event, EventSink, JsonlSink, ListSink, NullSink
+from .transcript import transcript_for
 
 __all__ = [
     "LoopState",
@@ -28,4 +31,11 @@ __all__ = [
     "FixProvider",
     "ProviderFixPort",
     "RecordedFixProvider",
+    "Event",
+    "EventSink",
+    "NullSink",
+    "ListSink",
+    "JsonlSink",
+    "persist_run",
+    "transcript_for",
 ]
