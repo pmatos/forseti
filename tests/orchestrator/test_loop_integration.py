@@ -18,7 +18,12 @@ from pathlib import Path
 import pytest
 
 from forseti.esbmc import Verified, Violated, verify
-from forseti.orchestrator import LoopState, run_loop
+from forseti.orchestrator import (
+    LoopState,
+    ProviderFixPort,
+    RecordedFixProvider,
+    run_loop,
+)
 
 pytestmark = pytest.mark.skipif(
     shutil.which("esbmc") is None, reason="esbmc binary not on PATH"
@@ -70,3 +75,21 @@ def test_abs_int_min_loop_converges_to_verified() -> None:
         a.binary is not None and a.binary.replace(" ", "") == _INT64_MIN_BITS
         for a in cex.inputs
     )
+
+
+def test_abs_int_min_loop_converges_via_provider(tmp_path: Path) -> None:
+    # Same real-esbmc abs/INT_MIN loop, driven through the #28 contract: a
+    # RecordedFixProvider proposes abs_fixed.c's text and ProviderFixPort writes
+    # + re-enters VERIFY. Proves the typed-cex parse and the applier write
+    # compose across a real esbmc run, not just the fakes.
+    provider = RecordedFixProvider({EXAMPLES / "abs.c": EXAMPLES / "abs_fixed.c"})
+    fix = ProviderFixPort(provider, work_dir=tmp_path / "work")
+
+    run = run_loop(
+        EXAMPLES / "abs.c", verify=verify, fix=fix, unwind=1, max_iterations=2
+    )
+
+    assert run.final_state is LoopState.DONE
+    assert isinstance(run.iterations[-1].result, Verified)
+    assert provider.calls == 1
+    assert run.iterations[-1].source.read_text() == (EXAMPLES / "abs_fixed.c").read_text()
