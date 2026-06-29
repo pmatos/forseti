@@ -5,6 +5,7 @@ A pure, deterministic skeleton that consumes `forseti.esbmc`'s typed
 LLM, no network, no file I/O in the driver itself — the ports own all effects.
 """
 
+from .fix import FixProvider, FixRequest, ProviderFixPort, RecordedFixProvider
 from .loop import DEFAULT_MAX_ITERATIONS, Iteration, LoopRun, run_loop
 from .ports import FixPort, VerifyPort
 from .report import IterationReport, Report, report_for
@@ -23,4 +24,8 @@ __all__ = [
     "Report",
     "IterationReport",
     "report_for",
+    "FixRequest",
+    "FixProvider",
+    "ProviderFixPort",
+    "RecordedFixProvider",
 ]
