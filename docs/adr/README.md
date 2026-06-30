@@ -13,3 +13,4 @@ accepted — to change one, add a new ADR that supersedes it.
 | [0006](0006-sequencing-gepa-before-real-code.md) | Sequence GEPA before real-code | Accepted |
 | [0007](0007-lean-off-critical-path.md) | Lean stretch off the critical path | Accepted |
 | [0008](0008-vow-out-of-scope.md) | Vow is out of scope | Accepted |
+| [0009](0009-ci-esbmc-binary-provenance.md) | CI ESBMC binary provenance: upstream release pin + corpus parity guard | Accepted |
