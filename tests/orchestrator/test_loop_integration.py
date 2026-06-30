@@ -19,10 +19,12 @@ import pytest
 
 from forseti.esbmc import Verified, Violated, verify
 from forseti.orchestrator import (
+    ListSink,
     LoopState,
     ProviderFixPort,
     RecordedFixProvider,
     run_loop,
+    transcript_for,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -93,3 +95,21 @@ def test_abs_int_min_loop_converges_via_provider(tmp_path: Path) -> None:
     assert isinstance(run.iterations[-1].result, Verified)
     assert provider.calls == 1
     assert run.iterations[-1].source.read_text() == (EXAMPLES / "abs_fixed.c").read_text()
+
+
+def test_abs_run_emits_telemetry_and_renders_transcript(tmp_path: Path) -> None:
+    # Acceptance: the transcript is verified on the real #2 abs run, and the loop
+    # emits a `converged` event through the pluggable sink.
+    provider = RecordedFixProvider({EXAMPLES / "abs.c": EXAMPLES / "abs_fixed.c"})
+    fix = ProviderFixPort(provider, work_dir=tmp_path / "work")
+    sink = ListSink()
+
+    run = run_loop(
+        EXAMPLES / "abs.c", verify=verify, fix=fix, unwind=1, max_iterations=2, sink=sink
+    )
+
+    assert run.final_state is LoopState.DONE
+    assert any(e.type == "converged" for e in sink.events)
+    text = transcript_for(run, unit_id="examples/abs.c::my_abs")
+    assert "examples/abs.c::my_abs" in text
+    assert "Outcome: DONE" in text
