@@ -9,6 +9,7 @@ query workload actually needs it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Sequence
 from pathlib import Path
@@ -19,11 +20,17 @@ from .telemetry import Event
 
 
 def _unit_slug(unit_id: str) -> str:
-    """A filesystem-safe key for a `path::symbol` unit id.
+    """A filesystem-safe, collision-free key for a `path::symbol` unit id.
 
-    `examples/abs.c::my_abs` -> `examples_abs.c__my_abs`.
+    A human-readable slug (`examples/abs.c::my_abs` -> `examples_abs.c__my_abs`)
+    plus a short stable hash of the *full* unit id. The readable part alone is
+    lossy — `a/b.c::f` and `a_b.c::f` slug alike — so the hash suffix (taken over
+    the exact unit id) keeps distinct units in distinct files, preserving the
+    one-file-per-unit `path::symbol` keying.
     """
-    return unit_id.replace("::", "__").replace("/", "_")
+    readable = unit_id.replace("::", "__").replace("/", "_")
+    digest = hashlib.sha256(unit_id.encode()).hexdigest()[:12]
+    return f"{readable}-{digest}"
 
 
 def persist_run(

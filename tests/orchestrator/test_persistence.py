@@ -49,7 +49,11 @@ def test_persist_writes_keyed_jsonl_record(tmp_path: Path) -> None:
         run, unit_id="examples/abs.c::my_abs", events=sink.events, root=tmp_path
     )
 
-    assert dest == tmp_path / "runs" / "examples_abs.c__my_abs.jsonl"
+    # A readable slug prefix, plus a stable hash suffix so distinct units never
+    # collide (the bare slug is lossy: `a/b.c::f` and `a_b.c::f` slug alike).
+    assert dest.parent == tmp_path / "runs"
+    assert dest.name.startswith("examples_abs.c__my_abs-")
+    assert dest.suffix == ".jsonl"
     assert dest.is_file()
     lines = dest.read_text().splitlines()
     assert len(lines) == 1
@@ -69,3 +73,18 @@ def test_persist_appends_second_run(tmp_path: Path) -> None:
     )
 
     assert len(dest.read_text().splitlines()) == 2
+
+
+def test_distinct_units_that_slug_alike_get_distinct_files(tmp_path: Path) -> None:
+    # `a/b.c::f` and `a_b.c::f` have the same lossy slug; the hash suffix must
+    # keep them in separate JSONL files so their histories never interleave.
+    run, sink = _abs_run()
+    d1 = persist_run(run, unit_id="a/b.c::f", events=sink.events, root=tmp_path)
+    d2 = persist_run(run, unit_id="a_b.c::f", events=sink.events, root=tmp_path)
+
+    assert d1 != d2
+    # the same unit id is stable (idempotent path), so a re-persist appends.
+    d1_again = persist_run(run, unit_id="a/b.c::f", events=sink.events, root=tmp_path)
+    assert d1_again == d1
+    assert len(d1.read_text().splitlines()) == 2
+    assert len(d2.read_text().splitlines()) == 1
