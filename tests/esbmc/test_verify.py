@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 
 from forseti.esbmc.result import Error, Unknown, UnknownReason
-from forseti.esbmc import runner
 from forseti.esbmc.runner import verify
 
 
@@ -52,7 +51,7 @@ def test_subprocess_timeout_is_unknown_timeout(
             cmd="esbmc", timeout=1.0, output=b"partial output\n"
         )
 
-    monkeypatch.setattr(runner.subprocess, "run", boom)
+    monkeypatch.setattr("forseti.esbmc.runner.subprocess.run", boom)
     result = verify(src, unwind=4, timeout_s=1.0)
     assert isinstance(result, Unknown)
     assert result.reason is UnknownReason.TIMEOUT

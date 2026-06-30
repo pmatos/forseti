@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  # Pinned ESBMC release (matches the documented corpus k bounds; the upstream
+  # v8.3 release is ESBMC 8.3.0, byte-identical to the dev fork on the corpus).
+  ESBMC_VERSION: "8.3"
+  # SHA-256 of the release asset below. Part of the cache key, so a version or
+  # asset rotation forces a fresh download + verify. Bump in lockstep.
+  ESBMC_SHA256: "982097d9987c40cd66bfcf1c7cb12a27cab89903571fe815a566e403345f04ab"
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache ESBMC
+        id: cache-esbmc
+        uses: actions/cache@v4
+        with:
+          path: ~/esbmc
+          key: esbmc-${{ env.ESBMC_VERSION }}-${{ env.ESBMC_SHA256 }}-ubuntu-24.04
+
+      - name: Install ESBMC
+        if: steps.cache-esbmc.outputs.cache-hit != 'true'
+        env:
+          ESBMC_ZIP: release-ubuntu-24.04--b.RelWithDebInfo.-e.OFF.zip
+        run: |
+          ESBMC_URL="https://github.com/esbmc/esbmc/releases/download/v$ESBMC_VERSION/$ESBMC_ZIP"
+
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            -o "/tmp/$ESBMC_ZIP" "$ESBMC_URL"
+
+          echo "$ESBMC_SHA256  /tmp/$ESBMC_ZIP" | sha256sum --check --strict -
+
+          unzip -q "/tmp/$ESBMC_ZIP" -d ~/esbmc
+          rm "/tmp/$ESBMC_ZIP"
+
+      - name: Add ESBMC to PATH
+        run: echo "$HOME/esbmc/bin" >> "$GITHUB_PATH"
+
+      - name: Sanity-check ESBMC is on PATH
+        # Fail loudly if esbmc does not resolve: otherwise the esbmc-gated corpus
+        # and integration tests would silently skip and the gate would be a no-op.
+        run: esbmc --version
+
+      - name: Install package + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Type-check (mypy --strict)
+        run: mypy src tests
+
+      - name: Tests (pytest)
+        run: pytest -q
