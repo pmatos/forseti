@@ -13,6 +13,7 @@ dependencies = []
 dev = ["pytest>=8", "mypy>=1.8"]
 
 [project.scripts]
+forseti = "forseti.core.cli:main"
 forseti-esbmc = "forseti.esbmc.cli:main"
 
 [tool.setuptools.packages.find]
