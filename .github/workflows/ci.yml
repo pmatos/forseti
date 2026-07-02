@@ -26,7 +26,7 @@ jobs:
 
       - name: Cache ESBMC
         id: cache-esbmc
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/esbmc
           key: esbmc-${{ env.ESBMC_VERSION }}-${{ env.ESBMC_SHA256 }}-ubuntu-24.04
