@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-"""Forseti — Codex `notify` reference hook (a *partial* gate).
+"""Forseti — Codex `notify` reference hook (a turn-end reminder).
 
-Codex has no tool-use hook that can block a turn, but it does invoke a `notify`
-program at the end of each agent turn with a single JSON argument. This script is
-the most a Codex adapter can do toward a Stop-gate: it fires *after* the turn, so
-it cannot prevent the agent handing back unverified code — it can only record a
-reminder for a human to notice. Real enforcement stays with the prompt+tools
-fallback in ./AGENTS.md; a hard gate needs the Claude Code adapter's `Stop` hook
-(#45).
+The enforcing gate is the `PostToolUse` hook (./verify_hook.py), which blocks on
+a counterexample. This `notify` script is a secondary backstop: it fires at
+`agent-turn-complete`, *after* the turn, so it cannot block a hand-off — it just
+records a reminder to confirm every changed unit is VERIFIED, covering edits the
+`PostToolUse` hook can't see (e.g. raw shell writes rather than `apply_patch`).
 
 Wire it in ~/.codex/config.toml (a top-level key — see ./config.toml.example):
 

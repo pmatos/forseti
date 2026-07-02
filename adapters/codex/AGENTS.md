@@ -13,10 +13,13 @@ The loop block below is a verbatim copy of adapters/prompt-tools-fallback.md
 # Forseti verification loop (Codex)
 
 This project uses **Forseti**: the ESBMC bounded model checker is available to
-you as an MCP tool (`verify`) exposed by the `forseti` MCP server. Codex has no
-tool-use hook that can *force* verification, so enforcement is the
-**prompt+tools fallback**: you are responsible for running the loop below. The
-`notify` hook (see README) is only a post-turn signal, not a gate.
+you as an MCP tool (`verify`) exposed by the `forseti` MCP server. A
+`PostToolUse` hook already verifies your `apply_patch` edits and will **block**
+with a counterexample when a unit is VIOLATED — so treat these instructions as
+how to work *with* the gate: verify deliberately, read the counterexample it
+returns, and fix. The hook cannot see edits made outside `apply_patch` (e.g. raw
+shell writes), and an inconclusive `unknown` is surfaced rather than blocked, so
+you remain responsible for the loop below.
 
 <!-- BEGIN forseti-fallback-instructions -->
 ## Verify before you hand code back

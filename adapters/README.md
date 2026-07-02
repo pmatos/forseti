@@ -16,14 +16,15 @@ Core calls.
 | Path | Harness | Trigger model |
 |---|---|---|
 | [`prompt-tools-fallback.md`](./prompt-tools-fallback.md) | *any hookless harness* | reusable prompt: the agent drives Core via MCP (#46) |
-| [`codex/`](./codex/) | Codex | `AGENTS.md` + Core-as-MCP + `notify` hook (partial gate) — #47 |
+| [`codex/`](./codex/) | Codex | `PostToolUse` verify hook (the gate) + `AGENTS.md` + Core-as-MCP + `notify` — #47 |
 | `opencode/` | opencode | custom command/subagent + Core-as-MCP, **no hooks** — #48 |
 
 The **Claude Code** adapter is intentionally *not* here: per RFC-0001 it is a
 downstream **fork of the `esbmc-plugin`** (kept downstream like the ESBMC fork),
 with a `PostToolUse` verify hook, a `Stop`-gate, and a property subagent — see
-issue #45. It is the reference "hooks enforce the gate" adapter; everything here
-is about the harnesses where that enforcement is weaker or absent.
+issue #45. It is the fullest reference gate (`PostToolUse` + `Stop` + a property
+subagent); the adapters here range from Codex's hook-enforced verify-after-edit
+down to opencode's prompt-only gate.
 
 ## Enforcement levels
 
@@ -33,7 +34,7 @@ The Core is identical everywhere; only the **trigger** and therefore the
 | Harness | `verify` after edit | Stop-gate ("done" blocked until VERIFIED) | Enforcement |
 |---|---|---|---|
 | Claude Code (#45) | `PostToolUse` hook | `Stop` hook | **Hard** — the harness runs it |
-| Codex (#47) | prompt; `notify` as a partial signal | prompt-emulated | **Partial** |
+| Codex (#47) | `PostToolUse` hook (blocks on VIOLATED) | prompt-emulated | **Hook** — verify-after-edit enforced |
 | opencode (#48) | prompt | prompt-emulated | **Soft** — instructions only |
 
 ## The prompt+tools fallback contract
