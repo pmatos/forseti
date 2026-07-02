@@ -1,0 +1,37 @@
+# Forseti — Codex adapter configuration.
+#
+# Merge these entries into your Codex config at ~/.codex/config.toml. They (1)
+# set the top-level `notify` reminder, (2) wire the PostToolUse verify gate, and
+# (3) register the Forseti Core as an MCP server so the model can call `verify`
+# itself. The enforcing gate is (2); (1) and ./AGENTS.md back it up.
+#
+# ORDER MATTERS: `notify` is a top-level key, so it must appear BEFORE any
+# `[table]` / `[[table]]` header — TOML assigns every key after a header to that
+# table, which would silently turn `notify` into `mcp_servers.forseti.notify`
+# (and Codex, reading only a top-level `notify`, would never run it).
+
+# (1) Turn-end reminder (post-turn, non-blocking). Codex passes the notify
+# program a single JSON argument. Use an absolute path to the script.
+notify = ["python3", "/absolute/path/to/adapters/codex/notify.py"]
+
+# (2) The gate: verify after every apply_patch edit and block on a counterexample
+# (see ./verify_hook.py). matcher may be apply_patch, Edit, or Write; the hook
+# input reports tool_name = "apply_patch" either way. Uses the SDK-free
+# `forseti verify` CLI, so esbmc must be on PATH.
+[[hooks.PostToolUse]]
+matcher = "apply_patch"
+
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = 'python3 "/absolute/path/to/adapters/codex/verify_hook.py"'
+timeout = 120
+statusMessage = "Forseti: verifying edited unit"
+
+# (3) Forseti Core over MCP (stdio) — lets the model call `verify`/`propose`
+# directly. `forseti mcp` starts the server (#49); it needs the `mcp` extra:
+#   pip install 'forseti[mcp]'
+# Equivalent CLI:  codex mcp add forseti -- forseti mcp
+[mcp_servers.forseti]
+command = "forseti"
+args = ["mcp"]
+# startup_timeout_sec = 10           # bump if esbmc/import warm-up is slow
