@@ -17,7 +17,7 @@ Core calls.
 |---|---|---|
 | [`prompt-tools-fallback.md`](./prompt-tools-fallback.md) | *any hookless harness* | reusable prompt: the agent drives Core via MCP (#46) |
 | [`codex/`](./codex/) | Codex | `PostToolUse` verify hook (the gate) + `AGENTS.md` + Core-as-MCP + `notify` — #47 |
-| `opencode/` | opencode | custom command/subagent + Core-as-MCP, **no hooks** — #48 |
+| [`opencode/`](./opencode/) | opencode | custom command/subagent + Core-as-MCP, **no hooks** — #48 |
 
 The **Claude Code** adapter is intentionally *not* here: per RFC-0001 it is a
 downstream **fork of the `esbmc-plugin`** (kept downstream like the ESBMC fork),

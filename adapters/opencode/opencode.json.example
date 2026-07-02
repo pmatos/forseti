@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "forseti": {
+      "type": "local",
+      "command": ["forseti", "mcp"],
+      "enabled": true,
+      "environment": {
+        "ESBMC_BIN": "esbmc"
+      }
+    }
+  }
+}
