@@ -16,7 +16,7 @@ dependencies = []
 # >=1.0 could install an SDK where `from mcp.server.fastmcp import FastMCP` fails.
 mcp = ["mcp>=1.2,<2"]
 # dev pulls in the mcp extra so CI type-checks and tests the server too.
-dev = ["pytest>=8", "mypy>=1.8", "forseti[mcp]"]
+dev = ["pytest>=9.1.1", "mypy>=1.8", "forseti[mcp]"]
 
 [project.scripts]
 forseti = "forseti.core.cli:main"
