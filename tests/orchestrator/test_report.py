@@ -21,8 +21,8 @@ from forseti.esbmc import (
     Unknown,
     UnknownReason,
     Verified,
-    ViolatedProperty,
     Violated,
+    ViolatedProperty,
 )
 from forseti.orchestrator import (
     GiveUpReason,

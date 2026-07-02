@@ -22,7 +22,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import assert_never
 
-from forseti.esbmc import EsbmcResult, Error, Unknown, Verified, Violated
+from forseti.esbmc import Error, EsbmcResult, Unknown, Verified, Violated
 
 
 class LoopState(Enum):

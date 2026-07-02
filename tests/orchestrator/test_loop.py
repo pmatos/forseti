@@ -14,8 +14,8 @@ from typing import TYPE_CHECKING
 import pytest
 
 from forseti.esbmc import (
-    EsbmcResult,
     Error,
+    EsbmcResult,
     RunMeta,
     Unknown,
     UnknownReason,

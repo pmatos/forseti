@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from forseti.esbmc import EsbmcResult, RunMeta, Unknown, UnknownReason, Verified, Violated
+from forseti.esbmc import (
+    EsbmcResult,
+    RunMeta,
+    Unknown,
+    UnknownReason,
+    Verified,
+    Violated,
+)
 from forseti.orchestrator import run_loop, transcript_for
 
 SRC = Path("kernel.c")
@@ -13,7 +20,13 @@ SRC = Path("kernel.c")
 def meta(unwind: int = 8) -> RunMeta:
     return RunMeta(
         esbmc_version="8.3.0",
-        argv=("esbmc", "kernel.c", "--unwind", str(unwind), "--no-unwinding-assertions"),
+        argv=(
+            "esbmc",
+            "kernel.c",
+            "--unwind",
+            str(unwind),
+            "--no-unwinding-assertions",
+        ),
         exit_code=0,
         duration_s=0.0,
         stdout="",
@@ -65,7 +78,10 @@ def test_transcript_for_give_up_shows_reason() -> None:
 
 def test_transcript_for_unknown_shows_reason() -> None:
     verify = FakeVerify(
-        [Unknown(meta(8), UnknownReason.TIMEOUT), Unknown(meta(16), UnknownReason.TIMEOUT)]
+        [
+            Unknown(meta(8), UnknownReason.TIMEOUT),
+            Unknown(meta(16), UnknownReason.TIMEOUT),
+        ]
     )
     run = run_loop(SRC, verify=verify, fix=FakeFix(), unwind=8, unwind_ladder=(16,))
 

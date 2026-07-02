@@ -158,10 +158,7 @@ def test_echoed_success_banner_in_diagnostic_is_not_verified() -> None:
 def test_parse_error_with_echoed_success_banner_is_error() -> None:
     # A parse error wins over an inline-echoed success banner, even when the
     # success substring precedes the error markers in the stream.
-    out = (
-        "note: in expansion 'VERIFICATION SUCCESSFUL'\n"
-        "ERROR: PARSING ERROR\n"
-    )
+    out = "note: in expansion 'VERIFICATION SUCCESSFUL'\nERROR: PARSING ERROR\n"
     result = classify(meta(stdout=out, exit_code=6))
     assert isinstance(result, Error)
     assert "parsing" in result.message.lower()

@@ -15,8 +15,8 @@ from pathlib import Path
 from typing import assert_never
 
 from forseti.esbmc import (
-    EsbmcResult,
     Error,
+    EsbmcResult,
     Frontend,
     Unknown,
     Verified,

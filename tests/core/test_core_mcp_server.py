@@ -15,11 +15,11 @@ import pytest
 
 pytest.importorskip("mcp")
 
-from mcp import ClientSession, StdioServerParameters  # noqa: E402
-from mcp.client.stdio import stdio_client  # noqa: E402
-from mcp.types import CallToolResult  # noqa: E402
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp.types import CallToolResult
 
-from forseti.core.mcp_server import build_server, verify_tool  # noqa: E402
+from forseti.core.mcp_server import build_server, verify_tool
 
 EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
 SRC = Path(__file__).resolve().parents[2] / "src"
@@ -75,13 +75,15 @@ def test_verify_stdio_roundtrip() -> None:
             args=["-m", "forseti.core", "mcp"],
             env=_child_env(),
         )
-        async with stdio_client(params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                return await session.call_tool(
-                    "verify",
-                    {"source": str(EXAMPLES / "abs.c"), "unwind": 1},
-                )
+        async with (
+            stdio_client(params) as (read, write),
+            ClientSession(read, write) as session,
+        ):
+            await session.initialize()
+            return await session.call_tool(
+                "verify",
+                {"source": str(EXAMPLES / "abs.c"), "unwind": 1},
+            )
 
     result = asyncio.run(asyncio.wait_for(roundtrip(), timeout=60.0))
     assert result.isError is False

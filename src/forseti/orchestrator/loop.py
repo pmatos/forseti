@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, assert_never
 
-from forseti.esbmc import EsbmcResult, Error, Unknown, Verified, Violated
+from forseti.esbmc import Error, EsbmcResult, Unknown, Verified, Violated
 
 from .ports import FixPort, VerifyPort
 from .state import GiveUpReason, LoopState, next_state
@@ -83,7 +83,7 @@ def run_loop(
     if max_iterations < 1:
         raise ValueError(f"max_iterations must be >= 1, got {max_iterations}")
     ladder = (unwind, *unwind_ladder)
-    if any(k < 1 for k in ladder) or any(b <= a for a, b in zip(ladder, ladder[1:])):
+    if any(k < 1 for k in ladder) or any(b <= a for a, b in itertools.pairwise(ladder)):
         raise ValueError(
             f"unwind ladder must be increasing positive ints, got {ladder}"
         )

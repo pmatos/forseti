@@ -54,9 +54,7 @@ def test_violated_payload_carries_counterexample() -> None:
 
 
 def test_unknown_payload_carries_reason() -> None:
-    payload = result_to_payload(
-        Unknown(_meta(), UnknownReason.TIMEOUT), Path("f.c"), 1
-    )
+    payload = result_to_payload(Unknown(_meta(), UnknownReason.TIMEOUT), Path("f.c"), 1)
     assert payload["verdict"] == "unknown"
     assert payload["reason"] == "timeout"
     json.dumps(payload)
