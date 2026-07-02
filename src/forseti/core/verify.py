@@ -1,12 +1,11 @@
 """Forseti Core's `verify` operation — the harness-neutral entry point.
 
 `verify_source` is the single place the `--function` flag and a sane default
-timeout are assembled before delegating to :func:`forseti.esbmc.verify`, so
-every Core face shares one behaviour. `result_to_payload` renders any
-:class:`~forseti.esbmc.EsbmcResult` as a JSON-serialisable dict — the wire shape
-the CLI's `--json` returns today, and the shape the forthcoming MCP `verify`
-tool (#49) will reuse, so a harness adapter sees the same verdict structure
-regardless of transport.
+timeout are assembled before delegating to :func:`forseti.esbmc.verify`, so the
+unified CLI and the MCP tool share one behaviour. `result_to_payload` renders
+any :class:`~forseti.esbmc.EsbmcResult` as a JSON-serialisable dict — the wire
+shape both the CLI (`--json`) and the MCP `verify` tool return, so a harness
+adapter sees the same verdict structure regardless of transport.
 """
 
 from __future__ import annotations

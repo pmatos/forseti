@@ -2,8 +2,8 @@
 
 Push *all logic* into a Core the harnesses share, then keep each harness's glue
 thin. This package is that Core's public face: the `verify` operation plus its
-JSON wire shape, exposed today as a unified `forseti` CLI
-(:mod:`forseti.core.cli`). An MCP server (#49), `propose`, and the loop
+JSON wire shape, exposed as a unified `forseti` CLI (:mod:`forseti.core.cli`)
+and an MCP server (:mod:`forseti.core.mcp_server`). `propose` and the loop
 orchestration land here next (tracked under epic #14).
 """
 
