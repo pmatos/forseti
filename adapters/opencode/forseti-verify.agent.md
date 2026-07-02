@@ -10,7 +10,7 @@ Forseti — opencode subagent. Place this file at:
   .opencode/agents/forseti-verify.md            (per-project)
   ~/.config/opencode/agents/forseti-verify.md   (global)
 Requires the Forseti Core registered as the `forseti` MCP server — see
-../opencode.json.example and ../README.md. opencode has NO tool-use hooks, so
+./opencode.json.example and ./README.md. opencode has NO tool-use hooks, so
 the Stop-gate below is emulated entirely in these instructions (soft
 enforcement). The loop block is a verbatim copy of
 adapters/prompt-tools-fallback.md (#46); keep the two in sync.
