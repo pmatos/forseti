@@ -35,12 +35,16 @@ counterexample; `AGENTS.md` and `notify` back it up.
    table and Codex ignores it.
 
 4. **Trust the hook.** Codex **skips non-managed command hooks until you review
-   and trust them** — so a freshly-wired `verify_hook.py` does *not* run yet. In
-   Codex, run `/hooks`, inspect the `PostToolUse` hook, and trust it (Codex also
-   prints a startup warning when a hook needs review). Trust is keyed to the
-   hook's exact contents, so **re-trust after editing `verify_hook.py`**. For
-   headless/CI use, `codex --dangerously-bypass-hook-trust` skips this — treat it
-   as the escape hatch it is.
+   and trust them** — so a freshly-wired hook does *not* run yet. In Codex, run
+   `/hooks`, inspect the `PostToolUse` hook, and trust it (Codex also prints a
+   startup warning when a hook needs review). Trust is keyed to the hook
+   **definition** in `config.toml` (event/matcher/command/timeout/status), **not**
+   the script's source — so **changing that definition requires re-trust**, but
+   note the flip side: **editing `verify_hook.py` itself does *not* re-prompt**,
+   and the modified script runs under the existing trust. Treat the script as
+   trusted code and review changes to it separately. For headless/CI use, `codex
+   --dangerously-bypass-hook-trust` skips the gate — treat it as the escape hatch
+   it is.
 
 ## Enforcement level: hook-enforced
 
