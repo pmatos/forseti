@@ -10,7 +10,7 @@ with `notify` as a **partial** (post-turn, non-blocking) gate.
 |---|---|
 | [`AGENTS.md`](./AGENTS.md) | Loop instructions Codex reads (embeds the #46 fallback block verbatim) |
 | [`config.toml.example`](./config.toml.example) | Registers the Core MCP server + wires `notify` |
-| [`notify.py`](./notify.py) | Reference `notify` hook — surfaces a reminder at turn end |
+| [`notify.py`](./notify.py) | Reference `notify` hook — records a reminder at turn end (log + desktop notification) |
 
 ## Install
 
@@ -30,8 +30,9 @@ with `notify` as a **partial** (post-turn, non-blocking) gate.
    codex mcp add forseti -- forseti mcp
    ```
 
-4. **(Optional) Wire the partial gate.** Point Codex's `notify` at `notify.py`
-   using an **absolute** path (see `config.toml.example`).
+4. **(Optional) Wire the partial gate.** Point Codex's top-level `notify` at
+   `notify.py` using an **absolute** path (see `config.toml.example`). `notify`
+   must sit *before* any `[table]` header or TOML scopes it into that table.
 
 ## Enforcement level: partial
 

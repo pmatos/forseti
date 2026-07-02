@@ -4,29 +4,73 @@
 Codex has no tool-use hook that can block a turn, but it does invoke a `notify`
 program at the end of each agent turn with a single JSON argument. This script is
 the most a Codex adapter can do toward a Stop-gate: it fires *after* the turn, so
-it cannot prevent the agent handing back unverified code — it can only surface a
-reminder so a human notices. Real enforcement stays with the prompt+tools
+it cannot prevent the agent handing back unverified code — it can only record a
+reminder for a human to notice. Real enforcement stays with the prompt+tools
 fallback in ./AGENTS.md; a hard gate needs the Claude Code adapter's `Stop` hook
 (#45).
 
-Wire it in ~/.codex/config.toml:
+Wire it in ~/.codex/config.toml (a top-level key — see ./config.toml.example):
 
     notify = ["python3", "/absolute/path/to/adapters/codex/notify.py"]
 
 Codex passes one JSON arg with `type` (currently only "agent-turn-complete"),
 `thread-id`, `turn-id`, `cwd`, `input-messages`, and `last-assistant-message`.
-The script never fails the caller: any error still exits 0 so a broken notify
-config cannot wedge Codex.
+
+Codex runs `notify` fire-and-forget and does **not** surface the program's
+stdout/stderr in its TUI, so a reminder must go somewhere durable. This script
+therefore (a) appends the reminder to `<cwd>/.forseti/notify.log`, (b) makes a
+best-effort desktop notification via a notifier on PATH (notify-send / osascript
+/ terminal-notifier), and (c) still writes to stderr as a last resort. Every step
+is best-effort: any error still exits 0 so a broken notify config cannot wedge
+Codex.
 """
 
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import sys
+from pathlib import Path
 
 # Words that suggest the agent is declaring completion — the moment the emulated
 # Stop-gate most needs a human to confirm every changed unit is VERIFIED up to k.
 _DONE_HINTS = ("done", "complete", "finished", "ready", "all set", "lgtm")
+
+
+def _log(cwd: str, message: str) -> None:
+    """Append the reminder to the per-project store; never raise."""
+    try:
+        log_dir = Path(cwd or ".") / ".forseti"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with (log_dir / "notify.log").open("a", encoding="utf-8") as fh:
+            fh.write(message + "\n")
+    except OSError:
+        pass
+
+
+def _desktop_notify(message: str) -> None:
+    """Best-effort desktop notification via whatever notifier is on PATH."""
+    cmd: list[str] | None = None
+    if shutil.which("notify-send"):
+        cmd = ["notify-send", "Forseti", message]
+    elif shutil.which("terminal-notifier"):
+        cmd = ["terminal-notifier", "-title", "Forseti", "-message", message]
+    elif shutil.which("osascript"):
+        script = f'display notification {json.dumps(message)} with title "Forseti"'
+        cmd = ["osascript", "-e", script]
+    if cmd is None:
+        return
+    try:
+        subprocess.run(cmd, check=False, capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _emit(cwd: str, message: str) -> None:
+    _log(cwd, message)
+    _desktop_notify(message)
+    print(message, file=sys.stderr)
 
 
 def main(argv: list[str]) -> int:
@@ -39,19 +83,19 @@ def main(argv: list[str]) -> int:
     if not isinstance(event, dict) or event.get("type") != "agent-turn-complete":
         return 0
 
+    cwd = str(event.get("cwd") or ".")
     last = str(event.get("last-assistant-message") or "").lower()
-    claims_done = any(hint in last for hint in _DONE_HINTS)
 
-    print(
+    _emit(
+        cwd,
         "[forseti] Codex turn complete — the verification gate here is advisory "
         "(prompt+tools fallback, no blocking hook).",
-        file=sys.stderr,
     )
-    if claims_done:
-        print(
+    if any(hint in last for hint in _DONE_HINTS):
+        _emit(
+            cwd,
             "[forseti] The turn reads as 'done'. Confirm every changed unit is "
             "VERIFIED up to k (no VIOLATED, no UNKNOWN) before trusting it.",
-            file=sys.stderr,
         )
     return 0
 
