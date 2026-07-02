@@ -14,7 +14,7 @@ dependencies = []
 # the base install and the loop/esbmc path stay dependency-free. Pinned to a
 # FastMCP-supporting range: mcp==1.0.0 predates mcp.server.fastmcp, so a loose
 # >=1.0 could install an SDK where `from mcp.server.fastmcp import FastMCP` fails.
-mcp = ["mcp>=1.2,<2"]
+mcp = ["mcp>=1.28.1,<2"]
 # dev pulls in the mcp extra so CI type-checks and tests the server too.
 dev = ["pytest>=8", "mypy>=1.8", "forseti[mcp]"]
 
