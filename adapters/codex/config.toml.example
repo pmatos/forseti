@@ -1,0 +1,21 @@
+# Forseti — Codex adapter configuration.
+#
+# Merge these entries into your Codex config at ~/.codex/config.toml. They (1)
+# register the Forseti Core as an MCP server so the `verify` tool is reachable,
+# and (2) wire the notify hook as a partial gate (see ./notify.py). Enforcement
+# of the loop itself is the prompt+tools fallback in ./AGENTS.md.
+
+# (1) Forseti Core over MCP (stdio). `forseti mcp` starts the server (#49); it
+# needs the `mcp` extra installed:  pip install 'forseti[mcp]'
+# Equivalent CLI:  codex mcp add forseti -- forseti mcp
+[mcp_servers.forseti]
+command = "forseti"
+args = ["mcp"]
+# startup_timeout_sec = 10           # bump if esbmc/import warm-up is slow
+# env = { ESBMC_BIN = "esbmc" }      # override the esbmc binary if not on PATH
+
+# (2) Partial gate: run the reference notify script at the end of each agent
+# turn. Codex passes the notify program a single JSON argument. This CANNOT block
+# a turn — it only surfaces a reminder when a turn ends (see ./notify.py). Use an
+# absolute path to the script.
+notify = ["python3", "/absolute/path/to/adapters/codex/notify.py"]

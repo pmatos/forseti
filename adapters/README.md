@@ -16,7 +16,7 @@ Core calls.
 | Path | Harness | Trigger model |
 |---|---|---|
 | [`prompt-tools-fallback.md`](./prompt-tools-fallback.md) | *any hookless harness* | reusable prompt: the agent drives Core via MCP (#46) |
-| `codex/` | Codex | `AGENTS.md` + Core-as-MCP + `notify` hook (partial gate) — #47 |
+| [`codex/`](./codex/) | Codex | `AGENTS.md` + Core-as-MCP + `notify` hook (partial gate) — #47 |
 | `opencode/` | opencode | custom command/subagent + Core-as-MCP, **no hooks** — #48 |
 
 The **Claude Code** adapter is intentionally *not* here: per RFC-0001 it is a
