@@ -86,8 +86,9 @@ def main(argv: list[str]) -> int:
 
     _emit(
         cwd,
-        "[forseti] Codex turn complete — the verification gate here is advisory "
-        "(prompt+tools fallback, no blocking hook).",
+        "[forseti] Codex turn complete — the PostToolUse verify hook is the "
+        "enforcement gate; this reminder covers edits it can't see (e.g. "
+        "non-apply_patch shell writes).",
     )
     if any(hint in last for hint in _DONE_HINTS):
         _emit(
