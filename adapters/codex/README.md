@@ -34,6 +34,14 @@ counterexample; `AGENTS.md` and `notify` back it up.
    sit *before* any `[table]`/`[[table]]` header, or TOML scopes it into that
    table and Codex ignores it.
 
+4. **Trust the hook.** Codex **skips non-managed command hooks until you review
+   and trust them** — so a freshly-wired `verify_hook.py` does *not* run yet. In
+   Codex, run `/hooks`, inspect the `PostToolUse` hook, and trust it (Codex also
+   prints a startup warning when a hook needs review). Trust is keyed to the
+   hook's exact contents, so **re-trust after editing `verify_hook.py`**. For
+   headless/CI use, `codex --dangerously-bypass-hook-trust` skips this — treat it
+   as the escape hatch it is.
+
 ## Enforcement level: hook-enforced
 
 - **`PostToolUse` (`verify_hook.py`) is the gate.** After an `apply_patch` edit
