@@ -22,10 +22,24 @@ from mcp.types import CallToolResult  # noqa: E402
 from forseti.core.mcp_server import build_server, verify_tool  # noqa: E402
 
 EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
+SRC = Path(__file__).resolve().parents[2] / "src"
 
 needs_esbmc = pytest.mark.skipif(
     shutil.which("esbmc") is None, reason="esbmc binary not on PATH"
 )
+
+
+def _child_env() -> dict[str, str]:
+    """Environment for the server subprocess.
+
+    Prepend `src/` to PYTHONPATH so the child imports `forseti` via the same
+    source tree pytest uses (pyproject `pythonpath = ["src"]`), rather than
+    depending on an editable install being present and correctly located. Also
+    carries PATH so the child finds esbmc.
+    """
+    existing = os.environ.get("PYTHONPATH")
+    pythonpath = f"{SRC}{os.pathsep}{existing}" if existing else str(SRC)
+    return {**os.environ, "PYTHONPATH": pythonpath}
 
 
 def test_build_server_registers_verify_tool() -> None:
@@ -51,15 +65,15 @@ def test_verify_stdio_roundtrip() -> None:
 
     Launches `python -m forseti.core mcp` as the server subprocess and calls the
     `verify` tool through an MCP client session — the same path a hookless
-    harness (opencode) takes. The child inherits our environment so it finds
-    esbmc on PATH.
+    harness (opencode) takes. The child gets `src/` on PYTHONPATH (so it imports
+    forseti) plus PATH (so it finds esbmc); see `_child_env`.
     """
 
     async def roundtrip() -> CallToolResult:
         params = StdioServerParameters(
             command=sys.executable,
             args=["-m", "forseti.core", "mcp"],
-            env={**os.environ},
+            env=_child_env(),
         )
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
