@@ -47,8 +47,10 @@ from pathlib import Path
 # Source kinds Forseti (ESBMC) targets: C -> C++ -> Python.
 _SRC_SUFFIXES = {".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".py"}
 
-# apply_patch names each touched file on its own header line.
-_FILE_RE = re.compile(r"^\*\*\* (?:Add|Update) File: (.+)$", re.MULTILINE)
+# apply_patch names each touched file on its own header line. `Move to:` is the
+# rename destination — capture it too, or a renamed+edited file would only be
+# recorded under its old (now-deleted) path and never verified at its new one.
+_FILE_RE = re.compile(r"^\*\*\* (?:(?:Add|Update) File|Move to): (.+)$", re.MULTILINE)
 
 _VERIFY_TIMEOUT_S = 120
 
@@ -105,7 +107,9 @@ def main() -> int:
         verdict, evidence = _verify(path)
         if verdict == "violated":
             violated.append((path, evidence))
-        elif verdict in ("unknown", "error"):
+        elif verdict in ("unknown", "error", "skipped"):
+            # "skipped" = verify could not run (launch/timeout/parse failure).
+            # Surface it, never let it fall through as an implicit pass.
             inconclusive.append((path, verdict))
 
     if violated:
