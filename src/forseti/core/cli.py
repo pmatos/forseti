@@ -20,7 +20,7 @@ import json
 import sys
 from pathlib import Path
 
-from forseti.esbmc import Error, EsbmcResult, Unknown, Violated
+from forseti.esbmc import render_result
 
 from . import EXIT_CODES
 from .verify import DEFAULT_TIMEOUT_S, DEFAULT_UNWIND, result_to_payload, verify_source
@@ -80,18 +80,6 @@ def _add_verify_parser(
     )
 
 
-def _report(result: EsbmcResult, source: Path, unwind: int) -> None:
-    version = result.meta.esbmc_version or "?"
-    print(f"{result.verdict.value.upper()}  ({source}, k={unwind}, esbmc {version})")
-    if isinstance(result, Violated):
-        print()
-        print(result.raw_counterexample)
-    elif isinstance(result, Unknown):
-        print(f"reason: {result.reason.value}")
-    elif isinstance(result, Error):
-        print(f"error: {result.message}")
-
-
 def _run_verify(args: argparse.Namespace) -> int:
     result = verify_source(
         args.source,
@@ -104,7 +92,7 @@ def _run_verify(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(result_to_payload(result, args.source, args.unwind)))
     else:
-        _report(result, args.source, args.unwind)
+        print(render_result(result, args.source, args.unwind))
     return EXIT_CODES[result.verdict]
 
 
