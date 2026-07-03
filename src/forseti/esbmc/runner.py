@@ -10,8 +10,8 @@ from pathlib import Path
 
 from .cex_parser import Frontend, parse_counterexample
 from .result import (
-    EsbmcResult,
     Error,
+    EsbmcResult,
     RunMeta,
     Unknown,
     UnknownReason,
@@ -75,7 +75,11 @@ def classify(meta: RunMeta, frontend: Frontend = Frontend.C) -> EsbmcResult:
     parsing returns `None` rather than disturbing the verdict on failure.
     """
     text = meta.stdout + "\n" + meta.stderr
-    if meta.exit_code == 6 or "PARSING ERROR" in text or "failed to open input file" in text:
+    if (
+        meta.exit_code == 6
+        or "PARSING ERROR" in text
+        or "failed to open input file" in text
+    ):
         return Error(meta, _error_message(text))
     if _has_banner(text, _FAILED):
         raw = _counterexample(text)
@@ -143,9 +147,7 @@ def verify(
 
     start = time.monotonic()
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=proc_timeout
-        )
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=proc_timeout)
     except OSError as exc:
         # The binary never ran (missing, non-executable, a directory, ...);
         # record the intended argv for provenance. FileNotFoundError is an

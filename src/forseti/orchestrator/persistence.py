@@ -40,7 +40,7 @@ def persist_run(
     events: Sequence[Event] = (),
     root: Path = Path(".forseti"),
 ) -> Path:
-    """Append one run record (JSON line) under `root/runs/<slug>.jsonl`; return its path.
+    """Append a run record (JSON line) under `root/runs/<slug>.jsonl`; return the path.
 
     The record is `{"unit", "report", "events"}` — `report` is `report_for(run)`'s
     serializable projection and `events` the emitted telemetry. Append-only, so a

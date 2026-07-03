@@ -20,8 +20,8 @@ from forseti.esbmc import (
     SourceLoc,
     Step,
     Verified,
-    ViolatedProperty,
     Violated,
+    ViolatedProperty,
 )
 from forseti.orchestrator import (
     FixRequest,

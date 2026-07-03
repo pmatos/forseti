@@ -27,13 +27,20 @@ from forseti.orchestrator import JsonlSink, ListSink, NullSink, run_loop
 def unknown(unwind: int = 8) -> Unknown:
     return Unknown(meta(unwind), UnknownReason.TIMEOUT)
 
+
 SRC = Path("kernel.c")
 
 
 def meta(unwind: int = 8) -> RunMeta:
     return RunMeta(
         esbmc_version="8.3.0",
-        argv=("esbmc", "kernel.c", "--unwind", str(unwind), "--no-unwinding-assertions"),
+        argv=(
+            "esbmc",
+            "kernel.c",
+            "--unwind",
+            str(unwind),
+            "--no-unwinding-assertions",
+        ),
         exit_code=0,
         duration_s=0.0,
         stdout="",
@@ -65,7 +72,9 @@ class FakeFix:
 
 def test_run_loop_emits_trigger_fired_first() -> None:
     sink = ListSink()
-    run_loop(SRC, verify=FakeVerify([Verified(meta())]), fix=FakeFix(), unwind=8, sink=sink)
+    run_loop(
+        SRC, verify=FakeVerify([Verified(meta())]), fix=FakeFix(), unwind=8, sink=sink
+    )
 
     assert sink.events, "expected at least one emitted event"
     first = sink.events[0]
@@ -99,7 +108,9 @@ def test_converge_emits_expected_event_sequence() -> None:
 def test_unknown_escalation_emits_policy_decision() -> None:
     sink = ListSink()
     verify = FakeVerify([unknown(8), Verified(meta(16))])
-    run_loop(SRC, verify=verify, fix=FakeFix(), unwind=8, unwind_ladder=(16,), sink=sink)
+    run_loop(
+        SRC, verify=verify, fix=FakeFix(), unwind=8, unwind_ladder=(16,), sink=sink
+    )
 
     decisions = [e for e in sink.events if e.type == "unknown.policy.decision"]
     assert len(decisions) == 1
@@ -116,13 +127,23 @@ def test_terminal_unknown_emits_exhausted() -> None:
         SRC, verify=verify, fix=FakeFix(), unwind=8, unwind_ladder=(16, 32), sink=sink
     )
 
-    decisions = [e.detail.get("decision") for e in sink.events if e.type == "unknown.policy.decision"]
+    decisions = [
+        e.detail.get("decision")
+        for e in sink.events
+        if e.type == "unknown.policy.decision"
+    ]
     assert decisions == ["escalate", "escalate", "exhausted"]
 
 
 def test_give_up_emits_reason_for_error() -> None:
     sink = ListSink()
-    run_loop(SRC, verify=FakeVerify([Error(meta(), "boom")]), fix=FakeFix(), unwind=8, sink=sink)
+    run_loop(
+        SRC,
+        verify=FakeVerify([Error(meta(), "boom")]),
+        fix=FakeFix(),
+        unwind=8,
+        sink=sink,
+    )
 
     give_ups = [e for e in sink.events if e.type == "give_up"]
     assert len(give_ups) == 1
@@ -148,8 +169,12 @@ def test_null_sink_is_default_and_behavior_unchanged() -> None:
         return FakeVerify([violated(), Verified(meta())])
 
     run_default = run_loop(SRC, verify=fresh_verify(), fix=FakeFix(), unwind=8)
-    run_null = run_loop(SRC, verify=fresh_verify(), fix=FakeFix(), unwind=8, sink=NullSink())
-    run_list = run_loop(SRC, verify=fresh_verify(), fix=FakeFix(), unwind=8, sink=ListSink())
+    run_null = run_loop(
+        SRC, verify=fresh_verify(), fix=FakeFix(), unwind=8, sink=NullSink()
+    )
+    run_list = run_loop(
+        SRC, verify=fresh_verify(), fix=FakeFix(), unwind=8, sink=ListSink()
+    )
 
     for other in (run_null, run_list):
         assert other.final_state is run_default.final_state

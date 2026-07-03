@@ -6,6 +6,16 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege: this job only reads the checkout; it posts nothing.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref so a rapid push sequence doesn't queue
+# redundant re-verifies (each otherwise re-runs unless the ESBMC cache hits).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   # Pinned ESBMC release (matches the documented corpus k bounds; the upstream
   # v8.3 release is ESBMC 8.3.0, byte-identical to the dev fork on the corpus).
@@ -19,6 +29,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v6
         with:
@@ -59,8 +71,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      - name: Lint + format (ruff)
+        run: |
+          ruff check src tests
+          ruff format --check src tests
+
       - name: Type-check (mypy --strict)
         run: mypy src tests
 
       - name: Tests (pytest)
-        run: pytest -q
+        run: pytest -q --cov=forseti --cov-report=term-missing --cov-report=xml --cov-fail-under=85

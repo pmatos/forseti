@@ -30,9 +30,7 @@ _STATE_RE = re.compile(
     r"^State (\d+) file (.+?) line (\d+) column (\d+)"
     r"(?: function (.+?))? thread (\d+)$"
 )
-_LOC_RE = re.compile(
-    r"^\s*file (.+?) line (\d+) column (\d+)(?: function (.+?))?$"
-)
+_LOC_RE = re.compile(r"^\s*file (.+?) line (\d+) column (\d+)(?: function (.+?))?$")
 _VIOLATED = "Violated property:"
 _CEX_MARKER = "[Counterexample]"
 _BINARY_RE = re.compile(r"\s+\(([01]+(?: [01]+)*)\)$")
@@ -76,7 +74,7 @@ def _parse_state(lines: list[str], i: int) -> tuple[Step, int]:
 
 
 def _parse_violated(lines: list[str], i: int) -> tuple[ViolatedProperty | None, int]:
-    """Parse the `Violated property:` block; return the property (or None) and next index.
+    """Parse a `Violated property:` block → the property (or None) and next index.
 
     Layout: a `file … line … column … function …` location line, then a human
     description, optional `CWE: <id>[, <id>…]` line(s), and an optional trailing

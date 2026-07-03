@@ -1,0 +1,25 @@
+# Local mirror of the CI gates (ruff + mypy) so failures surface before push.
+# Install once with `pre-commit install`; run over everything with
+# `pre-commit run --all-files`. mypy runs from the active environment (install
+# the dev extra first: `pip install -e ".[dev]"`).
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.15
+    hooks:
+      # Scoped to src/tests to mirror CI (`ruff check/format ... src tests`);
+      # adapters/ is outside the checked set, like mypy.
+      - id: ruff-check
+        args: [--fix]
+        files: ^(src|tests)/
+      - id: ruff-format
+        files: ^(src|tests)/
+
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy (strict)
+        entry: mypy
+        language: system
+        types: [python]
+        pass_filenames: false
+        args: [src, tests]

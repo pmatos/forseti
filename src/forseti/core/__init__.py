@@ -24,8 +24,8 @@ EXIT_CODES: dict[Verdict, int] = {
 }
 
 __all__ = [
-    "verify_source",
-    "result_to_payload",
-    "Payload",
     "EXIT_CODES",
+    "Payload",
+    "result_to_payload",
+    "verify_source",
 ]

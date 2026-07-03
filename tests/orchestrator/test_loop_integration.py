@@ -94,7 +94,9 @@ def test_abs_int_min_loop_converges_via_provider(tmp_path: Path) -> None:
     assert run.final_state is LoopState.DONE
     assert isinstance(run.iterations[-1].result, Verified)
     assert provider.calls == 1
-    assert run.iterations[-1].source.read_text() == (EXAMPLES / "abs_fixed.c").read_text()
+    assert (
+        run.iterations[-1].source.read_text() == (EXAMPLES / "abs_fixed.c").read_text()
+    )
 
 
 def test_abs_run_emits_telemetry_and_renders_transcript(tmp_path: Path) -> None:
@@ -105,7 +107,12 @@ def test_abs_run_emits_telemetry_and_renders_transcript(tmp_path: Path) -> None:
     sink = ListSink()
 
     run = run_loop(
-        EXAMPLES / "abs.c", verify=verify, fix=fix, unwind=1, max_iterations=2, sink=sink
+        EXAMPLES / "abs.c",
+        verify=verify,
+        fix=fix,
+        unwind=1,
+        max_iterations=2,
+        sink=sink,
     )
 
     assert run.final_state is LoopState.DONE

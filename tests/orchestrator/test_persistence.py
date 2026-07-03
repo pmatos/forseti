@@ -67,7 +67,9 @@ def test_persist_writes_keyed_jsonl_record(tmp_path: Path) -> None:
 
 def test_persist_appends_second_run(tmp_path: Path) -> None:
     run, sink = _abs_run()
-    persist_run(run, unit_id="examples/abs.c::my_abs", events=sink.events, root=tmp_path)
+    persist_run(
+        run, unit_id="examples/abs.c::my_abs", events=sink.events, root=tmp_path
+    )
     dest = persist_run(
         run, unit_id="examples/abs.c::my_abs", events=sink.events, root=tmp_path
     )

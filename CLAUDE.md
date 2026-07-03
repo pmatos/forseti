@@ -8,9 +8,24 @@ Forseti is an H2-2026 research program that puts the **ESBMC** bounded model che
 the agent coding loop: `write → verify → counterexample → fix`. The agent only hands over code
 that already passed.
 
-It is currently at **planning / foundation stage**: `src/` holds only placeholder READMEs, and
-there is **no build system, package manifest, or test suite yet** (implementation lands P1+).
-Don't go hunting for one.
+The Python package lives under `src/forseti/` (Python 3.12, `pyproject.toml`): the core CLI +
+MCP server (`forseti.core`), the ESBMC runner and counterexample parser (`forseti.esbmc`), and
+the `write → verify → fix` orchestrator loop (`forseti.orchestrator`). `tests/` holds the suite
+(unit fakes/ports plus ESBMC-gated integration and corpus tests). The MCP SDK is an optional
+extra; the base install and the loop/esbmc path stay dependency-free.
+
+Canonical commands (from the repo root):
+
+```
+pip install -e ".[dev]"          # package + dev tools (ruff, mypy, pytest, pytest-cov, hypothesis)
+ruff check src tests             # lint
+ruff format --check src tests    # format check
+mypy src tests                   # type-check (strict)
+pytest -q                        # tests
+```
+
+The ESBMC-gated integration and corpus tests skip when `esbmc` is not on `PATH`; CI installs a
+pinned, SHA-256-verified ESBMC so they always run there.
 
 - The 6-phase plan, exit criteria, and risk register: `docs/roadmap.md`
 - Decisions and their rationale: `docs/adr/` (index in `docs/adr/README.md`)

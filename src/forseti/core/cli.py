@@ -26,7 +26,9 @@ from . import EXIT_CODES
 from .verify import DEFAULT_TIMEOUT_S, DEFAULT_UNWIND, result_to_payload, verify_source
 
 
-def _add_verify_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+def _add_verify_parser(
+    sub: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
     p = sub.add_parser(
         "verify",
         help="run ESBMC on a source and report a typed verdict",
@@ -41,7 +43,10 @@ def _add_verify_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser])
         "--unwind",
         type=int,
         default=DEFAULT_UNWIND,
-        help=f"loop unwind bound k (default: {DEFAULT_UNWIND}); a VERIFIED is only 'verified up to k'",
+        help=(
+            f"loop unwind bound k (default: {DEFAULT_UNWIND}); "
+            "a VERIFIED is only 'verified up to k'"
+        ),
     )
     p.add_argument(
         "-t",
