@@ -10,18 +10,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .result import Error, EsbmcResult, Unknown, Verdict, Violated
+from .render import EXIT_CODES, render_result
 from .runner import verify
-
-# Our own exit-code contract (not esbmc's): each verdict maps to a distinct
-# status so a shell or CI step can branch on it. UNKNOWN is deliberately
-# non-zero — an inconclusive run is a distinct state, never a silent pass.
-_EXIT = {
-    Verdict.VERIFIED: 0,
-    Verdict.VIOLATED: 1,
-    Verdict.UNKNOWN: 2,
-    Verdict.ERROR: 3,
-}
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -75,18 +65,6 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _report(result: EsbmcResult, source: Path, unwind: int) -> None:
-    version = result.meta.esbmc_version or "?"
-    print(f"{result.verdict.value.upper()}  ({source}, k={unwind}, esbmc {version})")
-    if isinstance(result, Violated):
-        print()
-        print(result.raw_counterexample)
-    elif isinstance(result, Unknown):
-        print(f"reason: {result.reason.value}")
-    elif isinstance(result, Error):
-        print(f"error: {result.message}")
-
-
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
 
@@ -101,8 +79,8 @@ def main(argv: list[str] | None = None) -> int:
         extra_flags=tuple(extra),
         esbmc_bin=args.esbmc_bin,
     )
-    _report(result, args.source, args.unwind)
-    return _EXIT[result.verdict]
+    print(render_result(result, args.source, args.unwind))
+    return EXIT_CODES[result.verdict]
 
 
 if __name__ == "__main__":

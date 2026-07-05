@@ -14,6 +14,7 @@ from .counterexample import (
     Step,
     ViolatedProperty,
 )
+from .render import EXIT_CODES, render_result
 from .result import (
     Error,
     EsbmcResult,
@@ -27,6 +28,7 @@ from .result import (
 from .runner import classify, verify
 
 __all__ = [
+    "EXIT_CODES",
     "Assignment",
     "Counterexample",
     "Error",
@@ -43,5 +45,6 @@ __all__ = [
     "ViolatedProperty",
     "classify",
     "parse_counterexample",
+    "render_result",
     "verify",
 ]

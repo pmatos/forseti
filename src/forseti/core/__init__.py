@@ -9,19 +9,13 @@ orchestration land here next (tracked under epic #14).
 
 from __future__ import annotations
 
-from forseti.esbmc import Verdict
+from forseti.esbmc import EXIT_CODES
 
 from .verify import Payload, result_to_payload, verify_source
 
-# Our own exit-code contract (not esbmc's): each verdict maps to a distinct
-# status so a shell or CI step can branch on it. UNKNOWN is deliberately
-# non-zero — an inconclusive run is a distinct state, never a silent pass.
-EXIT_CODES: dict[Verdict, int] = {
-    Verdict.VERIFIED: 0,
-    Verdict.VIOLATED: 1,
-    Verdict.UNKNOWN: 2,
-    Verdict.ERROR: 3,
-}
+# The verdict->exit-code contract is owned by `forseti.esbmc` (the layer that
+# owns `Verdict`) and re-exported here, so the unified `forseti` CLI and the
+# low-level `forseti-esbmc` shell share one table and can never drift.
 
 __all__ = [
     "EXIT_CODES",
