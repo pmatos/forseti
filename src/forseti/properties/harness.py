@@ -1,0 +1,395 @@
+"""Render a semantic Property into a compilable ESBMC harness (C text).
+
+Given a verification unit (its C kernel *slice* + the target symbol's signature)
+and a semantic Property (domain preconditions + a postcondition over the
+parameters and the call's result), synthesize one self-contained C translation
+unit ESBMC can check: the inlined unit, a nondet generator per parameter type,
+``__ESBMC_assume(...)`` preconditions that constrain the domain (so a pass is
+non-vacuous), the call, and the postcondition as ``__ESBMC_assert(...)``.
+
+Pure: returns source *text* only -- no disk, no esbmc -- mirroring
+``orchestrator.fix``'s return-text seam so the loop and tests stay effect-free.
+The runner compiles a *single* ``source: Path`` (`esbmc/runner.py`), so the unit
+is **inlined** into the harness rather than referenced; `unit_source` must be a
+main-free kernel slice (the ``examples/*.c`` files ship their own ``main`` -- that
+is the example harness, not the unit). C only for W2 (ADR-0003); reachability
+emission is deferred (ADR-0009 D2).
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+from .model import Property, PropertyKind
+
+
+class HarnessError(ValueError):
+    """The unit/property cannot be rendered into a valid harness (fail-loud)."""
+
+
+@dataclass(frozen=True)
+class ScalarParam:
+    """A scalar arithmetic parameter, drawn from a single ``nondet_<T>()`` call."""
+
+    ctype: str  # type spelling as in the signature, e.g. "int64_t", "unsigned"
+    name: str  # identifier the property references, e.g. "x"
+
+
+@dataclass(frozen=True)
+class BufferParam:
+    """A pointer parameter backed by a nondet-filled (or output) VLA.
+
+    `length` is a C expression for the element count (usually another param's
+    name, e.g. "len"); `out=True` means an output buffer -- allocated but NOT
+    nondet-filled, referenced by `name` in the postcondition after the call. A
+    single-element output (`length == "1"`) is backed by a scalar and passed by
+    address (e.g. utf8's ``uint32_t *cp``); anything else is an array that decays
+    to a pointer at the call.
+    """
+
+    elem_ctype: str  # e.g. "unsigned char", "int"
+    name: str
+    length: str
+    const: bool = False
+    out: bool = False
+
+
+Param = ScalarParam | BufferParam  # sealed union (repo style)
+
+
+@dataclass(frozen=True)
+class UnitSignature:
+    """The C signature of the unit ``path::symbol``.
+
+    The Property (#62) keys the unit as "path::symbol" but carries no types, so
+    the signature is supplied here -- parsed by `extract_signature` or provided
+    directly by the caller/proposer. `return_ctype` is "void" when the unit
+    returns nothing.
+    """
+
+    symbol: str
+    return_ctype: str
+    params: tuple[Param, ...]
+
+
+@dataclass(frozen=True)
+class SemanticSpec:
+    """The checkable content of a semantic Property, as harness-ready C exprs.
+
+    `preconditions` are boolean C expressions over the parameter names -> each
+    becomes ``__ESBMC_assume((expr));`` before the call. `postcondition` is a
+    boolean C expression over the parameter names, output-buffer names, and the
+    reserved identifier `result_var` (bound to the call's return value) -> it
+    becomes the ``__ESBMC_assert(...)``. `result_var` is unused when the unit
+    returns void.
+    """
+
+    postcondition: str
+    preconditions: tuple[str, ...] = ()
+    result_var: str = "result"
+
+
+def render_semantic_harness(
+    *,
+    unit_source: str,
+    signature: UnitSignature,
+    spec: SemanticSpec,
+    includes: Sequence[str] = ("stdint.h", "stddef.h"),
+) -> str:
+    """Return a compilable ESBMC harness (C text) for one semantic property.
+
+    Deterministic, pure string synthesis. Emits, in order: the includes, the
+    inlined `unit_source`, one nondet prototype per distinct nondet type, then a
+    ``main`` that declares the scalar params, assumes the preconditions, sets up
+    the buffers, calls the unit, and asserts the postcondition. Raises
+    `HarnessError` on an un-renderable input (empty postcondition, `result_var`
+    clashing a param name, a void return referenced by `result_var`, a
+    `unit_source` that defines its own ``main``, or an unknown Param subtype).
+    """
+    postcondition = spec.postcondition.strip()
+    if not postcondition:
+        raise HarnessError("semantic property has an empty postcondition")
+
+    param_names = {p.name for p in signature.params}
+    if spec.result_var in param_names:
+        raise HarnessError(
+            f"result_var {spec.result_var!r} collides with a parameter name"
+        )
+
+    returns_void = signature.return_ctype.strip() == "void"
+    if returns_void and _references(postcondition, spec.result_var):
+        raise HarnessError(
+            f"postcondition references {spec.result_var!r} but "
+            f"{signature.symbol!r} returns void"
+        )
+
+    if _defines_main(unit_source):
+        raise HarnessError(
+            "unit_source defines main; pass the kernel slice, not the example harness"
+        )
+
+    scalars: list[ScalarParam] = []
+    buffers: list[BufferParam] = []
+    for param in signature.params:
+        if isinstance(param, ScalarParam):
+            scalars.append(param)
+        elif isinstance(param, BufferParam):
+            buffers.append(param)
+        else:
+            raise HarnessError(f"unknown Param subtype: {type(param).__name__}")
+
+    lines: list[str] = [f"#include <{inc}>" for inc in includes]
+    lines.append("")
+    lines.append(unit_source.strip("\n"))
+    lines.append("")
+    for ctype in _nondet_ctypes(signature.params):
+        lines.append(f"{ctype} {_nondet_slug(ctype)}(void);")
+    lines.append("")
+    lines.append("int main(void) {")
+    for scalar in scalars:
+        lines.append(
+            f"    {scalar.ctype} {scalar.name} = {_nondet_slug(scalar.ctype)}();"
+        )
+    for pre in spec.preconditions:
+        stripped = pre.strip()
+        if stripped:
+            lines.append(f"    __ESBMC_assume(({stripped}));")
+    for buf in buffers:
+        lines += _render_buffer(buf)
+    call = f"{signature.symbol}({', '.join(_call_arg(p) for p in signature.params)})"
+    if returns_void:
+        lines.append(f"    {call};")
+    else:
+        lines.append(f"    {signature.return_ctype} {spec.result_var} = {call};")
+    lines.append(f'    __ESBMC_assert(({postcondition}), "forseti:semantic");')
+    lines.append("    return 0;")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def spec_from_property(prop: Property) -> SemanticSpec:
+    """Project a semantic Property (#62) onto `SemanticSpec`.
+
+    Maps the Property's `expression` -> `postcondition` and `domain` ->
+    `preconditions`. Requires ``prop.kind == PropertyKind.SEMANTIC``; raises
+    `HarnessError` on a reachability property (deferred, ADR-0009 D2) or a
+    missing postcondition. Lives here so #62's Property model stays free of
+    harness concerns.
+    """
+    if prop.kind is not PropertyKind.SEMANTIC:
+        raise HarnessError(
+            f"cannot render a {prop.kind.value} property; only semantic is "
+            "supported (reachability deferred, ADR-0009 D2)"
+        )
+    if not prop.expression.strip():
+        raise HarnessError("semantic property has an empty expression")
+    return SemanticSpec(
+        postcondition=prop.expression,
+        preconditions=tuple(prop.domain),
+    )
+
+
+_STORAGE_SPECIFIERS = frozenset({"static", "inline", "extern", "_Noreturn"})
+_INT_TYPE_RE = re.compile(
+    r"\b(?:unsigned|signed|int|short|long|char|_Bool|bool"
+    r"|s?size_t|ptrdiff_t|u?int(?:_least|_fast)?\d+_t|u?intptr_t|u?intmax_t)\b"
+)
+_FLOAT_TYPE_RE = re.compile(r"\b(?:float|double)\b")
+
+
+def extract_signature(unit_source: str, symbol: str) -> UnitSignature:
+    """Best-effort regex parse of `symbol`'s signature from `unit_source`.
+
+    No libclang/pycparser (the base install is dependency-free). Isolated from
+    `render_semantic_harness` so rendering stays fully testable without C
+    parsing. Classifies a pointer param as a `BufferParam`, inferring its length
+    from an immediately-following integer parameter (the ``(buf, len)`` idiom); a
+    trailing non-const pointer is treated as a single-element output. Covers the
+    corpus styles (abs, utf8_decode, murmur3_32); K&R decls and function-pointer
+    params are out of scope. Raises `HarnessError` when the definition isn't
+    found or a param can't be classified -- non-load-bearing and fail-loud, so a
+    parser miss never silently corrupts a harness (the caller can always hand-
+    build a `UnitSignature`).
+    """
+    pattern = re.compile(
+        r"([A-Za-z_][\w \t\*]*?[\s\*])" + re.escape(symbol) + r"\s*\(([^)]*)\)\s*\{"
+    )
+    match = pattern.search(unit_source)
+    if match is None:
+        raise HarnessError(f"could not find a definition of {symbol!r} in unit_source")
+    return_ctype = " ".join(
+        t for t in match.group(1).split() if t not in _STORAGE_SPECIFIERS
+    )
+    if not return_ctype:
+        raise HarnessError(f"could not parse the return type of {symbol!r}")
+    raws = [_parse_fragment(frag, symbol) for frag in _split_params(match.group(2))]
+    return UnitSignature(
+        symbol=symbol,
+        return_ctype=return_ctype,
+        params=_to_params(raws),
+    )
+
+
+def _nondet_slug(ctype: str) -> str:
+    """Nondet generator name for a C type: ``int64_t`` -> ``nondet_int64_t``.
+
+    ESBMC models any *undefined* function named ``nondet_*`` as returning a fresh
+    unconstrained value of its return type, so the mapping is general -- no fixed
+    type enum.
+    """
+    return "nondet_" + re.sub(r"[^A-Za-z0-9_]", "_", ctype.strip())
+
+
+def _nondet_ctypes(params: Sequence[Param]) -> list[str]:
+    """The distinct nondet-source ctypes, in first-seen order (one prototype each).
+
+    Only nondet-*filled* inputs contribute: scalars always, and non-out buffers
+    (their element type); an output buffer is allocated, never filled, so it
+    needs no generator.
+    """
+    ordered: list[str] = []
+    for param in params:
+        if isinstance(param, ScalarParam):
+            ctype = param.ctype.strip()
+        elif isinstance(param, BufferParam) and not param.out:
+            ctype = param.elem_ctype.strip()
+        else:
+            continue
+        if ctype not in ordered:
+            ordered.append(ctype)
+    return ordered
+
+
+def _render_buffer(buf: BufferParam) -> list[str]:
+    """Decl (+ nondet fill for inputs) for one buffer param.
+
+    A single-element output is a plain scalar (passed by address at the call
+    site); everything else is a VLA sized to the *logical* length, so a read past
+    it is a genuine out-of-bounds rather than a read into slack. Input buffers are
+    nondet-filled element by element; output buffers are left for the unit to
+    write.
+    """
+    if _is_scalar_backed(buf):
+        return [f"    {buf.elem_ctype} {buf.name};"]
+    lines = [f"    {buf.elem_ctype} {buf.name}[{buf.length}];"]
+    if not buf.out:
+        lines.append(
+            f"    for (size_t _i = 0; _i < ({buf.length}); _i++) "
+            f"{buf.name}[_i] = {_nondet_slug(buf.elem_ctype)}();"
+        )
+    return lines
+
+
+def _call_arg(param: Param) -> str:
+    """The call-site argument for a param: name, or ``&name`` for a scalar-backed
+    output buffer (arrays decay to pointers on their own)."""
+    if isinstance(param, ScalarParam):
+        return param.name
+    if isinstance(param, BufferParam):
+        return f"&{param.name}" if _is_scalar_backed(param) else param.name
+    raise HarnessError(f"unknown Param subtype: {type(param).__name__}")
+
+
+def _is_scalar_backed(buf: BufferParam) -> bool:
+    return buf.out and buf.length.strip() == "1"
+
+
+def _references(expr: str, ident: str) -> bool:
+    return re.search(rf"\b{re.escape(ident)}\b", expr) is not None
+
+
+def _defines_main(source: str) -> bool:
+    return re.search(r"\bmain\s*\(", source) is not None
+
+
+@dataclass(frozen=True)
+class _RawParam:
+    """A parameter fragment before buffer length/out inference."""
+
+    type_str: str
+    name: str
+    is_ptr: bool
+    is_const: bool
+    array_len: str | None
+
+
+def _split_params(raw: str) -> list[str]:
+    """Split a parameter list on top-level commas; ``""``/``void`` -> no params."""
+    stripped = raw.strip()
+    if stripped in ("", "void"):
+        return []
+    parts: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for ch in stripped:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    parts.append("".join(current))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _parse_fragment(frag: str, symbol: str) -> _RawParam:
+    array = re.search(r"\[([^\]]*)\]", frag)
+    array_len = (array.group(1).strip() or None) if array is not None else None
+    body = (frag[: array.start()] + frag[array.end() :]) if array is not None else frag
+    body = body.strip()
+    name_match = re.search(r"([A-Za-z_]\w*)\s*$", body)
+    if name_match is None:
+        raise HarnessError(f"could not parse parameter {frag!r} of {symbol!r}")
+    type_str = body[: name_match.start()].strip()
+    if not type_str:
+        raise HarnessError(f"could not parse the type of parameter {frag!r}")
+    return _RawParam(
+        type_str=type_str,
+        name=name_match.group(1),
+        is_ptr="*" in type_str or array is not None,
+        is_const=bool(re.search(r"\bconst\b", type_str)),
+        array_len=array_len,
+    )
+
+
+def _to_params(raws: Sequence[_RawParam]) -> tuple[Param, ...]:
+    params: list[Param] = []
+    for i, raw in enumerate(raws):
+        if not raw.is_ptr:
+            params.append(ScalarParam(ctype=raw.type_str, name=raw.name))
+            continue
+        nxt = raws[i + 1] if i + 1 < len(raws) else None
+        if raw.array_len:
+            length, out = raw.array_len, False
+        elif nxt is not None and not nxt.is_ptr and _is_integer_type(nxt.type_str):
+            length, out = nxt.name, False
+        else:
+            length, out = "1", not raw.is_const
+        params.append(
+            BufferParam(
+                elem_ctype=_elem_ctype(raw.type_str),
+                name=raw.name,
+                length=length,
+                const=raw.is_const,
+                out=out,
+            )
+        )
+    return tuple(params)
+
+
+def _elem_ctype(type_str: str) -> str:
+    """A pointer/array param's element type: drop ``const`` and ``*``."""
+    without_const = re.sub(r"\bconst\b", "", type_str).replace("*", " ")
+    return " ".join(without_const.split())
+
+
+def _is_integer_type(type_str: str) -> bool:
+    return (
+        _INT_TYPE_RE.search(type_str) is not None
+        and _FLOAT_TYPE_RE.search(type_str) is None
+    )
