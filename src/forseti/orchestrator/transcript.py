@@ -3,8 +3,9 @@
 A pure projection over `report_for`: the unit, the final outcome (+ give-up
 reason), and one line per iteration (verdict, the bound `k` it ran at, the
 source verified, and the UNKNOWN reason when relevant). It reuses the report's
-already-extracted rows, so the bound `k` is read back from the esbmc argv in one
-place. The full counterexample is `report.py`'s job; this stays a summary.
+already-extracted rows, so the bound `k` the loop escalated to is carried
+straight through. The full counterexample is `report.py`'s job; this stays a
+summary.
 """
 
 from __future__ import annotations

@@ -30,14 +30,14 @@ class IterationReport:
 
     `source` is the path verified that pass (the path-level fix handle; a
     structured diff ref arrives with #28). `k` is the unwind bound the pass
-    actually ran at, read back from the esbmc argv. `unknown_reason` is the
-    `UnknownReason` (e.g. `"timeout"`) when the pass was `Unknown`, else `None` —
-    so a human can tell *why* the loop escalated.
+    actually ran at, carried straight from the loop's escalation decision.
+    `unknown_reason` is the `UnknownReason` (e.g. `"timeout"`) when the pass was
+    `Unknown`, else `None` — so a human can tell *why* the loop escalated.
     """
 
     index: int
     verdict: str
-    k: int | None
+    k: int
     source: str
     unknown_reason: str | None
 
@@ -81,30 +81,13 @@ class Report:
         }
 
 
-def _unwind_from_argv(argv: tuple[str, ...]) -> int | None:
-    """The unwind bound `k` the run actually used, read from the esbmc argv.
-
-    Bounds- and parse-safe — never raises: returns `None` when `--unwind` is
-    absent, is the last token (no value follows), or is followed by a non-int.
-    """
-    if "--unwind" not in argv:
-        return None
-    i = argv.index("--unwind")
-    if i + 1 >= len(argv):
-        return None
-    try:
-        return int(argv[i + 1])
-    except ValueError:
-        return None
-
-
 def report_for(run: LoopRun) -> Report:
     """Project a `LoopRun` into the report-to-human payload (pure, total)."""
     iterations = tuple(
         IterationReport(
             index=it.index,
             verdict=it.result.verdict.value,
-            k=_unwind_from_argv(it.result.meta.argv),
+            k=it.k,
             source=str(it.source),
             unknown_reason=(
                 it.result.reason.value if isinstance(it.result, Unknown) else None

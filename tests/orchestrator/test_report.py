@@ -26,8 +26,6 @@ from forseti.esbmc import (
 )
 from forseti.orchestrator import (
     GiveUpReason,
-    Iteration,
-    LoopRun,
     LoopState,
     report_for,
     run_loop,
@@ -119,36 +117,23 @@ def test_converged_report_has_no_cex_or_reason() -> None:
     assert report.last_counterexample_raw is None
 
 
-def test_k_extracted_from_argv() -> None:
+def test_k_is_the_bound_each_pass_ran_at() -> None:
     verify = FakeVerify([violated(), Verified(meta())])
     run = run_loop(SRC, verify=verify, fix=FakeFix(), unwind=8)
     report = report_for(run)
     assert [it.k for it in report.iterations] == [8, 8]
 
 
-def _run_with_argv(argv: tuple[str, ...]) -> LoopRun:
-    m = RunMeta(
-        esbmc_version="8.3.0",
-        argv=argv,
-        exit_code=0,
-        duration_s=0.0,
-        stdout="",
-        stderr="",
-    )
-    it = Iteration(index=0, source=SRC, result=Verified(m), state=LoopState.DONE)
-    return LoopRun(final_state=LoopState.DONE, iterations=(it,))
-
-
-def test_k_is_none_for_malformed_argv() -> None:
-    # Missing --unwind, a trailing --unwind with no value, and a non-int value
-    # must all yield k=None — never raise.
-    for argv in (
-        ("esbmc", "kernel.c", "--no-unwinding-assertions"),
-        ("esbmc", "kernel.c", "--unwind"),
-        ("esbmc", "kernel.c", "--unwind", "deep"),
-    ):
-        report = report_for(_run_with_argv(argv))
-        assert report.iterations[0].k is None
+def test_k_reflects_the_escalated_bound_not_the_argv() -> None:
+    # On the k-ladder the loop re-verifies the *same* source at a higher bound.
+    # The report's k must be the bound the loop ran that pass at (8, then 16) —
+    # the loop's own escalation decision, carried as data. Here the fake port
+    # reports a stale `--unwind 8` argv for every pass, so a k scraped from argv
+    # would wrongly read [8, 8] for an escalation the loop actually made to 16.
+    verify = FakeVerify([Unknown(meta(), UnknownReason.TIMEOUT), Verified(meta())])
+    run = run_loop(SRC, verify=verify, fix=FakeFix(), unwind=8, unwind_ladder=(16,))
+    report = report_for(run)
+    assert [it.k for it in report.iterations] == [8, 16]
 
 
 def test_report_surfaces_unknown_reason() -> None:

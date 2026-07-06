@@ -36,13 +36,16 @@ class Iteration:
 
     `source` is the path verified this pass — i.e. the output of the *previous*
     iteration's fix. With the minimal `FixPort` it is the only fix handle the
-    loop has; a structured diff handle arrives with #28.
+    loop has; a structured diff handle arrives with #28. `k` is the unwind bound
+    this pass ran at — the loop's own escalation decision along the k-ladder,
+    carried as data so the report never has to read it back from the esbmc argv.
     """
 
     index: int
     source: Path
     result: EsbmcResult
     state: LoopState
+    k: int
 
 
 @dataclass(frozen=True)
@@ -104,7 +107,7 @@ def run_loop(
         while True:
             result = verify(current, unwind=ladder[k_index])
             state = next_state(result)
-            iterations.append(Iteration(index, current, result, state))
+            iterations.append(Iteration(index, current, result, state, ladder[k_index]))
             emit(
                 "verify.verdict",
                 index=index,
