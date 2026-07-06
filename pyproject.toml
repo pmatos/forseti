@@ -19,7 +19,7 @@ mcp = ["mcp>=1.28.1,<2"]
 dev = [
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
-    "hypothesis>=6.98",
+    "hypothesis>=6.156.1",
     "mypy>=2.1.0",
     "ruff>=0.15.20",
     "forseti[mcp]",
