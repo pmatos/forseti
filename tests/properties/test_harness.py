@@ -193,6 +193,15 @@ def test_extract_signature_missing_symbol_is_error() -> None:
         extract_signature(ABS_SLICE, "not_there")
 
 
+def test_extract_signature_ambiguous_multibuffer_is_error() -> None:
+    # An interior pointer not followed by its length (two buffers sharing a
+    # trailing length) is ambiguous -- fail loud instead of inventing length 1.
+    with pytest.raises(HarnessError):
+        extract_signature(
+            "int dot(const int *a, const int *b, size_t n) { return 0; }", "dot"
+        )
+
+
 def test_spec_from_semantic_property() -> None:
     prop = _semantic_property("result >= 0", ("x > INT64_MIN",))
     assert spec_from_property(prop) == SemanticSpec("result >= 0", ("x > INT64_MIN",))

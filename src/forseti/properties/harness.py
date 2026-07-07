@@ -412,8 +412,20 @@ def _to_params(raws: Sequence[_RawParam]) -> tuple[Param, ...]:
             length, out = raw.array_len, False
         elif nxt is not None and not nxt.is_ptr and _is_integer_type(nxt.type_str):
             length, out = nxt.name, False
-        else:
+        elif nxt is None:
+            # a trailing pointer with no length param is a single-element output
+            # (e.g. utf8_decode's `uint32_t *cp`); non-const -> written by the unit.
             length, out = "1", not raw.is_const
+        else:
+            # an interior pointer not followed by its integer length: ambiguous
+            # (e.g. `dot(const int *a, const int *b, size_t n)`). Fail loud rather
+            # than invent length 1 -- the caller hand-builds a UnitSignature for
+            # multi-buffer signatures.
+            raise HarnessError(
+                f"cannot infer the length of pointer parameter {raw.name!r}: it is "
+                "not the (buffer, length) idiom nor a trailing output; supply a "
+                "UnitSignature explicitly for multi-buffer signatures"
+            )
         params.append(
             BufferParam(
                 elem_ctype=_elem_ctype(raw.type_str),
