@@ -25,7 +25,7 @@ from .result import (
     Verified,
     Violated,
 )
-from .runner import classify, verify
+from .runner import build_argv, classify, verify
 
 __all__ = [
     "EXIT_CODES",
@@ -43,6 +43,7 @@ __all__ = [
     "Verified",
     "Violated",
     "ViolatedProperty",
+    "build_argv",
     "classify",
     "parse_counterexample",
     "render_result",

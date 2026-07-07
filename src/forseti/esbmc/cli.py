@@ -68,15 +68,12 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
 
-    extra = list(args.esbmc_args)
-    if args.function:
-        extra += ["--function", args.function]
-
     result = verify(
         args.source,
         unwind=args.unwind,
         timeout_s=args.timeout,
-        extra_flags=tuple(extra),
+        function=args.function,
+        extra_flags=tuple(args.esbmc_args),
         esbmc_bin=args.esbmc_bin,
     )
     print(render_result(result, args.source, args.unwind))

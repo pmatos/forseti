@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import subprocess
 import time
@@ -114,11 +115,61 @@ def _as_text(value: str | bytes | None) -> str:
     return value
 
 
+def _encode_timeout_s(timeout_s: float) -> str:
+    """esbmc's `--timeout` value for a budget of `timeout_s` seconds.
+
+    esbmc takes a whole-second count with a unit suffix. We round *up* to whole
+    seconds and never below `1s`: a positive budget must stay a positive,
+    bounded timeout. Plain truncation is the trap here — `int(0.5)` is `0`, and
+    esbmc reads `--timeout 0s` as *no* timeout, silently turning a sub-second
+    budget into an unbounded run. Rounding up also keeps esbmc's own timeout
+    strictly under the wall-clock backstop (`timeout_s + _GRACE_S`), so esbmc
+    still self-terminates with a clean `Timed out` before we hard-kill it.
+    """
+    return f"{max(1, math.ceil(timeout_s))}s"
+
+
+def build_argv(
+    source: Path,
+    *,
+    unwind: int,
+    function: str | None = None,
+    timeout_s: float | None = None,
+    extra_flags: Sequence[str] = (),
+    esbmc_bin: str = "esbmc",
+) -> tuple[str, ...]:
+    """The exact esbmc command line for these verification parameters.
+
+    The single home for every argv decision: the recommended
+    `--unwind N --no-unwinding-assertions` bound, the optional `--function`
+    entry point, the verbatim `extra_flags` passthrough, and the `--timeout`
+    encoding. Keeping it pure and separate from the subprocess call makes the
+    command line directly testable without invoking esbmc, and gives callers one
+    place to spell a flag rather than open-coding `["--function", name]` at each
+    site. `function` and `--timeout` come *after* `extra_flags` so an explicit
+    passthrough flag keeps its position relative to esbmc's option precedence.
+    """
+    argv = [
+        esbmc_bin,
+        str(source),
+        "--unwind",
+        str(unwind),
+        "--no-unwinding-assertions",
+        *extra_flags,
+    ]
+    if function is not None:
+        argv += ["--function", function]
+    if timeout_s is not None:
+        argv += ["--timeout", _encode_timeout_s(timeout_s)]
+    return tuple(argv)
+
+
 def verify(
     source: Path,
     *,
     unwind: int,
     timeout_s: float | None = None,
+    function: str | None = None,
     extra_flags: Sequence[str] = (),
     esbmc_bin: str = "esbmc",
     frontend: Frontend = Frontend.C,
@@ -127,27 +178,28 @@ def verify(
 
     Uses the recommended `--unwind N --no-unwinding-assertions` bound. `unwind`
     is required and recorded in the result's `argv`, so a VERIFIED stays
-    qualified as "verified up to k". When `timeout_s` is set, esbmc's own
-    `--timeout` is used (it yields a clean `Timed out`), with a wall-clock
-    backstop that maps a Python-level timeout to `Unknown(TIMEOUT)`. `frontend`
-    selects the counterexample parser (C only, for now).
+    qualified as "verified up to k". `function` selects the entry point to
+    verify (esbmc's `--function`), spelled as data here rather than by the
+    caller. When `timeout_s` is set, esbmc's own `--timeout` is used (it yields a
+    clean `Timed out`), with a wall-clock backstop that maps a Python-level
+    timeout to `Unknown(TIMEOUT)`. `frontend` selects the counterexample parser
+    (C only, for now).
     """
-    cmd = [
-        esbmc_bin,
-        str(source),
-        "--unwind",
-        str(unwind),
-        "--no-unwinding-assertions",
-        *extra_flags,
-    ]
-    if timeout_s is not None:
-        cmd += ["--timeout", f"{int(timeout_s)}s"]
-    argv = tuple(cmd)
+    argv = build_argv(
+        source,
+        unwind=unwind,
+        function=function,
+        timeout_s=timeout_s,
+        extra_flags=extra_flags,
+        esbmc_bin=esbmc_bin,
+    )
     proc_timeout = timeout_s + _GRACE_S if timeout_s is not None else None
 
     start = time.monotonic()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=proc_timeout)
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=proc_timeout
+        )
     except OSError as exc:
         # The binary never ran (missing, non-executable, a directory, ...);
         # record the intended argv for provenance. FileNotFoundError is an
