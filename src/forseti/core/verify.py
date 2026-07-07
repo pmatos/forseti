@@ -1,8 +1,9 @@
 """Forseti Core's `verify` operation — the harness-neutral entry point.
 
-`verify_source` is the single place the `--function` flag and a sane default
-timeout are assembled before delegating to :func:`forseti.esbmc.verify`, so the
-unified CLI and the MCP tool share one behaviour. `result_to_payload` renders
+`verify_source` applies a sane default timeout and passes the target `function`
+through as data before delegating to :func:`forseti.esbmc.verify` (which owns
+the `--function` argv spelling), so the unified CLI and the MCP tool share one
+behaviour. `result_to_payload` renders
 any :class:`~forseti.esbmc.EsbmcResult` as a JSON-serialisable dict — the wire
 shape both the CLI (`--json`) and the MCP `verify` tool return, so a harness
 adapter sees the same verdict structure regardless of transport.
@@ -44,20 +45,18 @@ def verify_source(
 ) -> EsbmcResult:
     """Verify `source` with ESBMC and return the typed verdict.
 
-    A thin Core wrapper over :func:`forseti.esbmc.verify`: it folds `function`
-    into the forwarded flags (so `--function` is spelled once, here) and applies
-    a default timeout so an agent-driven call can never hang unbounded. `unwind`
-    is recorded in the result's provenance, so a VERIFIED stays honestly
-    qualified as "verified up to k".
+    A thin Core wrapper over :func:`forseti.esbmc.verify`: it passes `function`
+    through as data (esbmc owns the `--function` spelling) and applies a default
+    timeout so an agent-driven call can never hang unbounded. `unwind` is
+    recorded in the result's provenance, so a VERIFIED stays honestly qualified
+    as "verified up to k".
     """
-    flags = list(extra_flags)
-    if function is not None:
-        flags += ["--function", function]
     return verify(
         source,
         unwind=unwind,
         timeout_s=timeout_s,
-        extra_flags=tuple(flags),
+        function=function,
+        extra_flags=extra_flags,
         esbmc_bin=esbmc_bin,
         frontend=frontend,
     )
