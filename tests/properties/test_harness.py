@@ -109,6 +109,26 @@ def test_buffer_content_precondition_ordered_around_buffer() -> None:
     assert out.index(content_assume) < out.index("first(a, n)")
 
 
+def test_mixed_length_and_buffer_precondition_is_error() -> None:
+    # A single clause constraining both the length `n` and the buffer `a` cannot
+    # be ordered correctly (the `n` bound must precede `int a[n]`, the `a`
+    # predicate must follow it), so it is rejected -- the caller splits it into
+    # separate domain entries (see the ordering test above).
+    with pytest.raises(HarnessError):
+        render_semantic_harness(
+            unit_source="int first(const int *a, unsigned n) { return a[0]; }",
+            signature=UnitSignature(
+                "first",
+                "int",
+                (
+                    BufferParam("int", "a", "n", const=True),
+                    ScalarParam("unsigned", "n"),
+                ),
+            ),
+            spec=SemanticSpec("result == a[0]", ("n >= 1 && n <= 2 && a[0] >= 0",)),
+        )
+
+
 def test_output_buffer_captured() -> None:
     out = render_semantic_harness(
         unit_source="int decode(const unsigned char *b, unsigned len, uint32_t *cp)"

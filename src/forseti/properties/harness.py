@@ -154,8 +154,7 @@ def render_semantic_harness(
         lines.append(
             f"    {scalar.ctype} {scalar.name} = {_nondet_slug(scalar.ctype)}();"
         )
-    buffer_names = {buf.name for buf in buffers}
-    pre_buffer, post_buffer = _split_assumptions(spec.preconditions, buffer_names)
+    pre_buffer, post_buffer = _split_assumptions(spec.preconditions, buffers)
     for pre in pre_buffer:
         lines.append(f"    __ESBMC_assume(({pre}));")
     for buf in buffers:
@@ -301,7 +300,7 @@ def _is_scalar_backed(buf: BufferParam) -> bool:
 
 
 def _split_assumptions(
-    preconditions: Sequence[str], buffer_names: set[str]
+    preconditions: Sequence[str], buffers: Sequence[BufferParam]
 ) -> tuple[list[str], list[str]]:
     """Partition preconditions by whether they reference a buffer parameter.
 
@@ -310,15 +309,34 @@ def _split_assumptions(
     `_render_buffer`; a length/scalar-only precondition (e.g. ``len <= 4``) must
     stay *before* the VLA declaration it sizes. Blank entries are dropped.
     Returns ``(pre_buffer, post_buffer)``.
+
+    A single clause that constrains *both* a buffer and a buffer-length
+    identifier (e.g. ``n >= 1 && n <= 2 && a[0] >= 0``) cannot be placed
+    correctly — the length bound must precede the VLA, the buffer predicate must
+    follow it — so it is rejected with `HarnessError` (splitting arbitrary C on
+    ``&&`` is unsound under ``||`` precedence). The caller supplies the length
+    bound and the buffer predicate as separate `domain` entries instead.
     """
+    buffer_names = {buf.name for buf in buffers}
+    length_idents = {
+        ident for buf in buffers for ident in re.findall(r"[A-Za-z_]\w*", buf.length)
+    }
     pre_buffer: list[str] = []
     post_buffer: list[str] = []
     for raw in preconditions:
         stripped = raw.strip()
         if not stripped:
             continue
-        references_buffer = any(_references(stripped, name) for name in buffer_names)
-        (post_buffer if references_buffer else pre_buffer).append(stripped)
+        if not any(_references(stripped, name) for name in buffer_names):
+            pre_buffer.append(stripped)
+            continue
+        if any(_references(stripped, ident) for ident in length_idents):
+            raise HarnessError(
+                f"precondition {stripped!r} constrains both a buffer and a "
+                "buffer-length identifier; split it into separate domain entries "
+                "so the length bound can precede the VLA it sizes"
+            )
+        post_buffer.append(stripped)
     return pre_buffer, post_buffer
 
 
