@@ -102,8 +102,10 @@ def render_semantic_harness(
 
     Deterministic, pure string synthesis. Emits, in order: the includes, the
     inlined `unit_source`, one nondet prototype per distinct nondet type, then a
-    ``main`` that declares the scalar params, assumes the preconditions, sets up
-    the buffers, calls the unit, and asserts the postcondition. Raises
+    ``main`` that declares the scalar params, assumes the length/scalar
+    preconditions, sets up the buffers, assumes any buffer-content preconditions
+    (which reference an identifier only in scope after the buffer is declared and
+    filled), calls the unit, and asserts the postcondition. Raises
     `HarnessError` on an un-renderable input (empty postcondition, `result_var`
     clashing a param name, a void return referenced by `result_var`, a
     `unit_source` that defines its own ``main``, or an unknown Param subtype).
@@ -152,12 +154,14 @@ def render_semantic_harness(
         lines.append(
             f"    {scalar.ctype} {scalar.name} = {_nondet_slug(scalar.ctype)}();"
         )
-    for pre in spec.preconditions:
-        stripped = pre.strip()
-        if stripped:
-            lines.append(f"    __ESBMC_assume(({stripped}));")
+    buffer_names = {buf.name for buf in buffers}
+    pre_buffer, post_buffer = _split_assumptions(spec.preconditions, buffer_names)
+    for pre in pre_buffer:
+        lines.append(f"    __ESBMC_assume(({pre}));")
     for buf in buffers:
         lines += _render_buffer(buf)
+    for pre in post_buffer:
+        lines.append(f"    __ESBMC_assume(({pre}));")
     call = f"{signature.symbol}({', '.join(_call_arg(p) for p in signature.params)})"
     if returns_void:
         lines.append(f"    {call};")
@@ -294,6 +298,28 @@ def _call_arg(param: Param) -> str:
 
 def _is_scalar_backed(buf: BufferParam) -> bool:
     return buf.out and buf.length.strip() == "1"
+
+
+def _split_assumptions(
+    preconditions: Sequence[str], buffer_names: set[str]
+) -> tuple[list[str], list[str]]:
+    """Partition preconditions by whether they reference a buffer parameter.
+
+    A precondition over buffer *contents* (e.g. ``a[0] >= 0``) can only be
+    emitted once the buffer is declared and nondet-filled, so it goes *after*
+    `_render_buffer`; a length/scalar-only precondition (e.g. ``len <= 4``) must
+    stay *before* the VLA declaration it sizes. Blank entries are dropped.
+    Returns ``(pre_buffer, post_buffer)``.
+    """
+    pre_buffer: list[str] = []
+    post_buffer: list[str] = []
+    for raw in preconditions:
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        references_buffer = any(_references(stripped, name) for name in buffer_names)
+        (post_buffer if references_buffer else pre_buffer).append(stripped)
+    return pre_buffer, post_buffer
 
 
 def _references(expr: str, ident: str) -> bool:

@@ -15,6 +15,7 @@ import pytest
 
 from forseti.esbmc import Verified, Violated, verify
 from forseti.properties import (
+    BufferParam,
     ScalarParam,
     SemanticSpec,
     UnitSignature,
@@ -61,6 +62,29 @@ def test_false_property_is_violated(tmp_path: Path) -> None:
         a.binary is not None and a.binary.replace(" ", "") == _INT64_MIN_BITS
         for a in cex.inputs
     )
+
+
+def test_buffer_content_precondition_renders_valid_c(tmp_path: Path) -> None:
+    # A domain precondition over buffer *contents* must be emitted after the
+    # buffer is declared/filled. If it leaks before the VLA declaration the
+    # harness references an undeclared identifier and esbmc returns a parse
+    # Error (not a verdict) -- so a clean Verified proves the C is well-formed.
+    source = tmp_path / "buffer.c"
+    source.write_text(
+        render_semantic_harness(
+            unit_source="int first(const int *a, unsigned n) { return a[0]; }",
+            signature=UnitSignature(
+                "first",
+                "int",
+                (
+                    BufferParam("int", "a", "n", const=True),
+                    ScalarParam("unsigned", "n"),
+                ),
+            ),
+            spec=SemanticSpec("result == a[0]", ("n >= 1 && n <= 2", "a[0] >= 0")),
+        )
+    )
+    assert isinstance(verify(source, unwind=2), Verified)
 
 
 def test_true_property_is_non_vacuous(tmp_path: Path) -> None:

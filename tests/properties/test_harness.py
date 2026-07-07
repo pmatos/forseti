@@ -90,6 +90,25 @@ def test_buffer_param_vla_fill() -> None:
     assert "sum(a, n)" in out
 
 
+def test_buffer_content_precondition_ordered_around_buffer() -> None:
+    out = render_semantic_harness(
+        unit_source="int first(const int *a, unsigned n) { return a[0]; }",
+        signature=UnitSignature(
+            "first",
+            "int",
+            (BufferParam("int", "a", "n", const=True), ScalarParam("unsigned", "n")),
+        ),
+        spec=SemanticSpec("result == a[0]", ("n <= 4", "a[0] >= 0")),
+    )
+    # a length-only assume precedes the VLA it sizes; a buffer-content assume
+    # follows the declaration/fill so it references an in-scope identifier.
+    fill = "a[_i] = nondet_int();"
+    content_assume = "__ESBMC_assume((a[0] >= 0));"
+    assert out.index("__ESBMC_assume((n <= 4));") < out.index("int a[n];")
+    assert out.index(fill) < out.index(content_assume)
+    assert out.index(content_assume) < out.index("first(a, n)")
+
+
 def test_output_buffer_captured() -> None:
     out = render_semantic_harness(
         unit_source="int decode(const unsigned char *b, unsigned len, uint32_t *cp)"
