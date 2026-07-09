@@ -257,9 +257,18 @@ def test_domain_over_output_param_rejected() -> None:
 
 
 def test_output_param_allowed_in_expression() -> None:
-    # The same output param IS valid in the postcondition -- the unit writes it.
+    # The same output param IS valid in the postcondition -- the unit writes it --
+    # as long as it is named directly (the harness binds it as a scalar).
     spec = CandidateSpec(expression="cp <= 0", referenced_params=("cp",))
     assert validate_candidate(spec, out_sig()) is None
+
+
+@pytest.mark.parametrize("expr", ["*cp <= 0x10FFFF", "cp[0] <= 0x10FFFF"])
+def test_scalar_backed_output_deref_rejected(expr: str) -> None:
+    # Regression (#81): `*cp` / `cp[0]` on a single-element output would deref a
+    # scalar local and not compile; the validator must reject it up front.
+    reason = validate_candidate(CandidateSpec(expression=expr), out_sig())
+    assert reason is not None and "scalar-backed output 'cp'" in reason
 
 
 def test_posix_only_macro_is_rejected() -> None:

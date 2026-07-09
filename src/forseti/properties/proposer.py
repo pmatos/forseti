@@ -344,11 +344,28 @@ def validate_candidate(
         output_params = {
             p.name for p in signature.params if isinstance(p, BufferParam) and p.out
         }
+        # A single-element output is rendered as a plain scalar local (passed by
+        # address), so a postcondition must name it directly: `*cp`/`cp[0]` would
+        # deref/subscript a non-pointer and not compile. Reject that syntax rather
+        # than emit an uncompilable harness the renderability gate can't catch.
+        scalar_outputs = {
+            p.name
+            for p in signature.params
+            if isinstance(p, BufferParam) and p.out and p.length.strip() == "1"
+        }
         input_params = params - output_params
         allowed = params | {RESULT_IDENT} | _MACROS
         for ident in expr_idents:
             if ident not in allowed:
                 return f"expression references unknown identifier {ident!r}"
+        for name in scalar_outputs:
+            if re.search(rf"\*\s*{re.escape(name)}\b", spec.expression) or re.search(
+                rf"\b{re.escape(name)}\s*\[", spec.expression
+            ):
+                return (
+                    f"expression dereferences/subscripts scalar-backed output "
+                    f"{name!r}; the harness binds it as a scalar -- name it directly"
+                )
         for pre in spec.domain:
             for ident in _identifiers(pre):
                 if ident in output_params:
