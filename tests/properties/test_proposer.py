@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from forseti.properties import (
+    BufferParam,
     CandidateSpec,
     HarnessError,
     LLMError,
@@ -180,6 +181,11 @@ def test_parse_candidates_rejects_bad_domain_type() -> None:
         (CandidateSpec(expression="x = 0"), "assignment"),
         (CandidateSpec(expression="result >= abs(x)"), "function call"),
         (CandidateSpec(expression="result >= 0; x"), "';'"),
+        (CandidateSpec(expression="x++ > 0"), "increment/decrement"),
+        (
+            CandidateSpec(expression="result >= 0", domain=("x-- > 0",)),
+            "increment/decrement",
+        ),
         (CandidateSpec(expression="1 == 1"), "vacuous expression"),
         (
             CandidateSpec(expression="result >= 0", domain=("result > 0",)),
@@ -231,6 +237,29 @@ def test_limits_macro_accepted_and_renders_with_include() -> None:
     )
     assert "#include <limits.h>" in harness
     assert "INT_MIN" in harness
+
+
+def out_sig() -> UnitSignature:
+    # A trailing non-const output pointer, like utf8_decode's `uint32_t *cp`.
+    return UnitSignature(
+        symbol="decode",
+        return_ctype="int",
+        params=(BufferParam(elem_ctype="uint32_t", name="cp", length="1", out=True),),
+    )
+
+
+def test_domain_over_output_param_rejected() -> None:
+    # Regression (#81): a precondition can't constrain an output param -- it would
+    # __ESBMC_assume on uninitialized storage before the call.
+    spec = CandidateSpec(expression="result >= 0", domain=("cp <= 0",))
+    reason = validate_candidate(spec, out_sig())
+    assert reason is not None and "output parameter 'cp'" in reason
+
+
+def test_output_param_allowed_in_expression() -> None:
+    # The same output param IS valid in the postcondition -- the unit writes it.
+    spec = CandidateSpec(expression="cp <= 0", referenced_params=("cp",))
+    assert validate_candidate(spec, out_sig()) is None
 
 
 def test_posix_only_macro_is_rejected() -> None:

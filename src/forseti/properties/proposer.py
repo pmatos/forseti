@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 from .harness import (
+    BufferParam,
     HarnessError,
     SemanticSpec,
     UnitSignature,
@@ -335,13 +336,27 @@ def validate_candidate(
 
     if signature is not None:
         params = {p.name for p in signature.params}
+        # Output buffers hold the unit's *result*, written during the call. They
+        # are valid in the postcondition (`expression`), but a precondition
+        # (`domain`) over one would `__ESBMC_assume` on uninitialized storage
+        # before the call -- preconstraining a would-be output, which can mask a
+        # unit that never writes it. So domains constrain inputs only.
+        output_params = {
+            p.name for p in signature.params if isinstance(p, BufferParam) and p.out
+        }
+        input_params = params - output_params
         allowed = params | {RESULT_IDENT} | _MACROS
         for ident in expr_idents:
             if ident not in allowed:
                 return f"expression references unknown identifier {ident!r}"
         for pre in spec.domain:
             for ident in _identifiers(pre):
-                if ident not in (params | _MACROS):
+                if ident in output_params:
+                    return (
+                        f"domain expr {pre!r} constrains output parameter "
+                        f"{ident!r} (preconditions apply to inputs only)"
+                    )
+                if ident not in (input_params | _MACROS):
                     return f"domain expr {pre!r} references unknown ident {ident!r}"
         for name in spec.referenced_params:
             if name not in params:
@@ -418,13 +433,18 @@ def _unsafe(expr: str) -> str | None:
     """None if `expr` is a pure C boolean expression, else why it is rejected.
 
     Blocks statement separators, assignments (a bare ``=`` that is not part of a
-    relational operator), backticks, function calls, and unbalanced parentheses
-    -- everything that would let a "property" smuggle in side effects.
+    relational operator), increment/decrement operators, backticks, function
+    calls, and unbalanced parentheses -- everything that would let a "property"
+    smuggle in a side effect. ``++``/``--`` matter because a ``domain`` clause is
+    emitted as ``__ESBMC_assume((<expr>))`` *before* the call, so mutating an
+    input there would change the value actually passed to the unit.
     """
     if ";" in expr:
         return "contains ';'"
     if "`" in expr:
         return "contains a backtick"
+    if "++" in expr or "--" in expr:
+        return "contains an increment/decrement operator"
     if "=" in _RELATIONAL.sub("", expr):
         return "contains an assignment"
     if _CALL.search(expr):
