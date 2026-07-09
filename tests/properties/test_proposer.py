@@ -186,6 +186,11 @@ def test_parse_candidates_rejects_bad_domain_type() -> None:
             CandidateSpec(expression="result >= 0", domain=("x-- > 0",)),
             "increment/decrement",
         ),
+        (CandidateSpec(expression="x <<= 1"), "compound assignment"),
+        (
+            CandidateSpec(expression="result >= 0", domain=("x >>= 1",)),
+            "compound assignment",
+        ),
         (CandidateSpec(expression="1 == 1"), "vacuous expression"),
         (
             CandidateSpec(expression="result >= 0", domain=("result > 0",)),

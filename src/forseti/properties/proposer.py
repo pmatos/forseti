@@ -462,6 +462,10 @@ def _unsafe(expr: str) -> str | None:
         return "contains a backtick"
     if "++" in expr or "--" in expr:
         return "contains an increment/decrement operator"
+    if "<<=" in expr or ">>=" in expr:
+        # `_RELATIONAL` would strip the `<=`/`>=` embedded in `<<=`/`>>=`, hiding
+        # the compound assignment from the bare-`=` check below; catch it first.
+        return "contains a compound assignment operator"
     if "=" in _RELATIONAL.sub("", expr):
         return "contains an assignment"
     if _CALL.search(expr):
