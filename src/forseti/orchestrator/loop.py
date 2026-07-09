@@ -23,6 +23,7 @@ from typing import Any, assert_never
 
 from forseti.esbmc import Error, EsbmcResult, Unknown, Verified, Violated
 
+from .ladder import validated_ladder
 from .ports import FixPort, VerifyPort
 from .state import GiveUpReason, LoopState, next_state
 from .telemetry import Event, EventSink, NullSink
@@ -85,11 +86,7 @@ def run_loop(
     """
     if max_iterations < 1:
         raise ValueError(f"max_iterations must be >= 1, got {max_iterations}")
-    ladder = (unwind, *unwind_ladder)
-    if any(k < 1 for k in ladder) or any(b <= a for a, b in itertools.pairwise(ladder)):
-        raise ValueError(
-            f"unwind ladder must be increasing positive ints, got {ladder}"
-        )
+    ladder = validated_ladder(unwind, unwind_ladder)
     out = sink or NullSink()
     seq = itertools.count()
 
