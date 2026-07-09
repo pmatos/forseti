@@ -96,7 +96,7 @@ def render_semantic_harness(
     unit_source: str,
     signature: UnitSignature,
     spec: SemanticSpec,
-    includes: Sequence[str] = ("stdint.h", "stddef.h"),
+    includes: Sequence[str] = ("stdint.h", "stddef.h", "limits.h"),
 ) -> str:
     """Return a compilable ESBMC harness (C text) for one semantic property.
 

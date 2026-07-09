@@ -29,6 +29,7 @@ from forseti.properties import (
     parse_candidates,
     propose_properties,
     render_semantic_harness,
+    spec_from_property,
     validate_candidate,
 )
 
@@ -209,6 +210,35 @@ def test_validate_referenced_params_subset() -> None:
     spec = CandidateSpec(expression="result >= x", referenced_params=("x", "z"))
     reason = validate_candidate(spec, abs_sig())
     assert reason is not None and "non-parameter 'z'" in reason
+
+
+def test_limits_macro_accepted_and_renders_with_include() -> None:
+    # Regression (#81): an allowlisted <limits.h> macro must be accepted AND land
+    # in a harness whose includes actually declare it -- allowlist and emitted
+    # headers stay in lockstep, so an accepted property compiles downstream.
+    result = propose_properties(
+        ProposalRequest(ABS_UNIT, ABS_SOURCE, signature=abs_sig()),
+        client=FakeLLMClient(
+            reply({"expression": "result >= 0", "domain": ["x > INT_MIN"]})
+        ),
+        renderer=render_semantic_harness,
+    )
+    assert len(result.accepted) == 1, result.rejected
+    harness = render_semantic_harness(
+        unit_source=ABS_SOURCE,
+        signature=abs_sig(),
+        spec=spec_from_property(result.accepted[0]),
+    )
+    assert "#include <limits.h>" in harness
+    assert "INT_MIN" in harness
+
+
+def test_posix_only_macro_is_rejected() -> None:
+    # SSIZE_MAX is POSIX, not guaranteed by the harness's standard headers, so it
+    # was dropped from the allowlist (#81) and must now fail validation.
+    spec = CandidateSpec(expression="result <= SSIZE_MAX")
+    reason = validate_candidate(spec, abs_sig())
+    assert reason is not None and "SSIZE_MAX" in reason
 
 
 def test_rejections_land_in_result_not_raised() -> None:

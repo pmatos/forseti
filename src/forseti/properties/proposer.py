@@ -349,8 +349,12 @@ def validate_candidate(
     return None
 
 
-# Standard limit macros (limits.h / stdint.h) a pure property may name without a
-# declaration -- the renderer includes the headers that define them.
+# Standard limit macros a pure property may name without a declaration. Every
+# entry is defined by one of the headers the harness writer emits by default
+# (`limits.h` / `stdint.h` / `stddef.h`), so an accepted candidate that uses one
+# still renders to a *compilable* harness -- the allowlist and the emitted
+# includes are kept in lockstep (#81). POSIX-only names (e.g. SSIZE_MAX) are
+# deliberately excluded: they are not guaranteed by those standard headers.
 _MACROS = frozenset(
     [
         "NULL",
@@ -390,7 +394,6 @@ _MACROS = frozenset(
         "INTPTR_MAX",
         "UINTPTR_MAX",
         "SIZE_MAX",
-        "SSIZE_MAX",
         "PTRDIFF_MIN",
         "PTRDIFF_MAX",
     ]
