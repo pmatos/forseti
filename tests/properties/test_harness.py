@@ -36,6 +36,9 @@ def test_scalar_harness_shape() -> None:
         spec=SemanticSpec("result >= 0", ("x > INT64_MIN",)),
     )
     assert "#include <stdint.h>" in out
+    # limits.h ships by default so <limits.h> macros (INT_MIN, ...) that the
+    # proposer allows are actually declared in the harness (#81).
+    assert "#include <limits.h>" in out
     assert ABS_SLICE in out  # the unit is inlined verbatim
     assert "int64_t nondet_int64_t(void);" in out
     assert out.count("__ESBMC_assume(") == 1
