@@ -32,7 +32,14 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, assert_never
 
-from forseti.esbmc import Error, EsbmcResult, Unknown, Verified, Violated
+from forseti.esbmc import (
+    Error,
+    EsbmcResult,
+    Unknown,
+    Verified,
+    Violated,
+    result_to_dict,
+)
 from forseti.properties import (
     Property,
     PropertyKind,
@@ -279,39 +286,15 @@ def _outcome_for(result: EsbmcResult) -> PropertyOutcome:
 
 
 def _result_payload(result: EsbmcResult, k: int | None) -> dict[str, Any]:
-    """The raw-result slice of a verdict's JSON shape.
+    """The raw-result slice of a verdict's JSON shape — the settled `k` plus the
+    shared `forseti.esbmc.result_to_dict` projection.
 
-    Mirrors `core.verify.result_to_payload`: common provenance (verdict, k, esbmc
-    version, argv, duration) always present; per-variant evidence added — a
-    VIOLATED carries the raw counterexample text and the typed cex, an UNKNOWN
-    its reason, an ERROR its message. (Follow-up: hoist a single serializer into
-    `forseti.esbmc` so core and orchestrator stop keeping two copies — out of
-    scope for #66.)
+    The check phase keeps the typed counterexample (`structured_cex=True`, the
+    default): grading (#4) re-renders and diffs it against mutants, so it needs
+    the structured trace, not just the raw text. `k` is this front-end's framing
+    over the intrinsic verdict fields the projection owns.
     """
-    payload: dict[str, Any] = {
-        "verdict": result.verdict.value,
-        "k": k,
-        "esbmc_version": result.meta.esbmc_version,
-        "argv": list(result.meta.argv),
-        "duration_s": result.meta.duration_s,
-    }
-    if isinstance(result, Verified):
-        return payload
-    if isinstance(result, Violated):
-        payload["raw_counterexample"] = result.raw_counterexample
-        payload["counterexample"] = (
-            result.counterexample.to_dict()
-            if result.counterexample is not None
-            else None
-        )
-        return payload
-    if isinstance(result, Unknown):
-        payload["reason"] = result.reason.value
-        return payload
-    if isinstance(result, Error):
-        payload["message"] = result.message
-        return payload
-    assert_never(result)
+    return {"k": k, **result_to_dict(result)}
 
 
 def _harness_filename(unit_id: str, property_id: str) -> str:

@@ -3,27 +3,19 @@
 `verify_source` applies a sane default timeout and passes the target `function`
 through as data before delegating to :func:`forseti.esbmc.verify` (which owns
 the `--function` argv spelling), so the unified CLI and the MCP tool share one
-behaviour. `result_to_payload` renders
-any :class:`~forseti.esbmc.EsbmcResult` as a JSON-serialisable dict — the wire
-shape both the CLI (`--json`) and the MCP `verify` tool return, so a harness
-adapter sees the same verdict structure regardless of transport.
+behaviour. `result_to_payload` frames the shared
+:func:`forseti.esbmc.result_to_dict` projection with this front-end's context
+(`source`/`unwind`) — the wire shape both the CLI (`--json`) and the MCP `verify`
+tool return, so a harness adapter sees the same verdict structure regardless of
+transport.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
-from typing import assert_never
 
-from forseti.esbmc import (
-    Error,
-    EsbmcResult,
-    Frontend,
-    Unknown,
-    Verified,
-    Violated,
-    verify,
-)
+from forseti.esbmc import EsbmcResult, Frontend, result_to_dict, verify
 
 # One JSON object per verdict. `object` (not `Any`) keeps the dict honest under
 # mypy --strict while staying trivially `json.dumps`-able.
@@ -63,31 +55,16 @@ def verify_source(
 
 
 def result_to_payload(result: EsbmcResult, source: Path, unwind: int) -> Payload:
-    """Render a verdict as a JSON-serialisable dict.
+    """Render a verdict as a JSON-serialisable dict — the CLI/MCP wire shape.
 
-    Common provenance (verdict, source, k, esbmc version, argv, duration) is
-    always present; the variant-specific evidence an agent needs to act is added
-    per verdict: a VIOLATED carries the raw `counterexample`, an UNKNOWN its
-    `reason`, an ERROR its `message`. A VERIFIED adds nothing beyond the base —
-    "no violation found up to k" is the whole story.
+    This front-end's framing (`source`, `unwind`) over the shared
+    :func:`forseti.esbmc.result_to_dict` projection, which owns the intrinsic
+    verdict fields and the exhaustive per-variant evidence. `structured_cex` is
+    off, so a VIOLATED carries a single `counterexample` field holding the raw
+    trace text — the whole story an agent needs, mirroring `render_result`.
     """
-    payload: Payload = {
-        "verdict": result.verdict.value,
+    return {
         "source": str(source),
         "unwind": unwind,
-        "esbmc_version": result.meta.esbmc_version,
-        "duration_s": result.meta.duration_s,
-        "argv": list(result.meta.argv),
+        **result_to_dict(result, structured_cex=False),
     }
-    if isinstance(result, Verified):
-        return payload
-    if isinstance(result, Violated):
-        payload["counterexample"] = result.raw_counterexample
-        return payload
-    if isinstance(result, Unknown):
-        payload["reason"] = result.reason.value
-        return payload
-    if isinstance(result, Error):
-        payload["message"] = result.message
-        return payload
-    assert_never(result)
