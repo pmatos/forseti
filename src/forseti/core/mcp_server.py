@@ -1,10 +1,10 @@
 """Forseti Core as an MCP server — the substrate every harness shares (RFC-0001).
 
 Claude Code, Codex, and opencode all differ in their hooks but agree on MCP, so
-the Core exposes its operations as MCP tools here. Today that is a single
-`verify` tool; `propose` and the loop land alongside it (epic #14). The tool is
-a thin shell over :func:`forseti.core.verify_source` and returns the same JSON
-payload the CLI's `--json` does, so an adapter sees one verdict shape either way.
+the Core exposes its operations as MCP tools here: `verify` (ESBMC) and `propose`
+(the property proposer, #65); the loop lands alongside them (epic #14). Each tool
+is a thin shell over its `forseti.core` entry point and returns the same JSON
+payload the CLI's `--json` does, so an adapter sees one shape either way.
 
 This module imports the `mcp` SDK at import time (an optional dependency,
 `forseti[mcp]`); the unified CLI imports it lazily so `forseti verify` works
@@ -17,6 +17,15 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+from .propose import (
+    DEFAULT_MAX_CANDIDATES,
+    DEFAULT_MODEL,
+    DEFAULT_STORE_ROOT,
+    propose_source,
+)
+from .propose import (
+    DEFAULT_TIMEOUT_S as PROPOSE_TIMEOUT_S,
+)
 from .verify import (
     DEFAULT_TIMEOUT_S,
     DEFAULT_UNWIND,
@@ -26,9 +35,10 @@ from .verify import (
 )
 
 _INSTRUCTIONS = (
-    "Forseti Core: bounded verification with ESBMC. Call `verify` on a source "
-    "file after editing it; a VIOLATED verdict carries a concrete "
-    "counterexample to fix, and a VERIFIED is only 'verified up to k'."
+    "Forseti Core: bounded verification with ESBMC plus LLM property proposal. "
+    "Call `verify` on a source file after editing it; a VIOLATED verdict carries "
+    "a concrete counterexample to fix, and a VERIFIED is only 'verified up to k'. "
+    "Call `propose` to generate candidate properties for a unit before checking."
 )
 
 
@@ -63,13 +73,58 @@ def verify_tool(
     return result_to_payload(result, path, unwind)
 
 
+def propose_tool(
+    source: str,
+    function: str,
+    persist: bool = True,
+    store_root: str = str(DEFAULT_STORE_ROOT),
+    model: str = DEFAULT_MODEL,
+    timeout_s: float = PROPOSE_TIMEOUT_S,
+    max_candidates: int = DEFAULT_MAX_CANDIDATES,
+) -> dict[str, object]:
+    """Propose candidate properties for a unit and (optionally) store them.
+
+    Args:
+        source: Path to the source file defining the unit.
+        function: The function under test (the `symbol` of `path::symbol`).
+        persist: When true, store each accepted candidate as CANDIDATE; when
+            false, a dry run that proposes and validates without writing.
+        store_root: The `.forseti` store directory to persist into.
+        model: The LLM model the proposer calls.
+        timeout_s: Per-call timeout for the proposer's LLM invocation.
+        max_candidates: Cap on the number of accepted candidates.
+
+    Returns:
+        A JSON object with the unit id, prompt/backend provenance, and the
+        `accepted` and `rejected` candidate lists.
+    """
+    result = propose_source(
+        Path(source),
+        function=function,
+        persist=persist,
+        store_root=Path(store_root),
+        model=model,
+        timeout_s=timeout_s,
+        max_candidates=max_candidates,
+    )
+    return result.to_dict()
+
+
 def build_server(name: str = "forseti") -> FastMCP:
-    """A `FastMCP` server exposing Forseti Core's tools (currently `verify`)."""
+    """A `FastMCP` server exposing Forseti Core's tools (`verify`, `propose`)."""
     server: FastMCP = FastMCP(name, instructions=_INSTRUCTIONS)
     server.add_tool(
         verify_tool,
         name="verify",
         description="Verify a source file with ESBMC; returns a typed verdict.",
+    )
+    server.add_tool(
+        propose_tool,
+        name="propose",
+        description=(
+            "Propose candidate properties for a unit with the LLM proposer; "
+            "returns the accepted and rejected candidates."
+        ),
     )
     return server
 
