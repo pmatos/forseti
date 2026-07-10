@@ -14,7 +14,7 @@ from .counterexample import (
     Step,
     ViolatedProperty,
 )
-from .render import EXIT_CODES, render_result
+from .render import EXIT_CODES, render_result, result_to_dict
 from .result import (
     Error,
     EsbmcResult,
@@ -49,6 +49,7 @@ __all__ = [
     "classify",
     "parse_counterexample",
     "render_result",
+    "result_to_dict",
     "verify",
     "verify_kwargs",
 ]
