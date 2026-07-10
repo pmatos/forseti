@@ -9,7 +9,7 @@ Subcommands:
 - ``forseti propose <source> --function NAME`` — ask the property proposer (#65)
   for candidate properties over that unit and persist the survivors (``--json``
   emits the same payload the MCP tool returns). Exit 0 on a completed run,
-  1 when the proposer itself fails (LLM/parse/IO) — never a silent empty run.
+  1 when the run itself fails (LLM/parse/store/IO) — never a silent empty run.
 - ``forseti mcp`` — start the Core MCP server on stdio (needs the ``mcp`` extra;
   imported lazily so plain ``verify`` works without the SDK).
 
@@ -25,7 +25,12 @@ import sys
 from pathlib import Path
 
 from forseti.esbmc import render_result
-from forseti.properties import LLMError, ProposalParseError, ProposalResult
+from forseti.properties import (
+    LLMError,
+    PropertyStoreError,
+    ProposalParseError,
+    ProposalResult,
+)
 
 from . import EXIT_CODES
 from .propose import (
@@ -203,7 +208,7 @@ def _run_propose(args: argparse.Namespace) -> int:
             timeout_s=args.timeout,
             max_candidates=args.max_candidates,
         )
-    except (LLMError, ProposalParseError, OSError) as exc:
+    except (LLMError, ProposalParseError, PropertyStoreError, OSError) as exc:
         print(f"forseti propose: {exc}", file=sys.stderr)
         return 1
     if args.json:

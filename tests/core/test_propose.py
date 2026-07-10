@@ -17,7 +17,7 @@ import pytest
 
 from forseti.core import propose_source
 from forseti.core.cli import main
-from forseti.properties import LLMError, PropertyStore
+from forseti.properties import LLMError, PropertyStore, PropertyStoreError
 
 if TYPE_CHECKING:
     from forseti.properties import LLMClient
@@ -150,6 +150,38 @@ def test_propose_source_propagates_llm_error(tmp_path: Path) -> None:
         propose_source(
             source, function="my_abs", persist=False, client=RaisingLLMClient()
         )
+
+
+def _corrupt_store_root(tmp_path: Path) -> Path:
+    """A .forseti dir whose forseti.db is not a valid SQLite database."""
+    root = tmp_path / ".forseti"
+    root.mkdir()
+    (root / "forseti.db").write_text("this is not a database")
+    return root
+
+
+def test_propose_source_translates_store_error(tmp_path: Path) -> None:
+    # A corrupt store must surface as PropertyStoreError, not a raw sqlite3.Error
+    # traceback (sqlite3.Error is not an OSError, so it would otherwise escape).
+    source = _write_unit(tmp_path)
+    root = _corrupt_store_root(tmp_path)
+    with pytest.raises(PropertyStoreError):
+        propose_source(
+            source, function="my_abs", store_root=root, client=FakeLLMClient()
+        )
+
+
+def test_cli_propose_store_error_exits_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = _write_unit(tmp_path)
+    root = _corrupt_store_root(tmp_path)
+    monkeypatch.setattr("forseti.core.propose.ClaudeCliClient", FakeLLMClient)
+    code = main(
+        ["propose", str(source), "--function", "my_abs", "--store-root", str(root)]
+    )
+    assert code == 1
+    assert "forseti propose:" in capsys.readouterr().err
 
 
 def test_cli_propose_json_ok(

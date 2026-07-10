@@ -19,6 +19,7 @@ effect is the LLM call, behind the injected `client` seam so tests stay hermetic
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 from forseti.properties import (
@@ -27,6 +28,7 @@ from forseti.properties import (
     HarnessError,
     LLMClient,
     PropertyStore,
+    PropertyStoreError,
     ProposalRequest,
     ProposalResult,
     UnitSignature,
@@ -61,7 +63,10 @@ def propose_source(
     none is injected; an `LLMError` propagates — the proposer never silently yields
     nothing). When `persist` is true each accepted candidate is inserted
     idempotently into `store_root`'s `PropertyStore` as `CANDIDATE`; `persist=False`
-    is a dry run that proposes and validates without touching the store.
+    is a dry run that proposes and validates without touching the store. A raw
+    `sqlite3.Error` from opening or writing the store (e.g. a corrupt `forseti.db`)
+    is translated to `PropertyStoreError`, so both Core faces get a stable
+    domain-level failure instead of an uncaught SQLite traceback.
     """
     source_text = source.read_text()
     unit_id = f"{source}::{function}"
@@ -81,10 +86,16 @@ def propose_source(
     if not persist:
         return propose_properties(request, client=llm, max_candidates=max_candidates)
 
-    store = PropertyStore.open(store_root)
+    store: PropertyStore | None = None
     try:
+        store = PropertyStore.open(store_root)
         return propose_properties(
             request, client=llm, store=store, max_candidates=max_candidates
         )
+    except sqlite3.Error as exc:
+        raise PropertyStoreError(
+            f"property store error at {store_root}: {exc}"
+        ) from exc
     finally:
-        store.close()
+        if store is not None:
+            store.close()
