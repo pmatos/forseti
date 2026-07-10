@@ -37,12 +37,26 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
-          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }} --comment'
-          # The code-review plugin: (1) only posts when invoked with `--comment`
-          # (otherwise it prints a terminal summary and stops); (2) spawns sub-agents
-          # (Task); (3) posts inline findings via the action's github_inline_comment
-          # MCP tool (and the no-issues summary via `gh pr comment`), reading git
-          # history for context. Grant all three or the run ends "success" silently.
+          prompt: |
+            /code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }} --comment
+
+            After the review finishes, make a clean review visible instead of silent.
+            Keep it to a single status comment across pushes using the hidden marker
+            `<!-- claude-code-review-status -->`:
+            - Read the PR's existing comments:
+              `gh pr view ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --json comments --jq '.comments[].body'`
+            - If the review posted NO inline findings (nothing to flag) AND none of those
+              comments already contains the marker, post exactly one comment:
+              `gh pr comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --body $'<!-- claude-code-review-status -->\n✅ Claude Code review: no issues found.'`
+            - If you posted inline findings, or a marker comment already exists, do not
+              post a summary.
+          # The code-review plugin only posts *inline* findings (via the action's
+          # github_inline_comment MCP tool) when invoked with `--comment`, and stays
+          # silent when it finds nothing. The prompt above adds an explicit,
+          # marker-deduplicated "no issues found" status comment (posted with
+          # `gh pr comment`, covered by the Bash(gh:*) allow-rule) so a clean review is
+          # visible rather than an empty "success". Grant Task + the inline-comment MCP
+          # tool + gh/git, or the run ends "success" silently.
           claude_args: '--allowedTools "Task,Read,Grep,Glob,Bash(gh:*),Bash(git:*),mcp__github_inline_comment__create_inline_comment"'
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
