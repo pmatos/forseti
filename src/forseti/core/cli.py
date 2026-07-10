@@ -24,7 +24,7 @@ import json
 import sys
 from pathlib import Path
 
-from forseti.esbmc import render_result
+from forseti.esbmc import add_verify_arguments, render_result, verify_kwargs
 from forseti.properties import (
     LLMError,
     PropertyStoreError,
@@ -42,7 +42,7 @@ from .propose import (
 from .propose import (
     DEFAULT_TIMEOUT_S as PROPOSE_TIMEOUT_S,
 )
-from .verify import DEFAULT_TIMEOUT_S, DEFAULT_UNWIND, result_to_payload, verify_source
+from .verify import result_to_payload, verify_source
 
 
 def _add_verify_parser(
@@ -56,58 +56,16 @@ def _add_verify_parser(
             "unknown | error."
         ),
     )
-    p.add_argument("source", type=Path, help="source file to verify")
-    p.add_argument(
-        "-k",
-        "--unwind",
-        type=int,
-        default=DEFAULT_UNWIND,
-        help=(
-            f"loop unwind bound k (default: {DEFAULT_UNWIND}); "
-            "a VERIFIED is only 'verified up to k'"
-        ),
-    )
-    p.add_argument(
-        "-t",
-        "--timeout",
-        type=float,
-        default=DEFAULT_TIMEOUT_S,
-        metavar="SECONDS",
-        help=f"per-run timeout in seconds (default: {DEFAULT_TIMEOUT_S:g})",
-    )
-    p.add_argument(
-        "--function",
-        metavar="NAME",
-        help="entry function to verify (default: ESBMC's, i.e. main)",
-    )
-    p.add_argument(
-        "--esbmc-bin",
-        default="esbmc",
-        help="esbmc binary to invoke (default: esbmc on PATH)",
-    )
+    add_verify_arguments(p)
     p.add_argument(
         "--json",
         action="store_true",
         help="emit the verdict as a JSON object (the MCP tool's payload)",
     )
-    # Passthrough after `--`; see forseti.esbmc.cli for why not a `-X` option.
-    p.add_argument(
-        "esbmc_args",
-        nargs="*",
-        metavar="ESBMC_ARG",
-        help="flags forwarded verbatim to esbmc, placed after a `--` separator",
-    )
 
 
 def _run_verify(args: argparse.Namespace) -> int:
-    result = verify_source(
-        args.source,
-        unwind=args.unwind,
-        timeout_s=args.timeout,
-        function=args.function,
-        extra_flags=tuple(args.esbmc_args),
-        esbmc_bin=args.esbmc_bin,
-    )
+    result = verify_source(args.source, **verify_kwargs(args))
     if args.json:
         print(json.dumps(result_to_payload(result, args.source, args.unwind)))
     else:
