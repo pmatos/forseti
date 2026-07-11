@@ -1,0 +1,1 @@
+This is an empty folder (git init) - to keep track of my work for the next 6 months - what we call an investment in Igalia. There's no name to it, hence the dir name but we'll need to change that. I did a presentation on the investment and I will point to it next.
