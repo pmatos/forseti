@@ -1,0 +1,11 @@
+Base directory for this skill: /home/pmatos/.claude/skills/grill-me
+
+Interview me relentlessly about every aspect of this plan until we reach a shared understanding. Walk down each branch of the design tree, resolving dependencies between decisions one-by-one. For each question, provide your recommended answer.
+
+Ask the questions one at a time.
+
+If a question can be answered by exploring the codebase, explore the codebase instead.
+
+
+ARGUMENTS: on how to plan all the milestones, corner cases, work to do over the next 6 months until January 2027. The presentation detailing the work is in $HOME/slides/Future... 
+I have a pretty good idea of what's needed and how to achieve it but I need some planning help so I can easily track my progress and drill-down to each of the tasks as I progress. We'll also be creating a github repo for it but we'll need a name first so I also expect a name suggestion.
