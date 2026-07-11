@@ -1,0 +1,7 @@
+<task-notification>
+<task-id>bei4jgtes</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/a55022ca-d4ee-4c8a-a8e9-11fdba0aaad7/tasks/bei4jgtes.output</output-file>
+<status>failed</status>
+<summary>Background command "Kill buggy filler, launch corrected filler in background" failed with exit code 144</summary>
+</task-notification>
