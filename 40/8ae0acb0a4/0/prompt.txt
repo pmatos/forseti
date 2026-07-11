@@ -1,0 +1,7 @@
+<task-notification>
+<task-id>b7gb9jj5e</task-id>
+<tool-use-id>toolu_01SNMLNpAp29Z5jLgbdPoepD</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/a55022ca-d4ee-4c8a-a8e9-11fdba0aaad7/tasks/b7gb9jj5e.output</output-file>
+<status>failed</status>
+<summary>Background command "Launch slow well-spaced board filler in background" failed with exit code 144</summary>
+</task-notification>
