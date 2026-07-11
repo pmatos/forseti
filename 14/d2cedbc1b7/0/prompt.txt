@@ -1,0 +1,1 @@
+I see - so we don't really have a command wrapper, simply a library to access esbmc uniformly. Can we create a way to call it from the command line like uv run forseti.esbmc <file> ?
