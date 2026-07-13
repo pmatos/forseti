@@ -3,9 +3,10 @@
 `UNKNOWN` is a distinct, honest halt — never a silent pass (CLAUDE.md, roadmap
 Risk 1). On an inconclusive verdict a driver re-verifies the *same* source at the
 next-higher unwind bound along a bounded ladder, settling on a terminal `UNKNOWN`
-only once the ladder is exhausted. That policy was inline in `run_loop`; it is
-extracted here — pure and independently tested — so `check_properties` (#66)
-reuses the exact same rule instead of a second copy.
+only once the ladder is exhausted. That policy was once inline in `run_loop`; it
+lives here now — pure and independently tested — and *both* drivers, `run_loop`
+and `check_properties` (#66), verify through it, so the rule has exactly one home
+and the two can never drift on it.
 
 Pure with respect to emission: `verify_ladder` returns every attempt in order so
 the caller owns telemetry (each driver emits its own event vocabulary).

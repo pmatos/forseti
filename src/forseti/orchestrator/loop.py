@@ -12,6 +12,12 @@ per-iteration history + reason) is a pure projection over that record —
 re-verifying the same source until the verdict resolves or the ladder is
 exhausted (then a terminal `UNKNOWN` — never a silent pass); an exhausted
 iteration budget gives up.
+
+The escalation itself is *not* re-implemented here: each round delegates to
+`ladder.verify_ladder`, the single home of the k-escalation rule that
+`check_properties` also uses — so the two drivers can never drift on it. This
+driver owns only what is loop-specific: recording one `Iteration` per rung,
+emitting per-rung telemetry, and the fix/give-up control flow around the ladder.
 """
 
 from __future__ import annotations
@@ -23,7 +29,7 @@ from typing import Any, assert_never
 
 from forseti.esbmc import Error, EsbmcResult, Unknown, Verified, Violated
 
-from .ladder import validated_ladder
+from .ladder import validated_ladder, verify_ladder
 from .ports import FixPort, VerifyPort
 from .state import GiveUpReason, LoopState, next_state
 from .telemetry import Event, EventSink, NullSink
@@ -77,12 +83,14 @@ def run_loop(
     Two nested bounds. The **outer** loop is the fix budget: up to `max_iterations`
     rounds, each verifying the current source and, on `Violated`, calling `fix`
     (on every round, incl. the last) before the next round; exhausting the budget
-    ends in `GIVE_UP`. The **inner** loop is the k-escalation ladder: on `Unknown`
-    it re-verifies the *same* source at the next-higher unwind along
-    `(unwind, *unwind_ladder)`, settling on the terminal `UNKNOWN` only once the
-    ladder is exhausted (never a silent pass; roadmap Risk 1). `k` restarts at the
-    base bound for each fresh candidate. `next_state` is the single source of
-    truth for the recorded state label.
+    ends in `GIVE_UP`. The **inner** bound is the k-escalation ladder, delegated to
+    `verify_ladder`: on `Unknown` it re-verifies the *same* source at the
+    next-higher unwind along `(unwind, *unwind_ladder)`, settling on the terminal
+    `UNKNOWN` only once the ladder is exhausted (never a silent pass; roadmap
+    Risk 1). Each round records one `Iteration` per rung the ladder attempted.
+    `k` restarts at the base bound for each fresh candidate (a fresh
+    `verify_ladder` call). `next_state` is the single source of truth for the
+    recorded state label.
     """
     if max_iterations < 1:
         raise ValueError(f"max_iterations must be >= 1, got {max_iterations}")
@@ -100,31 +108,34 @@ def run_loop(
     emit("trigger.fired", detail={"source": str(source), "base_k": unwind})
     while rounds < max_iterations:
         rounds += 1
-        k_index = 0
-        while True:
-            result = verify(current, unwind=ladder[k_index])
-            state = next_state(result)
-            iterations.append(Iteration(index, current, result, state, ladder[k_index]))
+        attempts = verify_ladder(current, verify=verify, ladder=ladder)
+        for rung, attempt in enumerate(attempts):
+            result = attempt.result
+            iterations.append(
+                Iteration(index, current, result, next_state(result), attempt.k)
+            )
             emit(
                 "verify.verdict",
                 index=index,
-                k=ladder[k_index],
+                k=attempt.k,
                 verdict=result.verdict.value,
             )
-            index += 1
-            if isinstance(result, Unknown) and k_index + 1 < len(ladder):
+            if rung + 1 < len(attempts):
+                # verify_ladder stops at the first non-Unknown, so every rung it
+                # produced past the first escalated a non-terminal Unknown —
+                # surface it (mirrors check_properties' pairwise escalation emit).
                 emit(
                     "unknown.policy.decision",
-                    index=index - 1,
+                    index=index,
                     detail={
                         "decision": "escalate",
-                        "from_k": ladder[k_index],
-                        "to_k": ladder[k_index + 1],
+                        "from_k": attempt.k,
+                        "to_k": attempts[rung + 1].k,
                     },
                 )
-                k_index += 1  # escalate: re-verify the same source at higher k
-                continue
-            break
+            index += 1
+        result = attempts[-1].result
+        state = next_state(result)
         match result:
             case Verified():
                 emit("converged", index=index - 1)

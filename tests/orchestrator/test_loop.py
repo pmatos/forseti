@@ -22,7 +22,13 @@ from forseti.esbmc import (
     Verified,
     Violated,
 )
-from forseti.orchestrator import GiveUpReason, LoopState, run_loop
+from forseti.orchestrator import (
+    GiveUpReason,
+    LoopState,
+    run_loop,
+    validated_ladder,
+    verify_ladder,
+)
 
 if TYPE_CHECKING:
     from forseti.esbmc import verify
@@ -178,6 +184,60 @@ def test_ladder_restarts_at_base_after_a_fix() -> None:
     assert fix.calls == 1
     assert verify.unwinds == [8, 8, 16]
     assert len(run.iterations) == 3
+
+
+def test_run_loop_records_one_iteration_per_ladder_rung() -> None:
+    # Each rung of the escalation ladder is recorded as its own Iteration,
+    # carrying that rung's bound `k` and its verdict — the per-rung history a
+    # human reads. This pins the recording contract the shared-ladder migration
+    # must preserve (run_loop records every attempt, unlike check_properties,
+    # which keeps only the terminal one).
+    script: list[EsbmcResult] = [
+        Unknown(meta(), UnknownReason.TIMEOUT),
+        Unknown(meta(), UnknownReason.TIMEOUT),
+        Verified(meta()),
+    ]
+    run = run_loop(
+        SRC,
+        verify=FakeVerify(list(script)),
+        fix=FakeFix(),
+        unwind=8,
+        unwind_ladder=(16, 32),
+    )
+    assert [it.k for it in run.iterations] == [8, 16, 32]
+    assert [it.result.verdict.value for it in run.iterations] == [
+        "unknown",
+        "unknown",
+        "verified",
+    ]
+    assert [it.index for it in run.iterations] == [0, 1, 2]
+
+
+def test_run_loop_escalation_trace_matches_shared_ladder() -> None:
+    # run_loop's recorded escalation is exactly what the shared `verify_ladder`
+    # produces for the same verdict script: same bounds, same verdicts, in order.
+    # ladder.py is meant to be the single source of truth for the escalation
+    # rule; this locks run_loop to it so the driver can't drift from the rule
+    # check_properties already uses.
+    script: list[EsbmcResult] = [
+        Unknown(meta(), UnknownReason.TIMEOUT),
+        Unknown(meta(), UnknownReason.TIMEOUT),
+        Verified(meta()),
+    ]
+    ladder = validated_ladder(8, (16, 32))
+    expected = verify_ladder(SRC, verify=FakeVerify(list(script)), ladder=ladder)
+
+    run = run_loop(
+        SRC,
+        verify=FakeVerify(list(script)),
+        fix=FakeFix(),
+        unwind=8,
+        unwind_ladder=(16, 32),
+    )
+    assert [it.k for it in run.iterations] == [att.k for att in expected]
+    assert [it.result.verdict.value for it in run.iterations] == [
+        att.result.verdict.value for att in expected
+    ]
 
 
 def test_invalid_unwind_ladder_is_rejected() -> None:
