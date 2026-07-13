@@ -23,7 +23,7 @@ from typing import Any, assert_never
 
 from forseti.esbmc import Error, EsbmcResult, Unknown, Verified, Violated
 
-from .ladder import validated_ladder
+from .ladder import validated_ladder, verify_ladder
 from .ports import FixPort, VerifyPort
 from .state import GiveUpReason, LoopState, next_state
 from .telemetry import Event, EventSink, NullSink
@@ -77,11 +77,12 @@ def run_loop(
     Two nested bounds. The **outer** loop is the fix budget: up to `max_iterations`
     rounds, each verifying the current source and, on `Violated`, calling `fix`
     (on every round, incl. the last) before the next round; exhausting the budget
-    ends in `GIVE_UP`. The **inner** loop is the k-escalation ladder: on `Unknown`
-    it re-verifies the *same* source at the next-higher unwind along
-    `(unwind, *unwind_ladder)`, settling on the terminal `UNKNOWN` only once the
-    ladder is exhausted (never a silent pass; roadmap Risk 1). `k` restarts at the
-    base bound for each fresh candidate. `next_state` is the single source of
+    ends in `GIVE_UP`. The **inner** bound is the k-escalation ladder, delegated to
+    the shared `verify_ladder`: on `Unknown` it re-verifies the *same* source at
+    the next-higher unwind along `(unwind, *unwind_ladder)`, settling on the
+    terminal `UNKNOWN` only once the ladder is exhausted (never a silent pass;
+    roadmap Risk 1). `k` restarts at the base bound for each fresh candidate — a
+    fresh `verify_ladder` call per round. `next_state` is the single source of
     truth for the recorded state label.
     """
     if max_iterations < 1:
@@ -100,54 +101,58 @@ def run_loop(
     emit("trigger.fired", detail={"source": str(source), "base_k": unwind})
     while rounds < max_iterations:
         rounds += 1
-        k_index = 0
-        while True:
-            result = verify(current, unwind=ladder[k_index])
-            state = next_state(result)
-            iterations.append(Iteration(index, current, result, state, ladder[k_index]))
+        # The k-escalation ladder is the shared policy in `verify_ladder`: it
+        # verifies the same source rung-by-rung, escalating past each Unknown
+        # until the verdict resolves or the ladder is exhausted. Record one
+        # Iteration per rung and surface the escalation between consecutive rungs
+        # (a non-terminal attempt is always an escalation — the last is terminal).
+        attempts = verify_ladder(current, verify=verify, ladder=ladder)
+        for at_index, attempt in enumerate(attempts):
+            state = next_state(attempt.result)
+            iterations.append(
+                Iteration(index, current, attempt.result, state, attempt.k)
+            )
             emit(
                 "verify.verdict",
                 index=index,
-                k=ladder[k_index],
-                verdict=result.verdict.value,
+                k=attempt.k,
+                verdict=attempt.result.verdict.value,
             )
             index += 1
-            if isinstance(result, Unknown) and k_index + 1 < len(ladder):
+            if at_index + 1 < len(attempts):
                 emit(
                     "unknown.policy.decision",
                     index=index - 1,
                     detail={
                         "decision": "escalate",
-                        "from_k": ladder[k_index],
-                        "to_k": ladder[k_index + 1],
+                        "from_k": attempt.k,
+                        "to_k": attempts[at_index + 1].k,
                     },
                 )
-                k_index += 1  # escalate: re-verify the same source at higher k
-                continue
-            break
-        match result:
+        final = iterations[-1]  # verify_ladder returns >= 1 attempt
+        match final.result:
             case Verified():
-                emit("converged", index=index - 1)
-                return LoopRun(state, tuple(iterations))
+                emit("converged", index=final.index)
+                return LoopRun(final.state, tuple(iterations))
             case Violated() as violation:
-                emit("fix.attempt", index=index - 1)
+                emit("fix.attempt", index=final.index)
                 current = fix(current, violation)  # fix every round, incl. the last
             case Unknown():
                 emit(
                     "unknown.policy.decision",
-                    index=index - 1,
+                    index=final.index,
                     detail={"decision": "exhausted"},
                 )
-                return LoopRun(state, tuple(iterations))  # ladder exhausted
+                return LoopRun(final.state, tuple(iterations))  # ladder exhausted
             case Error():
-                emit("give_up", index=index - 1, detail={"reason": "esbmc_error"})
+                emit("give_up", index=final.index, detail={"reason": "esbmc_error"})
                 return LoopRun(
                     LoopState.GIVE_UP,
                     tuple(iterations),
                     give_up_reason=GiveUpReason.ESBMC_ERROR,
                 )
             case _:
-                assert_never(result)
+                assert_never(final.result)
     emit("give_up", detail={"reason": "max_iterations_exceeded"})
     return LoopRun(
         LoopState.GIVE_UP,
