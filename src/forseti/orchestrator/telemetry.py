@@ -10,6 +10,7 @@ serialization boundary, swappable for #15's emitter later).
 
 from __future__ import annotations
 
+import itertools
 import json
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, TextIO
@@ -48,6 +49,26 @@ class NullSink:
 
     def emit(self, event: Event) -> None:
         pass
+
+
+class EventEmitter:
+    """Binds a monotonic `seq` counter to a sink — one home for the emit boilerplate.
+
+    Every driver that emits (`run_loop`, `check_properties`) needs the same
+    seq-and-sink pairing: a monotonic order stamp assigned to each `Event`, sent
+    to the injected sink. Owning it here means a driver writes
+    `emit = EventEmitter(sink).emit` instead of re-declaring the counter closure,
+    and the `Event.seq` monotonicity guarantee lives in one tested place. A `None`
+    sink defaults to `NullSink`, so an emitter with no sink is effect-free.
+    """
+
+    def __init__(self, sink: EventSink | None = None) -> None:
+        self._sink = sink or NullSink()
+        self._seq = itertools.count()
+
+    def emit(self, type: str, **fields: Any) -> None:
+        """Stamp the next `seq` onto an `Event(type, **fields)` and send it on."""
+        self._sink.emit(Event(next(self._seq), type, **fields))
 
 
 class ListSink:
