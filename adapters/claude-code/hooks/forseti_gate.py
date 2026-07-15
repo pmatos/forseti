@@ -15,12 +15,15 @@ this gate.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -51,6 +54,7 @@ C_SUFFIXES = {".c", ".h"}
 
 _STATE_DIR = ".forseti"
 _STATE_FILE = "gate_state.json"
+_LOCK_FILE = "gate_state.lock"
 
 # Control-flow keywords that a permissive definition regex could mistake for a
 # function name; filtered out belt-and-suspenders.
@@ -224,6 +228,27 @@ def verify_file(
 
 def _gate_path(project_dir: str) -> Path:
     return Path(project_dir) / _STATE_DIR / _STATE_FILE
+
+
+@contextlib.contextmanager
+def gate_lock(project_dir: str) -> Iterator[None]:
+    """Serialize gate-state read-modify-write across concurrent hook processes.
+
+    Parallel PostToolUse hooks (one per edited file in a batch) each do
+    load_state → mutate → save_state; without a lock the last writer wins and a
+    concurrently-recorded `violated` unit can be dropped, letting the Stop-gate
+    pass silently. An exclusive advisory lock on a sidecar file makes the whole
+    sequence atomic between processes. POSIX-only — the platform ESBMC and this
+    gate target.
+    """
+    path = Path(project_dir) / _STATE_DIR / _LOCK_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def load_state(project_dir: str) -> dict:

@@ -17,7 +17,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import forseti_gate as gate  # noqa: E402
+import forseti_gate as gate
 
 _CEX_CLIP = 1200
 
@@ -30,8 +30,7 @@ def _residual(failures: list[dict]) -> str:
     lines = []
     for u in failures:
         lines.append(
-            f"✗ {u.get('unit_id')} — {str(u.get('verdict')).upper()} "
-            f"(k={u.get('k')})"
+            f"✗ {u.get('unit_id')} — {str(u.get('verdict')).upper()} (k={u.get('k')})"
         )
         cex, detail = u.get("counterexample"), u.get("detail")
         if cex:
@@ -51,14 +50,16 @@ def main() -> int:
     data = json.loads(raw) if raw.strip() else {}
     project_dir = _project_dir(data)
 
-    state = gate.load_state(project_dir)
-    failures = gate.unverified_units(state)
+    with gate.gate_lock(project_dir):  # serialize with concurrent PostToolUse hooks
+        state = gate.load_state(project_dir)
+        failures = gate.unverified_units(state)
+        if failures:
+            attempts = int(state.get("stop_attempts", 0)) + 1
+            state["stop_attempts"] = attempts
+            gate.save_state(project_dir, state)
+
     if not failures:
         return 0  # nothing outstanding — allow the turn to end
-
-    attempts = int(state.get("stop_attempts", 0)) + 1
-    state["stop_attempts"] = attempts
-    gate.save_state(project_dir, state)
 
     if attempts > gate.MAX_STOP_ATTEMPTS:
         return _emit(
@@ -79,8 +80,7 @@ def main() -> int:
                 f"Forseti verify-gate: {len(failures)} unit(s) are not VERIFIED "
                 "up to k. Do not end the turn — fix them and let the gate "
                 "re-verify, or explicitly report to the human which unit / "
-                "property / k could not be verified and why.\n\n"
-                + _residual(failures)
+                "property / k could not be verified and why.\n\n" + _residual(failures)
             ),
         }
     )
