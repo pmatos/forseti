@@ -242,9 +242,14 @@ def load_state(project_dir: str) -> dict:
 
 
 def save_state(project_dir: str, state: dict) -> None:
+    # Write atomically (temp + os.replace) so a hook killed mid-write can never
+    # leave a truncated gate_state.json — load_state fails open to an empty unit
+    # set, which would make the Stop-gate forget outstanding violations.
     path = _gate_path(project_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, indent=2, sort_keys=True))
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
+    os.replace(tmp, path)
 
 
 def record(state: dict, verdict: UnitVerdict) -> None:
