@@ -106,3 +106,9 @@ does the Stop-gate let the turn end. See
   the PostToolUse hook timeout can have its last, still-running function cut off
   before its verdict lands. Raise the hook timeout (and `FORSETI_UNWIND` budget)
   for such files.
+- **Only tool-based edits are gated.** The gate fires on `Write`/`Edit`/
+  `MultiEdit`. A C file created or modified out-of-band via the `Bash` tool
+  (`cat > f.c`, a generator script, `sed -i`) does not trigger it and is not
+  verified — the "hard gate" is only as complete as the tools it observes.
+  Closing this (Bash handling or a session-scoped worktree scan) is tracked in
+  [#99](https://github.com/pmatos/forseti/issues/99).
