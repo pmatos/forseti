@@ -57,7 +57,7 @@ directory:
   "hooks": {
     "PostToolUse": [
       { "matcher": "Write|Edit|MultiEdit",
-        "hooks": [{ "type": "command", "command": "python3 \"ABS_PATH/hooks/post_tool_use.py\"", "timeout": 120 }] }
+        "hooks": [{ "type": "command", "command": "python3 \"ABS_PATH/hooks/post_tool_use.py\"", "timeout": 300 }] }
     ],
     "Stop": [
       { "matcher": "*",
