@@ -216,6 +216,54 @@ def test_mixed_outcomes_and_ladder_restarts(tmp_path: Path) -> None:
     }
 
 
+def test_each_escalation_is_flushed_before_the_next_verify(tmp_path: Path) -> None:
+    # Issue #100 (sibling of run_loop): a rung's escalate decision must reach the
+    # sink *before* the next (possibly slow or stalling) verify runs — not
+    # buffered until the ladder resolves. The old eager path walked the whole
+    # ladder (`itertools.pairwise`) before emitting anything, so at k=16 the sink
+    # still held no escalation. `RecordingVerify` snapshots the event stream at
+    # the instant each rung runs, pinning the streaming contract.
+    store = InMemoryPropertyStore([semantic_prop("p1")])
+    sink = ListSink()
+    seen_before: dict[int, list[str]] = {}
+
+    class RecordingVerify:
+        def __init__(self, results: list[EsbmcResult]) -> None:
+            self._results = list(results)
+
+        def __call__(self, source: Path, *, unwind: int) -> EsbmcResult:
+            seen_before[unwind] = [e.type for e in sink.events]
+            return self._results.pop(0)
+
+    verify = RecordingVerify([unknown(), unknown(), Verified(meta())])
+    check_properties(
+        UNIT,
+        store=store,
+        render=FakeHarnessWriter(),
+        verify=verify,
+        work_dir=tmp_path / "work",
+        unwind=8,
+        unwind_ladder=(16, 32),
+        sink=sink,
+    )
+
+    # Before the base rung: the load + property-start events, no escalation yet.
+    assert seen_before[8] == ["properties.loaded", "property.check.start"]
+    # Before k=16: the 8 -> 16 escalation is already flushed.
+    assert seen_before[16] == [
+        "properties.loaded",
+        "property.check.start",
+        "unknown.policy.decision",
+    ]
+    # Before k=32: both escalations are flushed.
+    assert seen_before[32] == [
+        "properties.loaded",
+        "property.check.start",
+        "unknown.policy.decision",
+        "unknown.policy.decision",
+    ]
+
+
 def test_violated_verdict_carries_typed_cex_and_round_trips(tmp_path: Path) -> None:
     store = InMemoryPropertyStore([semantic_prop("p1")])
     run = check_properties(
