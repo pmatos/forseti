@@ -249,6 +249,20 @@ def record(state: dict, verdict: UnitVerdict) -> None:
     state["units"][verdict.unit_id] = asdict(verdict)
 
 
+def prune_file_units(state: dict, project_dir: str, file_path: str) -> None:
+    """Drop every tracked unit belonging to `file_path`.
+
+    `record` only ever upserts, so a function that was renamed or removed as part
+    of a fix would leave its stale (often `violated`) entry behind and the
+    Stop-gate would block forever on a unit that no longer exists. The caller
+    prunes here and then re-records whatever functions the file still defines, so
+    the tracked set always reflects the current file.
+    """
+    prefix = f"{unit_id(project_dir, file_path)}::"
+    for uid in [u for u in state["units"] if u.startswith(prefix)]:
+        del state["units"][uid]
+
+
 def unverified_units(state: dict) -> list[dict]:
     """Every tracked unit whose latest verdict is not `verified`."""
     return [u for u in state["units"].values() if u.get("verdict") != "verified"]
