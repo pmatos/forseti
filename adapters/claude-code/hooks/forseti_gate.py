@@ -203,29 +203,6 @@ def verify_function(
     )
 
 
-def verify_file(
-    file_path: str, *, project_dir: str, k: int = DEFAULT_K
-) -> list[UnitVerdict]:
-    """Verify every top-level function defined in `file_path`."""
-    try:
-        text = Path(file_path).read_text()
-    except OSError as exc:
-        return [
-            UnitVerdict(
-                unit_id(project_dir, file_path),
-                file_path,
-                "?",
-                "error",
-                k,
-                detail=str(exc),
-            )
-        ]
-    return [
-        verify_function(file_path, fn, project_dir=project_dir, k=k)
-        for fn in extract_functions(text)
-    ]
-
-
 def _gate_path(project_dir: str) -> Path:
     return Path(project_dir) / _STATE_DIR / _STATE_FILE
 
@@ -274,20 +251,76 @@ def record(state: dict, verdict: UnitVerdict) -> None:
     state["units"][verdict.unit_id] = asdict(verdict)
 
 
-def prune_file_units(state: dict, project_dir: str, file_path: str) -> None:
-    """Drop every tracked unit belonging to `file_path`.
+def prune_missing_units(
+    state: dict, project_dir: str, file_path: str, keep: set[str]
+) -> None:
+    """Drop tracked units for `file_path` whose function is not in `keep`.
 
-    `record` only ever upserts, so a function that was renamed or removed as part
-    of a fix would leave its stale (often `violated`) entry behind and the
-    Stop-gate would block forever on a unit that no longer exists. The caller
-    prunes here and then re-records whatever functions the file still defines, so
-    the tracked set always reflects the current file.
+    `record` only ever upserts, so a function renamed or removed as part of a fix
+    would leave its stale (often `violated`) entry behind and the Stop-gate would
+    block forever on a unit that no longer exists. Reconciling against the set of
+    functions the file *still* defines (`keep`) — at the end of a run rather than
+    by blanket-pruning up front — clears those without a mid-run hook kill being
+    able to drop a still-unverified violation.
     """
     prefix = f"{unit_id(project_dir, file_path)}::"
-    for uid in [u for u in state["units"] if u.startswith(prefix)]:
+    stale = [
+        u
+        for u in state["units"]
+        if u.startswith(prefix) and u[len(prefix) :] not in keep
+    ]
+    for uid in stale:
         del state["units"][uid]
 
 
 def unverified_units(state: dict) -> list[dict]:
     """Every tracked unit whose latest verdict is not `verified`."""
     return [u for u in state["units"].values() if u.get("verdict") != "verified"]
+
+
+def verify_and_record(
+    file_path: str, *, project_dir: str, k: int = DEFAULT_K
+) -> list[UnitVerdict]:
+    """Verify each function in `file_path`, persisting every verdict as it lands.
+
+    Kill-safety: the hook has a wall-clock timeout, and verifying a file with
+    several functions can exceed it. So each function's verdict is written under
+    the lock *immediately*, before the next function is verified — a hook kill can
+    never discard an already-found violation and let the Stop-gate pass silently.
+    Stale units (functions the file no longer defines) are reconciled only at the
+    end, so a mid-run kill leaves an un-reverified violation in place (it still
+    blocks) rather than dropping it.
+    """
+    rel = unit_id(project_dir, file_path)
+    try:
+        functions = extract_functions(Path(file_path).read_text())
+    except OSError as exc:
+        verdict = UnitVerdict(f"{rel}::?", rel, "?", "error", k, detail=str(exc))
+        with gate_lock(project_dir):
+            state = load_state(project_dir)
+            record(state, verdict)
+            state["stop_attempts"] = 0
+            save_state(project_dir, state)
+        return [verdict]
+
+    with gate_lock(project_dir):  # a fresh edit resets the Stop-gate's patience
+        state = load_state(project_dir)
+        state["stop_attempts"] = 0
+        save_state(project_dir, state)
+
+    verdicts: list[UnitVerdict] = []
+    for fn in functions:
+        verdict = verify_function(file_path, fn, project_dir=project_dir, k=k)
+        verdicts.append(verdict)
+        with gate_lock(project_dir):  # persist now, before the next verify
+            state = load_state(project_dir)
+            record(state, verdict)
+            save_state(project_dir, state)
+
+    with gate_lock(project_dir):  # drop units for functions the file no longer defines
+        state = load_state(project_dir)
+        prune_missing_units(
+            state, project_dir, file_path, {v.function for v in verdicts}
+        )
+        save_state(project_dir, state)
+    return verdicts

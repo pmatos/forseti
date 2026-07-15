@@ -39,18 +39,11 @@ def main() -> int:
     if not os.path.exists(file_path):
         return 0
 
-    verdicts = gate.verify_file(file_path, project_dir=project_dir)
-
-    with gate.gate_lock(project_dir):  # serialize with concurrent PostToolUse hooks
-        state = gate.load_state(project_dir)
-        gate.prune_file_units(state, project_dir, file_path)  # drop renamed/removed
-        for verdict in verdicts:
-            gate.record(state, verdict)
-        state["stop_attempts"] = 0  # a fresh edit resets the Stop-gate's patience
-        gate.save_state(project_dir, state)
-
+    # Verify + persist each function incrementally under the gate lock (kill-safe,
+    # and serialized against concurrent PostToolUse hooks).
+    verdicts = gate.verify_and_record(file_path, project_dir=project_dir)
     if not verdicts:
-        return 0  # no functions left in the file; stale units were just pruned
+        return 0  # no functions in the file; any stale units were just reconciled
 
     failures = [v for v in verdicts if not v.passed]
     if not failures:

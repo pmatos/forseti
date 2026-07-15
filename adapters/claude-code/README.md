@@ -87,7 +87,7 @@ does the Stop-gate let the turn end. See
 |---|---|---|---|
 | Safety flags | `SAFETY_FLAGS` in `hooks/forseti_gate.py` | `--overflow-check` | bounds/pointer/div-by-zero are ESBMC defaults; unsigned-overflow left OFF (legal wraparound) |
 | Unwind bound *k* | `FORSETI_UNWIND` env | `1` | a `VERIFIED` is only "up to k"; **loops need a higher k** |
-| Verify timeout | `FORSETI_VERIFY_TIMEOUT_S` env | `110` | per-function budget, passed to `forseti verify --timeout` so ESBMC honors it (the subprocess is bounded ~15 s higher) |
+| Verify timeout | `FORSETI_VERIFY_TIMEOUT_S` env | `110` | per-function budget, passed to `forseti verify --timeout` so ESBMC honors it (the subprocess is bounded ~15 s higher). Each verdict is persisted the moment it lands, so the `300` s PostToolUse hook timeout must stay above this per-function budget — raise both together for very slow units. |
 | Stop-gate attempts | `MAX_STOP_ATTEMPTS` in `forseti_gate.py` | `3` | blocks then lets the turn end with a loud residual |
 
 ## Known limitations (v0)
@@ -101,3 +101,8 @@ does the Stop-gate let the turn end. See
   laddering k automatically.
 - **Safety only.** Functional correctness beyond the built-in safety checks is
   the v1 semantic-property path.
+- **Very slow, many-function files.** Verdicts persist incrementally so a hook
+  kill can't cause a silent pass, but a file whose *total* verification exceeds
+  the PostToolUse hook timeout can have its last, still-running function cut off
+  before its verdict lands. Raise the hook timeout (and `FORSETI_UNWIND` budget)
+  for such files.
