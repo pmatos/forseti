@@ -62,9 +62,11 @@ def main() -> int:
         return 0  # nothing outstanding — allow the turn to end
 
     if attempts > gate.MAX_STOP_ATTEMPTS:
+        # Allow the turn to end by OMITTING `decision` — the Stop schema only
+        # recognizes "block", so emit just the loud residual as a systemMessage
+        # (a top-level field) rather than risk an unrecognized "approve" dropping it.
         return _emit(
             {
-                "decision": "approve",
                 "systemMessage": (
                     "⚠ Forseti: ending the turn with UNVERIFIED unit(s) after "
                     f"{gate.MAX_STOP_ATTEMPTS} attempts. This is NOT a pass — "
