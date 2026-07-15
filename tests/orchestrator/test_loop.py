@@ -22,7 +22,7 @@ from forseti.esbmc import (
     Verified,
     Violated,
 )
-from forseti.orchestrator import GiveUpReason, LoopState, run_loop
+from forseti.orchestrator import GiveUpReason, ListSink, LoopState, run_loop
 
 if TYPE_CHECKING:
     from forseti.esbmc import verify
@@ -178,6 +178,60 @@ def test_ladder_restarts_at_base_after_a_fix() -> None:
     assert fix.calls == 1
     assert verify.unwinds == [8, 8, 16]
     assert len(run.iterations) == 3
+
+
+def test_escalation_through_fix_records_every_rung_and_event() -> None:
+    # Contract for the shared k-escalation policy (`ladder.verify_ladder`): a
+    # fresh candidate restarts at the base bound and escalates rung-by-rung on
+    # each UNKNOWN. This pins the per-rung Iteration<->event correspondence
+    # *across* a fix boundary in one scenario — the exact seam the driver routes
+    # through `verify_ladder`, so a re-route can never drift the recorded rungs,
+    # the escalation events, or their interleaving.
+    sink = ListSink()
+    verify = FakeVerify(
+        [
+            violated(),  # round 1 @ k=8  -> FIX
+            Unknown(meta(), UnknownReason.TIMEOUT),  # round 2 @ k=8  -> escalate
+            Unknown(meta(), UnknownReason.TIMEOUT),  # round 2 @ k=16 -> escalate
+            Verified(meta()),  # round 2 @ k=32 -> DONE
+        ]
+    )
+    run = run_loop(
+        SRC, verify=verify, fix=FakeFix(), unwind=8, unwind_ladder=(16, 32), sink=sink
+    )
+
+    assert run.final_state is LoopState.DONE
+    # Every rung is recorded: base-restart after the fix, then 8 -> 16 -> 32.
+    assert verify.unwinds == [8, 8, 16, 32]
+    assert [it.index for it in run.iterations] == [0, 1, 2, 3]
+    assert [it.k for it in run.iterations] == [8, 8, 16, 32]
+    assert [it.state for it in run.iterations] == [
+        LoopState.FIX,
+        LoopState.UNKNOWN,
+        LoopState.UNKNOWN,
+        LoopState.DONE,
+    ]
+    # The full interleaved event stream: a verify.verdict per rung, an
+    # escalation decision *between* consecutive rungs, contiguous seq stamps.
+    assert [e.type for e in sink.events] == [
+        "trigger.fired",
+        "verify.verdict",  # i0 k=8 violated
+        "fix.attempt",  # i0
+        "verify.verdict",  # i1 k=8 unknown
+        "unknown.policy.decision",  # i1 escalate 8 -> 16
+        "verify.verdict",  # i2 k=16 unknown
+        "unknown.policy.decision",  # i2 escalate 16 -> 32
+        "verify.verdict",  # i3 k=32 verified
+        "converged",  # i3
+    ]
+    assert [e.seq for e in sink.events] == list(range(9))
+    escalations = [e for e in sink.events if e.type == "unknown.policy.decision"]
+    assert [e.detail for e in escalations] == [
+        {"decision": "escalate", "from_k": 8, "to_k": 16},
+        {"decision": "escalate", "from_k": 16, "to_k": 32},
+    ]
+    # both the Unknown pass and the escalated re-verify are the same iteration.
+    assert [e.index for e in escalations] == [1, 2]
 
 
 def test_invalid_unwind_ladder_is_rejected() -> None:
