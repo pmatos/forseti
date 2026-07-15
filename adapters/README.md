@@ -16,15 +16,19 @@ Core calls.
 | Path | Harness | Trigger model |
 |---|---|---|
 | [`prompt-tools-fallback.md`](./prompt-tools-fallback.md) | *any hookless harness* | reusable prompt: the agent drives Core via MCP (#46) |
+| [`claude-code/`](./claude-code/) | Claude Code | `PostToolUse` verify hook + `Stop`-gate, calling the `forseti` CLI directly — **hard** gate (#45) |
 | [`codex/`](./codex/) | Codex | `PostToolUse` verify hook (the gate) + `AGENTS.md` + Core-as-MCP + `notify` — #47 |
 | [`opencode/`](./opencode/) | opencode | custom command/subagent + Core-as-MCP, **no hooks** — #48 |
 
-The **Claude Code** adapter is intentionally *not* here: per RFC-0001 it is a
-downstream **fork of the `esbmc-plugin`** (kept downstream like the ESBMC fork),
-with a `PostToolUse` verify hook, a `Stop`-gate, and a property subagent — see
-issue #45. It is the fullest reference gate (`PostToolUse` + `Stop` + a property
-subagent); the adapters here range from Codex's hook-enforced verify-after-edit
-down to opencode's prompt-only gate.
+The **Claude Code** adapter is a **self-contained plugin in this repo**, not a
+fork of the `esbmc-plugin`. RFC-0001 originally planned it as a downstream fork;
+we deliberately reversed that so the reference hard gate is independent and
+self-testing. Its **v0** is a *safety* verify-gate: the `PostToolUse` hook runs
+`forseti verify --function <fn>` (function-level, no harness) after each C edit
+and the `Stop`-gate blocks "done" until every touched unit is `VERIFIED up to k`.
+The property subagent + generated *semantic* properties are **v1**. It is the
+fullest reference gate; the other adapters range from Codex's hook-enforced
+verify-after-edit down to opencode's prompt-only gate.
 
 ## Enforcement levels
 
