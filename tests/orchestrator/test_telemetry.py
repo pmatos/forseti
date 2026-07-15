@@ -21,7 +21,13 @@ from forseti.esbmc import (
     Verified,
     Violated,
 )
-from forseti.orchestrator import JsonlSink, ListSink, NullSink, run_loop
+from forseti.orchestrator import (
+    EventEmitter,
+    JsonlSink,
+    ListSink,
+    NullSink,
+    run_loop,
+)
 
 
 def unknown(unwind: int = 8) -> Unknown:
@@ -120,6 +126,42 @@ def test_unknown_escalation_emits_policy_decision() -> None:
     assert d.index == 0
 
 
+def test_escalation_after_fix_emits_full_event_stream() -> None:
+    # A fix, then an escalate-to-converge on the fresh candidate: pins the whole
+    # cross-round event stream (types, seqs, indices, ks) so the ladder-unifying
+    # refactor cannot drift the emitted telemetry. Verdicts: violated@8 -> fix ->
+    # unknown@8 -> escalate -> verified@16.
+    sink = ListSink()
+    verify = FakeVerify([violated(8), unknown(8), Verified(meta(16))])
+    run_loop(
+        SRC, verify=verify, fix=FakeFix(), unwind=8, unwind_ladder=(16,), sink=sink
+    )
+
+    assert [e.type for e in sink.events] == [
+        "trigger.fired",
+        "verify.verdict",
+        "fix.attempt",
+        "verify.verdict",
+        "unknown.policy.decision",
+        "verify.verdict",
+        "converged",
+    ]
+    assert [e.seq for e in sink.events] == [0, 1, 2, 3, 4, 5, 6]
+
+    verdicts = [e for e in sink.events if e.type == "verify.verdict"]
+    assert [(e.index, e.k, e.verdict) for e in verdicts] == [
+        (0, 8, "violated"),
+        (1, 8, "unknown"),
+        (2, 16, "verified"),
+    ]
+    fix_attempt = sink.events[2]
+    assert fix_attempt.index == 0
+    escalation = sink.events[4]
+    assert escalation.index == 1
+    assert escalation.detail == {"decision": "escalate", "from_k": 8, "to_k": 16}
+    assert sink.events[6].index == 2  # converged names the settling iteration
+
+
 def test_terminal_unknown_emits_exhausted() -> None:
     sink = ListSink()
     verify = FakeVerify([unknown(8), unknown(16), unknown(32)])
@@ -180,6 +222,37 @@ def test_null_sink_is_default_and_behavior_unchanged() -> None:
         assert other.final_state is run_default.final_state
         assert other.give_up_reason is run_default.give_up_reason
         assert len(other.iterations) == len(run_default.iterations)
+
+
+def test_event_emitter_stamps_monotonic_seq_from_zero() -> None:
+    # Each emit stamps the next seq, starting at 0 — the monotonic order guarantee
+    # both drivers rely on, owned in one place instead of a per-driver closure.
+    sink = ListSink()
+    emitter = EventEmitter(sink)
+    emitter.emit("a")
+    emitter.emit("b")
+    emitter.emit("c")
+
+    assert [e.seq for e in sink.events] == [0, 1, 2]
+    assert [e.type for e in sink.events] == ["a", "b", "c"]
+
+
+def test_event_emitter_forwards_type_and_fields() -> None:
+    # The type tag and every keyword field land on the Event handed to the sink.
+    sink = ListSink()
+    EventEmitter(sink).emit("verify.verdict", index=2, k=16, verdict="verified")
+
+    (event,) = sink.events
+    assert event.type == "verify.verdict"
+    assert (event.index, event.k, event.verdict) == (2, 16, "verified")
+
+
+def test_event_emitter_defaults_to_null_sink() -> None:
+    # A None sink defaults to NullSink, so an emitter with no sink is effect-free
+    # (mirrors the driver default) and never raises.
+    emitter = EventEmitter()
+    emitter.emit("trigger.fired", detail={"source": "kernel.c"})
+    emitter.emit("converged", index=0)  # does not raise; nothing observed
 
 
 def test_jsonl_sink_writes_parseable_lines() -> None:

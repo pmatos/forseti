@@ -26,12 +26,20 @@ from .ports import (
 )
 from .report import IterationReport, Report, report_for
 from .state import GiveUpReason, LoopState, next_state
-from .telemetry import Event, EventSink, JsonlSink, ListSink, NullSink
+from .telemetry import (
+    Event,
+    EventEmitter,
+    EventSink,
+    JsonlSink,
+    ListSink,
+    NullSink,
+)
 from .transcript import property_check_transcript, transcript_for
 
 __all__ = [
     "DEFAULT_MAX_ITERATIONS",
     "Event",
+    "EventEmitter",
     "EventSink",
     "FixPort",
     "FixProvider",
