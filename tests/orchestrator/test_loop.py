@@ -234,6 +234,53 @@ def test_escalation_through_fix_records_every_rung_and_event() -> None:
     assert [e.index for e in escalations] == [1, 2]
 
 
+def test_each_rung_is_flushed_before_the_next_verify() -> None:
+    # Issue #100: a completed rung's verdict and its escalate decision must reach
+    # the sink *before* the next (possibly slow or stalling) verify is invoked —
+    # not buffered until the whole ladder resolves. `RecordingVerify` snapshots
+    # the sink's event stream at the instant each rung runs; the old eager code
+    # emitted nothing until `verify_ladder` returned, so it would show only
+    # "trigger.fired" at every rung. These assertions pin the streaming contract.
+    sink = ListSink()
+    seen_before: dict[int, list[str]] = {}
+
+    class RecordingVerify:
+        def __init__(self, results: list[EsbmcResult]) -> None:
+            self._results = list(results)
+
+        def __call__(self, source: Path, *, unwind: int) -> EsbmcResult:
+            seen_before[unwind] = [e.type for e in sink.events]
+            return self._results.pop(0)
+
+    verify = RecordingVerify(
+        [
+            Unknown(meta(), UnknownReason.TIMEOUT),  # k=8  -> escalate
+            Unknown(meta(), UnknownReason.TIMEOUT),  # k=16 -> escalate
+            Verified(meta()),  # k=32 -> DONE
+        ]
+    )
+    run_loop(
+        SRC, verify=verify, fix=FakeFix(), unwind=8, unwind_ladder=(16, 32), sink=sink
+    )
+
+    # Before the base rung runs: only the trigger has fired.
+    assert seen_before[8] == ["trigger.fired"]
+    # Before k=16 runs: the k=8 verdict and its escalation are already flushed.
+    assert seen_before[16] == [
+        "trigger.fired",
+        "verify.verdict",
+        "unknown.policy.decision",
+    ]
+    # Before k=32 runs: both prior rungs' verdict + escalation are flushed.
+    assert seen_before[32] == [
+        "trigger.fired",
+        "verify.verdict",
+        "unknown.policy.decision",
+        "verify.verdict",
+        "unknown.policy.decision",
+    ]
+
+
 def test_invalid_unwind_ladder_is_rejected() -> None:
     # The effective ladder (unwind, *unwind_ladder) must be strictly increasing
     # positive ints: reject non-increasing, duplicate, and < 1 bounds loudly.

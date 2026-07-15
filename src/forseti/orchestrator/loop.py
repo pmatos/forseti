@@ -22,7 +22,7 @@ from typing import assert_never
 
 from forseti.esbmc import Error, EsbmcResult, Unknown, Verified, Violated
 
-from .ladder import validated_ladder, verify_ladder
+from .ladder import LadderAttempt, validated_ladder, verify_ladder
 from .ports import FixPort, VerifyPort
 from .state import GiveUpReason, LoopState, next_state
 from .telemetry import EventEmitter, EventSink
@@ -99,10 +99,16 @@ def run_loop(
         rounds += 1
         # The shared k-ladder owns the escalation walk (never a silent pass on
         # UNKNOWN; roadmap Risk 1) — the same rule `check_properties` runs. It
-        # returns every rung's attempt in order; the driver turns each into an
-        # `Iteration` and surfaces the escalations in its own event vocabulary.
-        attempts = verify_ladder(current, verify=verify, ladder=ladder)
-        for position, attempt in enumerate(attempts):
+        # *yields* each rung's attempt as it is computed; the driver turns each
+        # into an `Iteration` and, before the next (possibly slow) rung runs,
+        # flushes this rung's verdict and — when the ladder will escalate past
+        # its non-terminal Unknown — that escalation, in its own event vocabulary
+        # (issue #100). A non-terminal Unknown is one at a non-final ladder rung.
+        attempts: list[LadderAttempt] = []
+        for position, attempt in enumerate(
+            verify_ladder(current, verify=verify, ladder=ladder)
+        ):
+            attempts.append(attempt)
             state = next_state(attempt.result)
             iterations.append(
                 Iteration(index, current, attempt.result, state, attempt.k)
@@ -113,16 +119,16 @@ def run_loop(
                 k=attempt.k,
                 verdict=attempt.result.verdict.value,
             )
-            if position + 1 < len(attempts):
-                # every attempt before the last is a non-terminal Unknown that the
-                # ladder escalated past — surface that decision (mirrors check.py).
+            if isinstance(attempt.result, Unknown) and position + 1 < len(ladder):
+                # a non-terminal Unknown the ladder will escalate past — surface
+                # that decision now, before the next verify (mirrors check.py).
                 emit(
                     "unknown.policy.decision",
                     index=index,
                     detail={
                         "decision": "escalate",
                         "from_k": attempt.k,
-                        "to_k": attempts[position + 1].k,
+                        "to_k": ladder[position + 1],
                     },
                 )
             index += 1
