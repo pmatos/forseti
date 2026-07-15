@@ -10,7 +10,9 @@ serialization boundary, swappable for #15's emitter later).
 
 from __future__ import annotations
 
+import itertools
 import json
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, TextIO
 
@@ -69,6 +71,24 @@ class JsonlSink:
     def emit(self, event: Event) -> None:
         self._stream.write(json.dumps(event.to_dict()) + "\n")
         self._stream.flush()
+
+
+def sequential_emitter(sink: EventSink | None) -> Callable[..., None]:
+    """Build the `emit(type, **fields)` closure a driver uses to record events.
+
+    Hides the three-line preamble both `run_loop` and `check_properties` open
+    with: default a missing sink to `NullSink` (so an unobserved driver stays
+    effect-free), keep a monotonic `seq` counter, and construct each `Event`.
+    The returned closure owns its own counter, so events from one driver are
+    never renumbered by another's.
+    """
+    out = sink or NullSink()
+    seq = itertools.count()
+
+    def emit(type: str, **fields: Any) -> None:
+        out.emit(Event(next(seq), type, **fields))
+
+    return emit
 
 
 if TYPE_CHECKING:

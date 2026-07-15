@@ -26,7 +26,14 @@ from .ports import (
 )
 from .report import IterationReport, Report, report_for
 from .state import GiveUpReason, LoopState, next_state
-from .telemetry import Event, EventSink, JsonlSink, ListSink, NullSink
+from .telemetry import (
+    Event,
+    EventSink,
+    JsonlSink,
+    ListSink,
+    NullSink,
+    sequential_emitter,
+)
 from .transcript import property_check_transcript, transcript_for
 
 __all__ = [
@@ -64,6 +71,7 @@ __all__ = [
     "property_check_transcript",
     "report_for",
     "run_loop",
+    "sequential_emitter",
     "transcript_for",
     "validated_ladder",
     "verify_ladder",

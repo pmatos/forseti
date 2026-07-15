@@ -56,7 +56,7 @@ from .ports import (
     Unit,
     VerifyPort,
 )
-from .telemetry import Event, EventSink, NullSink
+from .telemetry import EventSink, sequential_emitter
 
 
 class PropertyOutcome(Enum):
@@ -182,11 +182,7 @@ def check_properties(
     and `Event.seq` is monotonic.
     """
     ladder = validated_ladder(unwind, unwind_ladder)
-    out = sink or NullSink()
-    seq = itertools.count()
-
-    def emit(type: str, **kw: Any) -> None:
-        out.emit(Event(next(seq), type, **kw))
+    emit = sequential_emitter(sink)
 
     work_dir.mkdir(parents=True, exist_ok=True)
 
