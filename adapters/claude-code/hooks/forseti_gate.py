@@ -35,8 +35,12 @@ SAFETY_FLAGS: tuple[str, ...] = ("--overflow-check",)
 # (a k below the trip count can report a spurious verdict — roadmap Risk 1).
 DEFAULT_K = int(os.environ.get("FORSETI_UNWIND", "1"))
 
-# Per-run wall-clock budget for a single verify (< the hook's own timeout).
+# Per-function verify budget. Passed to `forseti verify --timeout` so ESBMC
+# itself honors it — without it the Core CLI falls back to its 30s default and
+# this knob is inert. The subprocess is bounded a little higher (below) so ESBMC
+# self-terminates with UNKNOWN before the hard kill.
 VERIFY_TIMEOUT_S = float(os.environ.get("FORSETI_VERIFY_TIMEOUT_S", "110"))
+_SUBPROCESS_MARGIN_S = 15.0
 
 # How many times the Stop-gate blocks before it gives up and lets the turn end
 # with a LOUD unverified residual (never a silent pass, but never an infinite
@@ -51,8 +55,17 @@ _STATE_FILE = "gate_state.json"
 # Control-flow keywords that a permissive definition regex could mistake for a
 # function name; filtered out belt-and-suspenders.
 _KEYWORDS = {
-    "if", "for", "while", "switch", "do", "else", "return", "sizeof",
-    "case", "default", "goto",
+    "if",
+    "for",
+    "while",
+    "switch",
+    "do",
+    "else",
+    "return",
+    "sizeof",
+    "case",
+    "default",
+    "goto",
 }
 
 # A top-level C function *definition*: starts at column 0 with at least one
@@ -127,6 +140,8 @@ def verify_function(
         function,
         "--unwind",
         str(k),
+        "--timeout",
+        str(int(VERIFY_TIMEOUT_S)),
         "--json",
         "--",
         *SAFETY_FLAGS,
@@ -136,27 +151,39 @@ def verify_function(
             argv,
             capture_output=True,
             text=True,
-            timeout=VERIFY_TIMEOUT_S,
+            timeout=VERIFY_TIMEOUT_S + _SUBPROCESS_MARGIN_S,
             cwd=project_dir,
         )
     except FileNotFoundError:
         return UnitVerdict(
-            uid, rel, function, "error", k,
+            uid,
+            rel,
+            function,
+            "error",
+            k,
             detail="forseti CLI not found; install the forseti package "
             "(pip install -e .) so `forseti` is on PATH",
         )
     except subprocess.TimeoutExpired:
         return UnitVerdict(
-            uid, rel, function, "unknown", k,
-            detail=f"verify timed out after {VERIFY_TIMEOUT_S:g}s (raise k budget "
-            "or simplify the unit)",
+            uid,
+            rel,
+            function,
+            "unknown",
+            k,
+            detail=f"verify exceeded {VERIFY_TIMEOUT_S:g}s (raise "
+            "FORSETI_VERIFY_TIMEOUT_S, raise k, or simplify the unit)",
         )
 
     try:
         payload = json.loads(proc.stdout)
     except json.JSONDecodeError:
         return UnitVerdict(
-            uid, rel, function, "error", k,
+            uid,
+            rel,
+            function,
+            "error",
+            k,
             detail=(proc.stderr or proc.stdout).strip()[:800] or "no output",
         )
 
@@ -172,12 +199,23 @@ def verify_function(
     )
 
 
-def verify_file(file_path: str, *, project_dir: str, k: int = DEFAULT_K) -> list[UnitVerdict]:
+def verify_file(
+    file_path: str, *, project_dir: str, k: int = DEFAULT_K
+) -> list[UnitVerdict]:
     """Verify every top-level function defined in `file_path`."""
     try:
         text = Path(file_path).read_text()
     except OSError as exc:
-        return [UnitVerdict(unit_id(project_dir, file_path), file_path, "?", "error", k, detail=str(exc))]
+        return [
+            UnitVerdict(
+                unit_id(project_dir, file_path),
+                file_path,
+                "?",
+                "error",
+                k,
+                detail=str(exc),
+            )
+        ]
     return [
         verify_function(file_path, fn, project_dir=project_dir, k=k)
         for fn in extract_functions(text)
