@@ -221,17 +221,15 @@ def check_properties(
         harness_path = work_dir / _harness_filename(unit.unit_id, prop.property_id)
         harness_path.write_text(rendered.source_text)
 
-        # verify_ladder *yields* each rung as it is computed; consume it lazily
-        # so a non-terminal Unknown's escalation is flushed before the next
-        # (possibly slow) rung runs (issue #100) — never pull the next rung ahead
-        # of emitting (that was the eager bug). A non-terminal Unknown is one at a
-        # non-final ladder rung; the ladder only escalates past those.
+        # verify_ladder *yields* each rung as it is computed, already carrying its
+        # `escalate_to` decision; consume it lazily so a non-terminal Unknown's
+        # escalation is flushed before the next (possibly slow) rung runs (issue
+        # #100) — never pull the next rung ahead of emitting (that was the eager
+        # bug).
         attempts: list[LadderAttempt] = []
-        for position, attempt in enumerate(
-            verify_ladder(harness_path, verify=verify, ladder=ladder)
-        ):
+        for attempt in verify_ladder(harness_path, verify=verify, ladder=ladder):
             attempts.append(attempt)
-            if isinstance(attempt.result, Unknown) and position + 1 < len(ladder):
+            if attempt.escalate_to is not None:
                 emit(
                     "unknown.policy.decision",
                     index=index,
@@ -239,7 +237,7 @@ def check_properties(
                         "decision": "escalate",
                         "property_id": prop.property_id,
                         "from_k": attempt.k,
-                        "to_k": ladder[position + 1],
+                        "to_k": attempt.escalate_to,
                     },
                 )
         final = attempts[-1]

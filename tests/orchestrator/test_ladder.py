@@ -92,6 +92,30 @@ def test_verify_ladder_exhausts_ladder_all_unknown() -> None:
     assert isinstance(attempts[-1], LadderAttempt)
 
 
+def test_escalate_to_carries_the_next_bound_on_a_non_terminal_unknown() -> None:
+    # An Unknown at a non-final rung *will* escalate: the attempt names the next
+    # bound so drivers read the decision instead of re-deriving ladder[pos + 1].
+    verify = FakeVerify([unknown(), Verified(meta())])
+    attempts = list(verify_ladder(SRC, verify=verify, ladder=(8, 16)))
+    assert attempts[0].escalate_to == 16  # unknown@8 -> escalate to 16
+    assert attempts[1].escalate_to is None  # verified@16 settles, no escalation
+
+
+def test_escalate_to_is_none_when_the_ladder_is_exhausted() -> None:
+    # An Unknown at the *final* rung is terminal (never a silent pass): it settles
+    # the ladder, so it carries no escalation target.
+    verify = FakeVerify([unknown(), unknown(), unknown()])
+    attempts = list(verify_ladder(SRC, verify=verify, ladder=(8, 16, 32)))
+    assert [a.escalate_to for a in attempts] == [16, 32, None]
+
+
+def test_escalate_to_is_none_on_a_resolved_verdict() -> None:
+    # A non-Unknown verdict resolves the ladder in place — no escalation follows.
+    verify = FakeVerify([Verified(meta())])
+    attempts = list(verify_ladder(SRC, verify=verify, ladder=(8, 16)))
+    assert attempts[-1].escalate_to is None
+
+
 def test_verify_ladder_is_lazy_one_rung_at_a_time() -> None:
     # The ladder yields incrementally: pulling the first attempt must not have
     # run any later rung yet (the incremental contract behind issue #100).
