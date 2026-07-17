@@ -99,15 +99,13 @@ def run_loop(
         rounds += 1
         # The shared k-ladder owns the escalation walk (never a silent pass on
         # UNKNOWN; roadmap Risk 1) — the same rule `check_properties` runs. It
-        # *yields* each rung's attempt as it is computed; the driver turns each
-        # into an `Iteration` and, before the next (possibly slow) rung runs,
-        # flushes this rung's verdict and — when the ladder will escalate past
-        # its non-terminal Unknown — that escalation, in its own event vocabulary
-        # (issue #100). A non-terminal Unknown is one at a non-final ladder rung.
+        # *yields* each rung's attempt as it is computed, already carrying its
+        # `escalate_to` decision; the driver turns each into an `Iteration` and,
+        # before the next (possibly slow) rung runs, flushes this rung's verdict
+        # and — when it will escalate — that escalation, in its own event
+        # vocabulary (issue #100).
         attempts: list[LadderAttempt] = []
-        for position, attempt in enumerate(
-            verify_ladder(current, verify=verify, ladder=ladder)
-        ):
+        for attempt in verify_ladder(current, verify=verify, ladder=ladder):
             attempts.append(attempt)
             state = next_state(attempt.result)
             iterations.append(
@@ -119,7 +117,7 @@ def run_loop(
                 k=attempt.k,
                 verdict=attempt.result.verdict.value,
             )
-            if isinstance(attempt.result, Unknown) and position + 1 < len(ladder):
+            if attempt.escalate_to is not None:
                 # a non-terminal Unknown the ladder will escalate past — surface
                 # that decision now, before the next verify (mirrors check.py).
                 emit(
@@ -128,7 +126,7 @@ def run_loop(
                     detail={
                         "decision": "escalate",
                         "from_k": attempt.k,
-                        "to_k": ladder[position + 1],
+                        "to_k": attempt.escalate_to,
                     },
                 )
             index += 1

@@ -43,10 +43,19 @@ def validated_ladder(unwind: int, unwind_ladder: tuple[int, ...]) -> tuple[int, 
 
 @dataclass(frozen=True)
 class LadderAttempt:
-    """One rung of the ladder: the bound `k` verified at, and the verdict there."""
+    """One rung of the ladder: the bound `k`, its verdict, and the escalation.
+
+    `escalate_to` is the next bound the ladder will re-verify at *because* this
+    rung's verdict was a non-terminal `Unknown`, or `None` when this attempt
+    settles the ladder — a resolved (non-`Unknown`) verdict, or an `Unknown` at
+    the final rung (exhausted, never a silent pass). It is the "will we escalate,
+    and to what k" decision made data, so each driver reads it instead of
+    re-deriving `ladder[position + 1]` for itself (the two can't drift).
+    """
 
     k: int
     result: EsbmcResult
+    escalate_to: int | None
 
 
 def verify_ladder(
@@ -57,15 +66,18 @@ def verify_ladder(
     Verify at `ladder[0]`; on an `Unknown` verdict re-verify at the next rung,
     repeating until a non-`Unknown` verdict resolves it or the ladder is
     exhausted. Yields every attempt in order, one at a time *as it is computed*
-    (at least one; the last is terminal): a caller emitting per attempt therefore
-    flushes each completed rung — and, since it holds the same `ladder`, that
-    rung's escalation decision — before the next verify is invoked, so a slow or
-    interrupted later rung can't swallow an earlier verdict (issue #100). When
-    every rung is `Unknown` the final attempt is that terminal `Unknown` — the
-    ladder is exhausted, never coerced to a pass.
+    (at least one; the last is terminal), each carrying its own `escalate_to`
+    decision: a caller emitting per attempt therefore flushes each completed rung
+    — and its escalation — before the next verify is invoked, so a slow or
+    interrupted later rung can't swallow an earlier verdict (issue #100). The
+    escalation target is read from `ladder`, not by peeking at the next verify, so
+    yielding stays lazy. When every rung is `Unknown` the final attempt is that
+    terminal `Unknown` — the ladder is exhausted, never coerced to a pass.
     """
-    for k in ladder:
+    for position, k in enumerate(ladder):
         result = verify(source, unwind=k)
-        yield LadderAttempt(k, result)
+        will_escalate = isinstance(result, Unknown) and position + 1 < len(ladder)
+        escalate_to = ladder[position + 1] if will_escalate else None
+        yield LadderAttempt(k, result, escalate_to)
         if not isinstance(result, Unknown):
             return
