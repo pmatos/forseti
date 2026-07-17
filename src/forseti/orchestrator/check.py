@@ -40,6 +40,7 @@ from forseti.esbmc import (
     result_to_dict,
 )
 from forseti.properties import (
+    HarnessError,
     Property,
     PropertyKind,
     extract_signature,
@@ -81,7 +82,7 @@ class PropertyVerdict:
     `k` is the bound the verdict settled at (`None` when `SKIPPED`); `result` is
     the raw typed ESBMC result (`None` when `SKIPPED`); `harness_source` is the
     exact harness checked, kept as provenance so #4 can re-render it against
-    mutants. `skip_reason` explains a `SKIPPED` outcome.
+    mutants. `skip_reason` explains a `SKIPPED` outcome or a render-failure `ERROR`.
     """
 
     property_id: str
@@ -217,7 +218,34 @@ def check_properties(
             )
             continue
 
-        rendered = render.render(unit, prop)
+        try:
+            rendered = render.render(unit, prop)
+        except HarnessError as exc:
+            # #64 renders fail-loud on an un-renderable property (e.g. a
+            # postcondition that dereferences a scalar-backed output). Record it as
+            # a per-property ERROR -- CLAUDE.md "never silently pass" and this
+            # module's own contract that a bad harness is never dropped -- rather
+            # than crash the whole unit's run or hand esbmc un-compilable C.
+            reason = f"harness render failed: {exc}"
+            verdicts.append(
+                PropertyVerdict(
+                    prop.property_id,
+                    unit.unit_id,
+                    kind,
+                    PropertyOutcome.ERROR,
+                    None,
+                    None,
+                    None,
+                    reason,
+                )
+            )
+            emit(
+                "property.verdict",
+                index=index,
+                verdict=PropertyOutcome.ERROR.value,
+                detail={"property_id": prop.property_id, "reason": reason},
+            )
+            continue
         harness_path = work_dir / _harness_filename(unit.unit_id, prop.property_id)
         harness_path.write_text(rendered.source_text)
 

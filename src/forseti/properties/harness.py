@@ -132,6 +132,10 @@ def render_semantic_harness(
             "unit_source defines main; pass the kernel slice, not the example harness"
         )
 
+    reason = renderability_reason(signature, spec)
+    if reason is not None:
+        raise HarnessError(reason)
+
     scalars: list[ScalarParam] = []
     buffers: list[BufferParam] = []
     for param in signature.params:
@@ -192,6 +196,56 @@ def spec_from_property(prop: Property) -> SemanticSpec:
         postcondition=prop.expression,
         preconditions=tuple(prop.domain),
     )
+
+
+def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | None:
+    """None if `spec` renders to compilable, sound C for `signature`, else why not.
+
+    The static, parser-free authority on two emission rules the postcondition and
+    preconditions must obey -- kept *here*, the module that emits the C, so callers
+    (the proposer's static gate, the renderer itself) need not re-derive harness
+    internals:
+
+    * A **scalar-backed output** (a trailing single-element ``out`` buffer) is
+      bound as a plain scalar passed by address, so the postcondition may only
+      *name* it -- dereferencing or subscripting it (``*cp``, ``cp[0]``,
+      ``*(cp + 0)``) would deref/subscript a non-pointer and fail to compile.
+    * A **precondition** is emitted as ``__ESBMC_assume(...)`` *before* the call,
+      so it may not constrain an **output** parameter -- that would preconstrain a
+      would-be result on uninitialized storage, masking a unit that never writes
+      it; domains constrain inputs only.
+
+    Best-effort and conservative: it may over-reject an exotic postcondition, but a
+    rejected *renderable* property is safe whereas emitting un-compilable C is not.
+    It does not duplicate the structural guards `render_semantic_harness` raises on
+    directly (empty postcondition, `result_var` clash, void return, a `unit_source`
+    that defines ``main``).
+    """
+    output_params = [
+        p.name for p in signature.params if isinstance(p, BufferParam) and p.out
+    ]
+    scalar_outputs = {
+        p.name
+        for p in signature.params
+        if isinstance(p, BufferParam) and _is_scalar_backed(p)
+    }
+    for name in scalar_outputs:
+        if _derefs_or_subscripts(spec.postcondition, name):
+            return (
+                f"expression dereferences/subscripts scalar-backed output "
+                f"{name!r}; the harness binds it as a scalar -- name it directly"
+            )
+    # Word-boundary detection, not a raw identifier scan: `\bu\b` does not match the
+    # `u` in a suffixed literal like `10u`, so an output named `u`/`L`/`UL` cannot be
+    # spuriously flagged by an input-only precondition such as `x < 10u`.
+    for pre in spec.preconditions:
+        for name in output_params:
+            if _references(pre, name):
+                return (
+                    f"domain expr {pre!r} constrains output parameter "
+                    f"{name!r} (preconditions apply to inputs only)"
+                )
+    return None
 
 
 _STORAGE_SPECIFIERS = frozenset({"static", "inline", "extern", "_Noreturn"})
@@ -342,6 +396,21 @@ def _split_assumptions(
 
 def _references(expr: str, ident: str) -> bool:
     return re.search(rf"\b{re.escape(ident)}\b", expr) is not None
+
+
+def _derefs_or_subscripts(expr: str, name: str) -> bool:
+    """True if `name` is subscripted (``name[...]``) or dereferenced (``*name`` or
+    ``*(...name...)``) in `expr` -- the pointer uses a scalar binding cannot compile.
+
+    Best-effort: the parenthesized form catches ``*(cp + 0)`` / ``*(cp)`` that a
+    bare ``*name`` test misses; it does not see arbitrarily nested derefs.
+    """
+    n = re.escape(name)
+    return (
+        re.search(rf"\b{n}\s*\[", expr) is not None
+        or re.search(rf"\*\s*{n}\b", expr) is not None
+        or re.search(rf"\*\s*\([^()]*\b{n}\b", expr) is not None
+    )
 
 
 def _defines_main(source: str) -> bool:

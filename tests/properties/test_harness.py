@@ -22,6 +22,7 @@ from forseti.properties import (
     extract_signature,
     make_property_id,
     render_semantic_harness,
+    renderability_reason,
     spec_from_property,
 )
 
@@ -151,6 +152,116 @@ def test_output_buffer_captured() -> None:
     assert "int result = decode(b, len, &cp);" in out  # passed by address
     assert "cp[_i]" not in out  # output is not nondet-filled
     assert "nondet_uint32_t" not in out  # ... so it needs no generator
+
+
+def _out_sig() -> UnitSignature:
+    # A trailing single-element output pointer, like utf8_decode's `uint32_t *cp`:
+    # rendered as a scalar local, passed by address at the call.
+    return UnitSignature(
+        "decode", "int", (BufferParam("uint32_t", "cp", "1", out=True),)
+    )
+
+
+_OUT_SLICE = "int decode(uint32_t *cp) { *cp = 0; return 1; }"
+
+
+@pytest.mark.parametrize(
+    "expr", ["*cp == 0", "cp[0] == 0", "*(cp + 0) == 0", "*(cp) == 0"]
+)
+def test_scalar_backed_output_deref_is_error(expr: str) -> None:
+    # A scalar-backed output is bound as a plain scalar; dereferencing or
+    # subscripting it would not compile, so the harness refuses to emit it rather
+    # than leak un-compilable C to esbmc. `*(cp + 0)`/`*(cp)` are the parenthesized
+    # forms the old proposer regex silently accepted.
+    with pytest.raises(HarnessError, match="scalar-backed output 'cp'"):
+        render_semantic_harness(
+            unit_source=_OUT_SLICE, signature=_out_sig(), spec=SemanticSpec(expr)
+        )
+
+
+def test_domain_over_output_param_is_error() -> None:
+    # A precondition is emitted as __ESBMC_assume *before* the call, so it may not
+    # constrain an output parameter -- that would preconstrain a would-be result on
+    # uninitialized storage, masking a unit that never writes it.
+    with pytest.raises(HarnessError, match="output parameter 'cp'"):
+        render_semantic_harness(
+            unit_source=_OUT_SLICE,
+            signature=_out_sig(),
+            spec=SemanticSpec("result >= 0", ("cp <= 0",)),
+        )
+
+
+def test_scalar_backed_output_named_directly_renders() -> None:
+    # Naming the output directly is valid -- the unit writes it -- so the predicate
+    # must not over-reject it.
+    out = render_semantic_harness(
+        unit_source=_OUT_SLICE,
+        signature=_out_sig(),
+        spec=SemanticSpec("cp <= 0x10FFFF"),
+    )
+    assert "uint32_t cp;" in out
+    assert '__ESBMC_assert((cp <= 0x10FFFF), "forseti:semantic");' in out
+
+
+def test_renderability_reason_accepts_scalar_signature() -> None:
+    # No output buffers -> neither emission rule can fire.
+    spec = SemanticSpec("result >= 0", ("x > 0",))
+    assert renderability_reason(ABS_SIG, spec) is None
+
+
+def test_renderability_reason_accepts_directly_named_output() -> None:
+    assert renderability_reason(_out_sig(), SemanticSpec("cp <= 0x10FFFF")) is None
+
+
+@pytest.mark.parametrize("expr", ["*cp == 0", "cp[0] == 0", "*(cp + 0) == 0"])
+def test_renderability_reason_flags_scalar_output_deref(expr: str) -> None:
+    reason = renderability_reason(_out_sig(), SemanticSpec(expr))
+    assert reason is not None and "scalar-backed output 'cp'" in reason
+
+
+def test_renderability_reason_flags_domain_over_output() -> None:
+    reason = renderability_reason(_out_sig(), SemanticSpec("result >= 0", ("cp <= 0",)))
+    assert reason is not None and "output parameter 'cp'" in reason
+
+
+def _suffix_out_sig() -> UnitSignature:
+    # An output named like a C integer suffix (`u`/`L`/`UL`): a precondition over an
+    # input that carries a suffixed literal (e.g. `x < 10u`) must not be misread as
+    # constraining this output.
+    return UnitSignature(
+        "f",
+        "int",
+        (ScalarParam("int64_t", "x"), BufferParam("uint32_t", "u", "1", out=True)),
+    )
+
+
+@pytest.mark.parametrize("pre", ["x < 10u", "x <= 10UL", "x > 0L && x < 5u"])
+def test_renderability_reason_ignores_literal_suffix_named_output(pre: str) -> None:
+    # A raw identifier scan matches the `u`/`L`/`UL` inside a suffixed literal as the
+    # output name; boundary-aware detection (`\bu\b` misses `10u`) must not flag it.
+    spec = SemanticSpec("result >= 0", (pre,))
+    assert renderability_reason(_suffix_out_sig(), spec) is None
+
+
+def test_renderability_reason_still_flags_genuine_suffix_output_ref() -> None:
+    # Guard against over-correcting: a real reference to output `u` is still rejected.
+    spec = SemanticSpec("result >= 0", ("u < 5",))
+    reason = renderability_reason(_suffix_out_sig(), spec)
+    assert reason is not None and "output parameter 'u'" in reason
+
+
+_SUFFIX_OUT_SLICE = "int f(int64_t x, uint32_t *u) { *u = 0; return 1; }"
+
+
+def test_literal_suffix_named_output_renders() -> None:
+    # End-to-end: the writer emits the harness instead of raising on `x < 10u`.
+    out = render_semantic_harness(
+        unit_source=_SUFFIX_OUT_SLICE,
+        signature=_suffix_out_sig(),
+        spec=SemanticSpec("result >= 0", ("x < 10u",)),
+    )
+    assert "__ESBMC_assume((x < 10u));" in out
+    assert "uint32_t u;" in out
 
 
 def test_extract_signature_scalar() -> None:

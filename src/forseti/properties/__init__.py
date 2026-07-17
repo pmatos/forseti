@@ -20,6 +20,7 @@ from .harness import (
     UnitSignature,
     extract_signature,
     render_semantic_harness,
+    renderability_reason,
     spec_from_property,
 )
 from .llm import ClaudeCliClient, LLMClient, LLMError
@@ -103,6 +104,7 @@ __all__ = [
     "propose_properties",
     "render_prompt",
     "render_semantic_harness",
+    "renderability_reason",
     "spec_from_property",
     "validate_candidate",
 ]

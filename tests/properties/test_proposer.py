@@ -268,10 +268,40 @@ def test_output_param_allowed_in_expression() -> None:
     assert validate_candidate(spec, out_sig()) is None
 
 
-@pytest.mark.parametrize("expr", ["*cp <= 0x10FFFF", "cp[0] <= 0x10FFFF"])
+def suffix_out_sig() -> UnitSignature:
+    # An output named like a C integer suffix (`u`): a domain over an input that
+    # carries a suffixed literal must not be misread as constraining the output.
+    return UnitSignature(
+        symbol="f",
+        return_ctype="int",
+        params=(
+            ScalarParam(ctype="int64_t", name="x"),
+            BufferParam(elem_ctype="uint32_t", name="u", length="1", out=True),
+        ),
+    )
+
+
+def test_domain_with_suffixed_literal_not_flagged_as_output() -> None:
+    # A valid input-only precondition `x < 10u` must not be rejected just because an
+    # output is named `u` -- the `u` suffix on the literal is not a reference to it.
+    spec = CandidateSpec(expression="result >= 0", domain=("x < 10u",))
+    assert validate_candidate(spec, suffix_out_sig()) is None
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "*cp <= 0x10FFFF",
+        "cp[0] <= 0x10FFFF",
+        "*(cp + 0) <= 0x10FFFF",  # parenthesized deref the old regex missed
+        "*(cp) <= 0x10FFFF",
+    ],
+)
 def test_scalar_backed_output_deref_rejected(expr: str) -> None:
     # Regression (#81): `*cp` / `cp[0]` on a single-element output would deref a
-    # scalar local and not compile; the validator must reject it up front.
+    # scalar local and not compile; the validator must reject it up front. The
+    # parenthesized forms are the propose-path evasion this refactor closes -- the
+    # rule now lives in `renderability_reason` (harness), consulted here statically.
     reason = validate_candidate(CandidateSpec(expression=expr), out_sig())
     assert reason is not None and "scalar-backed output 'cp'" in reason
 
