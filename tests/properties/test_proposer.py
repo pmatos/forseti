@@ -268,6 +268,26 @@ def test_output_param_allowed_in_expression() -> None:
     assert validate_candidate(spec, out_sig()) is None
 
 
+def suffix_out_sig() -> UnitSignature:
+    # An output named like a C integer suffix (`u`): a domain over an input that
+    # carries a suffixed literal must not be misread as constraining the output.
+    return UnitSignature(
+        symbol="f",
+        return_ctype="int",
+        params=(
+            ScalarParam(ctype="int64_t", name="x"),
+            BufferParam(elem_ctype="uint32_t", name="u", length="1", out=True),
+        ),
+    )
+
+
+def test_domain_with_suffixed_literal_not_flagged_as_output() -> None:
+    # A valid input-only precondition `x < 10u` must not be rejected just because an
+    # output is named `u` -- the `u` suffix on the literal is not a reference to it.
+    spec = CandidateSpec(expression="result >= 0", domain=("x < 10u",))
+    assert validate_candidate(spec, suffix_out_sig()) is None
+
+
 @pytest.mark.parametrize(
     "expr",
     [

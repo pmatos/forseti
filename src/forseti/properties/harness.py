@@ -221,9 +221,9 @@ def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | 
     directly (empty postcondition, `result_var` clash, void return, a `unit_source`
     that defines ``main``).
     """
-    output_params = {
+    output_params = [
         p.name for p in signature.params if isinstance(p, BufferParam) and p.out
-    }
+    ]
     scalar_outputs = {
         p.name
         for p in signature.params
@@ -235,12 +235,15 @@ def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | 
                 f"expression dereferences/subscripts scalar-backed output "
                 f"{name!r}; the harness binds it as a scalar -- name it directly"
             )
+    # Word-boundary detection, not a raw identifier scan: `\bu\b` does not match the
+    # `u` in a suffixed literal like `10u`, so an output named `u`/`L`/`UL` cannot be
+    # spuriously flagged by an input-only precondition such as `x < 10u`.
     for pre in spec.preconditions:
-        for ident in re.findall(r"[A-Za-z_]\w*", pre):
-            if ident in output_params:
+        for name in output_params:
+            if _references(pre, name):
                 return (
                     f"domain expr {pre!r} constrains output parameter "
-                    f"{ident!r} (preconditions apply to inputs only)"
+                    f"{name!r} (preconditions apply to inputs only)"
                 )
     return None
 
