@@ -268,10 +268,20 @@ def test_output_param_allowed_in_expression() -> None:
     assert validate_candidate(spec, out_sig()) is None
 
 
-@pytest.mark.parametrize("expr", ["*cp <= 0x10FFFF", "cp[0] <= 0x10FFFF"])
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "*cp <= 0x10FFFF",
+        "cp[0] <= 0x10FFFF",
+        "*(cp + 0) <= 0x10FFFF",  # parenthesized deref the old regex missed
+        "*(cp) <= 0x10FFFF",
+    ],
+)
 def test_scalar_backed_output_deref_rejected(expr: str) -> None:
     # Regression (#81): `*cp` / `cp[0]` on a single-element output would deref a
-    # scalar local and not compile; the validator must reject it up front.
+    # scalar local and not compile; the validator must reject it up front. The
+    # parenthesized forms are the propose-path evasion this refactor closes -- the
+    # rule now lives in `renderability_reason` (harness), consulted here statically.
     reason = validate_candidate(CandidateSpec(expression=expr), out_sig())
     assert reason is not None and "scalar-backed output 'cp'" in reason
 

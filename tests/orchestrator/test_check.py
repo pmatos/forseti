@@ -38,7 +38,13 @@ from forseti.orchestrator import (
     persist_property_check,
     property_check_transcript,
 )
-from forseti.properties import Property, PropertyKind, PropertyStatus, Provenance
+from forseti.properties import (
+    HarnessError,
+    Property,
+    PropertyKind,
+    PropertyStatus,
+    Provenance,
+)
 
 UNIT = Unit("u.c::f", Path("u.c"), "f", "int f(int x) { return x; }")
 
@@ -315,6 +321,41 @@ def test_esbmc_error_is_surfaced(tmp_path: Path) -> None:
     )
     assert run.verdicts[0].outcome is PropertyOutcome.ERROR
     assert run.verdicts[0].to_dict()["result"]["message"] == "esbmc: parse error"
+
+
+class RaisingHarnessWriter:
+    """A HarnessWriterPort whose render fails (the #64 writer's fail-loud signal)."""
+
+    def render(self, unit: Unit, prop: Property) -> RenderedHarness:
+        raise HarnessError("cannot render: scalar-backed output 'cp' dereferenced")
+
+
+def test_render_failure_is_error_not_crash(tmp_path: Path) -> None:
+    # A property the harness writer cannot render (fail-loud HarnessError) is
+    # recorded as a per-property ERROR verdict -- the driver's documented "a bad
+    # harness is never silently dropped" -- rather than crashing the unit's run or
+    # spending an esbmc invocation on un-compilable C.
+    store = InMemoryPropertyStore([semantic_prop("p1")])
+    verify = FakeVerify([])  # must never be reached
+    sink = ListSink()
+    run = check_properties(
+        UNIT,
+        store=store,
+        render=RaisingHarnessWriter(),
+        verify=verify,
+        work_dir=tmp_path / "work",
+        unwind=8,
+        sink=sink,
+    )
+    verdict = run.verdicts[0]
+    assert verdict.outcome is PropertyOutcome.ERROR
+    assert verdict.result is None
+    assert verdict.k is None
+    assert verdict.skip_reason is not None and "cannot render" in verdict.skip_reason
+    assert verify.calls == 0  # a render failure never runs esbmc
+    assert any(
+        e.type == "property.verdict" and e.verdict == "error" for e in sink.events
+    )
 
 
 def test_reachability_property_is_skipped(tmp_path: Path) -> None:

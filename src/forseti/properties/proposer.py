@@ -31,6 +31,7 @@ from .harness import (
     SemanticSpec,
     UnitSignature,
     render_semantic_harness,
+    renderability_reason,
     spec_from_property,
 )
 from .llm import LLMClient
@@ -336,43 +337,26 @@ def validate_candidate(
 
     if signature is not None:
         params = {p.name for p in signature.params}
-        # Output buffers hold the unit's *result*, written during the call. They
-        # are valid in the postcondition (`expression`), but a precondition
-        # (`domain`) over one would `__ESBMC_assume` on uninitialized storage
-        # before the call -- preconstraining a would-be output, which can mask a
-        # unit that never writes it. So domains constrain inputs only.
         output_params = {
             p.name for p in signature.params if isinstance(p, BufferParam) and p.out
-        }
-        # A single-element output is rendered as a plain scalar local (passed by
-        # address), so a postcondition must name it directly: `*cp`/`cp[0]` would
-        # deref/subscript a non-pointer and not compile. Reject that syntax rather
-        # than emit an uncompilable harness the renderability gate can't catch.
-        scalar_outputs = {
-            p.name
-            for p in signature.params
-            if isinstance(p, BufferParam) and p.out and p.length.strip() == "1"
         }
         input_params = params - output_params
         allowed = params | {RESULT_IDENT} | _MACROS
         for ident in expr_idents:
             if ident not in allowed:
                 return f"expression references unknown identifier {ident!r}"
-        for name in scalar_outputs:
-            if re.search(rf"\*\s*{re.escape(name)}\b", spec.expression) or re.search(
-                rf"\b{re.escape(name)}\s*\[", spec.expression
-            ):
-                return (
-                    f"expression dereferences/subscripts scalar-backed output "
-                    f"{name!r}; the harness binds it as a scalar -- name it directly"
-                )
+        # The two signature-dependent emission rules -- a scalar-backed output must
+        # be named directly (not `*cp`/`cp[0]`/`*(cp+0)`) and a precondition must
+        # not constrain an output -- are owned by the harness writer, the module
+        # that emits the C. Delegating keeps that harness knowledge in one place
+        # and closes the propose-path evasion the old inline regex left open (#81).
+        render_block = renderability_reason(
+            signature, SemanticSpec(spec.expression, spec.domain)
+        )
+        if render_block is not None:
+            return render_block
         for pre in spec.domain:
             for ident in _identifiers(pre):
-                if ident in output_params:
-                    return (
-                        f"domain expr {pre!r} constrains output parameter "
-                        f"{ident!r} (preconditions apply to inputs only)"
-                    )
                 if ident not in (input_params | _MACROS):
                     return f"domain expr {pre!r} references unknown ident {ident!r}"
         for name in spec.referenced_params:
