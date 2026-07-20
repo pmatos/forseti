@@ -86,7 +86,13 @@ _FUNC_RE = re.compile(
 
 @dataclass(frozen=True)
 class UnitVerdict:
-    """One function's verdict from a single ``forseti verify`` call."""
+    """One function's verdict from a single ``forseti verify`` call.
+
+    ``argv`` (the exact ESBMC command line) and ``duration_s`` (wall-clock of the
+    verify) come from the CLI's ``--json`` payload and are carried for the loop
+    trace (``event_log``); they are ``None`` when the call never reached ESBMC
+    (CLI missing, timeout, unparseable output).
+    """
 
     unit_id: str  # "relpath::symbol"
     file: str
@@ -95,6 +101,8 @@ class UnitVerdict:
     k: int
     counterexample: str | None = None
     detail: str | None = None
+    argv: tuple[str, ...] | None = None
+    duration_s: float | None = None
 
     @property
     def passed(self) -> bool:
@@ -192,6 +200,7 @@ def verify_function(
         )
 
     verdict = str(payload.get("verdict", "error"))
+    raw_argv = payload.get("argv")
     return UnitVerdict(
         uid,
         rel,
@@ -200,6 +209,8 @@ def verify_function(
         int(payload.get("unwind", k)),
         counterexample=payload.get("counterexample"),
         detail=payload.get("reason") or payload.get("message"),
+        argv=tuple(raw_argv) if isinstance(raw_argv, list) else None,
+        duration_s=payload.get("duration_s"),
     )
 
 

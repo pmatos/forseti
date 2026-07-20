@@ -16,6 +16,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import event_log
 import forseti_gate as gate
 
 _CEX_CLIP = 1500
@@ -42,12 +43,43 @@ def main() -> int:
     # Verify + persist each function incrementally under the gate lock (kill-safe,
     # and serialized against concurrent PostToolUse hooks).
     verdicts = gate.verify_and_record(file_path, project_dir=project_dir)
+
+    # Trace the loop (best-effort): the edit Claude made, each ESBMC call, then
+    # the gate decision. `duration_s` is per-call accurate even though the events
+    # are logged together after the (serialized) verify batch returns.
+    rel = gate.unit_id(project_dir, file_path)
+    event_log.log_event(
+        project_dir,
+        event_log.EDIT,
+        tool=data.get("tool_name", "?"),
+        file=rel,
+        functions=[v.function for v in verdicts],
+    )
+    for v in verdicts:
+        event_log.log_event(
+            project_dir,
+            event_log.VERIFY,
+            unit=v.unit_id,
+            verdict=v.verdict,
+            k=v.k,
+            duration_s=v.duration_s,
+            argv=list(v.argv) if v.argv else None,
+        )
+
     if not verdicts:
         return 0  # no functions in the file; any stale units were just reconciled
 
     failures = [v for v in verdicts if not v.passed]
     if not failures:
         oks = ", ".join(f"{v.unit_id} (k={v.k})" for v in verdicts)
+        event_log.log_event(
+            project_dir,
+            event_log.GATE,
+            file=rel,
+            decision="pass",
+            n_failures=0,
+            exit_code=0,
+        )
         print(f"Forseti: VERIFIED up to k — {oks}")
         return 0
 
@@ -69,6 +101,14 @@ def main() -> int:
         "re-verified automatically on the next edit. Do not report the task "
         "done until every unit is VERIFIED up to k. An UNKNOWN is not a pass — "
         "raise k (FORSETI_UNWIND) or simplify the unit."
+    )
+    event_log.log_event(
+        project_dir,
+        event_log.GATE,
+        file=rel,
+        decision="block",
+        n_failures=len(failures),
+        exit_code=2,
     )
     print("\n".join(lines), file=sys.stderr)
     return 2

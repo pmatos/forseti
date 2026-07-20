@@ -17,6 +17,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import event_log
 import forseti_gate as gate
 
 _CEX_CLIP = 1200
@@ -59,12 +60,22 @@ def main() -> int:
             gate.save_state(project_dir, state)
 
     if not failures:
+        event_log.log_event(
+            project_dir, event_log.STOP, decision="allow", n_unverified=0, attempt=0
+        )
         return 0  # nothing outstanding — allow the turn to end
 
     if attempts > gate.MAX_STOP_ATTEMPTS:
         # Allow the turn to end by OMITTING `decision` — the Stop schema only
         # recognizes "block", so emit just the loud residual as a systemMessage
         # (a top-level field) rather than risk an unrecognized "approve" dropping it.
+        event_log.log_event(
+            project_dir,
+            event_log.STOP,
+            decision="residual",
+            n_unverified=len(failures),
+            attempt=attempts,
+        )
         return _emit(
             {
                 "systemMessage": (
@@ -75,6 +86,13 @@ def main() -> int:
             }
         )
 
+    event_log.log_event(
+        project_dir,
+        event_log.STOP,
+        decision="block",
+        n_unverified=len(failures),
+        attempt=attempts,
+    )
     return _emit(
         {
             "decision": "block",
