@@ -23,7 +23,9 @@ server — the hooks call the neutral `forseti` CLI directly.
   silent pass, never an infinite loop.
 
 Latest verdicts are cached in `.forseti/gate_state.json` (per project,
-gitignored). Forseti core stays stateless; the *gate* is what is stateful.
+gitignored). Forseti core stays stateless; the *gate* is what is stateful. The
+full ordered history of the loop — every hook firing, ESBMC call, and gate
+decision — is appended to `.forseti/events.jsonl` (see **Loop trace** below).
 
 ### Scope: v0 = safety, v1 = semantics
 
@@ -80,6 +82,52 @@ INT64_MIN` (`arithmetic overflow on neg`, CWE-190/191). Claude reads it, saturat
 `INT64_MIN → INT64_MAX`, and the re-verify returns **VERIFIED up to k**. Only then
 does the Stop-gate let the turn end. See
 [`docs/walkthroughs/0002-hook-enforced-safety.md`](../../docs/walkthroughs/0002-hook-enforced-safety.md).
+
+## Loop trace (understand the back-and-forth)
+
+`gate_state.json` is a *snapshot* (latest verdict per unit). To see the whole
+`write → verify → cex → fix` sequence, the hooks also append an ordered event log
+to **`.forseti/events.jsonl`** — one JSON object per line:
+
+- `edit` — a `Write`/`Edit`/`MultiEdit` fired: the tool, the file, the functions found.
+- `verify` — one ESBMC call: the unit, `verdict`, `k`, `duration_s`, and the **exact `argv`**.
+- `gate` — the PostToolUse decision: `pass`, or `block` (how many cex were fed back).
+- `stop` — the Stop-gate decision: `block`, loud `residual`, or `allow`.
+
+Render it as a **mermaid sequence diagram** with the bundled tool (point it at the
+project dir or the `events.jsonl` file):
+
+```console
+$ python3 adapters/claude-code/tools/trace_to_mermaid.py path/to/project
+```
+
+For the `my_abs` demo the one turn comes out as:
+
+```mermaid
+sequenceDiagram
+    participant C as Claude
+    participant G as Gate (PostToolUse)
+    participant E as ESBMC
+    participant S as Stop-gate
+    C->>G: Write abs64.c (my_abs)
+    G->>E: verify abs64.c::my_abs (k=1)
+    E-->>G: VIOLATED (0.15s)
+    G-->>C: block — 1 cex fed back (exit 2)
+    C->>S: end turn?
+    S-->>C: BLOCK (attempt 1)
+    C->>G: Edit abs64.c (my_abs)
+    G->>E: verify abs64.c::my_abs (k=1)
+    E-->>G: VERIFIED (0.12s)
+    G-->>C: pass — VERIFIED up to k
+    C->>S: end turn?
+    S-->>C: ALLOW (clean)
+```
+
+The trace captures Claude's **actions** (the code it writes/edits) and the
+verifier's responses, not Claude's natural-language messages — those live only in
+Claude Code's own session transcript (`~/.claude/projects/<slug>/<session>.jsonl`)
+and can be woven in by timestamp. Logging is best-effort: a trace write never
+turns a verdict into an error.
 
 ## Configuration
 
