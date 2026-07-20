@@ -1,0 +1,35 @@
+# semantic-release baseline for NON-JS repos (Rust / Python / Racket / C / ...).
+# Produces GitHub Releases + a maintained CHANGELOG.md from Conventional Commits.
+# Ecosystem publishing (crates.io / PyPI) is deliberately NOT wired here — add the
+# relevant plugin (@semantic-release/exec, semantic-release-cargo, etc.) per repo.
+name: Release
+
+on:
+  push:
+    branches: [__DEFAULT_BRANCH__]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  release:
+    name: semantic-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: lts/*
+      - uses: cycjimmy/semantic-release-action@v6.0.0
+        with:
+          extra_plugins: |
+            @semantic-release/changelog@6
+            @semantic-release/git@10
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
