@@ -115,6 +115,33 @@ def _as_text(value: str | bytes | None) -> str:
     return value
 
 
+def _run_meta(
+    argv: tuple[str, ...],
+    *,
+    exit_code: int,
+    duration_s: float,
+    stdout: str,
+    stderr: str,
+) -> RunMeta:
+    """Assemble the provenance of one finished-or-failed esbmc invocation.
+
+    The single place that turns a subprocess outcome into a `RunMeta`, so the
+    version banner is parsed from the captured output the same way on every
+    exit path. esbmc prints its banner before it starts solving, so a run that
+    times out *after* the banner still records the build here — provenance the
+    success-only version parse used to drop. When no banner was captured (the
+    binary never ran, or the timeout fired first) `esbmc_version` stays empty.
+    """
+    return RunMeta(
+        esbmc_version=_parse_version(stdout) or _parse_version(stderr),
+        argv=argv,
+        exit_code=exit_code,
+        duration_s=duration_s,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
 def _encode_timeout_s(timeout_s: float) -> str:
     """esbmc's `--timeout` value for a budget of `timeout_s` seconds.
 
@@ -207,9 +234,8 @@ def verify(
         # PermissionError and other OSErrors become a typed Error too, never a
         # leaked exception, per the wrapper's "invocation failures are Error"
         # invariant.
-        meta = RunMeta(
-            esbmc_version="",
-            argv=argv,
+        meta = _run_meta(
+            argv,
             exit_code=-1,
             duration_s=time.monotonic() - start,
             stdout="",
@@ -222,9 +248,8 @@ def verify(
         )
         return Error(meta, message)
     except subprocess.TimeoutExpired as exc:
-        meta = RunMeta(
-            esbmc_version="",
-            argv=argv,
+        meta = _run_meta(
+            argv,
             exit_code=-1,
             duration_s=time.monotonic() - start,
             stdout=_as_text(exc.stdout),
@@ -232,9 +257,8 @@ def verify(
         )
         return Unknown(meta, UnknownReason.TIMEOUT)
 
-    meta = RunMeta(
-        esbmc_version=_parse_version(proc.stdout) or _parse_version(proc.stderr),
-        argv=argv,
+    meta = _run_meta(
+        argv,
         exit_code=proc.returncode,
         duration_s=time.monotonic() - start,
         stdout=proc.stdout,
