@@ -6,7 +6,7 @@ name: Release
 
 on:
   push:
-    branches: [__DEFAULT_BRANCH__]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
