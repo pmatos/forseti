@@ -57,3 +57,28 @@ def test_subprocess_timeout_is_unknown_timeout(
     assert result.reason is UnknownReason.TIMEOUT
     # partial output captured on the result, decoded to text
     assert result.meta.stdout == "partial output\n"
+
+
+def test_timeout_after_version_banner_records_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # esbmc prints its version banner before it starts solving, so a run that
+    # later times out still carries the banner in its captured output. The
+    # engine build is provenance worth keeping even on an inconclusive verdict,
+    # so it must be parsed from the captured output on the timeout path too, not
+    # only on the success path.
+    src = tmp_path / "x.c"
+    src.write_text("int main(void){ return 0; }\n")
+
+    def boom(*args: object, **kwargs: object) -> object:
+        raise subprocess.TimeoutExpired(
+            cmd="esbmc",
+            timeout=1.0,
+            output=b"ESBMC version 8.3.0 64-bit x86_64 linux\nSolving...\n",
+        )
+
+    monkeypatch.setattr("forseti.esbmc.runner.subprocess.run", boom)
+    result = verify(src, unwind=4, timeout_s=1.0)
+    assert isinstance(result, Unknown)
+    assert result.reason is UnknownReason.TIMEOUT
+    assert result.meta.esbmc_version == "8.3.0"
