@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 from .harness import (
+    HARNESS_MACROS,
     BufferParam,
     HarnessError,
     SemanticSpec,
@@ -326,13 +327,13 @@ def validate_candidate(
             return f"unsafe domain expr {pre!r}: {unsafe}"
 
     expr_idents = _identifiers(spec.expression)
-    if RESULT_IDENT not in expr_idents and not (set(expr_idents) - _MACROS):
+    if RESULT_IDENT not in expr_idents and not (set(expr_idents) - HARNESS_MACROS):
         return "vacuous expression: references neither a parameter nor the result"
     for pre in spec.domain:
         pre_idents = _identifiers(pre)
         if RESULT_IDENT in pre_idents:
             return f"domain expr {pre!r} references the result (unavailable pre-call)"
-        if not (set(pre_idents) - _MACROS):
+        if not (set(pre_idents) - HARNESS_MACROS):
             return f"vacuous domain expr {pre!r}: references no parameter"
 
     if signature is not None:
@@ -341,7 +342,7 @@ def validate_candidate(
             p.name for p in signature.params if isinstance(p, BufferParam) and p.out
         }
         input_params = params - output_params
-        allowed = params | {RESULT_IDENT} | _MACROS
+        allowed = params | {RESULT_IDENT} | HARNESS_MACROS
         for ident in expr_idents:
             if ident not in allowed:
                 return f"expression references unknown identifier {ident!r}"
@@ -357,7 +358,7 @@ def validate_candidate(
             return render_block
         for pre in spec.domain:
             for ident in _identifiers(pre):
-                if ident not in (input_params | _MACROS):
+                if ident not in (input_params | HARNESS_MACROS):
                     return f"domain expr {pre!r} references unknown ident {ident!r}"
         for name in spec.referenced_params:
             if name not in params:
@@ -365,55 +366,9 @@ def validate_candidate(
     return None
 
 
-# Standard limit macros a pure property may name without a declaration. Every
-# entry is defined by one of the headers the harness writer emits by default
-# (`limits.h` / `stdint.h` / `stddef.h`), so an accepted candidate that uses one
-# still renders to a *compilable* harness -- the allowlist and the emitted
-# includes are kept in lockstep (#81). POSIX-only names (e.g. SSIZE_MAX) are
-# deliberately excluded: they are not guaranteed by those standard headers.
-_MACROS = frozenset(
-    [
-        "NULL",
-        "CHAR_MIN",
-        "CHAR_MAX",
-        "SCHAR_MIN",
-        "SCHAR_MAX",
-        "UCHAR_MAX",
-        "SHRT_MIN",
-        "SHRT_MAX",
-        "USHRT_MAX",
-        "INT_MIN",
-        "INT_MAX",
-        "UINT_MAX",
-        "LONG_MIN",
-        "LONG_MAX",
-        "ULONG_MAX",
-        "LLONG_MIN",
-        "LLONG_MAX",
-        "ULLONG_MAX",
-        "INT8_MIN",
-        "INT8_MAX",
-        "UINT8_MAX",
-        "INT16_MIN",
-        "INT16_MAX",
-        "UINT16_MAX",
-        "INT32_MIN",
-        "INT32_MAX",
-        "UINT32_MAX",
-        "INT64_MIN",
-        "INT64_MAX",
-        "UINT64_MAX",
-        "INTMAX_MIN",
-        "INTMAX_MAX",
-        "UINTMAX_MAX",
-        "INTPTR_MIN",
-        "INTPTR_MAX",
-        "UINTPTR_MAX",
-        "SIZE_MAX",
-        "PTRDIFF_MIN",
-        "PTRDIFF_MAX",
-    ]
-)
+# The macro allowlist (`HARNESS_MACROS`) is owned by the harness writer -- the
+# module that emits the includes -- so the accepted-without-declaration set and
+# the emitted headers cannot drift out of lockstep (#81).
 
 _NUMERIC_LITERAL = re.compile(r"\b0[xX][0-9A-Fa-f]+[uUlL]*\b|\b\d+[uUlL]*\b")
 _IDENT = re.compile(r"[A-Za-z_]\w*")

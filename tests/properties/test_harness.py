@@ -393,3 +393,78 @@ def _semantic_property(
         provenance=Provenance("proposer-v1", "1"),
         domain=domain,
     )
+
+
+# The full macro allowlist as of the #81 consolidation, pasted as a known-good
+# literal. This is an *independent* second construction of the set: the harness
+# derives HARNESS_MACROS by union over the headers in DEFAULT_INCLUDES, so a
+# miscategorised or typo'd macro in that header map makes the two disagree and
+# this guard fails. It also pins behaviour across the proposer._MACROS move.
+_EXPECTED_HARNESS_MACROS = frozenset(
+    {
+        "NULL",
+        "CHAR_MIN",
+        "CHAR_MAX",
+        "SCHAR_MIN",
+        "SCHAR_MAX",
+        "UCHAR_MAX",
+        "SHRT_MIN",
+        "SHRT_MAX",
+        "USHRT_MAX",
+        "INT_MIN",
+        "INT_MAX",
+        "UINT_MAX",
+        "LONG_MIN",
+        "LONG_MAX",
+        "ULONG_MAX",
+        "LLONG_MIN",
+        "LLONG_MAX",
+        "ULLONG_MAX",
+        "INT8_MIN",
+        "INT8_MAX",
+        "UINT8_MAX",
+        "INT16_MIN",
+        "INT16_MAX",
+        "UINT16_MAX",
+        "INT32_MIN",
+        "INT32_MAX",
+        "UINT32_MAX",
+        "INT64_MIN",
+        "INT64_MAX",
+        "UINT64_MAX",
+        "INTMAX_MIN",
+        "INTMAX_MAX",
+        "UINTMAX_MAX",
+        "INTPTR_MIN",
+        "INTPTR_MAX",
+        "UINTPTR_MAX",
+        "SIZE_MAX",
+        "PTRDIFF_MIN",
+        "PTRDIFF_MAX",
+    }
+)
+
+
+def test_harness_macros_match_known_good_set() -> None:
+    from forseti.properties.harness import HARNESS_MACROS
+
+    assert HARNESS_MACROS == _EXPECTED_HARNESS_MACROS
+
+
+def test_default_includes_are_emitted_and_named_once() -> None:
+    # HARNESS_MACROS is only sound because the default harness emits these
+    # headers; the derivation ties the allowlist to DEFAULT_INCLUDES so the two
+    # cannot drift out of lockstep (#81). Assert render emits exactly the headers
+    # DEFAULT_INCLUDES names, in order, and that representative macros from each
+    # default header are in the allowlist.
+    from forseti.properties.harness import DEFAULT_INCLUDES, HARNESS_MACROS
+
+    assert DEFAULT_INCLUDES == ("stdint.h", "stddef.h", "limits.h")
+    out = render_semantic_harness(
+        unit_source=ABS_SLICE,
+        signature=ABS_SIG,
+        spec=SemanticSpec("result >= 0"),
+    )
+    for header in DEFAULT_INCLUDES:
+        assert f"#include <{header}>" in out
+    assert {"INT_MIN", "SIZE_MAX", "NULL"} <= HARNESS_MACROS

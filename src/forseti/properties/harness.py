@@ -24,6 +24,79 @@ from dataclasses import dataclass
 
 from .model import Property, PropertyKind
 
+# Standard headers the semantic harness emits by default. Every macro a pure
+# property may name without a declaration is guaranteed by one of these, so the
+# allowlist below stays in lockstep with what the emitted C actually declares.
+DEFAULT_INCLUDES: tuple[str, ...] = ("stdint.h", "stddef.h", "limits.h")
+
+# Standard limit/pointer macros grouped by the header that defines them. This is
+# the single source of truth: `HARNESS_MACROS` is derived by unioning the groups
+# whose header appears in `DEFAULT_INCLUDES`, so dropping a header from the
+# emitted includes automatically drops its macros from the allowlist -- the
+# lockstep is a property of this shape, not a hand-maintained comment (#81).
+# POSIX-only names (e.g. SSIZE_MAX) are deliberately absent: no standard header
+# here guarantees them, so an accepted candidate that used one would not compile.
+_MACROS_BY_HEADER: dict[str, frozenset[str]] = {
+    "limits.h": frozenset(
+        {
+            "CHAR_MIN",
+            "CHAR_MAX",
+            "SCHAR_MIN",
+            "SCHAR_MAX",
+            "UCHAR_MAX",
+            "SHRT_MIN",
+            "SHRT_MAX",
+            "USHRT_MAX",
+            "INT_MIN",
+            "INT_MAX",
+            "UINT_MAX",
+            "LONG_MIN",
+            "LONG_MAX",
+            "ULONG_MAX",
+            "LLONG_MIN",
+            "LLONG_MAX",
+            "ULLONG_MAX",
+        }
+    ),
+    "stdint.h": frozenset(
+        {
+            "INT8_MIN",
+            "INT8_MAX",
+            "UINT8_MAX",
+            "INT16_MIN",
+            "INT16_MAX",
+            "UINT16_MAX",
+            "INT32_MIN",
+            "INT32_MAX",
+            "UINT32_MAX",
+            "INT64_MIN",
+            "INT64_MAX",
+            "UINT64_MAX",
+            "INTMAX_MIN",
+            "INTMAX_MAX",
+            "UINTMAX_MAX",
+            "INTPTR_MIN",
+            "INTPTR_MAX",
+            "UINTPTR_MAX",
+            "SIZE_MAX",
+            "PTRDIFF_MIN",
+            "PTRDIFF_MAX",
+        }
+    ),
+    "stddef.h": frozenset({"NULL"}),
+}
+
+# Macros a pure property may reference without declaring them. Derived from the
+# headers actually emitted (`DEFAULT_INCLUDES`) so the allowlist cannot drift out
+# of lockstep with the harness's includes. The proposer's static gate imports
+# this rather than restating the set.
+HARNESS_MACROS: frozenset[str] = frozenset(
+    macro
+    for header, macros in _MACROS_BY_HEADER.items()
+    if header in DEFAULT_INCLUDES
+    for macro in macros
+)
+
 
 class HarnessError(ValueError):
     """The unit/property cannot be rendered into a valid harness (fail-loud)."""
@@ -96,7 +169,7 @@ def render_semantic_harness(
     unit_source: str,
     signature: UnitSignature,
     spec: SemanticSpec,
-    includes: Sequence[str] = ("stdint.h", "stddef.h", "limits.h"),
+    includes: Sequence[str] = DEFAULT_INCLUDES,
 ) -> str:
     """Return a compilable ESBMC harness (C text) for one semantic property.
 
