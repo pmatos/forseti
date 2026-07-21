@@ -12,6 +12,8 @@ pipeline the rest of W2 (Epic #3) hangs off.
 """
 
 from .harness import (
+    DEFAULT_INCLUDES,
+    HARNESS_MACROS,
     BufferParam,
     HarnessError,
     Param,
@@ -64,7 +66,9 @@ from .store import (
 )
 
 __all__ = [
+    "DEFAULT_INCLUDES",
     "DEFAULT_PROMPT",
+    "HARNESS_MACROS",
     "MAX_CANDIDATES_DEFAULT",
     "PROMPTS",
     "RESULT_IDENT",
