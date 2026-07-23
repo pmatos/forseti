@@ -250,6 +250,31 @@ def render_semantic_harness(
     return "\n".join(lines) + "\n"
 
 
+def render_property_harness(*, unit_source: str, symbol: str, prop: Property) -> str:
+    """Render a stored semantic Property into a compilable ESBMC harness (C text).
+
+    The "I only have the source slice + symbol" entry point over the writer:
+    parse the unit signature from the slice (`extract_signature`), project the
+    Property onto a `SemanticSpec` (`spec_from_property`), and render a
+    self-contained harness (`render_semantic_harness`). This is the recipe the
+    #66 check phase runs per property; it lives *here*, beside the three
+    functions it composes, so a driver need only ask for "the harness for this
+    property" rather than carry the knowledge that building one means
+    parse -> project -> render (`render_semantic_harness` alone wants a
+    pre-parsed `UnitSignature`; this is the variant that starts from source).
+
+    Fail-loud: a `HarnessError` from any leg -- an unparseable signature, a
+    non-semantic (reachability) property, or an un-renderable postcondition --
+    propagates unchanged, so a bad unit/property is never turned into a silent
+    mis-harness.
+    """
+    signature = extract_signature(unit_source, symbol)
+    spec = spec_from_property(prop)
+    return render_semantic_harness(
+        unit_source=unit_source, signature=signature, spec=spec
+    )
+
+
 def spec_from_property(prop: Property) -> SemanticSpec:
     """Project a semantic Property (#62) onto `SemanticSpec`.
 
