@@ -1,0 +1,1 @@
+Lets move the WORKFLOW.md out of tree and make it a workflow.yml like jsse has installed in $HOME/.config/symphonika.
