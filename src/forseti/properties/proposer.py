@@ -21,10 +21,14 @@ from __future__ import annotations
 
 import contextlib
 import json
-import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
+from .cexpr import identifiers, unsafe_reason
+
+# The macro allowlist (`HARNESS_MACROS`) is owned by the harness writer -- the
+# module that emits the includes -- so the accepted-without-declaration set and
+# the emitted headers cannot drift out of lockstep (#81).
 from .harness import (
     HARNESS_MACROS,
     BufferParam,
@@ -318,19 +322,19 @@ def validate_candidate(
     if spec.kind is not None and spec.kind != PropertyKind.SEMANTIC.value:
         return f"non-semantic kind {spec.kind!r} (semantic-only, ADR-0009 D2)"
 
-    unsafe = _unsafe(spec.expression)
+    unsafe = unsafe_reason(spec.expression)
     if unsafe is not None:
         return f"unsafe expression: {unsafe}"
     for pre in spec.domain:
-        unsafe = _unsafe(pre)
+        unsafe = unsafe_reason(pre)
         if unsafe is not None:
             return f"unsafe domain expr {pre!r}: {unsafe}"
 
-    expr_idents = _identifiers(spec.expression)
+    expr_idents = identifiers(spec.expression)
     if RESULT_IDENT not in expr_idents and not (set(expr_idents) - HARNESS_MACROS):
         return "vacuous expression: references neither a parameter nor the result"
     for pre in spec.domain:
-        pre_idents = _identifiers(pre)
+        pre_idents = identifiers(pre)
         if RESULT_IDENT in pre_idents:
             return f"domain expr {pre!r} references the result (unavailable pre-call)"
         if not (set(pre_idents) - HARNESS_MACROS):
@@ -357,60 +361,12 @@ def validate_candidate(
         if render_block is not None:
             return render_block
         for pre in spec.domain:
-            for ident in _identifiers(pre):
+            for ident in identifiers(pre):
                 if ident not in (input_params | HARNESS_MACROS):
                     return f"domain expr {pre!r} references unknown ident {ident!r}"
         for name in spec.referenced_params:
             if name not in params:
                 return f"referenced_params includes non-parameter {name!r}"
-    return None
-
-
-# The macro allowlist (`HARNESS_MACROS`) is owned by the harness writer -- the
-# module that emits the includes -- so the accepted-without-declaration set and
-# the emitted headers cannot drift out of lockstep (#81).
-
-_NUMERIC_LITERAL = re.compile(r"\b0[xX][0-9A-Fa-f]+[uUlL]*\b|\b\d+[uUlL]*\b")
-_IDENT = re.compile(r"[A-Za-z_]\w*")
-_CALL = re.compile(r"[A-Za-z_]\w*\s*\(")
-_RELATIONAL = re.compile(r"[=!<>]=")
-
-
-def _identifiers(expr: str) -> list[str]:
-    """Identifier tokens in `expr`, in first-seen order, numeric literals removed.
-
-    Stripping literals first keeps a hex constant like ``0x1F`` from being misread
-    as an identifier ``x1F``.
-    """
-    return _IDENT.findall(_NUMERIC_LITERAL.sub(" ", expr))
-
-
-def _unsafe(expr: str) -> str | None:
-    """None if `expr` is a pure C boolean expression, else why it is rejected.
-
-    Blocks statement separators, assignments (a bare ``=`` that is not part of a
-    relational operator), increment/decrement operators, backticks, function
-    calls, and unbalanced parentheses -- everything that would let a "property"
-    smuggle in a side effect. ``++``/``--`` matter because a ``domain`` clause is
-    emitted as ``__ESBMC_assume((<expr>))`` *before* the call, so mutating an
-    input there would change the value actually passed to the unit.
-    """
-    if ";" in expr:
-        return "contains ';'"
-    if "`" in expr:
-        return "contains a backtick"
-    if "++" in expr or "--" in expr:
-        return "contains an increment/decrement operator"
-    if "<<=" in expr or ">>=" in expr:
-        # `_RELATIONAL` would strip the `<=`/`>=` embedded in `<<=`/`>>=`, hiding
-        # the compound assignment from the bare-`=` check below; catch it first.
-        return "contains a compound assignment operator"
-    if "=" in _RELATIONAL.sub("", expr):
-        return "contains an assignment"
-    if _CALL.search(expr):
-        return "contains a function call"
-    if expr.count("(") != expr.count(")"):
-        return "unbalanced parentheses"
     return None
 
 

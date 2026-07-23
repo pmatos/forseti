@@ -22,6 +22,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from .cexpr import derefs_or_subscripts, identifiers, references
 from .model import Property, PropertyKind
 
 # Standard headers the semantic harness emits by default. Every macro a pure
@@ -194,7 +195,7 @@ def render_semantic_harness(
         )
 
     returns_void = signature.return_ctype.strip() == "void"
-    if returns_void and _references(postcondition, spec.result_var):
+    if returns_void and references(postcondition, spec.result_var):
         raise HarnessError(
             f"postcondition references {spec.result_var!r} but "
             f"{signature.symbol!r} returns void"
@@ -303,7 +304,7 @@ def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | 
         if isinstance(p, BufferParam) and _is_scalar_backed(p)
     }
     for name in scalar_outputs:
-        if _derefs_or_subscripts(spec.postcondition, name):
+        if derefs_or_subscripts(spec.postcondition, name):
             return (
                 f"expression dereferences/subscripts scalar-backed output "
                 f"{name!r}; the harness binds it as a scalar -- name it directly"
@@ -313,7 +314,7 @@ def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | 
     # spuriously flagged by an input-only precondition such as `x < 10u`.
     for pre in spec.preconditions:
         for name in output_params:
-            if _references(pre, name):
+            if references(pre, name):
                 return (
                     f"domain expr {pre!r} constrains output parameter "
                     f"{name!r} (preconditions apply to inputs only)"
@@ -445,19 +446,17 @@ def _split_assumptions(
     bound and the buffer predicate as separate `domain` entries instead.
     """
     buffer_names = {buf.name for buf in buffers}
-    length_idents = {
-        ident for buf in buffers for ident in re.findall(r"[A-Za-z_]\w*", buf.length)
-    }
+    length_idents = {ident for buf in buffers for ident in identifiers(buf.length)}
     pre_buffer: list[str] = []
     post_buffer: list[str] = []
     for raw in preconditions:
         stripped = raw.strip()
         if not stripped:
             continue
-        if not any(_references(stripped, name) for name in buffer_names):
+        if not any(references(stripped, name) for name in buffer_names):
             pre_buffer.append(stripped)
             continue
-        if any(_references(stripped, ident) for ident in length_idents):
+        if any(references(stripped, ident) for ident in length_idents):
             raise HarnessError(
                 f"precondition {stripped!r} constrains both a buffer and a "
                 "buffer-length identifier; split it into separate domain entries "
@@ -465,25 +464,6 @@ def _split_assumptions(
             )
         post_buffer.append(stripped)
     return pre_buffer, post_buffer
-
-
-def _references(expr: str, ident: str) -> bool:
-    return re.search(rf"\b{re.escape(ident)}\b", expr) is not None
-
-
-def _derefs_or_subscripts(expr: str, name: str) -> bool:
-    """True if `name` is subscripted (``name[...]``) or dereferenced (``*name`` or
-    ``*(...name...)``) in `expr` -- the pointer uses a scalar binding cannot compile.
-
-    Best-effort: the parenthesized form catches ``*(cp + 0)`` / ``*(cp)`` that a
-    bare ``*name`` test misses; it does not see arbitrarily nested derefs.
-    """
-    n = re.escape(name)
-    return (
-        re.search(rf"\b{n}\s*\[", expr) is not None
-        or re.search(rf"\*\s*{n}\b", expr) is not None
-        or re.search(rf"\*\s*\([^()]*\b{n}\b", expr) is not None
-    )
 
 
 def _defines_main(source: str) -> bool:
