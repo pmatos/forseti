@@ -43,9 +43,7 @@ from forseti.properties import (
     HarnessError,
     Property,
     PropertyKind,
-    extract_signature,
-    render_semantic_harness,
-    spec_from_property,
+    render_property_harness,
 )
 
 from .ladder import LadderAttempt, validated_ladder, verify_ladder
@@ -140,21 +138,22 @@ class PropertyCheckRun:
 
 
 class SemanticHarnessWriter:
-    """The production `HarnessWriterPort`: render a semantic property via #64.
+    """The production `HarnessWriterPort`: a thin adapter over #64's writer.
 
-    Parses the unit signature from the slice (`extract_signature`), projects the
-    property onto a `SemanticSpec` (`spec_from_property`), and renders a
-    self-contained ESBMC harness (`render_semantic_harness`). Fail-loud: a
-    non-renderable unit/property raises `HarnessError` rather than emit a silent
-    mis-harness. Non-semantic properties are skipped by the driver *before* this
-    is reached (ADR-0009 D2), so `render` only ever sees semantic ones.
+    Adapts the driver's `Unit`/`RenderedHarness` carriers to
+    `render_property_harness`, the properties-domain recipe that owns the harness
+    knowledge (parse the signature from the slice -> project the property onto a
+    `SemanticSpec` -> render). Keeping the recipe in #64 (not here) is what lets
+    `check_properties` stay a pure driver that need not know how a stored
+    property becomes a harness. Fail-loud: a non-renderable unit/property raises
+    `HarnessError` rather than emit a silent mis-harness. Non-semantic properties
+    are skipped by the driver *before* this is reached (ADR-0009 D2), so `render`
+    only ever sees semantic ones.
     """
 
     def render(self, unit: Unit, prop: Property) -> RenderedHarness:
-        signature = extract_signature(unit.source_text, unit.symbol)
-        spec = spec_from_property(prop)
-        text = render_semantic_harness(
-            unit_source=unit.source_text, signature=signature, spec=spec
+        text = render_property_harness(
+            unit_source=unit.source_text, symbol=unit.symbol, prop=prop
         )
         return RenderedHarness(source_text=text)
 

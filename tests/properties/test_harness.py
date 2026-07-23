@@ -21,6 +21,7 @@ from forseti.properties import (
     UnitSignature,
     extract_signature,
     make_property_id,
+    render_property_harness,
     render_semantic_harness,
     renderability_reason,
     spec_from_property,
@@ -325,6 +326,81 @@ def test_spec_from_reachability_property_is_error() -> None:
     prop = _semantic_property("some_label", (), kind=PropertyKind.REACHABILITY)
     with pytest.raises(HarnessError):
         spec_from_property(prop)
+
+
+# render_property_harness is the "I only have source + symbol" entry point: it
+# parses the signature *from the slice* (extract_signature), projects the stored
+# Property onto a SemanticSpec (spec_from_property), and renders the harness
+# (render_semantic_harness). These tests target that composed behaviour -- the
+# signature being inferred from source, not handed in pre-parsed -- and the
+# fail-loud contract that a HarnessError from any leg of the recipe surfaces.
+
+
+def test_render_property_harness_parses_scalar_signature_and_renders() -> None:
+    out = render_property_harness(
+        unit_source=ABS_SLICE,
+        symbol="my_abs",
+        prop=_semantic_property("result >= 0", ("x > INT64_MIN",)),
+    )
+    assert ABS_SLICE in out  # the unit is inlined verbatim
+    # the scalar param and its type were recovered from the slice, not supplied
+    assert "int64_t x = nondet_int64_t();" in out
+    assert "int64_t result = my_abs(x);" in out
+    assert "__ESBMC_assume((x > INT64_MIN));" in out
+    assert '__ESBMC_assert((result >= 0), "forseti:semantic");' in out
+
+
+def test_render_property_harness_infers_buffer_and_output_from_source() -> None:
+    # The distinguishing behaviour vs render_semantic_harness: the (buffer,
+    # length) and trailing-output classification is inferred from the slice. A
+    # `uint32_t *cp` with no following length becomes a scalar-backed output
+    # (`uint32_t cp;`, passed by address), and `const unsigned char *b` with a
+    # following `unsigned len` becomes a nondet-filled VLA.
+    slice_ = (
+        "int decode(const unsigned char *b, unsigned len, uint32_t *cp)"
+        " { *cp = 0; return 1; }"
+    )
+    out = render_property_harness(
+        unit_source=slice_,
+        symbol="decode",
+        prop=_semantic_property(
+            "result <= 0 || cp <= 0x10FFFF", ("len >= 1 && len <= 4",)
+        ),
+    )
+    assert "unsigned char b[len];" in out  # (buffer, length) idiom inferred
+    assert "uint32_t cp;" in out  # scalar-backed output, not an array
+    assert "int result = decode(b, len, &cp);" in out  # output passed by address
+
+
+def test_render_property_harness_unparseable_symbol_raises() -> None:
+    # extract_signature can't find the symbol -> HarnessError surfaces.
+    with pytest.raises(HarnessError):
+        render_property_harness(
+            unit_source=ABS_SLICE,
+            symbol="not_there",
+            prop=_semantic_property("result >= 0", ()),
+        )
+
+
+def test_render_property_harness_reachability_property_raises() -> None:
+    # spec_from_property rejects a non-semantic kind -> HarnessError surfaces.
+    with pytest.raises(HarnessError):
+        render_property_harness(
+            unit_source=ABS_SLICE,
+            symbol="my_abs",
+            prop=_semantic_property("some_label", (), kind=PropertyKind.REACHABILITY),
+        )
+
+
+def test_render_property_harness_unrenderable_property_raises() -> None:
+    # Signature parses, but a void unit whose postcondition names `result` is
+    # unrenderable -> the render leg's HarnessError surfaces.
+    with pytest.raises(HarnessError):
+        render_property_harness(
+            unit_source="void consume(int x) { (void)x; }",
+            symbol="consume",
+            prop=_semantic_property("result >= 0", ()),
+        )
 
 
 def test_empty_postcondition_is_error() -> None:
