@@ -26,6 +26,9 @@ import pytest
         ("void f(void) { }", "f", False),  # no params
         ("unsigned f(const char *k, unsigned long n){return n;}", "f", True),
         ("void f(int (*cb)(void)) { }", "f", True),  # function-pointer param
+        ("int neg(int x /* input */) { return -x; }", "neg", False),  # comment '*'
+        ("int f(int *p /* ptr */) { return *p; }", "f", True),  # real ptr + comment
+        ("int g(int a, /* a */ int b) { return a + b; }", "g", False),  # mid-list
     ],
 )
 def test_pointer_param_detection(src: str, name: str, takes_pointer: bool) -> None:

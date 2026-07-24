@@ -147,16 +147,23 @@ class FuncDef:
     takes_pointer: bool
 
 
+# C comments (block `/* ... */`, possibly multi-line, and line `// ...`) so a `*`
+# inside a comment in the parameter list is not mistaken for a pointer declarator.
+_C_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
+
+
 def _params_take_pointer(params: str) -> bool:
     """True if a C parameter list has a pointer or array parameter.
 
     Heuristic (matches the definition regex's reach, not a parser): a `*` or `[`
-    anywhere in the parameter text means at least one parameter is a pointer, or
-    an array that decays to a pointer at the function boundary. Misses a pointer
-    hidden behind a typedef — acceptable for the same reason definition detection
-    is a regex (documented in the README).
+    anywhere in the parameter text — after stripping comments, so `/* ... */` /
+    `// ...` don't false-positive — means at least one parameter is a pointer, or
+    an array that decays to a pointer at the function boundary. Still misses a
+    pointer hidden behind a typedef, or a `*` inside a string literal; a real C
+    parse is the robust fix (documented in the README).
     """
-    return "*" in params or "[" in params
+    cleaned = _C_COMMENT_RE.sub(" ", params)
+    return "*" in cleaned or "[" in cleaned
 
 
 def extract_function_defs(source_text: str) -> list[FuncDef]:
