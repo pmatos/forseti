@@ -143,6 +143,16 @@ def is_valid_transition(current: PropertyStatus, requested: PropertyStatus) -> b
     return requested in _ALLOWED[current]
 
 
+def is_terminal(status: PropertyStatus) -> bool:
+    """True iff `status` admits no onward transition (`ACCEPTED`/`REJECTED`).
+
+    Derived from `_ALLOWED` (not a hardcoded pair) so it stays correct if the
+    lifecycle grows a new terminal state. A terminal property's fate is settled,
+    which is what lets `check_properties` (#84) treat it as an invalid check input.
+    """
+    return not _ALLOWED[status]
+
+
 def make_property_id(
     unit_id: str,
     kind: PropertyKind,

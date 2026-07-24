@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -168,11 +169,34 @@ class PropertyStore:
         row = cur.fetchone()
         return None if row is None else _row_to_property(row)
 
-    def list_for_unit(self, unit_id: str) -> tuple[Property, ...]:
-        """All properties for `unit_id`, in insertion order; `()` if none."""
-        cur = self._conn.execute(
-            "SELECT * FROM properties WHERE unit_id = ? ORDER BY rowid", (unit_id,)
-        )
+    def list_for_unit(
+        self,
+        unit_id: str,
+        statuses: Collection[PropertyStatus] | None = None,
+    ) -> tuple[Property, ...]:
+        """Properties for `unit_id`, in insertion order; `()` if none.
+
+        `statuses` scopes the read to a lifecycle subset (covered by the
+        `idx_properties_unit_status` index): `None` returns every row (the
+        default, unchanged); a collection returns only rows whose status is in
+        it, and an *empty* collection returns `()` (no status is selected).
+        Callers that must not feed terminal rows into a downstream verdict
+        (`check_properties`, #84) pass the valid-input subset here rather than
+        filter after the read.
+        """
+        if statuses is None:
+            cur = self._conn.execute(
+                "SELECT * FROM properties WHERE unit_id = ? ORDER BY rowid", (unit_id,)
+            )
+        elif not statuses:
+            return ()
+        else:
+            placeholders = ",".join("?" * len(statuses))
+            cur = self._conn.execute(
+                "SELECT * FROM properties WHERE unit_id = ? "
+                f"AND status IN ({placeholders}) ORDER BY rowid",
+                (unit_id, *(status.value for status in statuses)),
+            )
         return tuple(_row_to_property(row) for row in cur.fetchall())
 
     def update_status(self, property_id: str, new_status: PropertyStatus) -> Property:

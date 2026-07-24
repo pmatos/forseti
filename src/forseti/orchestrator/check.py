@@ -43,6 +43,8 @@ from forseti.properties import (
     HarnessError,
     Property,
     PropertyKind,
+    PropertyStatus,
+    is_terminal,
     render_property_harness,
 )
 
@@ -55,6 +57,15 @@ from .ports import (
     VerifyPort,
 )
 from .telemetry import EventEmitter, EventSink
+
+# Valid check inputs = non-terminal statuses only. Excludes ACCEPTED/REJECTED so
+# a property whose lifecycle is already settled is not re-verified back into the
+# counts()/held() set grading (#4) consumes (#84 — the discarded-REJECTED case
+# #66 flagged, and the already-decided ACCEPTED case the title generalizes to).
+# Which statuses are valid check inputs is genuinely open until #4 lands
+# (re-check GRADED? only CANDIDATE?); revisit this set there. Derived from
+# `is_terminal` (not a hardcoded pair) so a new terminal state is excluded too.
+_CHECKABLE_STATUSES = frozenset(s for s in PropertyStatus if not is_terminal(s))
 
 
 class PropertyOutcome(Enum):
@@ -169,9 +180,13 @@ def check_properties(
     unwind_ladder: tuple[int, ...] = (),
     sink: EventSink | None = None,
 ) -> PropertyCheckRun:
-    """Check every stored property for `unit`, returning a verdict per property.
+    """Check the checkable stored properties for `unit`, one verdict each.
 
-    For each property: emit a start event, then — a reachability property is
+    Only non-terminal properties are checked (`_CHECKABLE_STATUSES`): a terminal
+    `ACCEPTED`/`REJECTED` row is settled, so it is never rendered, verified, or
+    counted into the `counts()`/`held()` set grading (#4) consumes (#84).
+
+    For each remaining property: emit a start event, then — a reachability property is
     `SKIPPED` (ADR-0009 D2, never verified); a semantic property is rendered to a
     harness (written under `work_dir`, the file esbmc reads) and verified along
     `(unwind, *unwind_ladder)`, escalating on each `Unknown` and settling on the
@@ -185,7 +200,7 @@ def check_properties(
 
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    props = store.list_for_unit(unit.unit_id)
+    props = store.list_for_unit(unit.unit_id, _CHECKABLE_STATUSES)
     emit("properties.loaded", detail={"unit": unit.unit_id, "count": len(props)})
 
     verdicts: list[PropertyVerdict] = []
