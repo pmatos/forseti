@@ -16,7 +16,9 @@ server — the hooks call the neutral `forseti` CLI directly.
   **function level** (`esbmc --function <name>`): no `main`, no harness. ESBMC
   havocs the parameters and checks the built-in **safety** properties (memory
   safety, signed overflow, array bounds, division by zero, UB). A non-`VERIFIED`
-  verdict is fed straight back to Claude as the counterexample to fix.
+  verdict is fed straight back to Claude as the counterexample to fix — **except**
+  a unit that takes a **pointer/array parameter**, which is reported
+  `NEEDS_CONTRACT` and *not* gated (see the note under **Known limitations**).
 - **Stop hook** — blocks the turn from ending while any touched unit is not
   `VERIFIED up to k`. After `MAX_STOP_ATTEMPTS` (3) consecutive blocks with no
   fix, it lets the turn end but with a **loud** unverified residual — never a
@@ -147,6 +149,18 @@ turns a verdict into an error.
 - **No k-escalation.** The gate verifies at one fixed k; an `UNKNOWN` (e.g. a
   loop under-unwound) blocks with guidance to raise `FORSETI_UNWIND`, rather than
   laddering k automatically.
+- **Pointer/array units are not gated yet (`NEEDS_CONTRACT`).** At the function
+  level ESBMC passes a pointer parameter an *unconstrained* value (object identity
+  + offset over the whole object universe, including the invalid object), so any
+  `*p`/`p[i]` yields a **sound but unactionable** `dereference failure` — the code
+  isn't wrong; the caller-side memory precondition is simply absent. Rather than
+  feed that phantom back as a fixable counterexample (which made correct code loop
+  forever), a unit with a pointer/array parameter is classified `NEEDS_CONTRACT`
+  by **signature** (never by matching the cex text — a real out-of-bounds prints
+  the same string): the ESBMC run is skipped, the unit is **not** gated, and it is
+  reported loudly but non-blocking. Actually verifying these — by generating a
+  memory precondition/harness — is [#122](https://github.com/pmatos/forseti/issues/122)
+  (design in [RFC-0003](../../docs/design/0003-memory-preconditions.md)).
 - **Safety only.** Functional correctness beyond the built-in safety checks is
   the v1 semantic-property path.
 - **Very slow, many-function files.** Verdicts persist incrementally so a hook

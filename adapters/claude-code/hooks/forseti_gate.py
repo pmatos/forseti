@@ -79,8 +79,21 @@ _KEYWORDS = {
 _FUNC_RE = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_ \t\*]*?[ \t\*]"
     r"([A-Za-z_][A-Za-z0-9_]*)"
-    r"[ \t]*\([^;{}]*\)[ \t\r\n]*\{",
+    r"[ \t]*\(([^;{}]*)\)[ \t\r\n]*\{",
     re.MULTILINE,
+)
+
+# Verdict string for a unit the gate declines to check at the function level: it
+# takes a pointer/array parameter, so an unconstrained (havoc'd) caller makes the
+# function-level memory-safety verdict meaningless — a *sound* but unactionable
+# `dereference failure`. Rather than feed that phantom back as a fixable
+# counterexample, the gate marks the unit NEEDS_CONTRACT: not verified, but
+# non-blocking and loudly reported. A generated memory precondition/harness
+# (issue #122, stage S2) is what will actually verify these. See RFC-0003.
+NEEDS_CONTRACT = "needs_contract"
+_NEEDS_CONTRACT_DETAIL = (
+    "pointer/array parameter(s); function-level safety is unreliable without a "
+    "memory precondition/harness — not gated (see issue #122)"
 )
 
 
@@ -97,7 +110,7 @@ class UnitVerdict:
     unit_id: str  # "relpath::symbol"
     file: str
     function: str
-    verdict: str  # verified | violated | unknown | error
+    verdict: str  # verified | violated | unknown | error | needs_contract
     k: int
     counterexample: str | None = None
     detail: str | None = None
@@ -121,14 +134,47 @@ def is_c_source(path: str | os.PathLike[str]) -> bool:
     return Path(path).suffix.lower() in C_SUFFIXES
 
 
-def extract_functions(source_text: str) -> list[str]:
-    """Names of top-level functions defined in `source_text` (heuristic, deduped)."""
-    seen: list[str] = []
+@dataclass(frozen=True)
+class FuncDef:
+    """A top-level function definition the gate found.
+
+    `takes_pointer` is true when any parameter is a pointer or array — the case
+    the function-level gate cannot verify without a materialized backing object
+    (`NEEDS_CONTRACT`).
+    """
+
+    name: str
+    takes_pointer: bool
+
+
+def _params_take_pointer(params: str) -> bool:
+    """True if a C parameter list has a pointer or array parameter.
+
+    Heuristic (matches the definition regex's reach, not a parser): a `*` or `[`
+    anywhere in the parameter text means at least one parameter is a pointer, or
+    an array that decays to a pointer at the function boundary. Misses a pointer
+    hidden behind a typedef — acceptable for the same reason definition detection
+    is a regex (documented in the README).
+    """
+    return "*" in params or "[" in params
+
+
+def extract_function_defs(source_text: str) -> list[FuncDef]:
+    """Top-level function definitions in `source_text` (heuristic, deduped by name)."""
+    seen: set[str] = set()
+    defs: list[FuncDef] = []
     for match in _FUNC_RE.finditer(source_text):
         name = match.group(1)
-        if name not in _KEYWORDS and name not in seen:
-            seen.append(name)
-    return seen
+        if name in _KEYWORDS or name in seen:
+            continue
+        seen.add(name)
+        defs.append(FuncDef(name, _params_take_pointer(match.group(2))))
+    return defs
+
+
+def extract_functions(source_text: str) -> list[str]:
+    """Names of top-level functions defined in `source_text` (heuristic, deduped)."""
+    return [d.name for d in extract_function_defs(source_text)]
 
 
 def unit_id(project_dir: str, file_path: str) -> str:
@@ -289,9 +335,40 @@ def prune_missing_units(
         del state["units"][uid]
 
 
-def unverified_units(state: dict) -> list[dict]:
-    """Every tracked unit whose latest verdict is not `verified`."""
-    return [u for u in state["units"].values() if u.get("verdict") != "verified"]
+_NON_BLOCKING_VERDICTS = frozenset({"verified", NEEDS_CONTRACT})
+
+
+def blocking_units(state: dict) -> list[dict]:
+    """Units the Stop-gate must block on: not `verified` and not `needs_contract`.
+
+    `verified` passed; `needs_contract` is honestly-unverified but is not something
+    a source fix can resolve (it needs a generated harness — issue #122), so it is
+    reported loudly yet never blocks. Everything else (`violated` / `unknown` /
+    `error`, incl. the pre-recorded pending `unknown`) blocks — preserving the
+    kill-safety guarantee that a not-yet-verified unit cannot silently pass.
+    """
+    return [
+        u
+        for u in state["units"].values()
+        if u.get("verdict") not in _NON_BLOCKING_VERDICTS
+    ]
+
+
+def needs_contract_units(state: dict) -> list[dict]:
+    """Units marked `needs_contract` — reported as a loud residual, never blocking."""
+    return [u for u in state["units"].values() if u.get("verdict") == NEEDS_CONTRACT]
+
+
+def _needs_contract_verdict(rel: str, function: str, k: int) -> UnitVerdict:
+    """The `NEEDS_CONTRACT` verdict for a pointer/array-taking unit (no ESBMC run)."""
+    return UnitVerdict(
+        f"{rel}::{function}",
+        rel,
+        function,
+        NEEDS_CONTRACT,
+        k,
+        detail=_NEEDS_CONTRACT_DETAIL,
+    )
 
 
 def verify_and_record(
@@ -309,7 +386,7 @@ def verify_and_record(
     """
     rel = unit_id(project_dir, file_path)
     try:
-        functions = extract_functions(Path(file_path).read_text())
+        defs = extract_function_defs(Path(file_path).read_text())
     except OSError as exc:
         verdict = UnitVerdict(f"{rel}::?", rel, "?", "error", k, detail=str(exc))
         with gate_lock(project_dir):
@@ -319,26 +396,43 @@ def verify_and_record(
             save_state(project_dir, state)
         return [verdict]
 
-    # Reconcile + mark every current function pending BEFORE the slow verifies:
-    # drop functions the file no longer defines, reset the Stop-gate's patience,
-    # and pre-record each current function as `unknown` so a mid-run kill leaves
-    # the not-yet-verified ones blocking rather than absent.
+    # Reconcile + record every current function BEFORE the slow verifies: drop
+    # functions the file no longer defines, reset the Stop-gate's patience, and
+    # pre-record each — a pointer/array-taking unit as its final `needs_contract`
+    # (we skip its meaningless function-level verify), every other as pending
+    # `unknown` so a mid-run kill leaves the not-yet-verified ones blocking
+    # rather than absent.
     with gate_lock(project_dir):
         state = load_state(project_dir)
         state["stop_attempts"] = 0
-        prune_missing_units(state, project_dir, file_path, set(functions))
-        for fn in functions:
-            record(
-                state,
-                UnitVerdict(
-                    f"{rel}::{fn}", rel, fn, "unknown", k, detail="verification pending"
-                ),
-            )
+        prune_missing_units(state, project_dir, file_path, {d.name for d in defs})
+        for d in defs:
+            if d.takes_pointer:
+                record(state, _needs_contract_verdict(rel, d.name, k))
+            else:
+                record(
+                    state,
+                    UnitVerdict(
+                        f"{rel}::{d.name}",
+                        rel,
+                        d.name,
+                        "unknown",
+                        k,
+                        detail="verification pending",
+                    ),
+                )
         save_state(project_dir, state)
 
     verdicts: list[UnitVerdict] = []
-    for fn in functions:
-        verdict = verify_function(file_path, fn, project_dir=project_dir, k=k)
+    for d in defs:
+        if d.takes_pointer:
+            # Signature-based, a priori: skip the (meaningless) function-level
+            # verify — no ESBMC call — and report NEEDS_CONTRACT. Classifying by
+            # signature, never by matching "dereference failure" in a cex, keeps a
+            # genuine out-of-bounds bug (same string) from being suppressed.
+            verdicts.append(_needs_contract_verdict(rel, d.name, k))
+            continue
+        verdict = verify_function(file_path, d.name, project_dir=project_dir, k=k)
         verdicts.append(verdict)
         with gate_lock(project_dir):  # overwrite the pending entry
             state = load_state(project_dir)
