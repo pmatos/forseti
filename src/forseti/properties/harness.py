@@ -184,23 +184,11 @@ def render_semantic_harness(
     clashing a param name, a void return referenced by `result_var`, a
     `unit_source` that defines its own ``main``, or an unknown Param subtype).
     """
-    postcondition = spec.postcondition.strip()
-    if not postcondition:
-        raise HarnessError("semantic property has an empty postcondition")
-
-    param_names = {p.name for p in signature.params}
-    if spec.result_var in param_names:
-        raise HarnessError(
-            f"result_var {spec.result_var!r} collides with a parameter name"
-        )
-
-    returns_void = signature.return_ctype.strip() == "void"
-    if returns_void and references(postcondition, spec.result_var):
-        raise HarnessError(
-            f"postcondition references {spec.result_var!r} but "
-            f"{signature.symbol!r} returns void"
-        )
-
+    # The source-level guard needs `unit_source`, so it stays here; every
+    # `(signature, spec)` guard -- empty postcondition, `result_var` clash, void
+    # return, the two emission rules, and a precondition mixing a buffer with its
+    # length -- is delegated to the single static authority so the renderer and the
+    # proposer's gate consult one predicate.
     if _defines_main(unit_source):
         raise HarnessError(
             "unit_source defines main; pass the kernel slice, not the example harness"
@@ -209,6 +197,9 @@ def render_semantic_harness(
     reason = renderability_reason(signature, spec)
     if reason is not None:
         raise HarnessError(reason)
+
+    postcondition = spec.postcondition.strip()
+    returns_void = signature.return_ctype.strip() == "void"
 
     scalars: list[ScalarParam] = []
     buffers: list[BufferParam] = []
@@ -300,26 +291,50 @@ def spec_from_property(prop: Property) -> SemanticSpec:
 def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | None:
     """None if `spec` renders to compilable, sound C for `signature`, else why not.
 
-    The static, parser-free authority on two emission rules the postcondition and
-    preconditions must obey -- kept *here*, the module that emits the C, so callers
-    (the proposer's static gate, the renderer itself) need not re-derive harness
-    internals:
+    The static, parser-free, source-free authority on whether a `(signature, spec)`
+    pair can become a valid harness -- kept *here*, the module that emits the C, so
+    callers (the proposer's static gate, `render_semantic_harness` itself) consult
+    one predicate instead of re-deriving harness internals. It covers, in order:
 
-    * A **scalar-backed output** (a trailing single-element ``out`` buffer) is
-      bound as a plain scalar passed by address, so the postcondition may only
-      *name* it -- dereferencing or subscripting it (``*cp``, ``cp[0]``,
-      ``*(cp + 0)``) would deref/subscript a non-pointer and fail to compile.
-    * A **precondition** is emitted as ``__ESBMC_assume(...)`` *before* the call,
-      so it may not constrain an **output** parameter -- that would preconstrain a
-      would-be result on uninitialized storage, masking a unit that never writes
-      it; domains constrain inputs only.
+    * an **empty postcondition** -- there is nothing to assert;
+    * a **`result_var` that collides with a parameter name** -- the result binding
+      would shadow the parameter;
+    * a **`result_var` referenced under a void return** -- there is no result to
+      bind;
+    * a **scalar-backed output** (a trailing single-element ``out`` buffer) that is
+      dereferenced or subscripted (``*cp``, ``cp[0]``, ``*(cp + 0)``) -- it is bound
+      as a plain scalar passed by address, so the postcondition may only *name* it;
+    * a **precondition constraining an output parameter** -- emitted as
+      ``__ESBMC_assume(...)`` *before* the call, it would preconstrain a would-be
+      result on uninitialized storage, masking a unit that never writes it; domains
+      constrain inputs only.
+    * a **precondition mixing a buffer and its length** -- a single clause naming
+      both a buffer and a buffer-length identifier (``n >= 1 && a[0] >= 0``) has no
+      correct emission point: the length bound must precede the ``int a[n]`` VLA and
+      the buffer-content predicate must follow it, so it is rejected rather than
+      mis-ordered (the renderer's `_split_assumptions` reuses this very predicate).
 
-    Best-effort and conservative: it may over-reject an exotic postcondition, but a
-    rejected *renderable* property is safe whereas emitting un-compilable C is not.
-    It does not duplicate the structural guards `render_semantic_harness` raises on
-    directly (empty postcondition, `result_var` clash, void return, a `unit_source`
-    that defines ``main``).
+    Best-effort and conservative on the emission rules: it may over-reject an exotic
+    postcondition, but a rejected *renderable* property is safe whereas emitting
+    un-compilable C is not. It does **not** cover the one structural guard that needs
+    the source text -- a `unit_source` that defines its own ``main`` -- which
+    `render_semantic_harness` checks directly.
     """
+    if not spec.postcondition.strip():
+        return "semantic property has an empty postcondition"
+
+    param_names = {p.name for p in signature.params}
+    if spec.result_var in param_names:
+        return f"result_var {spec.result_var!r} collides with a parameter name"
+
+    if signature.return_ctype.strip() == "void" and references(
+        spec.postcondition, spec.result_var
+    ):
+        return (
+            f"postcondition references {spec.result_var!r} but "
+            f"{signature.symbol!r} returns void"
+        )
+
     output_params = [
         p.name for p in signature.params if isinstance(p, BufferParam) and p.out
     ]
@@ -344,7 +359,10 @@ def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | 
                     f"domain expr {pre!r} constrains output parameter "
                     f"{name!r} (preconditions apply to inputs only)"
                 )
-    return None
+    return _mixed_buffer_length_reason(
+        spec.preconditions,
+        [p for p in signature.params if isinstance(p, BufferParam)],
+    )
 
 
 _STORAGE_SPECIFIERS = frozenset({"static", "inline", "extern", "_Noreturn"})
@@ -452,6 +470,35 @@ def _is_scalar_backed(buf: BufferParam) -> bool:
     return buf.out and buf.length.strip() == "1"
 
 
+def _mixed_buffer_length_reason(
+    preconditions: Sequence[str], buffers: Sequence[BufferParam]
+) -> str | None:
+    """Why a precondition cannot be ordered around its VLA, or None if all can.
+
+    A single clause that constrains *both* a buffer and a buffer-length identifier
+    (e.g. ``n >= 1 && n <= 2 && a[0] >= 0``) has no correct emission point: the
+    length bound must precede the ``int a[n]`` VLA declaration, the buffer-content
+    predicate must follow the nondet fill, and splitting arbitrary C on ``&&`` is
+    unsound under ``||`` precedence. Source-free -- it needs only the
+    signature-derived buffers and the spec's preconditions -- so it is a
+    `(signature, spec)` guard `renderability_reason` owns and `_split_assumptions`
+    reuses: one rule, two callers, one message.
+    """
+    buffer_names = {buf.name for buf in buffers}
+    length_idents = {ident for buf in buffers for ident in identifiers(buf.length)}
+    for raw in preconditions:
+        stripped = raw.strip()
+        if not stripped or not any(references(stripped, n) for n in buffer_names):
+            continue
+        if any(references(stripped, ident) for ident in length_idents):
+            return (
+                f"precondition {stripped!r} constrains both a buffer and a "
+                "buffer-length identifier; split it into separate domain entries "
+                "so the length bound can precede the VLA it sizes"
+            )
+    return None
+
+
 def _split_assumptions(
     preconditions: Sequence[str], buffers: Sequence[BufferParam]
 ) -> tuple[list[str], list[str]]:
@@ -463,31 +510,28 @@ def _split_assumptions(
     stay *before* the VLA declaration it sizes. Blank entries are dropped.
     Returns ``(pre_buffer, post_buffer)``.
 
-    A single clause that constrains *both* a buffer and a buffer-length
-    identifier (e.g. ``n >= 1 && n <= 2 && a[0] >= 0``) cannot be placed
-    correctly — the length bound must precede the VLA, the buffer predicate must
-    follow it — so it is rejected with `HarnessError` (splitting arbitrary C on
-    ``&&`` is unsound under ``||`` precedence). The caller supplies the length
-    bound and the buffer predicate as separate `domain` entries instead.
+    A single clause constraining *both* a buffer and a buffer-length identifier
+    cannot be placed correctly; `_mixed_buffer_length_reason` -- the same guard
+    `renderability_reason` consults statically -- names why, raised here as
+    `HarnessError`. The caller supplies the length bound and the buffer predicate
+    as separate `domain` entries instead. (In practice `render_semantic_harness`
+    delegates to `renderability_reason` first, so this raise is the renderer's
+    own invariant rather than the only line of defense.)
     """
+    mixed = _mixed_buffer_length_reason(preconditions, buffers)
+    if mixed is not None:
+        raise HarnessError(mixed)
     buffer_names = {buf.name for buf in buffers}
-    length_idents = {ident for buf in buffers for ident in identifiers(buf.length)}
     pre_buffer: list[str] = []
     post_buffer: list[str] = []
     for raw in preconditions:
         stripped = raw.strip()
         if not stripped:
             continue
-        if not any(references(stripped, name) for name in buffer_names):
+        if any(references(stripped, name) for name in buffer_names):
+            post_buffer.append(stripped)
+        else:
             pre_buffer.append(stripped)
-            continue
-        if any(references(stripped, ident) for ident in length_idents):
-            raise HarnessError(
-                f"precondition {stripped!r} constrains both a buffer and a "
-                "buffer-length identifier; split it into separate domain entries "
-                "so the length bound can precede the VLA it sizes"
-            )
-        post_buffer.append(stripped)
     return pre_buffer, post_buffer
 
 

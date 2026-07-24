@@ -50,7 +50,6 @@ from .prompts import (
 from .proposer import (
     CandidateSpec,
     CandidateStore,
-    HarnessRenderer,
     ProposalParseError,
     ProposalRequest,
     ProposalResult,
@@ -82,7 +81,6 @@ __all__ = [
     "Grading",
     "GradingVerdict",
     "HarnessError",
-    "HarnessRenderer",
     "InvalidStatusTransition",
     "LLMClient",
     "LLMError",
