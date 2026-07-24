@@ -175,14 +175,17 @@ _OUT_SLICE = "int decode(uint32_t *cp) { *cp = 0; return 1; }"
         "*(cp) == 0",
         "(int)*cp == 0",  # a cast's `)` before `*` is a unary deref, not a multiply
         "(uint32_t) * cp == 0",
+        "(char * const)*cp == 0",  # a qualified pointer cast, still a unary deref
+        "sizeof *cp >= 4",  # `sizeof *cp` is `sizeof(*cp)`, a deref on a scalar
     ],
 )
 def test_scalar_backed_output_deref_is_error(expr: str) -> None:
     # A scalar-backed output is bound as a plain scalar; dereferencing or
     # subscripting it would not compile, so the harness refuses to emit it rather
     # than leak un-compilable C to esbmc. `*(cp + 0)`/`*(cp)` are the parenthesized
-    # forms the old proposer regex silently accepted; `(int)*cp` is the casted deref
-    # a closing-`)`-is-an-operand shortcut let slip (PR #136 review).
+    # forms the old proposer regex silently accepted; `(int)*cp`, the qualified
+    # `(char * const)*cp`, and `sizeof *cp` are the casted/keyword derefs a
+    # closing-`)`-is-an-operand shortcut let slip (PR #136 review).
     with pytest.raises(HarnessError, match="scalar-backed output 'cp'"):
         render_semantic_harness(
             unit_source=_OUT_SLICE, signature=_out_sig(), spec=SemanticSpec(expr)
@@ -224,11 +227,21 @@ def test_renderability_reason_accepts_directly_named_output() -> None:
 
 
 @pytest.mark.parametrize(
-    "expr", ["*cp == 0", "cp[0] == 0", "*(cp + 0) == 0", "(int)*cp == 0"]
+    "expr",
+    [
+        "*cp == 0",
+        "cp[0] == 0",
+        "*(cp + 0) == 0",
+        "(int)*cp == 0",
+        "(char * const)*cp == 0",
+        "sizeof *cp >= 4",
+    ],
 )
 def test_renderability_reason_flags_scalar_output_deref(expr: str) -> None:
-    # `(int)*cp` casts then unary-derefs `cp`: the reason must fire so the property
-    # is rejected rather than emitted as an invalid `*cp` on a scalar (PR #136).
+    # `(int)*cp` casts then unary-derefs `cp`; `(char * const)*cp` is the same with
+    # a qualified pointer type; `sizeof *cp` derefs the operand `sizeof` binds. The
+    # reason must fire for each so the property is rejected rather than emitted as
+    # an invalid `*cp` on a scalar (PR #136).
     reason = renderability_reason(_out_sig(), SemanticSpec(expr))
     assert reason is not None and "scalar-backed output 'cp'" in reason
 
