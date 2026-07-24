@@ -118,6 +118,64 @@ def test_extract_function_defs_raises_on_malformed_payload(
         gate.extract_function_defs(str(tmp_path / "x.c"), project_dir=str(tmp_path))
 
 
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        '{"source": "x.c"}',  # no `units` key (older/incompatible build)
+        '{"units": null}',  # present but null
+        '{"units": "f"}',  # present but not a list
+        "[]",  # a JSON array, not an object
+        '"ok"',  # a JSON scalar
+    ],
+)
+def test_extract_function_defs_raises_when_units_absent_or_not_a_list(
+    tmp_path: Path, monkeypatch, stdout: str
+) -> None:
+    # An exit-0 payload without a list-valued `units` (e.g. an older `forseti`
+    # build) must NOT default to "no units" — that would let an edited `.c` pass
+    # unverified. It has to surface as a blocking UnitsUnavailable.
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _fake_forseti_cmd(tmp_path, stdout=stdout)
+    )
+    with pytest.raises(gate.UnitsUnavailable):
+        gate.extract_function_defs(str(tmp_path / "x.c"), project_dir=str(tmp_path))
+
+
+def test_extract_function_defs_empty_units_is_a_clean_pass(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # An *empty* list is a legitimate "file defines no functions" pass — only an
+    # absent/non-list `units` blocks. Guards against over-rejecting the empty case.
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _fake_forseti_cmd(tmp_path, stdout='{"source": "x.c", "units": []}'),
+    )
+    assert (
+        gate.extract_function_defs(str(tmp_path / "x.c"), project_dir=str(tmp_path))
+        == []
+    )
+
+
+def test_units_absent_payload_records_blocking_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # End to end: an exit-0 payload with no `units` key must make verify_and_record
+    # persist a blocking `error` verdict, not silently pass the edited file.
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _fake_forseti_cmd(tmp_path, stdout='{"source": "x.c"}'),
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+    assert len(verdicts) == 1
+    assert verdicts[0].verdict == "error"
+    state = gate.load_state(str(tmp_path))
+    assert gate.blocking_units(state)  # non-empty → the Stop-gate blocks
+
+
 def test_header_edit_short_circuits_to_clean_pass(tmp_path: Path, monkeypatch) -> None:
     # ESBMC can't parse a .h standalone, so a header is out of gate scope: enumerate
     # nothing (clean pass) WITHOUT shelling out — the fake CLI here would fail if

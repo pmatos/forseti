@@ -191,10 +191,20 @@ def extract_function_defs(
         raise UnitsUnavailable(
             (proc.stderr or proc.stdout).strip()[:800] or "no JSON output"
         ) from exc
+    # Require an explicit list-valued `units`. Defaulting a missing key to `[]`
+    # would let an older/incompatible `forseti` build — one that exits 0 with a
+    # JSON object that has no `units` member — read as "this file defines no
+    # functions" (a clean pass), so an edited `.c` slips through unverified. An
+    # *empty* list is still a legitimate no-functions pass; only absence blocks.
+    if not isinstance(payload, dict) or not isinstance(payload.get("units"), list):
+        raise UnitsUnavailable(
+            "list-units payload has no list-valued `units` key (incompatible "
+            f"`forseti` build?): {proc.stdout.strip()[:800] or '<empty>'}"
+        )
     try:
         return [
             FuncDef(str(u["function"]), bool(u.get("takes_pointer")))
-            for u in payload.get("units", [])
+            for u in payload["units"]
         ]
     except (AttributeError, KeyError, TypeError) as exc:
         raise UnitsUnavailable(f"malformed list-units payload: {exc}") from exc
