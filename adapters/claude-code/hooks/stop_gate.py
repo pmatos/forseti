@@ -85,6 +85,10 @@ def main() -> int:
 
     with gate.gate_lock(project_dir):  # serialize with concurrent PostToolUse hooks
         state = gate.load_state(project_dir)
+        # Reconcile away units whose C source was deleted out-of-band (a Bash `rm`)
+        # BEFORE reading `blocking_units`, or the turn would block forever on a unit
+        # whose file no longer exists (issue #99 review).
+        pruned = gate.prune_deleted_units(state, project_dir)
         blocking = gate.blocking_units(state)
         needs = gate.needs_contract_units(state)
         oob = gate.stale_sources(project_dir, state, discovered) if discovered else []
@@ -92,7 +96,15 @@ def main() -> int:
         attempts = int(state.get("stop_attempts", 0)) + 1
         if outstanding:
             state["stop_attempts"] = attempts
+        if outstanding or pruned:
             gate.save_state(project_dir, state)
+
+    if pruned:
+        # Never a silent reconcile: the trace records which units were dropped
+        # because their backing file was deleted.
+        event_log.log_event(
+            project_dir, event_log.STOP, decision="pruned_deleted", pruned=pruned
+        )
 
     if discovered is None:
         # Never a silent no-op: the trace records that out-of-band writes could

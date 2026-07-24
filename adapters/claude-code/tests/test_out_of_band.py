@@ -143,6 +143,32 @@ def test_discover_resolves_repo_root_and_scopes_to_project_dir(tmp_path: Path) -
     assert os.path.isfile(found[0])  # path resolved correctly against the repo root
 
 
+# --- deleted-source reconciliation (issue #99 review) -----------------------
+
+
+def test_prune_deleted_units_drops_gone_files(tmp_path: Path) -> None:
+    kept = tmp_path / "kept.c"
+    kept.write_text("int k(void){return 0;}\n")
+    state = gate.load_state(str(tmp_path))
+    # one unit whose file still exists, one whose file is gone
+    gate.record(state, gate.UnitVerdict("kept.c::k", "kept.c", "k", "violated", 1))
+    gate.record(state, gate.UnitVerdict("gone.c::g", "gone.c", "g", "violated", 1))
+    state["scanned"] = {"kept.c": "h1", "gone.c": "h2"}
+
+    pruned = gate.prune_deleted_units(state, str(tmp_path))
+    assert pruned == ["gone.c::g"]
+    assert set(state["units"]) == {"kept.c::k"}  # present file untouched
+    assert "gone.c" not in state["scanned"]  # stale baseline cleared
+    assert state["scanned"]["kept.c"] == "h1"
+
+
+def test_prune_deleted_units_keeps_units_without_a_file_field(tmp_path: Path) -> None:
+    # A malformed/legacy unit with no `file` we cannot locate — keep it, never guess.
+    state = {"units": {"x::f": {"verdict": "violated"}}, "scanned": {}}
+    assert gate.prune_deleted_units(state, str(tmp_path)) == []
+    assert "x::f" in state["units"]
+
+
 # --- content-hash freshness / dedup ----------------------------------------
 
 
@@ -205,6 +231,50 @@ def test_stop_gate_residual_after_max_attempts(
     out = json.loads(capsys.readouterr().out)
     assert "decision" not in out  # allowed to end...
     assert "out-of-band" in out["systemMessage"]  # ...but with a LOUD residual
+
+
+def test_stop_gate_prunes_untracked_deleted_unit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The review's real case: a C file WRITTEN out-of-band via Bash is untracked,
+    # so once it is removed `git status` never reports it as deleted. Its VIOLATED
+    # unit must still be pruned by file existence — not block the turn forever.
+    _git_init(tmp_path)
+    src = tmp_path / "new.c"
+    src.write_text("int f(void){return 0;}\n")
+    state = gate.load_state(str(tmp_path))
+    state["scanned"]["new.c"] = gate.content_hash(str(src))
+    gate.record(state, gate.UnitVerdict("new.c::f", "new.c", "f", "violated", 1))
+    gate.save_state(str(tmp_path), state)
+    src.unlink()  # `rm new.c` via Bash — untracked, so git status shows nothing
+
+    rc = _run(stop_gate.main, tmp_path, monkeypatch)
+    assert rc == 0 and capsys.readouterr().out.strip() == ""  # not blocked
+    after = gate.load_state(str(tmp_path))
+    assert "new.c::f" not in after["units"]  # stale unit pruned
+    assert "new.c" not in after["scanned"]  # baseline cleared for a future recreate
+    assert any(
+        e.get("decision") == "pruned_deleted" for e in event_log.read_events(tmp_path)
+    )  # reconcile is traced, never silent
+
+
+def test_stop_gate_prunes_committed_deleted_unit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The committed-then-deleted variant: git DOES report `old.c` as deleted here,
+    # but the same file-existence prune handles it with no git-status special case.
+    _git_init(tmp_path)
+    src = tmp_path / "old.c"
+    src.write_text("int f(void){return 0;}\n")
+    _git_commit_all(tmp_path)
+    state = gate.load_state(str(tmp_path))
+    gate.record(state, gate.UnitVerdict("old.c::f", "old.c", "f", "unknown", 1))
+    gate.save_state(str(tmp_path), state)
+    src.unlink()  # `rm old.c` via Bash — git status now shows ` D old.c`
+
+    rc = _run(stop_gate.main, tmp_path, monkeypatch)
+    assert rc == 0 and capsys.readouterr().out.strip() == ""  # not blocked
+    assert "old.c::f" not in gate.load_state(str(tmp_path))["units"]
 
 
 def test_stop_gate_non_git_allows_but_records_skip(

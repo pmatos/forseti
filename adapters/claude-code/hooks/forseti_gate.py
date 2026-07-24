@@ -335,6 +335,12 @@ def discover_changed_c_sources(project_dir: str) -> list[str] | None:
     found: list[str] = []
     for rel in rels:
         abspath = os.path.join(root, rel)
+        # A path git reports changed but that is gone from disk (a Bash `rm`) is
+        # skipped here — there is nothing to *verify*. Its recorded units are
+        # reconciled separately by `prune_deleted_units`, which keys off actual
+        # file existence so it also catches an untracked file git never tracked
+        # (issue #99 review): keep discovery about "what to verify", pruning about
+        # "what no longer exists".
         if not is_c_source(abspath) or not os.path.isfile(abspath):
             continue
         try:
@@ -541,6 +547,41 @@ def prune_missing_units(
     ]
     for uid in stale:
         del state["units"][uid]
+
+
+def prune_deleted_units(state: dict, project_dir: str) -> list[str]:
+    """Drop recorded units whose backing C source no longer exists on disk.
+
+    `record`/`verify_and_record` only ever upsert per file, so a C source removed
+    out-of-band — `rm f.c` via Bash, whether it was committed or written earlier
+    this session — leaves its `violated`/`unknown` units in the gate state and the
+    Stop-gate would block forever (then only emit a residual after the attempt cap)
+    on a unit whose file is gone. Discovery correctly skips a missing file *for
+    verification*; this reconciles the recorded side, dropping units whose file is
+    absent and clearing each such file's `scanned` baseline (so a same-name file
+    recreated later re-verifies from scratch).
+
+    Keys off each unit's recorded `file` (project-relative), not `git status`, so
+    it also catches an untracked Bash-written file git never knew existed — the
+    case a git-scoped deletion scan would miss. Only ever *removes* already-recorded
+    units (files the agent touched), so it can never over-reach into gating C the
+    agent left alone. Returns the pruned unit ids.
+    """
+    units = state.get("units", {})
+    scanned = state.get("scanned", {})
+    pruned: list[str] = []
+    gone_rels: set[str] = set()
+    for uid, unit in list(units.items()):
+        rel = unit.get("file")
+        if not rel:
+            continue  # cannot locate the backing file — keep it, never guess
+        if not os.path.isfile(os.path.join(project_dir, rel)):
+            del units[uid]
+            pruned.append(uid)
+            gone_rels.add(rel)
+    for rel in gone_rels:
+        scanned.pop(rel, None)
+    return pruned
 
 
 _NON_BLOCKING_VERDICTS = frozenset({"verified", NEEDS_CONTRACT})
