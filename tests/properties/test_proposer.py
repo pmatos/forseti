@@ -285,6 +285,52 @@ def test_domain_with_suffixed_literal_not_flagged_as_output() -> None:
     assert validate_candidate(spec, suffix_out_sig()) is None
 
 
+def buf_sig() -> UnitSignature:
+    # A (buffer, length) pair, like `int first(const int *a, unsigned n)`.
+    return UnitSignature(
+        symbol="first",
+        return_ctype="int",
+        params=(
+            BufferParam(elem_ctype="int", name="a", length="n", const=True),
+            ScalarParam(ctype="unsigned", name="n"),
+        ),
+    )
+
+
+def test_mixed_buffer_length_domain_rejected() -> None:
+    # A single domain clause constraining both the buffer `a` and its length `n`
+    # renders to no valid harness (`_split_assumptions` cannot order it). The static
+    # gate (`renderability_reason`) now rejects it, so the proposer never persists a
+    # candidate the check phase would fail to harness -- the propose/check divergence
+    # left open once the never-wired renderer seam is gone.
+    spec = CandidateSpec(
+        expression="result == a[0]", domain=("n >= 1 && n <= 2 && a[0] >= 0",)
+    )
+    reason = validate_candidate(spec, buf_sig())
+    assert reason is not None and "constrains both a buffer" in reason
+
+
+def test_mixed_buffer_length_domain_rejected_in_flow() -> None:
+    # End-to-end: the same candidate is routed into `rejected`, not persisted.
+    result = propose_properties(
+        ProposalRequest(
+            "u::first",
+            "int first(const int *a, unsigned n) { return a[0]; }",
+            signature=buf_sig(),
+        ),
+        client=FakeLLMClient(
+            reply(
+                {
+                    "expression": "result == a[0]",
+                    "domain": ["n >= 1 && n <= 2 && a[0] >= 0"],
+                }
+            )
+        ),
+    )
+    assert not result.accepted
+    assert "constrains both a buffer" in result.rejected[0].reason
+
+
 @pytest.mark.parametrize(
     "expr",
     [

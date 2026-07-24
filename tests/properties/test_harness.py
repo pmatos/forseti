@@ -269,6 +269,39 @@ def test_renderability_reason_flags_void_return_referencing_result() -> None:
     assert reason is not None and "returns void" in reason
 
 
+_BUF_SIG = UnitSignature(
+    "first",
+    "int",
+    (BufferParam("int", "a", "n", const=True), ScalarParam("unsigned", "n")),
+)
+
+
+def test_renderability_reason_flags_mixed_buffer_length_clause() -> None:
+    # A single clause constraining both the buffer `a` and its length `n` has no
+    # correct emission point, so the static authority rejects it up front -- the
+    # `_split_assumptions` guard is now a `(signature, spec)` rule the proposer's
+    # gate can see without rendering, closing the propose/check divergence removing
+    # the renderer seam would otherwise open.
+    reason = renderability_reason(
+        _BUF_SIG, SemanticSpec("result == a[0]", ("n >= 1 && n <= 2 && a[0] >= 0",))
+    )
+    assert reason is not None and "constrains both a buffer" in reason
+
+
+def test_static_gate_and_renderer_agree_on_mixed_clause() -> None:
+    # Parity: the same mixed clause the static authority rejects, the renderer
+    # rejects with the same message -- the invariant the "single static authority"
+    # refactor promises, now covering this guard too.
+    spec = SemanticSpec("result == a[0]", ("n >= 1 && n <= 2 && a[0] >= 0",))
+    assert renderability_reason(_BUF_SIG, spec) is not None
+    with pytest.raises(HarnessError, match="constrains both a buffer"):
+        render_semantic_harness(
+            unit_source="int first(const int *a, unsigned n) { return a[0]; }",
+            signature=_BUF_SIG,
+            spec=spec,
+        )
+
+
 _SUFFIX_OUT_SLICE = "int f(int64_t x, uint32_t *u) { *u = 0; return 1; }"
 
 

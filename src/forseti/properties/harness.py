@@ -186,8 +186,9 @@ def render_semantic_harness(
     """
     # The source-level guard needs `unit_source`, so it stays here; every
     # `(signature, spec)` guard -- empty postcondition, `result_var` clash, void
-    # return, and the two emission rules -- is delegated to the single static
-    # authority so the renderer and the proposer's gate consult one predicate.
+    # return, the two emission rules, and a precondition mixing a buffer with its
+    # length -- is delegated to the single static authority so the renderer and the
+    # proposer's gate consult one predicate.
     if _defines_main(unit_source):
         raise HarnessError(
             "unit_source defines main; pass the kernel slice, not the example harness"
@@ -307,6 +308,11 @@ def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | 
       ``__ESBMC_assume(...)`` *before* the call, it would preconstrain a would-be
       result on uninitialized storage, masking a unit that never writes it; domains
       constrain inputs only.
+    * a **precondition mixing a buffer and its length** -- a single clause naming
+      both a buffer and a buffer-length identifier (``n >= 1 && a[0] >= 0``) has no
+      correct emission point: the length bound must precede the ``int a[n]`` VLA and
+      the buffer-content predicate must follow it, so it is rejected rather than
+      mis-ordered (the renderer's `_split_assumptions` reuses this very predicate).
 
     Best-effort and conservative on the emission rules: it may over-reject an exotic
     postcondition, but a rejected *renderable* property is safe whereas emitting
@@ -353,7 +359,10 @@ def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | 
                     f"domain expr {pre!r} constrains output parameter "
                     f"{name!r} (preconditions apply to inputs only)"
                 )
-    return None
+    return _mixed_buffer_length_reason(
+        spec.preconditions,
+        [p for p in signature.params if isinstance(p, BufferParam)],
+    )
 
 
 _STORAGE_SPECIFIERS = frozenset({"static", "inline", "extern", "_Noreturn"})
@@ -461,6 +470,35 @@ def _is_scalar_backed(buf: BufferParam) -> bool:
     return buf.out and buf.length.strip() == "1"
 
 
+def _mixed_buffer_length_reason(
+    preconditions: Sequence[str], buffers: Sequence[BufferParam]
+) -> str | None:
+    """Why a precondition cannot be ordered around its VLA, or None if all can.
+
+    A single clause that constrains *both* a buffer and a buffer-length identifier
+    (e.g. ``n >= 1 && n <= 2 && a[0] >= 0``) has no correct emission point: the
+    length bound must precede the ``int a[n]`` VLA declaration, the buffer-content
+    predicate must follow the nondet fill, and splitting arbitrary C on ``&&`` is
+    unsound under ``||`` precedence. Source-free -- it needs only the
+    signature-derived buffers and the spec's preconditions -- so it is a
+    `(signature, spec)` guard `renderability_reason` owns and `_split_assumptions`
+    reuses: one rule, two callers, one message.
+    """
+    buffer_names = {buf.name for buf in buffers}
+    length_idents = {ident for buf in buffers for ident in identifiers(buf.length)}
+    for raw in preconditions:
+        stripped = raw.strip()
+        if not stripped or not any(references(stripped, n) for n in buffer_names):
+            continue
+        if any(references(stripped, ident) for ident in length_idents):
+            return (
+                f"precondition {stripped!r} constrains both a buffer and a "
+                "buffer-length identifier; split it into separate domain entries "
+                "so the length bound can precede the VLA it sizes"
+            )
+    return None
+
+
 def _split_assumptions(
     preconditions: Sequence[str], buffers: Sequence[BufferParam]
 ) -> tuple[list[str], list[str]]:
@@ -472,31 +510,28 @@ def _split_assumptions(
     stay *before* the VLA declaration it sizes. Blank entries are dropped.
     Returns ``(pre_buffer, post_buffer)``.
 
-    A single clause that constrains *both* a buffer and a buffer-length
-    identifier (e.g. ``n >= 1 && n <= 2 && a[0] >= 0``) cannot be placed
-    correctly — the length bound must precede the VLA, the buffer predicate must
-    follow it — so it is rejected with `HarnessError` (splitting arbitrary C on
-    ``&&`` is unsound under ``||`` precedence). The caller supplies the length
-    bound and the buffer predicate as separate `domain` entries instead.
+    A single clause constraining *both* a buffer and a buffer-length identifier
+    cannot be placed correctly; `_mixed_buffer_length_reason` -- the same guard
+    `renderability_reason` consults statically -- names why, raised here as
+    `HarnessError`. The caller supplies the length bound and the buffer predicate
+    as separate `domain` entries instead. (In practice `render_semantic_harness`
+    delegates to `renderability_reason` first, so this raise is the renderer's
+    own invariant rather than the only line of defense.)
     """
+    mixed = _mixed_buffer_length_reason(preconditions, buffers)
+    if mixed is not None:
+        raise HarnessError(mixed)
     buffer_names = {buf.name for buf in buffers}
-    length_idents = {ident for buf in buffers for ident in identifiers(buf.length)}
     pre_buffer: list[str] = []
     post_buffer: list[str] = []
     for raw in preconditions:
         stripped = raw.strip()
         if not stripped:
             continue
-        if not any(references(stripped, name) for name in buffer_names):
+        if any(references(stripped, name) for name in buffer_names):
+            post_buffer.append(stripped)
+        else:
             pre_buffer.append(stripped)
-            continue
-        if any(references(stripped, ident) for ident in length_idents):
-            raise HarnessError(
-                f"precondition {stripped!r} constrains both a buffer and a "
-                "buffer-length identifier; split it into separate domain entries "
-                "so the length bound can precede the VLA it sizes"
-            )
-        post_buffer.append(stripped)
     return pre_buffer, post_buffer
 
 
