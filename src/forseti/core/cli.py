@@ -24,7 +24,13 @@ import json
 import sys
 from pathlib import Path
 
-from forseti.esbmc import add_verify_arguments, render_result, verify_kwargs
+from forseti.esbmc import (
+    ListUnitsError,
+    add_verify_arguments,
+    list_units,
+    render_result,
+    verify_kwargs,
+)
 from forseti.properties import (
     LLMError,
     PropertyStoreError,
@@ -71,6 +77,65 @@ def _run_verify(args: argparse.Namespace) -> int:
     else:
         print(render_result(result, args.source, args.unwind))
     return EXIT_CODES[result.verdict]
+
+
+def _add_list_units_parser(
+    sub: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    p = sub.add_parser(
+        "list-units",
+        help="list a C source's function definitions and their parameter types",
+        description=(
+            "Parse <source> with ESBMC's clang frontend (`--parse-tree-only`, no "
+            "main needed) and report each function definition, its parameters "
+            "with canonical (typedef-resolved) types, and whether it takes a "
+            "pointer/array parameter."
+        ),
+    )
+    p.add_argument("source", type=Path, help="C source file to inspect")
+    p.add_argument(
+        "-t",
+        "--timeout",
+        type=float,
+        default=30.0,
+        metavar="SECONDS",
+        help="esbmc parse timeout in seconds (default: 30)",
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the units as a JSON object",
+    )
+
+
+def _run_list_units(args: argparse.Namespace) -> int:
+    try:
+        units = list_units(args.source, timeout_s=args.timeout)
+    except ListUnitsError as exc:
+        print(f"forseti list-units: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        payload = {
+            "source": str(args.source),
+            "units": [
+                {
+                    "function": u.name,
+                    "takes_pointer": u.takes_pointer,
+                    "params": [
+                        {"name": p.name, "type": p.type, "is_pointer": p.is_pointer}
+                        for p in u.params
+                    ],
+                }
+                for u in units
+            ],
+        }
+        print(json.dumps(payload))
+    else:
+        for u in units:
+            mark = " [needs-contract]" if u.takes_pointer else ""
+            sig = ", ".join(f"{p.type} {p.name}".strip() for p in u.params) or "void"
+            print(f"{u.name}({sig}){mark}")
+    return 0
 
 
 def _add_propose_parser(
@@ -197,6 +262,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
     _add_verify_parser(sub)
+    _add_list_units_parser(sub)
     _add_propose_parser(sub)
     sub.add_parser(
         "mcp",
@@ -210,6 +276,8 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "verify":
         return _run_verify(args)
+    if args.command == "list-units":
+        return _run_list_units(args)
     if args.command == "propose":
         return _run_propose(args)
     if args.command == "mcp":
