@@ -29,9 +29,10 @@ server — the hooks call the neutral `forseti` CLI directly.
   (working-tree/index changes) and C **committed since the session baseline HEAD**,
   so a command that writes *and* commits a C file in one shot (`cat > f.c && git
   commit …`, leaving a clean worktree) is still caught. Content-hash freshness is
-  the real gate, so untouched committed/third-party C — and a file merely committed
-  unchanged — is never swept in. Requires the project to be a **git repository**
-  (see **Known limitations**).
+  the real gate, so a file merely committed *unchanged* is deduped back out and
+  untouched third-party C is skipped — save for C a HEAD movement
+  (`checkout`/`merge`/`rebase`) sweeps in, a deliberate over-gate noted under
+  **Known limitations**. Requires the project to be a **git repository**.
 - **SessionStart hook** — records the content of every C file already dirty at
   session start as the *baseline*, plus the baseline HEAD commit, so the
   out-of-band scan gates only C the agent changes **during** the session (whether
