@@ -19,7 +19,6 @@ import contextlib
 import fcntl
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -45,6 +44,10 @@ DEFAULT_K = int(os.environ.get("FORSETI_UNWIND", "1"))
 VERIFY_TIMEOUT_S = float(os.environ.get("FORSETI_VERIFY_TIMEOUT_S", "110"))
 _SUBPROCESS_MARGIN_S = 15.0
 
+# Budget for the one `forseti list-units` parse per edited file. A `--parse-tree-only`
+# run does no solving, so it is fast; keep it well under the verify budget.
+LIST_UNITS_TIMEOUT_S = float(os.environ.get("FORSETI_LIST_UNITS_TIMEOUT_S", "30"))
+
 # How many times the Stop-gate blocks before it gives up and lets the turn end
 # with a LOUD unverified residual (never a silent pass, but never an infinite
 # loop either).
@@ -55,33 +58,6 @@ C_SUFFIXES = {".c", ".h"}
 _STATE_DIR = ".forseti"
 _STATE_FILE = "gate_state.json"
 _LOCK_FILE = "gate_state.lock"
-
-# Control-flow keywords that a permissive definition regex could mistake for a
-# function name; filtered out belt-and-suspenders.
-_KEYWORDS = {
-    "if",
-    "for",
-    "while",
-    "switch",
-    "do",
-    "else",
-    "return",
-    "sizeof",
-    "case",
-    "default",
-    "goto",
-}
-
-# A top-level C function *definition*: starts at column 0 with at least one
-# return-type token, then `name(params)` and an opening `{` (a trailing `;`
-# makes it a prototype, which `[^;{}]*` excludes). Heuristic, not a parser —
-# good enough for the small kernels this gate targets; documented in the README.
-_FUNC_RE = re.compile(
-    r"^[A-Za-z_][A-Za-z0-9_ \t\*]*?[ \t\*]"
-    r"([A-Za-z_][A-Za-z0-9_]*)"
-    r"[ \t]*\(([^;{}]*)\)[ \t\r\n]*\{",
-    re.MULTILINE,
-)
 
 # Verdict string for a unit the gate declines to check at the function level: it
 # takes a pointer/array parameter, so an unconstrained (havoc'd) caller makes the
@@ -140,48 +116,95 @@ class FuncDef:
 
     `takes_pointer` is true when any parameter is a pointer or array — the case
     the function-level gate cannot verify without a materialized backing object
-    (`NEEDS_CONTRACT`).
+    (`NEEDS_CONTRACT`). It is read from `forseti list-units`' canonical,
+    typedef-resolved parameter types, so a pointer hidden behind a typedef counts.
     """
 
     name: str
     takes_pointer: bool
 
 
-# C comments (block `/* ... */`, possibly multi-line, and line `// ...`) so a `*`
-# inside a comment in the parameter list is not mistaken for a pointer declarator.
-_C_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
+class UnitsUnavailable(RuntimeError):
+    """`forseti list-units` could not enumerate a file's function definitions.
 
-
-def _params_take_pointer(params: str) -> bool:
-    """True if a C parameter list has a pointer or array parameter.
-
-    Heuristic (matches the definition regex's reach, not a parser): a `*` or `[`
-    anywhere in the parameter text — after stripping comments, so `/* ... */` /
-    `// ...` don't false-positive — means at least one parameter is a pointer, or
-    an array that decays to a pointer at the function boundary. Still misses a
-    pointer hidden behind a typedef, or a `*` inside a string literal; a real C
-    parse is the robust fix (documented in the README).
+    Distinct from "the file defines no functions" (an empty list): a failed
+    enumeration must surface as a blocking `error` verdict, never be mistaken for
+    a clean pass (kill-safety — a not-verified unit can't silently slip through).
     """
-    cleaned = _C_COMMENT_RE.sub(" ", params)
-    return "*" in cleaned or "[" in cleaned
 
 
-def extract_function_defs(source_text: str) -> list[FuncDef]:
-    """Top-level function definitions in `source_text` (heuristic, deduped by name)."""
-    seen: set[str] = set()
-    defs: list[FuncDef] = []
-    for match in _FUNC_RE.finditer(source_text):
-        name = match.group(1)
-        if name in _KEYWORDS or name in seen:
-            continue
-        seen.add(name)
-        defs.append(FuncDef(name, _params_take_pointer(match.group(2))))
-    return defs
+def extract_function_defs(
+    file_path: str | os.PathLike[str], *, project_dir: str
+) -> list[FuncDef]:
+    """Enumerate `file_path`'s function definitions via ``forseti list-units``.
+
+    Shells out to the same authoritative clang-based frontend that *verifies* the
+    unit (``forseti list-units --json``) rather than a regex, so typedef'd
+    pointers, K&R and multi-line signatures, function-like macros, ``#if`` blocks,
+    and a ``*`` inside a comment are all classified correctly (issue #131). The
+    hook stays dependency-free — it only spawns the CLI, never imports the
+    package. Raises `UnitsUnavailable` when the CLI cannot be run or the parse
+    fails (missing binary, C parse error, timeout, unreadable file), so the caller
+    records a blocking `error` verdict instead of silently skipping the file.
+
+    Only ``.c`` translation units are enumerated: ESBMC cannot parse a header
+    standalone (``forseti verify`` errors on a ``.h`` too — "failed to figure out
+    type of file"), and clang's path-match keeps a header-resident definition out
+    of its includer's unit list, so functions defined in a ``.h`` are simply out
+    of gate scope. A non-``.c`` file yields ``[]`` (a clean pass) rather than an
+    unresolvable block.
+    """
+    if Path(file_path).suffix.lower() != ".c":
+        return []
+    argv = [
+        *resolve_forseti_cmd(),
+        "list-units",
+        str(file_path),
+        "--json",
+        "--timeout",
+        str(int(LIST_UNITS_TIMEOUT_S)),
+    ]
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=LIST_UNITS_TIMEOUT_S + _SUBPROCESS_MARGIN_S,
+            cwd=project_dir,
+        )
+    except OSError as exc:  # missing CLI, etc. — resolve_forseti_cmd falls back to -m
+        raise UnitsUnavailable(
+            "forseti CLI could not be launched; install the forseti package "
+            f"(pip install -e .) so `forseti` is on PATH: {exc}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise UnitsUnavailable(
+            f"list-units exceeded {LIST_UNITS_TIMEOUT_S:g}s (raise "
+            "FORSETI_LIST_UNITS_TIMEOUT_S)"
+        ) from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()[:800] or f"exit {proc.returncode}"
+        raise UnitsUnavailable(detail)
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise UnitsUnavailable(
+            (proc.stderr or proc.stdout).strip()[:800] or "no JSON output"
+        ) from exc
+    try:
+        return [
+            FuncDef(str(u["function"]), bool(u.get("takes_pointer")))
+            for u in payload.get("units", [])
+        ]
+    except (AttributeError, KeyError, TypeError) as exc:
+        raise UnitsUnavailable(f"malformed list-units payload: {exc}") from exc
 
 
-def extract_functions(source_text: str) -> list[str]:
-    """Names of top-level functions defined in `source_text` (heuristic, deduped)."""
-    return [d.name for d in extract_function_defs(source_text)]
+def extract_functions(
+    file_path: str | os.PathLike[str], *, project_dir: str
+) -> list[str]:
+    """Names of `file_path`'s top-level functions (via ``forseti list-units``)."""
+    return [d.name for d in extract_function_defs(file_path, project_dir=project_dir)]
 
 
 def unit_id(project_dir: str, file_path: str) -> str:
@@ -393,9 +416,12 @@ def verify_and_record(
     """
     rel = unit_id(project_dir, file_path)
     try:
-        defs = extract_function_defs(Path(file_path).read_text())
-    except OSError as exc:
-        verdict = UnitVerdict(f"{rel}::?", rel, "?", "error", k, detail=str(exc))
+        defs = extract_function_defs(file_path, project_dir=project_dir)
+    except UnitsUnavailable as exc:
+        # Couldn't enumerate the file's units (esbmc missing, C parse error, …).
+        # Record a blocking `error` verdict rather than skip: a file that was
+        # edited but can't be parsed must not pass silently.
+        verdict = UnitVerdict(f"{rel}::?", rel, "?", "error", k, detail=str(exc)[:800])
         with gate_lock(project_dir):
             state = load_state(project_dir)
             record(state, verdict)
