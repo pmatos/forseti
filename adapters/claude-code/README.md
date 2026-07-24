@@ -138,14 +138,25 @@ turns a verdict into an error.
 | Safety flags | `SAFETY_FLAGS` in `hooks/forseti_gate.py` | `--overflow-check` | bounds/pointer/div-by-zero are ESBMC defaults; unsigned-overflow left OFF (legal wraparound) |
 | Unwind bound *k* | `FORSETI_UNWIND` env | `1` | a `VERIFIED` is only "up to k"; **loops need a higher k** |
 | Verify timeout | `FORSETI_VERIFY_TIMEOUT_S` env | `110` | per-function budget, passed to `forseti verify --timeout` so ESBMC honors it (the subprocess is bounded ~15 s higher). Each verdict is persisted the moment it lands, so the `300` s PostToolUse hook timeout must stay above this per-function budget — raise both together for very slow units. |
+| List-units timeout | `FORSETI_LIST_UNITS_TIMEOUT_S` env | `30` | budget for the one `forseti list-units` parse per edited file; a `--parse-tree-only` run does no solving, so this rarely needs raising |
 | Stop-gate attempts | `MAX_STOP_ATTEMPTS` in `forseti_gate.py` | `3` | blocks then lets the turn end with a loud residual |
 
 ## Known limitations (v0)
 
-- **Function detection is a regex heuristic**, not a C parser — it finds
-  column-0 function *definitions* (prototypes excluded). Unusual formatting
-  (return type on its own line, K&R style) may be missed; a false positive
-  surfaces as an ERROR verdict rather than a silent skip.
+- **Function detection uses ESBMC's clang frontend** (`forseti list-units`), the
+  same parser that verifies — so typedef'd pointers, K&R and multi-line
+  signatures, function-like macros, `#if` blocks, and a `*` inside a comment are
+  all classified correctly (no regex, issue #131). Each edited `.c` file gets one
+  extra `--parse-tree-only` parse (no solving, fast); if enumeration fails (esbmc
+  missing, C parse error) the file's units are recorded as a blocking ERROR
+  verdict rather than silently skipped.
+- **Only `.c` translation units are verified; header definitions are out of
+  scope.** ESBMC cannot parse a `.h` standalone (`forseti verify`/`list-units`
+  both error with "failed to figure out type of file"), and a function defined in
+  an `#include`d header is attributed to the header, not its includer — so it is
+  not gated either way. A `.h` edit is a clean pass (nothing enumerated). This
+  trades the old regex's behaviour, which errored on a header that happened to
+  contain a definition; you can't verify what ESBMC won't parse.
 - **No k-escalation.** The gate verifies at one fixed k; an `UNKNOWN` (e.g. a
   loop under-unwound) blocks with guidance to raise `FORSETI_UNWIND`, rather than
   laddering k automatically.
