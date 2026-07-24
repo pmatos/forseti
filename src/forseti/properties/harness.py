@@ -184,23 +184,10 @@ def render_semantic_harness(
     clashing a param name, a void return referenced by `result_var`, a
     `unit_source` that defines its own ``main``, or an unknown Param subtype).
     """
-    postcondition = spec.postcondition.strip()
-    if not postcondition:
-        raise HarnessError("semantic property has an empty postcondition")
-
-    param_names = {p.name for p in signature.params}
-    if spec.result_var in param_names:
-        raise HarnessError(
-            f"result_var {spec.result_var!r} collides with a parameter name"
-        )
-
-    returns_void = signature.return_ctype.strip() == "void"
-    if returns_void and references(postcondition, spec.result_var):
-        raise HarnessError(
-            f"postcondition references {spec.result_var!r} but "
-            f"{signature.symbol!r} returns void"
-        )
-
+    # The source-level guard needs `unit_source`, so it stays here; every
+    # `(signature, spec)` guard -- empty postcondition, `result_var` clash, void
+    # return, and the two emission rules -- is delegated to the single static
+    # authority so the renderer and the proposer's gate consult one predicate.
     if _defines_main(unit_source):
         raise HarnessError(
             "unit_source defines main; pass the kernel slice, not the example harness"
@@ -209,6 +196,9 @@ def render_semantic_harness(
     reason = renderability_reason(signature, spec)
     if reason is not None:
         raise HarnessError(reason)
+
+    postcondition = spec.postcondition.strip()
+    returns_void = signature.return_ctype.strip() == "void"
 
     scalars: list[ScalarParam] = []
     buffers: list[BufferParam] = []
@@ -300,26 +290,45 @@ def spec_from_property(prop: Property) -> SemanticSpec:
 def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | None:
     """None if `spec` renders to compilable, sound C for `signature`, else why not.
 
-    The static, parser-free authority on two emission rules the postcondition and
-    preconditions must obey -- kept *here*, the module that emits the C, so callers
-    (the proposer's static gate, the renderer itself) need not re-derive harness
-    internals:
+    The static, parser-free, source-free authority on whether a `(signature, spec)`
+    pair can become a valid harness -- kept *here*, the module that emits the C, so
+    callers (the proposer's static gate, `render_semantic_harness` itself) consult
+    one predicate instead of re-deriving harness internals. It covers, in order:
 
-    * A **scalar-backed output** (a trailing single-element ``out`` buffer) is
-      bound as a plain scalar passed by address, so the postcondition may only
-      *name* it -- dereferencing or subscripting it (``*cp``, ``cp[0]``,
-      ``*(cp + 0)``) would deref/subscript a non-pointer and fail to compile.
-    * A **precondition** is emitted as ``__ESBMC_assume(...)`` *before* the call,
-      so it may not constrain an **output** parameter -- that would preconstrain a
-      would-be result on uninitialized storage, masking a unit that never writes
-      it; domains constrain inputs only.
+    * an **empty postcondition** -- there is nothing to assert;
+    * a **`result_var` that collides with a parameter name** -- the result binding
+      would shadow the parameter;
+    * a **`result_var` referenced under a void return** -- there is no result to
+      bind;
+    * a **scalar-backed output** (a trailing single-element ``out`` buffer) that is
+      dereferenced or subscripted (``*cp``, ``cp[0]``, ``*(cp + 0)``) -- it is bound
+      as a plain scalar passed by address, so the postcondition may only *name* it;
+    * a **precondition constraining an output parameter** -- emitted as
+      ``__ESBMC_assume(...)`` *before* the call, it would preconstrain a would-be
+      result on uninitialized storage, masking a unit that never writes it; domains
+      constrain inputs only.
 
-    Best-effort and conservative: it may over-reject an exotic postcondition, but a
-    rejected *renderable* property is safe whereas emitting un-compilable C is not.
-    It does not duplicate the structural guards `render_semantic_harness` raises on
-    directly (empty postcondition, `result_var` clash, void return, a `unit_source`
-    that defines ``main``).
+    Best-effort and conservative on the emission rules: it may over-reject an exotic
+    postcondition, but a rejected *renderable* property is safe whereas emitting
+    un-compilable C is not. It does **not** cover the one structural guard that needs
+    the source text -- a `unit_source` that defines its own ``main`` -- which
+    `render_semantic_harness` checks directly.
     """
+    if not spec.postcondition.strip():
+        return "semantic property has an empty postcondition"
+
+    param_names = {p.name for p in signature.params}
+    if spec.result_var in param_names:
+        return f"result_var {spec.result_var!r} collides with a parameter name"
+
+    if signature.return_ctype.strip() == "void" and references(
+        spec.postcondition, spec.result_var
+    ):
+        return (
+            f"postcondition references {spec.result_var!r} but "
+            f"{signature.symbol!r} returns void"
+        )
+
     output_params = [
         p.name for p in signature.params if isinstance(p, BufferParam) and p.out
     ]

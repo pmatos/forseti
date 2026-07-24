@@ -9,12 +9,13 @@ unit into well-formed candidates.
 
 Validation is static and shape-only (no ESBMC, no execution): it rejects unsafe
 or vacuous expressions and -- when a `UnitSignature` is supplied -- expressions
-that name non-existent identifiers, and it gates each survivor through the #64
-harness writer so only *renderable* candidates are kept. Effect-free by default
-(no store, no renderer injected -> pure); the LLM call is the one effect, behind
-the injected `client` seam so unit tests stay hermetic. The harness types are a
-plain runtime import: `harness` depends only on `model`, so there is no import
-cycle to route around.
+that name non-existent identifiers or that would not render to sound C. That last
+gate is `renderability_reason` (`harness.py`), the single static authority on
+renderability; the proposer consults it directly rather than rendering a trial
+harness, so there is no renderer to inject. Effect-free by default (no store ->
+pure); the LLM call is the one effect, behind the injected `client` seam so unit
+tests stay hermetic. The harness types are a plain runtime import: `harness`
+depends only on `model`, so there is no import cycle to route around.
 """
 
 from __future__ import annotations
@@ -32,12 +33,9 @@ from .cexpr import identifiers, unsafe_reason
 from .harness import (
     HARNESS_MACROS,
     BufferParam,
-    HarnessError,
     SemanticSpec,
     UnitSignature,
-    render_semantic_harness,
     renderability_reason,
-    spec_from_property,
 )
 from .llm import LLMClient
 from .model import (
@@ -65,18 +63,6 @@ class CandidateStore(Protocol):
     def get(self, property_id: str) -> Property | None: ...
 
     def add(self, prop: Property) -> None: ...
-
-
-class HarnessRenderer(Protocol):
-    """The #64 renderer subset the renderability gate calls.
-
-    `render_semantic_harness` satisfies it structurally, so the loop/#44 pass the
-    real writer while tests inject a stub.
-    """
-
-    def __call__(
-        self, *, unit_source: str, signature: UnitSignature, spec: SemanticSpec
-    ) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -174,7 +160,6 @@ def propose_properties(
     request: ProposalRequest,
     *,
     client: LLMClient,
-    renderer: HarnessRenderer | None = None,
     store: CandidateStore | None = None,
     max_candidates: int = MAX_CANDIDATES_DEFAULT,
 ) -> ProposalResult:
@@ -183,11 +168,10 @@ def propose_properties(
     Renders the prompt, calls `client.complete` (an `LLMError` propagates -- the
     proposer never silently yields nothing), parses the reply (a
     `ProposalParseError` propagates), then for each candidate: enforces the
-    static checks (`validate_candidate`), builds a `status=CANDIDATE` `Property`,
-    drops batch duplicates by content id, and -- when a `renderer` and
-    `signature` are both present -- keeps only candidates that render to a
-    non-empty harness. When a `store` is given, each survivor is inserted
-    idempotently (its content id makes a re-run a no-op).
+    static checks (`validate_candidate`, which -- given a `signature` -- rejects
+    candidates that would not render to sound C), builds a `status=CANDIDATE`
+    `Property`, and drops batch duplicates by content id. When a `store` is given,
+    each survivor is inserted idempotently (its content id makes a re-run a no-op).
     """
     template = request.prompt
     prompt = render_prompt(
@@ -231,11 +215,6 @@ def propose_properties(
         if prop.property_id in seen:
             rejected.append(RejectedCandidate(spec, "duplicate in batch"))
             continue
-        if renderer is not None and signature is not None:
-            gate = _renderability(renderer, request.source_text, signature, prop)
-            if gate is not None:
-                rejected.append(RejectedCandidate(spec, gate))
-                continue
         seen.add(prop.property_id)
         accepted.append(prop)
 
@@ -256,27 +235,6 @@ def propose_properties(
         rejected=tuple(rejected),
         model_raw=raw,
     )
-
-
-def _renderability(
-    renderer: HarnessRenderer,
-    unit_source: str,
-    signature: UnitSignature,
-    prop: Property,
-) -> str | None:
-    """None if `prop` renders to a non-empty harness, else a rejection reason.
-
-    A `HarnessError` is the writer's documented "can't render this" signal, so it
-    becomes a rejection; any other exception is a real bug and is left to
-    propagate rather than masqueraded as an unrenderable candidate.
-    """
-    try:
-        rendered = renderer(
-            unit_source=unit_source, signature=signature, spec=spec_from_property(prop)
-        )
-    except HarnessError as exc:
-        return f"unrenderable: {exc}"
-    return None if rendered.strip() else "empty harness"
 
 
 def parse_candidates(model_text: str) -> tuple[CandidateSpec, ...]:
@@ -315,9 +273,10 @@ def validate_candidate(
     non-semantic), V2 safety (no statements/assignments/calls, balanced parens),
     V5 non-vacuity (the expression must constrain the result or a parameter; a
     precondition must not mention the result and must constrain something) always
-    apply. V3 identifiers and V4 `referenced_params` need a `signature` and are
-    skipped when it is `None`. V6 renderability is enforced separately, in the
-    flow, where the harness writer is available.
+    apply. V3 identifiers, V4 `referenced_params`, and V6 renderability need a
+    `signature` and are skipped when it is `None`; V6 delegates to
+    `renderability_reason`, the harness's single static authority on whether the
+    `(signature, spec)` pair renders to sound C.
     """
     if spec.kind is not None and spec.kind != PropertyKind.SEMANTIC.value:
         return f"non-semantic kind {spec.kind!r} (semantic-only, ADR-0009 D2)"
@@ -415,10 +374,7 @@ def _opt_str(value: object) -> str:
 
 
 if TYPE_CHECKING:
-    # mypy-only structural guards: fail type-checking if a concrete class/function
-    # ever drifts from the protocol it must satisfy (mirrors fix.py).
+    # mypy-only structural guard: fail type-checking if the concrete store ever
+    # drifts from the protocol it must satisfy (mirrors fix.py).
     def _store_is_candidatestore(s: PropertyStore) -> CandidateStore:
         return s
-
-    def _renderer_is_harnessrenderer() -> HarnessRenderer:
-        return render_semantic_harness

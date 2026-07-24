@@ -251,6 +251,24 @@ def test_renderability_reason_still_flags_genuine_suffix_output_ref() -> None:
     assert reason is not None and "output parameter 'u'" in reason
 
 
+def test_renderability_reason_flags_empty_postcondition() -> None:
+    # The single static authority now owns the structural guards too, so a caller
+    # (the proposer's gate) can reject an empty postcondition without rendering.
+    reason = renderability_reason(ABS_SIG, SemanticSpec("   "))
+    assert reason is not None and "empty postcondition" in reason
+
+
+def test_renderability_reason_flags_result_var_param_clash() -> None:
+    reason = renderability_reason(ABS_SIG, SemanticSpec("x >= 0", result_var="x"))
+    assert reason is not None and "collides with a parameter name" in reason
+
+
+def test_renderability_reason_flags_void_return_referencing_result() -> None:
+    void_sig = UnitSignature("consume", "void", (ScalarParam("int", "x"),))
+    reason = renderability_reason(void_sig, SemanticSpec("result >= 0"))
+    assert reason is not None and "returns void" in reason
+
+
 _SUFFIX_OUT_SLICE = "int f(int64_t x, uint32_t *u) { *u = 0; return 1; }"
 
 

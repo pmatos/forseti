@@ -1,9 +1,10 @@
 """Tests for the property proposer -- pure, with the LLM and store faked.
 
 No subprocess, no network, no esbmc: a `FakeLLMClient` returns a canned JSON
-string, a dict-backed `FakeStore` stands in for #62's SQLite store, and the real
-`render_semantic_harness` (or a stub) serves the renderability gate. Mirrors
-`tests/orchestrator/test_fix.py` (fakes + TYPE_CHECKING protocol guards).
+string and a dict-backed `FakeStore` stands in for #62's SQLite store. The
+renderability gate is static -- `validate_candidate` consults `renderability_reason`
+directly -- so no renderer is injected. Mirrors `tests/orchestrator/test_fix.py`
+(fakes + TYPE_CHECKING protocol guards).
 """
 
 from __future__ import annotations
@@ -17,7 +18,6 @@ import pytest
 from forseti.properties import (
     BufferParam,
     CandidateSpec,
-    HarnessError,
     LLMError,
     Property,
     PropertyKind,
@@ -25,7 +25,6 @@ from forseti.properties import (
     ProposalParseError,
     ProposalRequest,
     ScalarParam,
-    SemanticSpec,
     UnitSignature,
     parse_candidates,
     propose_properties,
@@ -35,7 +34,7 @@ from forseti.properties import (
 )
 
 if TYPE_CHECKING:
-    from forseti.properties import CandidateStore, HarnessRenderer, LLMClient
+    from forseti.properties import CandidateStore, LLMClient
 
 ABS_SOURCE = "int64_t my_abs(int64_t x) {\n    return (x < 0) ? -x : x;\n}\n"
 ABS_UNIT = "examples/abs.c::my_abs"
@@ -112,7 +111,6 @@ def test_happy_path_two_candidates() -> None:
     result = propose_properties(
         ProposalRequest(ABS_UNIT, ABS_SOURCE, signature=abs_sig()),
         client=FakeLLMClient(TWO_GOOD),
-        renderer=render_semantic_harness,
     )
     assert len(result.accepted) == 2
     assert not result.rejected
@@ -232,7 +230,6 @@ def test_limits_macro_accepted_and_renders_with_include() -> None:
         client=FakeLLMClient(
             reply({"expression": "result >= 0", "domain": ["x > INT_MIN"]})
         ),
-        renderer=render_semantic_harness,
     )
     assert len(result.accepted) == 1, result.rejected
     harness = render_semantic_harness(
@@ -322,35 +319,39 @@ def test_rejections_land_in_result_not_raised() -> None:
     result = propose_properties(
         ProposalRequest(ABS_UNIT, ABS_SOURCE, signature=abs_sig()),
         client=FakeLLMClient(bad),
-        renderer=render_semantic_harness,
     )
     assert len(result.accepted) == 1
     assert len(result.rejected) == 1
     assert "assignment" in result.rejected[0].reason
 
 
-def test_v6_unrenderable_candidate_rejected() -> None:
-    def raising_renderer(
-        *, unit_source: str, signature: UnitSignature, spec: SemanticSpec
-    ) -> str:
-        raise HarnessError("cannot render")
+def _void_sig() -> UnitSignature:
+    return UnitSignature(
+        symbol="consume",
+        return_ctype="void",
+        params=(ScalarParam(ctype="int", name="x"),),
+    )
 
+
+def test_void_return_result_reference_rejected() -> None:
+    # A void unit has no result to bind, so a candidate whose expression names
+    # `result` is unrenderable. The static V6 gate (`renderability_reason`) catches
+    # it -- a gap the never-wired renderer injection used to be the sole gate for.
+    reason = validate_candidate(CandidateSpec(expression="result >= 0"), _void_sig())
+    assert reason is not None and "returns void" in reason
+
+
+def test_unrenderable_candidate_rejected_in_flow() -> None:
+    # End-to-end: the same unrenderable candidate is rejected inside the propose
+    # flow (routed into `rejected`, not raised), with no renderer to inject.
     result = propose_properties(
-        ProposalRequest(ABS_UNIT, ABS_SOURCE, signature=abs_sig()),
+        ProposalRequest(
+            "u::consume", "void consume(int x) { (void)x; }", signature=_void_sig()
+        ),
         client=FakeLLMClient(reply({"expression": "result >= 0"})),
-        renderer=raising_renderer,
     )
     assert not result.accepted
-    assert "unrenderable" in result.rejected[0].reason
-
-
-def test_renderer_none_skips_v6() -> None:
-    result = propose_properties(
-        ProposalRequest(ABS_UNIT, ABS_SOURCE, signature=abs_sig()),
-        client=FakeLLMClient(reply({"expression": "result >= 0"})),
-        renderer=None,
-    )
-    assert len(result.accepted) == 1
+    assert "returns void" in result.rejected[0].reason
 
 
 def test_duplicate_in_batch_kept_once() -> None:
@@ -398,6 +399,3 @@ if TYPE_CHECKING:
 
     def _fake_store_is_candidatestore(s: FakeStore) -> CandidateStore:
         return s
-
-    def _real_renderer_is_harnessrenderer() -> HarnessRenderer:
-        return render_semantic_harness

@@ -18,7 +18,6 @@ from forseti.properties import (
     ProposalRequest,
     extract_signature,
     propose_properties,
-    render_semantic_harness,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -35,7 +34,6 @@ def test_live_proposer_yields_a_renderable_candidate() -> None:
     result = propose_properties(
         ProposalRequest(ABS_UNIT, ABS_SOURCE, signature=signature),
         client=ClaudeCliClient(),
-        renderer=render_semantic_harness,
     )
     assert result.accepted, f"no candidate survived; rejected={result.rejected}"
     prop = result.accepted[0]
