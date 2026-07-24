@@ -133,3 +133,26 @@ class TestDerefsOrSubscripts:
 
     def test_other_name_untouched(self) -> None:
         assert derefs_or_subscripts("*cp == 0", "count") is False
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            "result * cp >= 0",  # scalar output as the right factor -- #106
+            "result * (cp + 1) >= 0",  # parenthesized factor, not a deref
+            "result*cp >= 0",  # no whitespace around the binary `*`
+            "cp * result >= 0",  # left factor -- the form that never tripped it
+            "2 * cp >= 0",  # a numeric left operand precedes the `*`
+            "(a + b) * cp >= 0",  # a closing `)` precedes the `*`
+            "arr[i] * cp >= 0",  # a closing `]` precedes the `*`
+        ],
+    )
+    def test_multiplication_is_not_a_pointer_use(self, expr: str) -> None:
+        # A binary `*` -- an operand (identifier, number, `)`, `]`) immediately
+        # before it -- multiplies the scalar-bound output; only a *unary* `*`
+        # dereferences it.
+        assert derefs_or_subscripts(expr, "cp") is False
+
+    def test_multiplication_beside_a_genuine_deref_still_flags(self) -> None:
+        # The second `*` in `a * *cp` is unary (an operator, not an operand,
+        # precedes it), so the deref is still caught despite the multiplication.
+        assert derefs_or_subscripts("a * *cp >= 0", "cp") is True

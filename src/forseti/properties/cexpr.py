@@ -22,6 +22,10 @@ _NUMERIC_LITERAL = re.compile(r"\b0[xX][0-9A-Fa-f]+[uUlL]*\b|\b\d+[uUlL]*\b")
 _IDENT = re.compile(r"[A-Za-z_]\w*")
 _CALL = re.compile(r"[A-Za-z_]\w*\s*\(")
 _RELATIONAL = re.compile(r"[=!<>]=")
+# The last non-blank char before a `*` when it is the *right* operand of binary
+# multiplication: an identifier char, a digit, or a closing `)`/`]`. Its absence
+# (start of clause, or an operator) marks the `*` as a unary pointer dereference.
+_OPERAND_TAIL = re.compile(r"[\w)\]]$")
 
 
 def identifiers(expr: str) -> list[str]:
@@ -75,12 +79,21 @@ def derefs_or_subscripts(expr: str, name: str) -> bool:
     """True if `name` is subscripted (``name[...]``) or dereferenced (``*name`` or
     ``*(...name...)``) in `expr` -- the pointer uses a scalar binding cannot compile.
 
-    Best-effort: the parenthesized form catches ``*(cp + 0)`` / ``*(cp)`` that a
-    bare ``*name`` test misses; it does not see arbitrarily nested derefs.
+    A leading ``*`` counts as a dereference only when it is *unary*: an operand
+    (identifier, number, ``)``, or ``]``) immediately before it -- across
+    whitespace -- makes the ``*`` binary multiplication, so ``result * cp`` and
+    ``result * (cp + 1)`` name `cp` as a scalar factor and render fine, whereas
+    ``*cp`` / ``*(cp + 0)`` / ``*(cp)`` do not. Best-effort: the parenthesized form
+    catches derefs a bare ``*name`` test misses; it does not see arbitrarily
+    nested derefs.
     """
     n = re.escape(name)
-    return (
-        re.search(rf"\b{n}\s*\[", expr) is not None
-        or re.search(rf"\*\s*{n}\b", expr) is not None
-        or re.search(rf"\*\s*\([^()]*\b{n}\b", expr) is not None
-    )
+    if re.search(rf"\b{n}\s*\[", expr) is not None:
+        return True
+    for star in re.finditer(r"\*\s*", expr):
+        if _OPERAND_TAIL.search(expr[: star.start()].rstrip()):
+            continue  # an operand precedes this `*`: multiplication, not a deref
+        rest = expr[star.end() :]
+        if re.match(rf"{n}\b", rest) or re.match(rf"\([^()]*\b{n}\b", rest):
+            return True
+    return False

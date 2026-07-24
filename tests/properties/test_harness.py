@@ -220,6 +220,16 @@ def test_renderability_reason_flags_scalar_output_deref(expr: str) -> None:
     assert reason is not None and "scalar-backed output 'cp'" in reason
 
 
+@pytest.mark.parametrize(
+    "expr", ["result * cp >= 0", "result * (cp + 1) >= 0", "cp * result >= 0"]
+)
+def test_renderability_reason_accepts_scalar_output_multiplication(expr: str) -> None:
+    # Multiplying a scalar-backed output is valid C -- the binary `*` names `cp`,
+    # it does not dereference it. Regression for #106: the deref guard must not
+    # turn this into a HarnessError / per-property ERROR verdict on the render path.
+    assert renderability_reason(_out_sig(), SemanticSpec(expr)) is None
+
+
 def test_renderability_reason_flags_domain_over_output() -> None:
     reason = renderability_reason(_out_sig(), SemanticSpec("result >= 0", ("cp <= 0",)))
     assert reason is not None and "output parameter 'cp'" in reason
