@@ -20,6 +20,7 @@ the cost of a dependency + include-path coupling) can swap in behind
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from collections.abc import Sequence
@@ -101,6 +102,14 @@ def _depth(art: str) -> int:
     return len(art) // 2
 
 
+def _error_line(text: str) -> str:
+    """The first ``ERROR:``-prefixed line, so a failed run is self-describing."""
+    for line in text.splitlines():
+        if line.startswith("ERROR:"):
+            return line[len("ERROR:") :].strip()
+    return ""
+
+
 def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
     """Function definitions in `source` from an ``esbmc --parse-tree-only`` dump.
 
@@ -111,7 +120,11 @@ def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
     declarations yields nothing, matching what the gate can verify). Deduped by
     name, first definition wins.
     """
-    target = Path(source).name
+    # Attribute a function to `source` by a normalized full-path match against
+    # clang's location (clang echoes the input path verbatim), so a definition
+    # from a same-basename `#include`d file in another directory is not misread
+    # as belonging to `source`.
+    source_norm = os.path.normpath(str(source))
     units: list[Unit] = []
     seen: set[str] = set()
     current_file = ""
@@ -147,7 +160,9 @@ def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
             name_match = _NAME_RE.search(rest)
             fn_name = name_match.group(1) if name_match else None
             fn_depth = depth
-            fn_in_target = Path(current_file).name == target
+            fn_in_target = bool(current_file) and (
+                os.path.normpath(current_file) == source_norm
+            )
             params = []
             is_definition = False
         elif fn_name is not None and depth > fn_depth:
@@ -176,9 +191,12 @@ def list_units(
 ) -> list[Unit]:
     """Run ``esbmc --parse-tree-only`` on `source` and parse its function units.
 
-    Raises `ListUnitsError` when esbmc cannot be invoked (missing/again binary);
-    an esbmc run that produces no parseable definitions returns ``[]`` (an empty
-    or declaration-only file), never an error.
+    Raises `ListUnitsError` when esbmc cannot be invoked (missing/unrunnable
+    binary) **or** when the parse run fails (missing source, bad include path, C
+    parse error — esbmc exits nonzero). Only a *successful* run that defines no
+    functions returns ``[]`` (an empty or declaration-only file). Never treats a
+    failed parse as an empty file, which would be indistinguishable from a valid
+    one and could let the gate silently skip a unit.
     """
     argv = (esbmc_bin, str(source), "--parse-tree-only", *extra_flags)
     try:
@@ -187,6 +205,13 @@ def list_units(
         raise ListUnitsError(
             f"esbmc --parse-tree-only failed: {esbmc_bin}: {exc}"
         ) from exc
+    if proc.returncode != 0:
+        detail = (
+            _error_line(proc.stderr)
+            or _error_line(proc.stdout)
+            or f"exit {proc.returncode}"
+        )
+        raise ListUnitsError(f"esbmc --parse-tree-only failed ({esbmc_bin}): {detail}")
     # ESBMC prints the AST dump to stderr; combine both streams so the parser is
     # robust to which stream a given build uses.
     return parse_units(proc.stdout + "\n" + proc.stderr, source)
