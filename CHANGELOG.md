@@ -1,3 +1,10 @@
+## [1.2.1](https://github.com/pmatos/forseti/compare/v1.2.0...v1.2.1) (2026-07-24)
+
+
+### Bug Fixes
+
+* **check:** filter terminal-status properties out of check_properties inputs ([#84](https://github.com/pmatos/forseti/issues/84)) ([#133](https://github.com/pmatos/forseti/issues/133)) ([2fa27a4](https://github.com/pmatos/forseti/commit/2fa27a459450f139bccdf2293771162d863aec32))
+
 # [1.2.0](https://github.com/pmatos/forseti/compare/v1.1.0...v1.2.0) (2026-07-24)
 
 
