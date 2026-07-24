@@ -158,7 +158,7 @@ Q.E.D.‑up‑to‑k vocabulary. Anything stronger over‑claims.
 | Stage | Deliverable | Value |
 |---|---|---|
 | **S1** | **Stop the phantoms.** Signature‑based `NEEDS_CONTRACT`; don't feed the havoc cex back as fixable; non‑blocking residual. | Unblocks the demo today; ends the thrash. |
-| **S2** | **L0 mechanical synthesis + right ESBMC config** (assertions ON, k‑ladder, non‑vacuity). Sidecar harness for scalar `T*` / `ptr,len` / `T p[N]`. | sha1's pointer units **verify** (assumed, up to MAX_LEN). Demo lands. |
+| **S2** ✅ | **L0 mechanical synthesis + right ESBMC config** (assertions ON, k‑ladder, non‑vacuity). Sidecar harness for scalar `T*` / `ptr,len` / `T p[N]`. | sha1's pointer units **verify** (assumed, up to MAX_LEN). Demo lands. |
 | **S3** | **Compositional discharge** (`--replace-call-with-contract`); prototype transparent contract injection; upgrade "assumed" → "discharged". | Closes the soundness hole. |
 | **S4** | **L1 structural inference** (context‑via‑init, aliasing, sentinels) — a structural analyzer, *not* the semantic proposer. | Genericity beyond the easy shapes. |
 | **S5** | **Unboundedness** via loop invariants, where "all lengths" matters. | Escapes the bound where it counts. |
@@ -166,6 +166,14 @@ Q.E.D.‑up‑to‑k vocabulary. Anything stronger over‑claims.
 Termination policy (the Stop‑gate's `MAX_STOP_ATTEMPTS`) is **downstream of S1**: once phantoms are
 gone the model only loops on real, fixable verdicts, at which point a progress‑ + budget‑based
 policy (not a magic count) replaces the "3". Tracked separately.
+
+**S2 landed** ([#125](https://github.com/pmatos/forseti/issues/125)): the signature‑driven
+synthesizer + sidecar verify live in `src/forseti/precond/` behind `forseti synth <source>
+--function NAME`, with fixed‑array extents recovered by `list_units` (`Param.array_extent`). Verdicts
+are **honestly labelled** — `ASSUMED_VERIFIED` ("VERIFIED assuming valid caller pointers —
+undischarged"), never a full verdict (D3). The `examples/sha1.c` units verify assumed; the
+`sha1_bug.c` off‑by‑one is VIOLATED non‑vacuously. Under‑unwound loops (assertions ON) are told from
+real out‑of‑bounds structurally and *escalate the k‑ladder*, never masquerade as a violation.
 
 ## Decisions (recommended) & open questions
 

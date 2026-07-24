@@ -46,6 +46,14 @@ def test_uses_recommended_unwind_discipline() -> None:
     assert "--no-unwinding-assertions" in argv
 
 
+def test_unwinding_assertions_can_be_turned_on() -> None:
+    # The S2 synthesizer needs assertions ON so an under-unwound loop is a
+    # distinct unwinding-assertion failure, not a fake proof.
+    argv = build_argv(SRC, unwind=8, no_unwinding_assertions=False)
+    assert "--no-unwinding-assertions" not in argv
+    assert _value_after(argv, "--unwind") == "8"
+
+
 def test_extra_flags_forwarded_verbatim() -> None:
     argv = build_argv(
         SRC, unwind=1, extra_flags=("--overflow-check", "--memory-leak-check")

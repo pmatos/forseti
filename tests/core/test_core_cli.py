@@ -46,3 +46,56 @@ def test_verify_json_payload(capsys: pytest.CaptureFixture[str]) -> None:
     assert payload["unwind"] == 1
     assert payload["source"].endswith("abs.c")
     assert payload["counterexample"]  # non-empty trace for the agent to fix
+
+
+# --- forseti synth (memory-precondition gate, RFC-0003 S2) ------------------
+
+
+def test_synth_assumed_verified_exits_zero(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(["synth", str(EXAMPLES / "sha1.c"), "--function", "sha1_init"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "assuming valid caller pointers" in out
+
+
+def test_synth_violated_exits_one(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(["synth", str(EXAMPLES / "sha1_bug.c"), "--function", "sha1_update"])
+    assert code == 1
+    assert "VIOLATED" in capsys.readouterr().out
+
+
+def test_synth_emit_only_prints_sidecar(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(
+        ["synth", str(EXAMPLES / "sha1.c"), "--function", "sha1_update", "--emit-only"]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert '#include "' in out and "sha1.c" in out
+    assert "malloc((size_t)len)" in out
+    assert "sha1_update(ctx, data, len);" in out
+
+
+def test_synth_json_payload(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(
+        ["synth", str(EXAMPLES / "sha1_bug.c"), "--function", "sha1_update", "--json"]
+    )
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["assessment"] == "violated"
+    assert payload["assumed"] is False
+    assert {p["name"] for p in payload["params"]} == {"ctx", "data", "len"}
+
+
+def test_synth_needs_contract_exits_five(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A void* pointee has no size → L0 cannot synthesise → NEEDS_CONTRACT (5).
+    src = tmp_path / "opaque.c"
+    src.write_text("void g(void *p) { (void)p; }\n")
+    code = main(["synth", str(src), "--function", "g"])
+    assert code == 5
+    assert "NEEDS_CONTRACT" in capsys.readouterr().out

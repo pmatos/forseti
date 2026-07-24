@@ -11,7 +11,14 @@ from pathlib import Path
 
 import pytest
 
-from forseti.esbmc.units import ListUnitsError, Param, list_units, parse_units
+from forseti.esbmc.units import (
+    ListUnitsError,
+    Param,
+    Unit,
+    annotate_array_extents,
+    list_units,
+    parse_units,
+)
 
 # A clang textual AST in ESBMC's `--parse-tree-only` shape, exercising: an
 # intrinsic in another file (excluded), a definition in a *same-basename* file in
@@ -98,6 +105,56 @@ def test_param_is_pointer(type_str: str, is_ptr: bool) -> None:
     assert Param("p", type_str).is_pointer is is_ptr
 
 
+def _extent(source: str, param: Param, fn: str = "f") -> int | None:
+    """The `array_extent` `annotate_array_extents` harvests for `param` in `source`."""
+    unit = Unit(fn, (param,))
+    return annotate_array_extents([unit], source)[0].params[0].array_extent
+
+
+@pytest.mark.parametrize(
+    "decl, expected",
+    [
+        ("void f(uint8_t p[20]) {}", 20),
+        ("void f(uint8_t p [64]) {}", 64),  # space before bracket
+        ("void f(uint8_t p[ 32 ]) {}", 32),  # spaces inside bracket
+        ("void f(uint8_t *p) {}", None),  # plain pointer, no extent
+        ("void f(uint8_t p[]) {}", None),  # unsized array
+        ("void f(int p[2][3]) {}", None),  # multi-dim (pointer-to-array) is not L0
+    ],
+)
+def test_annotate_array_extents_shapes(decl: str, expected: int | None) -> None:
+    assert _extent(decl, Param("p", "uint8_t *")) == expected
+
+
+def test_annotate_array_extents_prefers_definition_over_prototype() -> None:
+    # A prototype (`);`) and a call site must not be mistaken for the definition
+    # whose `)` is followed by `{`.
+    source = "void f(uint8_t p[20]);\nvoid g(void){ f(0); }\nvoid f(uint8_t p[20]){}\n"
+    assert _extent(source, Param("p", "uint8_t *")) == 20
+
+
+def test_annotate_array_extents_ignores_bracket_in_comment() -> None:
+    source = "void f(uint8_t *p /* was p[99] */) {}"
+    assert _extent(source, Param("p", "uint8_t *")) is None
+
+
+def test_annotate_array_extents_only_named_pointer_params() -> None:
+    # An unnamed pointer param and a scalar param both stay None; only the named
+    # pointer written `q[8]` is sized.
+    source = "void f(int n, uint8_t q[8], uint8_t *) {}"
+    unit = Unit(
+        "f",
+        (Param("n", "int"), Param("q", "uint8_t *"), Param("", "uint8_t *")),
+    )
+    out = annotate_array_extents([unit], source)[0].params
+    assert [p.array_extent for p in out] == [None, 8, None]
+
+
+def test_annotate_array_extents_unknown_function_unchanged() -> None:
+    unit = Unit("missing", (Param("p", "uint8_t *"),))
+    assert annotate_array_extents([unit], "void other(int x){}")[0] == unit
+
+
 _HAVE_ESBMC = shutil.which("esbmc") is not None
 
 
@@ -113,6 +170,21 @@ def test_list_units_end_to_end(tmp_path: Path) -> None:
     )
     units = {u.name: u.takes_pointer for u in list_units(src)}
     assert units == {"scal": False, "hash": True, "reg": True}
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_recovers_fixed_array_extent(tmp_path: Path) -> None:
+    # End-to-end: clang adjusts `uint8_t digest[20]` to `uint8_t *` (extent lost
+    # from the type), so `list_units` must recover the 20 from the source.
+    src = tmp_path / "sig.c"
+    src.write_text(
+        "#include <stdint.h>\n#include <stddef.h>\n"
+        "void f(uint8_t digest[20], const uint8_t *data, size_t len) {\n"
+        "  (void)digest; (void)data; (void)len;\n}\n"
+    )
+    f = next(u for u in list_units(src) if u.name == "f")
+    extents = {p.name: p.array_extent for p in f.params}
+    assert extents == {"digest": 20, "data": None, "len": None}
 
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
