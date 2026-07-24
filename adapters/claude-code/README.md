@@ -42,9 +42,15 @@ server — the hooks call the neutral `forseti` CLI directly.
   `VERIFIED up to k`. As an ESBMC-free backstop it also re-checks `git` for C
   files changed out-of-band that are still unverified, and blocks on those too —
   so the heavy verification stays in the 300 s PostToolUse budget, never in the
-  kill-sensitive Stop hook. After `MAX_STOP_ATTEMPTS` (3) consecutive blocks with
-  no fix, it lets the turn end but with a **loud** unverified residual — never a
-  silent pass, never an infinite loop.
+  kill-sensitive Stop hook. Freshness compares the last-verified content against
+  the worktree copy **and** the staged (index) and committed (`HEAD`) blobs, so a
+  Bash command that stages or commits a divergent blob and then reverts the
+  worktree — leaving it hashing clean while unverified C sits in the index/`HEAD`,
+  ready to ship — is still caught (issue #99 review); the block spells out the
+  index/commit-shaped remediation (`git add`/`git restore --staged`), since
+  editing the worktree cannot reconcile a staged blob. After `MAX_STOP_ATTEMPTS`
+  (3) consecutive blocks with no fix, it lets the turn end but with a **loud**
+  unverified residual — never a silent pass, never an infinite loop.
 
 Latest verdicts are cached in `.forseti/gate_state.json` (per project,
 gitignored). Forseti core stays stateless; the *gate* is what is stateful. The
@@ -220,6 +226,14 @@ turns a verdict into an error.
   git can see; a change git cannot (a file outside the work tree, or one matched by
   `.gitignore`) is not scanned. A file changed *between* sessions is re-baselined
   on the next fresh start, so it is treated as pre-existing rather than gated.
+- **Staged/committed-blob freshness is single-hash and content-literal.** The gate
+  records one last-verified hash per file, so if you stage a *previously* verified
+  blob and then keep editing to a newer verified version, the now-superseded staged
+  blob is conservatively gated until you re-stage or unstage it — an over-gate that
+  blocks loudly, never a silent pass. Likewise the staged/committed blob is compared
+  byte-for-byte, so a git content filter (`core.autocrlf`, a clean/smudge filter)
+  that rewrites the blob relative to the worktree can over-gate. Both resolve by
+  bringing the index/commit to the verified content (`git add`) and re-verifying.
 - **mtime is not used.** Freshness is keyed on a SHA-256 of file content, so a
   `cp -p`/`tar` that preserves an old timestamp cannot slip an unverified change
   past the gate, and an unchanged file is never needlessly re-verified.

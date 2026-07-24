@@ -67,6 +67,45 @@ def _oob_note(project_dir: str, oob: list[str]) -> str:
     )
 
 
+def _blob_note(blob: list[dict]) -> str:
+    """Loud note for C staged/committed out-of-band whose blob was never verified.
+
+    The worktree copy can hash clean while the *index* or *HEAD* holds a divergent,
+    unverified blob (a `git add`/commit of C the gate never saw — issue #99 review).
+    Remediation is reason-specific: a *staged* divergence lives in the index (clear it
+    with `git add`/`git restore --staged`), a *committed* one lives in `HEAD` (those
+    index commands can NOT clear it — the verified content has to reach `HEAD`).
+    Spelling the right move out per reason is what turns each block into a convergent
+    one instead of a loop; editing the worktree alone reconciles neither.
+    """
+    staged = [b["rel"] for b in blob if b.get("reason") == "staged"]
+    committed = [b["rel"] for b in blob if b.get("reason") == "committed"]
+    lines = [
+        f"⚠ Forseti: {len(blob)} C blob(s) were staged/committed out-of-band and are "
+        "UNVERIFIED — the index/HEAD holds C the gate never saw while the worktree may "
+        "hash clean, so committing/shipping it would ship unverified code. Editing the "
+        "worktree alone will NOT clear this:"
+    ]
+    if staged:
+        lines.append(
+            "• Staged in the index: "
+            + ", ".join(staged)
+            + " — reconcile the index: re-stage the verified file (`git add <file>`), "
+            "unstage it (`git restore --staged <file>`), or recreate the intended "
+            "content in the worktree and let the gate re-verify."
+        )
+    if committed:
+        lines.append(
+            "• Committed since session start: "
+            + ", ".join(committed)
+            + " — this lives in HEAD, so `git add`/`git restore --staged` cannot clear "
+            "it: bring the committed content into the worktree and let the gate "
+            "re-verify it, or commit the verified content over it."
+        )
+    lines.append("Reconcile before ending.")
+    return "\n".join(lines)
+
+
 def _emit(obj: dict) -> int:
     print(json.dumps(obj))
     return 0
@@ -83,9 +122,20 @@ def main() -> int:
     # allow). `None` means no git repo → out-of-band detection is inactive. The
     # baseline HEAD (read outside the lock — it is set once at session start and
     # never mutated mid-session) also surfaces C committed in the same Bash command.
-    baseline_head = gate.load_state(project_dir).get("baseline_head")
+    pre = gate.load_state(project_dir)
+    baseline_head = pre.get("baseline_head")
     discovered = gate.discover_changed_c_sources(
         project_dir, baseline_head=baseline_head
+    )
+    # C whose STAGED or COMMITTED blob diverges from the last verified content while
+    # the worktree hashes clean (issue #99 review). Git-only, so it runs OUTSIDE the
+    # lock like discovery; `pre` is a good-enough snapshot of `scanned` for it (a
+    # concurrent verify would only relax an over-gate on the next turn, never mask a
+    # divergence). Empty (skipped) when this is not a git work tree.
+    blob = (
+        gate.divergent_blob_sources(project_dir, pre, baseline_head=baseline_head)
+        if discovered is not None
+        else []
     )
 
     with gate.gate_lock(project_dir):  # serialize with concurrent PostToolUse hooks
@@ -97,7 +147,7 @@ def main() -> int:
         blocking = gate.blocking_units(state)
         needs = gate.needs_contract_units(state)
         oob = gate.stale_sources(project_dir, state, discovered) if discovered else []
-        outstanding = bool(blocking) or bool(oob)
+        outstanding = bool(blocking) or bool(oob) or bool(blob)
         attempts = int(state.get("stop_attempts", 0)) + 1
         if outstanding:
             state["stop_attempts"] = attempts
@@ -139,17 +189,20 @@ def main() -> int:
         )
         return 0  # nothing outstanding — allow the turn to end
 
-    # Fold the recorded-blocking residual, any out-of-band files, and any
-    # NEEDS_CONTRACT note into one message. Only blocking + oob drive the block.
+    # Fold the recorded-blocking residual, any out-of-band files, any divergent
+    # staged/committed blobs, and any NEEDS_CONTRACT note into one message. Only
+    # blocking + oob + blob drive the block.
     sections = []
     if blocking:
         sections.append(_residual(blocking))
     if oob:
         sections.append(_oob_note(project_dir, oob))
+    if blob:
+        sections.append(_blob_note(blob))
     if needs:
         sections.append(_needs_message(needs))
     detail = "\n\n".join(sections)
-    n_out = len(blocking) + len(oob)
+    n_out = len(blocking) + len(oob) + len(blob)
 
     if attempts > gate.MAX_STOP_ATTEMPTS:
         # Allow the turn to end by OMITTING `decision` — the Stop schema only
@@ -161,6 +214,7 @@ def main() -> int:
             decision="residual",
             n_unverified=len(blocking),
             n_oob=len(oob),
+            n_blob=len(blob),
             attempt=attempts,
         )
         return _emit(
@@ -179,6 +233,7 @@ def main() -> int:
         decision="block",
         n_unverified=len(blocking),
         n_oob=len(oob),
+        n_blob=len(blob),
         attempt=attempts,
     )
     return _emit(

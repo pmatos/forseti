@@ -276,6 +276,142 @@ def test_verify_and_record_stamps_scanned_and_dedups(tmp_path: Path) -> None:
     assert gate.stale_sources(str(tmp_path), state, [str(src)]) == [str(src)]
 
 
+# --- staged / committed blob freshness (issue #99 review) -------------------
+
+
+def _stage(path: Path, name: str) -> None:
+    subprocess.run(["git", "-C", str(path), "add", name], check=True)
+
+
+def test_staged_paths_from_porcelain() -> None:
+    # Only a set X-status (index change) counts as staged: ' M' (worktree-only) and
+    # '??' (untracked) are excluded; a rename ('R  new\0old') keeps the new path.
+    out = "MM a.c\x00 M b.c\x00A  c.c\x00?? d.c\x00D  e.c\x00R  new.c\x00old.c\x00"
+    assert gate._staged_paths_from_porcelain(out) == ["a.c", "c.c", "e.c", "new.c"]
+
+
+def test_git_blob_hash(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    src = tmp_path / "foo.c"
+    src.write_text("int f(void){return 0;}\n")  # A
+    _git_commit_all(tmp_path)
+    a_hash = gate.content_hash(str(src))
+
+    src.write_text("int f(void){return 1;}\n")  # B, staged
+    _stage(tmp_path, "foo.c")
+    b_hash = gate.content_hash(str(src))
+    src.write_text("int f(void){return 0;}\n")  # worktree reverted to A
+
+    assert gate.git_blob_hash(str(tmp_path), ":foo.c") == b_hash  # index holds B
+    assert gate.git_blob_hash(str(tmp_path), "HEAD:foo.c") == a_hash  # HEAD holds A
+    assert gate.git_blob_hash(str(tmp_path), "HEAD:nope.c") is None  # no such blob
+
+
+def test_divergent_blob_sources_flags_staged_blob(tmp_path: Path) -> None:
+    # The review's bypass: stage a divergent blob, then revert the worktree so it
+    # hashes as the last-verified content. `stale_sources` sees nothing; the staged
+    # blob would still commit unverified.
+    _git_init(tmp_path)
+    src = tmp_path / "foo.c"
+    src.write_text("int f(void){return 0;}\n")  # A
+    _git_commit_all(tmp_path)
+    state = gate.load_state(str(tmp_path))
+    state["scanned"]["foo.c"] = gate.content_hash(str(src))  # A verified
+
+    src.write_text("int f(void){return 1;}\n")  # B
+    _stage(tmp_path, "foo.c")  # index = B
+    src.write_text("int f(void){return 0;}\n")  # worktree back to A (hashes fresh)
+
+    assert gate.stale_sources(str(tmp_path), state, [str(src)]) == []  # worktree fresh
+    assert gate.divergent_blob_sources(str(tmp_path), state) == [
+        {"rel": "foo.c", "reason": "staged"}
+    ]
+
+
+def test_divergent_blob_sources_flags_committed_blob(tmp_path: Path) -> None:
+    # The committed variant: commit a divergent blob, revert the worktree. `HEAD`
+    # holds unverified C while the worktree hashes clean.
+    _git_init(tmp_path)
+    src = tmp_path / "foo.c"
+    src.write_text("int f(void){return 0;}\n")  # A
+    _git_commit_all(tmp_path)
+    base = gate.git_head(str(tmp_path))
+    state = gate.load_state(str(tmp_path))
+    state["scanned"]["foo.c"] = gate.content_hash(str(src))
+
+    src.write_text("int f(void){return 1;}\n")  # B
+    _git_commit_all(tmp_path)  # HEAD now B
+    src.write_text("int f(void){return 0;}\n")  # worktree reverted to A
+
+    assert gate.stale_sources(str(tmp_path), state, [str(src)]) == []
+    assert gate.divergent_blob_sources(str(tmp_path), state, baseline_head=base) == [
+        {"rel": "foo.c", "reason": "committed"}
+    ]
+
+
+def test_divergent_blob_sources_committed_survives_worktree_delete(
+    tmp_path: Path,
+) -> None:
+    # `cat > new.c && git add new.c && rm new.c && git commit`: HEAD holds the blob
+    # but the worktree file is gone, so discovery's isfile filter drops it. The blob
+    # scan must catch it directly, or committed C ends the turn with no verdict.
+    _git_init(tmp_path)
+    (tmp_path / "seed.txt").write_text("x")
+    _git_commit_all(tmp_path)
+    base = gate.git_head(str(tmp_path))
+    state = gate.load_state(str(tmp_path))
+
+    new = tmp_path / "new.c"
+    new.write_text("int g(void){return 0;}\n")
+    _stage(tmp_path, "new.c")
+    new.unlink()  # rm before the commit — worktree file gone, blob still staged
+    # commit the staged index directly (not `git add -A`, which would restage the
+    # worktree deletion and drop the blob) — HEAD now carries new.c
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "add new"], check=True)
+
+    # discovery misses it (nothing to verify on disk) — proves the blob scan is not
+    # bounded by discovery.
+    assert gate.discover_changed_c_sources(str(tmp_path), baseline_head=base) == []
+    assert gate.divergent_blob_sources(str(tmp_path), state, baseline_head=base) == [
+        {"rel": "new.c", "reason": "committed"}
+    ]
+
+
+def test_divergent_blob_sources_dedups_verified_staged(tmp_path: Path) -> None:
+    # A normal `git add` of already-verified C must NOT be gated: the staged blob
+    # equals the recorded scanned hash, so it dedups straight out.
+    _git_init(tmp_path)
+    src = tmp_path / "foo.c"
+    src.write_text("int f(void){return 0;}\n")  # A committed
+    _git_commit_all(tmp_path)
+    src.write_text("int f(void){return 2;}\n")  # A' — worktree edit, verified
+    state = gate.load_state(str(tmp_path))
+    state["scanned"]["foo.c"] = gate.content_hash(str(src))  # A' verified
+    _stage(tmp_path, "foo.c")  # stage the verified A' (index = scanned)
+
+    assert gate.divergent_blob_sources(str(tmp_path), state) == []
+
+
+def test_divergent_blob_sources_ignores_worktree_only_edit(tmp_path: Path) -> None:
+    # ' M': a verified worktree edit that was never staged. The index still holds the
+    # OLD HEAD blob; it must not be mistaken for a divergent staged blob (over-gate).
+    _git_init(tmp_path)
+    src = tmp_path / "foo.c"
+    src.write_text("int f(void){return 0;}\n")  # A committed
+    _git_commit_all(tmp_path)
+    src.write_text("int f(void){return 1;}\n")  # B, edited but NOT staged
+    state = gate.load_state(str(tmp_path))
+    state["scanned"]["foo.c"] = gate.content_hash(str(src))  # B verified (worktree)
+
+    assert gate.divergent_blob_sources(str(tmp_path), state) == []
+
+
+def test_divergent_blob_sources_non_git_is_empty(tmp_path: Path) -> None:
+    (tmp_path / "a.c").write_text("int a(void){return 0;}\n")
+    state = gate.load_state(str(tmp_path))
+    assert gate.divergent_blob_sources(str(tmp_path), state) == []
+
+
 # --- Stop-gate backstop -----------------------------------------------------
 
 
@@ -427,6 +563,107 @@ def test_stop_gate_allows_committed_unchanged_baselined_c(
 
     rc = _run(stop_gate.main, tmp_path, monkeypatch)
     assert rc == 0 and capsys.readouterr().out.strip() == ""  # not gated
+
+
+def test_stop_gate_blocks_on_staged_blob_then_converges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The review's bypass end-to-end: a staged divergent blob with a reverted (clean)
+    # worktree blocks; then re-staging the verified worktree content clears it — a
+    # convergent block, not a dead-end loop.
+    _git_init(tmp_path)
+    src = tmp_path / "foo.c"
+    src.write_text("int f(void){return 0;}\n")  # A
+    _git_commit_all(tmp_path)
+    state = gate.load_state(str(tmp_path))
+    state["scanned"]["foo.c"] = gate.content_hash(str(src))
+    gate.record(state, gate.UnitVerdict("foo.c::f", "foo.c", "f", "verified", 1))
+    gate.save_state(str(tmp_path), state)
+
+    src.write_text("int f(void){return 1;}\n")  # B
+    _stage(tmp_path, "foo.c")  # index = B (unverified)
+    src.write_text("int f(void){return 0;}\n")  # worktree back to A (hashes fresh)
+
+    _run(stop_gate.main, tmp_path, monkeypatch)
+    out = json.loads(capsys.readouterr().out)
+    assert out.get("decision") == "block"
+    assert "Staged in the index" in out["reason"] and "foo.c" in out["reason"]
+    # The remediation must be index-shaped, not "edit the file" (which can't help).
+    assert "git add" in out["reason"]
+
+    _stage(tmp_path, "foo.c")  # re-stage the verified worktree A → index == scanned
+    rc = _run(stop_gate.main, tmp_path, monkeypatch)
+    assert rc == 0 and capsys.readouterr().out.strip() == ""  # now allowed, silent
+
+
+def test_stop_gate_blocks_on_committed_blob_worktree_reverted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A divergent blob committed in one Bash command, then the worktree reverted so it
+    # hashes clean: `HEAD` holds unverified C. The committed-since scan must block, and
+    # — because the divergence lives in HEAD — its remediation is HEAD-shaped: `git
+    # add` cannot clear it; re-verifying the committed content can.
+    _git_init(tmp_path)
+    src = tmp_path / "foo.c"
+    src.write_text("int f(void){return 0;}\n")  # A
+    _git_commit_all(tmp_path)
+    _run(session_start.main, tmp_path, monkeypatch, source="startup")  # baselines HEAD
+    state = gate.load_state(str(tmp_path))
+    state["scanned"]["foo.c"] = gate.content_hash(str(src))
+    gate.record(state, gate.UnitVerdict("foo.c::f", "foo.c", "f", "verified", 1))
+    gate.save_state(str(tmp_path), state)
+
+    src.write_text("int f(void){return 1;}\n")  # B
+    _git_commit_all(tmp_path)  # HEAD now B
+    src.write_text("int f(void){return 0;}\n")  # worktree reverted to A (hashes fresh)
+
+    _run(stop_gate.main, tmp_path, monkeypatch)
+    out = json.loads(capsys.readouterr().out)
+    assert out.get("decision") == "block"
+    assert "Committed since session start" in out["reason"] and "foo.c" in out["reason"]
+    # The message must NOT steer the agent to a `git add` that leaves HEAD divergent.
+    assert "cannot clear" in out["reason"]
+
+    # `git add foo.c` (the index remediation) does NOT converge a committed
+    # divergence — HEAD still holds B — so the turn keeps blocking.
+    _stage(tmp_path, "foo.c")  # stage worktree A; HEAD is still B
+    _run(stop_gate.main, tmp_path, monkeypatch)
+    assert json.loads(capsys.readouterr().out).get("decision") == "block"
+
+    # Re-verifying the committed content is what converges: bring B into the worktree,
+    # reconcile the index to it, and let the gate stamp B verified — now the worktree,
+    # index, and HEAD blob all equal the last-verified hash.
+    src.write_text("int f(void){return 1;}\n")  # B in the worktree
+    _stage(tmp_path, "foo.c")  # index = B (matches HEAD), no stale staged A left
+    state = gate.load_state(str(tmp_path))
+    state["scanned"]["foo.c"] = gate.content_hash(str(src))  # B verified
+    gate.save_state(str(tmp_path), state)
+    rc = _run(stop_gate.main, tmp_path, monkeypatch)
+    assert rc == 0 and capsys.readouterr().out.strip() == ""  # now allowed, silent
+
+
+def test_stop_gate_staged_blob_residual_after_max_attempts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A persistent staged-blob divergence must degrade to a LOUD residual after the
+    # attempt cap — never an infinite block, never a silent pass.
+    _git_init(tmp_path)
+    src = tmp_path / "foo.c"
+    src.write_text("int f(void){return 0;}\n")
+    _git_commit_all(tmp_path)
+    state = gate.load_state(str(tmp_path))
+    state["scanned"]["foo.c"] = gate.content_hash(str(src))
+    state["stop_attempts"] = gate.MAX_STOP_ATTEMPTS  # next attempt exceeds the cap
+    gate.save_state(str(tmp_path), state)
+
+    src.write_text("int f(void){return 1;}\n")
+    _stage(tmp_path, "foo.c")
+    src.write_text("int f(void){return 0;}\n")
+
+    _run(stop_gate.main, tmp_path, monkeypatch)
+    out = json.loads(capsys.readouterr().out)
+    assert "decision" not in out  # allowed to end...
+    assert "Staged in the index" in out["systemMessage"]  # ...but with a LOUD residual
 
 
 def test_stop_gate_non_git_allows_but_records_skip(

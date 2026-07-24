@@ -259,8 +259,8 @@ def _included(rel: str) -> bool:
     return not include or _matches(rel, include)
 
 
-def _parse_porcelain_z(out: str) -> list[str]:
-    """Relative paths from ``git status --porcelain -z`` (NUL-separated, unquoted).
+def _iter_porcelain_z(out: str) -> Iterator[tuple[str, str]]:
+    """Yield ``(XY status, path)`` for each ``git status --porcelain -z`` record.
 
     Each record is ``XY<space>path``; a rename/copy record is followed by a second
     NUL-separated field holding the *original* path, which we skip (the current
@@ -268,7 +268,6 @@ def _parse_porcelain_z(out: str) -> list[str]:
     quoted, so no unescaping is needed.
     """
     tokens = out.split("\0")
-    paths: list[str] = []
     i = 0
     while i < len(tokens):
         entry = tokens[i]
@@ -278,8 +277,23 @@ def _parse_porcelain_z(out: str) -> list[str]:
         status, path = entry[:2], entry[3:]
         if "R" in status or "C" in status:
             i += 1  # the following token is the rename/copy source — skip it
-        paths.append(path)
-    return paths
+        yield status, path
+
+
+def _parse_porcelain_z(out: str) -> list[str]:
+    """Relative paths from ``git status --porcelain -z`` (current path per record)."""
+    return [path for _, path in _iter_porcelain_z(out)]
+
+
+def _staged_paths_from_porcelain(out: str) -> list[str]:
+    """Paths with a STAGED change: porcelain X-status neither clean (space) nor ``?``.
+
+    An ``X`` of ``M``/``A``/``R``/``C``/… means the index holds a blob differing from
+    ``HEAD`` (a `git add` of new or modified content) — the blob a plain `git commit`
+    would ship. A clean ``X`` (space) is a worktree-only edit the porcelain scan
+    already covers; ``?`` is untracked (no index entry).
+    """
+    return [path for status, path in _iter_porcelain_z(out) if status[0] not in " ?"]
 
 
 def _git(project_dir: str, *args: str) -> str | None:
@@ -300,6 +314,44 @@ def _git(project_dir: str, *args: str) -> str | None:
     except (FileNotFoundError, OSError, subprocess.SubprocessError):
         return None
     return proc.stdout if proc.returncode == 0 else None
+
+
+def _git_bytes(project_dir: str, *args: str) -> bytes | None:
+    """Like `_git`, but return raw stdout bytes (no text decoding), or ``None``.
+
+    Used to hash a git blob (``git cat-file blob <ref>``): the hash must be taken
+    over the exact bytes so it lines up with `content_hash`'s ``read_bytes`` digest —
+    a text decode/re-encode (newline translation) would spuriously diverge.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", project_dir, *args],
+            capture_output=True,
+            timeout=30,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def git_blob_hash(project_dir: str, ref: str) -> str | None:
+    """SHA-256 of the git blob at `ref` (``:path`` = index, ``HEAD:path`` = commit).
+
+    ``None`` when the ref does not resolve to a blob — a staged deletion, a rename's
+    stale source, or a path absent from ``HEAD`` — so the caller treats "no blob
+    there" as nothing to gate rather than a divergence.
+    """
+    out = _git_bytes(project_dir, "cat-file", "blob", ref)
+    return hashlib.sha256(out).hexdigest() if out is not None else None
+
+
+def staged_source_paths(project_dir: str) -> list[str]:
+    """Repo-root-relative paths with a STAGED change in the index (best-effort).
+
+    The blobs a plain `git commit` would ship. Empty when not a git work tree.
+    """
+    out = _git(project_dir, "status", "--porcelain", "-z", "-uall")
+    return [] if out is None else _staged_paths_from_porcelain(out)
 
 
 def git_changed_files(project_dir: str) -> list[str] | None:
@@ -348,6 +400,31 @@ def git_committed_files_since(project_dir: str, baseline_head: str | None) -> li
     return [p for p in out.split("\0") if p]
 
 
+def _in_scope_c_abspath(
+    project_dir: str, root: str, proj_real: str, rel: str
+) -> str | None:
+    """Absolute path for repo-root-relative `rel` if it is an in-scope, included C
+    source under `project_dir`, else ``None``.
+
+    Applies the C-suffix, project-subtree, and include/exclude-glob filters shared by
+    the worktree scan (`discover_changed_c_sources`) and the staged/committed-blob
+    scan (`divergent_blob_sources`). Deliberately does **not** check file existence —
+    a staged or committed blob can outlive its worktree file (a `git add`-then-`rm`),
+    and the blob scan must still gate it.
+    """
+    abspath = os.path.join(root, rel)
+    if not is_c_source(abspath):
+        return None
+    try:
+        if os.path.commonpath([proj_real, os.path.realpath(abspath)]) != proj_real:
+            return None  # changed outside this project subtree — out of scope
+    except ValueError:
+        return None  # different drive/root — cannot be under proj
+    if not _included(os.path.relpath(abspath, project_dir)):
+        return None
+    return abspath
+
+
 def discover_changed_c_sources(
     project_dir: str, *, baseline_head: str | None = None
 ) -> list[str] | None:
@@ -385,21 +462,15 @@ def discover_changed_c_sources(
     proj_real = os.path.realpath(project_dir)
     found: list[str] = []
     for rel in rels:
-        abspath = os.path.join(root, rel)
+        abspath = _in_scope_c_abspath(project_dir, root, proj_real, rel)
         # A path git reports changed but that is gone from disk (a Bash `rm`) is
         # skipped here — there is nothing to *verify*. Its recorded units are
         # reconciled separately by `prune_deleted_units`, which keys off actual
         # file existence so it also catches an untracked file git never tracked
         # (issue #99 review): keep discovery about "what to verify", pruning about
-        # "what no longer exists".
-        if not is_c_source(abspath) or not os.path.isfile(abspath):
-            continue
-        try:
-            if os.path.commonpath([proj_real, os.path.realpath(abspath)]) != proj_real:
-                continue  # changed outside this project subtree — out of scope
-        except ValueError:
-            continue  # different drive/root — cannot be under proj
-        if _included(os.path.relpath(abspath, project_dir)):
+        # "what no longer exists". A staged/committed blob that outlives its worktree
+        # file is gated instead by `divergent_blob_sources`.
+        if abspath is not None and os.path.isfile(abspath):
             found.append(abspath)
     return found
 
@@ -420,6 +491,63 @@ def stale_sources(project_dir: str, state: dict, files: Iterable[str]) -> list[s
         if scanned.get(unit_id(project_dir, abspath)) != digest:
             stale.append(abspath)
     return stale
+
+
+def divergent_blob_sources(
+    project_dir: str, state: dict, *, baseline_head: str | None = None
+) -> list[dict]:
+    """C whose STAGED or COMMITTED blob was never verified (issue #99 review).
+
+    `stale_sources` hashes only the worktree copy, so a Bash command that stages one
+    C blob and then reverts the worktree — ``git status`` reports ``MM`` yet the
+    worktree hashes as the last-verified content — could commit the staged blob
+    unverified; likewise a divergent blob committed while the worktree is reverted
+    leaves ``HEAD`` holding C the gate never saw, still worktree-fresh. This scans the
+    index (staged) and the committed-since-baseline (``HEAD``) blobs **directly** —
+    not `discover_changed_c_sources`, whose existence filter would drop a
+    staged/committed-then-``rm``ed path (its blob still ships) — and reports each blob
+    whose SHA-256 differs from the recorded `scanned` (last-verified) hash.
+
+    Keyed by content, so a blob equal to verified content is deduped straight out (no
+    over-gating a `git add`/commit of already-verified C). Only the staged set
+    (porcelain X-status) and the committed-since set are consulted, never every
+    tracked file, so a merely worktree-edited-but-uncommitted unit is *not* dragged in
+    by a stale ``HEAD``. Degrades to empty when not a git repo. Each entry is
+    ``{"rel": <project-relative path>, "reason": "staged" | "committed"}``.
+    """
+    root = _git(project_dir, "rev-parse", "--show-toplevel")
+    if root is None:
+        return []
+    root = root.strip()
+    proj_real = os.path.realpath(project_dir)
+    scanned = state.get("scanned", {})
+    # committed first: an already-shipped divergence is the graver of the two, and
+    # dedup keeps a single (rel, reason) entry per path.
+    candidates = [
+        (rel, f"HEAD:{rel}", "committed")
+        for rel in git_committed_files_since(project_dir, baseline_head)
+    ]
+    candidates += [
+        (rel, f":{rel}", "staged") for rel in staged_source_paths(project_dir)
+    ]
+
+    results: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for repo_rel, ref, reason in candidates:
+        abspath = _in_scope_c_abspath(project_dir, root, proj_real, repo_rel)
+        if abspath is None:
+            continue
+        rel = unit_id(project_dir, abspath)
+        key = (rel, reason)
+        if key in seen:
+            continue
+        digest = git_blob_hash(project_dir, ref)
+        if digest is None:
+            continue  # no blob at that ref (staged deletion / rename source) — skip
+        if scanned.get(rel) != digest:
+            seen.add(key)
+            results.append({"rel": rel, "reason": reason})
+    return results
 
 
 def baseline_scanned(project_dir: str) -> int | None:
