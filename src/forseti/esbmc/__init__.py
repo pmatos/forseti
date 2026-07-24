@@ -26,6 +26,7 @@ from .result import (
     Violated,
 )
 from .runner import build_argv, classify, verify
+from .units import ListUnitsError, Param, Unit, list_units, parse_units
 from .verify_cli import add_verify_arguments, verify_kwargs
 
 __all__ = [
@@ -35,9 +36,12 @@ __all__ = [
     "Error",
     "EsbmcResult",
     "Frontend",
+    "ListUnitsError",
+    "Param",
     "RunMeta",
     "SourceLoc",
     "Step",
+    "Unit",
     "Unknown",
     "UnknownReason",
     "Verdict",
@@ -47,7 +51,9 @@ __all__ = [
     "add_verify_arguments",
     "build_argv",
     "classify",
+    "list_units",
     "parse_counterexample",
+    "parse_units",
     "render_result",
     "result_to_dict",
     "verify",
