@@ -25,7 +25,17 @@ _RELATIONAL = re.compile(r"[=!<>]=")
 # The last non-blank char before a `*` when it is the *right* operand of binary
 # multiplication: an identifier char, a digit, or a closing `)`/`]`. Its absence
 # (start of clause, or an operator) marks the `*` as a unary pointer dereference.
+# A closing `)` is the ambiguous case, resolved by `_CLOSING_CAST` below.
 _OPERAND_TAIL = re.compile(r"[\w)\]]$")
+# The pre-`*` text (right-stripped) whose closing `)` ends a C *cast* -- a
+# parenthesized type such as `(int)`, `(uint32_t)`, `(char *)`, `(const unsigned
+# int)` -- rather than a value group like `(a + b)` or `(a * b)`. A cast's `)` is
+# not an operand, so a `*` after it is a unary dereference, not multiplication. The
+# negative lookbehind rejects `name(...)` (a call, whose `)` yields a value); the
+# body admits only type-shaped tokens -- identifier/keyword words (which may hold
+# digits, as in `uint32_t`) and trailing pointer `*`s -- so any group carrying an
+# operator is left as multiplication.
+_CLOSING_CAST = re.compile(r"(?<!\w)\(\s*[A-Za-z_]\w*(?:\s+[A-Za-z_]\w*)*\s*\**\s*\)$")
 
 
 def identifiers(expr: str) -> list[str]:
@@ -83,16 +93,20 @@ def derefs_or_subscripts(expr: str, name: str) -> bool:
     (identifier, number, ``)``, or ``]``) immediately before it -- across
     whitespace -- makes the ``*`` binary multiplication, so ``result * cp`` and
     ``result * (cp + 1)`` name `cp` as a scalar factor and render fine, whereas
-    ``*cp`` / ``*(cp + 0)`` / ``*(cp)`` do not. Best-effort: the parenthesized form
-    catches derefs a bare ``*name`` test misses; it does not see arbitrarily
-    nested derefs.
+    ``*cp`` / ``*(cp + 0)`` / ``*(cp)`` do not. A closing *cast* ``)`` is not an
+    operand: ``(int)*cp`` and ``(uint32_t) * cp`` unary-dereference `cp`, so they
+    are flagged even though a ``)`` precedes the ``*``. Best-effort: the
+    parenthesized form catches derefs a bare ``*name`` test misses; it does not see
+    arbitrarily nested derefs, and a parenthesized single name (``(x) * cp``, a
+    typedef-name cast lexically) is read as a cast -- the conservative reject side.
     """
     n = re.escape(name)
     if re.search(rf"\b{n}\s*\[", expr) is not None:
         return True
     for star in re.finditer(r"\*\s*", expr):
-        if _OPERAND_TAIL.search(expr[: star.start()].rstrip()):
-            continue  # an operand precedes this `*`: multiplication, not a deref
+        head = expr[: star.start()].rstrip()
+        if _OPERAND_TAIL.search(head) and not _CLOSING_CAST.search(head):
+            continue  # an operand (not a cast's `)`) precedes this `*`: not a deref
         rest = expr[star.end() :]
         if re.match(rf"{n}\b", rest) or re.match(rf"\([^()]*\b{n}\b", rest):
             return True
