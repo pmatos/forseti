@@ -36,6 +36,13 @@ def test_scalar_pointer_is_one_fresh_object() -> None:
     assert _roles(unit) == {"ctx": ParamRole.SCALAR_PTR}
 
 
+def test_restrict_qualified_concrete_pointer_still_materialisable() -> None:
+    # Scrubbing `restrict` to catch `void *restrict` must not demote a concrete
+    # pointee to UNRESOLVED — `uint8_t *restrict` is still one fresh object.
+    unit = _unit(Param("p", "const uint8_t *restrict"))
+    assert _roles(unit) == {"p": ParamRole.SCALAR_PTR}
+
+
 def test_byte_length_pairing() -> None:
     unit = _unit(Param("data", "const uint8_t *"), Param("len", "unsigned long"))
     plan = plan_unit(unit)
@@ -71,6 +78,9 @@ def test_non_length_named_next_param_is_not_paired() -> None:
     [
         "void *",  # no pointee size
         "const void *",
+        "void *restrict",  # restrict qualifier must not hide the void pointee
+        "const void *restrict",
+        "void *__restrict",  # GCC spelling
         "int **",  # multi-level: one fresh T* still dangles
         "void (*)(void)",  # function pointer
         "int (*)[10]",  # pointer to array

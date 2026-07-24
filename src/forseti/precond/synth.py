@@ -154,7 +154,15 @@ def _is_pointee_materialisable(type_str: str) -> bool:
         return False
     if stripped.count("*") != 1:  # only single-level pointers
         return False
-    without_ptr = re.sub(r"\bconst\b|\bvolatile\b|\*|\s", "", stripped)
+    # Scrub the cv/`restrict` qualifiers clang keeps on the canonical type
+    # (`void *restrict`, `const void *restrict`) so a `void` pointee is detected
+    # whatever qualifies it — otherwise the qualifier survives and a `void *`
+    # would be mis-sized `malloc(sizeof(void))` instead of falling to UNRESOLVED.
+    without_ptr = re.sub(
+        r"\bconst\b|\bvolatile\b|\b__restrict__\b|\b__restrict\b|\brestrict\b|\*|\s",
+        "",
+        stripped,
+    )
     return without_ptr != "void" and without_ptr != ""
 
 
