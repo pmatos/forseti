@@ -1,3 +1,10 @@
+# [1.3.0](https://github.com/pmatos/forseti/compare/v1.2.1...v1.3.0) (2026-07-24)
+
+
+### Features
+
+* **precond:** L0 memory-precondition synthesis + sidecar verify ([#134](https://github.com/pmatos/forseti/issues/134)) ([ff011f3](https://github.com/pmatos/forseti/commit/ff011f3ca702307dace9a094fca464134c5d2df5))
+
 ## [1.2.1](https://github.com/pmatos/forseti/compare/v1.2.0...v1.2.1) (2026-07-24)
 
 
