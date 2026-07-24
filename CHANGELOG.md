@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/pmatos/forseti/compare/v1.0.0...v1.1.0) (2026-07-24)
+
+
+### Features
+
+* **claude-adapter:** classify pointer/array units as NEEDS_CONTRACT ([#130](https://github.com/pmatos/forseti/issues/130)) ([dea75a4](https://github.com/pmatos/forseti/commit/dea75a4d5a4516e179589f9655d9915a2a45f190))
+
 # 1.0.0 (2026-07-20)
 
 
