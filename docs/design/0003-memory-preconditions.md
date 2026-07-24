@@ -90,7 +90,11 @@ flowchart TB
 ```
 
 - **L0 — mechanical (deterministic, zero‑LLM).** `scalar T*` → one fresh object; `T* p` adjacent
-  to an integer `len|n|size|count` → `is_fresh(p, len)` / `malloc(len)`; fixed array `T p[N]` →
+  to an integer whose **kind** sets the size — a **byte length** (`len`/`size`/`nbytes`) →
+  `is_fresh(p, len)` / `malloc(len)`, an **element count** (`n`/`count`/`nmemb`) →
+  `is_fresh(p, n * sizeof(*p))` / `malloc(n * sizeof(*p))` (equal only when `sizeof(*p) == 1`,
+  e.g. sha1's `uint8_t*`; conflating them for a wide `T` reintroduces the phantom VIOLATED this
+  gate exists to remove); fixed array `T p[N]` →
   size `N` straight from the signature. Covers most real C **and all of sha1's one‑shot + digest**.
 - **L1 — structural inference (LLM fallback, still automatic + transparent).** Reachable context
   (construct `ctx` by calling `sha1_init`, *not* a nondet blob), ambiguous pointer/length pairing,
