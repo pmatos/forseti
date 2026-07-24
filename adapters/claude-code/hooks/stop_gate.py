@@ -80,8 +80,13 @@ def main() -> int:
     # Discover C files changed out-of-band (Bash) that the gate has not verified.
     # This is an ESBMC-free, git-fast backstop — the heavy verify runs in the
     # `post_bash` PostToolUse hook (300 s budget), never here (120 s, kill = silent
-    # allow). `None` means no git repo → out-of-band detection is inactive.
-    discovered = gate.discover_changed_c_sources(project_dir)
+    # allow). `None` means no git repo → out-of-band detection is inactive. The
+    # baseline HEAD (read outside the lock — it is set once at session start and
+    # never mutated mid-session) also surfaces C committed in the same Bash command.
+    baseline_head = gate.load_state(project_dir).get("baseline_head")
+    discovered = gate.discover_changed_c_sources(
+        project_dir, baseline_head=baseline_head
+    )
 
     with gate.gate_lock(project_dir):  # serialize with concurrent PostToolUse hooks
         state = gate.load_state(project_dir)

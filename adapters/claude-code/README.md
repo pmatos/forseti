@@ -25,14 +25,18 @@ server — the hooks call the neutral `forseti` CLI directly.
   `Bash` call this hook asks `git` which C sources changed and verifies each one
   whose content differs from what the gate last saw — the same function-level
   ESBMC pass, feeding any counterexample back the same way. It never parses the
-  shell command for filenames (unreliable); discovery is scoped to `git status`,
-  so untouched committed/third-party C is never swept in. Requires the project to
-  be a **git repository** (see **Known limitations**).
+  shell command for filenames (unreliable); discovery is the union of `git status`
+  (working-tree/index changes) and C **committed since the session baseline HEAD**,
+  so a command that writes *and* commits a C file in one shot (`cat > f.c && git
+  commit …`, leaving a clean worktree) is still caught. Content-hash freshness is
+  the real gate, so untouched committed/third-party C — and a file merely committed
+  unchanged — is never swept in. Requires the project to be a **git repository**
+  (see **Known limitations**).
 - **SessionStart hook** — records the content of every C file already dirty at
-  session start as the *baseline*, so the out-of-band scan gates only C the agent
-  changes **during** the session, never pre-existing WIP it never touched. Without
-  it a `git status` scan would flag the user's uncommitted C on the very first
-  turn.
+  session start as the *baseline*, plus the baseline HEAD commit, so the
+  out-of-band scan gates only C the agent changes **during** the session (whether
+  left dirty or committed), never pre-existing WIP it never touched. Without it a
+  `git status` scan would flag the user's uncommitted C on the very first turn.
 - **Stop hook** — blocks the turn from ending while any touched unit is not
   `VERIFIED up to k`. As an ESBMC-free backstop it also re-checks `git` for C
   files changed out-of-band that are still unverified, and blocks on those too —
@@ -202,12 +206,19 @@ turns a verdict into an error.
   recorded in the trace (`oob_scan_skipped`) rather than passing silently, but it
   is not gated. Scope is **"C changed since session start"** (issue
   [#99](https://github.com/pmatos/forseti/issues/99)): the SessionStart hook
-  baselines the already-dirty tree, so the scan catches this session's Bash writes
-  while never gating pre-existing uncommitted or committed/third-party C the agent
-  never touched. It relies on content changes git can see; a change git cannot
-  (a file outside the work tree, or one matched by `.gitignore`) is not scanned.
-  A file changed *between* sessions is re-baselined on the next fresh start, so it
-  is treated as pre-existing rather than gated.
+  baselines the already-dirty tree *and* the current HEAD, so the scan catches this
+  session's Bash writes — including a C file written **and committed in one shot**
+  (a clean worktree `git status` alone would miss), recovered by diffing the
+  baseline HEAD against the current one — while never gating pre-existing
+  uncommitted or committed/third-party C the agent never touched. Two documented
+  bounds of the HEAD-diff: (1) a HEAD movement that brings in C without the agent
+  authoring it (a `git checkout`/`merge`/`rebase` run via Bash) is conservatively
+  gated — an over-gate that blocks loudly, never a silent pass; (2) in a repo with
+  **no commits** at session start there is no baseline HEAD, so the very first
+  commit's C is caught only if it is also left dirty. It relies on content changes
+  git can see; a change git cannot (a file outside the work tree, or one matched by
+  `.gitignore`) is not scanned. A file changed *between* sessions is re-baselined
+  on the next fresh start, so it is treated as pre-existing rather than gated.
 - **mtime is not used.** Freshness is keyed on a SHA-256 of file content, so a
   `cp -p`/`tar` that preserves an old timestamp cannot slip an unverified change
   past the gate, and an unchanged file is never needlessly re-verified.

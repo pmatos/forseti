@@ -314,7 +314,43 @@ def git_changed_files(project_dir: str) -> list[str] | None:
     return None if out is None else _parse_porcelain_z(out)
 
 
-def discover_changed_c_sources(project_dir: str) -> list[str] | None:
+def git_head(project_dir: str) -> str | None:
+    """The current ``HEAD`` commit SHA, or ``None``.
+
+    ``None`` when `project_dir` is not a work tree *or* the repo has no commits
+    yet (`git rev-parse HEAD` fails) — the SessionStart baseline stores this, and a
+    ``None`` baseline simply disables the committed-since scan (below).
+    """
+    out = _git(project_dir, "rev-parse", "HEAD")
+    return out.strip() if out else None
+
+
+def git_committed_files_since(project_dir: str, baseline_head: str | None) -> list[str]:
+    """Repo-root-relative paths committed since `baseline_head` (best-effort).
+
+    ``git status`` reports only working-tree/index state, so a Bash command that
+    writes a C file *and* commits it in one shot (``cat > f.c && git commit ...``)
+    leaves a clean tree the porcelain scan cannot see (issue #99 review). Diffing
+    the session baseline HEAD against the current HEAD recovers those committed
+    paths. Best-effort and purely additive: an empty list when there is no
+    baseline, HEAD has not moved, or the diff fails (e.g. the baseline commit was
+    rewritten) — the porcelain scan still covers uncommitted work either way.
+
+    ``-z`` for unquoted NUL-separated paths; ``--name-only`` emits one entry per
+    changed path (a rename's stale source, if listed, is dropped later by the
+    existence filter), so no rename bookkeeping is needed here.
+    """
+    if not baseline_head:
+        return []
+    out = _git(project_dir, "diff", "--name-only", "-z", baseline_head, "HEAD")
+    if out is None:
+        return []
+    return [p for p in out.split("\0") if p]
+
+
+def discover_changed_c_sources(
+    project_dir: str, *, baseline_head: str | None = None
+) -> list[str] | None:
     """Absolute paths of changed, still-present C sources under `project_dir`.
 
     git reports paths relative to the *repository root*, which need not be
@@ -322,12 +358,27 @@ def discover_changed_c_sources(project_dir: str) -> list[str] | None:
     `project_dir` (a subdir checkout gates only its own changes). Include/exclude
     globs are applied to the project-relative path, matching `unit_id`. ``None``
     when discovery is unavailable (not a git repo).
+
+    Discovery is the union of the working-tree/index changes (``git status``) and
+    C committed since the session `baseline_head` (issue #99 review): a Bash
+    command that writes and commits a C file in one shot leaves a clean tree the
+    porcelain scan alone would miss. The union is deduped and content-hash
+    freshness (`stale_sources`) remains the real gate, so a file committed
+    *unchanged* since the baseline is filtered back out. A ``None`` baseline (no
+    commits yet, or SessionStart never seeded one) degrades cleanly to the
+    porcelain-only scan.
     """
     root = _git(project_dir, "rev-parse", "--show-toplevel")
     rels = git_changed_files(project_dir)
     if root is None or rels is None:
         return None
     root = root.strip()
+    # Both git subcommands emit repo-root-relative paths, so the committed-since
+    # set unions straight into `rels` before the shared join/scope/filter below.
+    # dict.fromkeys dedups while preserving order (a path both dirty and committed
+    # is verified once).
+    committed = git_committed_files_since(project_dir, baseline_head)
+    rels = list(dict.fromkeys([*rels, *committed]))
     # Keep the returned path expressed relative to the raw `project_dir` so its
     # `unit_id`/`scanned` key matches what `verify_and_record` stamps; realpath is
     # used only to compare against the (possibly symlinked) project subtree.
@@ -380,11 +431,14 @@ def baseline_scanned(project_dir: str) -> int | None:
     over-reach this issue was careful to avoid. Seeding `scanned` with each
     pre-session dirty file's current hash scopes the gate to "changed **since
     session start**": those files are gated only once the agent actually modifies
-    them. Returns the number baselined, or ``None`` if not a git repo.
+    them. The baseline HEAD is recorded too, so the committed-since scan can later
+    catch C a Bash command writes *and* commits in one shot (issue #99 review).
+    Returns the number baselined, or ``None`` if not a git repo.
     """
     discovered = discover_changed_c_sources(project_dir)
     if discovered is None:
         return None
+    head = git_head(project_dir)  # resolve HEAD outside the lock (a subprocess)
     with gate_lock(project_dir):
         state = load_state(project_dir)
         baseline: dict[str, str] = {}
@@ -393,6 +447,7 @@ def baseline_scanned(project_dir: str) -> int | None:
             if digest is not None:
                 baseline[unit_id(project_dir, abspath)] = digest
         state["scanned"] = baseline
+        state["baseline_head"] = head
         save_state(project_dir, state)
     return len(baseline)
 
@@ -506,10 +561,11 @@ def load_state(project_dir: str) -> dict:
             state.setdefault("units", {})
             state.setdefault("stop_attempts", 0)
             state.setdefault("scanned", {})
+            state.setdefault("baseline_head", None)
             return state
         except (json.JSONDecodeError, OSError):
             pass
-    return {"units": {}, "stop_attempts": 0, "scanned": {}}
+    return {"units": {}, "stop_attempts": 0, "scanned": {}, "baseline_head": None}
 
 
 def save_state(project_dir: str, state: dict) -> None:

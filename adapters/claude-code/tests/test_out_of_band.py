@@ -143,6 +143,95 @@ def test_discover_resolves_repo_root_and_scopes_to_project_dir(tmp_path: Path) -
     assert os.path.isfile(found[0])  # path resolved correctly against the repo root
 
 
+# --- committed-since-baseline discovery (issue #99 review) ------------------
+
+
+def test_git_head_and_committed_files_since(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    (tmp_path / "a.c").write_text("int a(void){return 0;}\n")
+    _git_commit_all(tmp_path)
+    base = gate.git_head(str(tmp_path))
+    assert base is not None
+    assert gate.git_committed_files_since(str(tmp_path), base) == []  # no movement
+
+    (tmp_path / "b.c").write_text("int b(void){return 0;}\n")
+    _git_commit_all(tmp_path)  # HEAD moves
+    assert gate.git_committed_files_since(str(tmp_path), base) == ["b.c"]
+    # a None baseline (no commits yet / never seeded) disables the scan
+    assert gate.git_committed_files_since(str(tmp_path), None) == []
+    # a rewritten/unknown baseline degrades to empty, never raises
+    assert gate.git_committed_files_since(str(tmp_path), "0" * 40) == []
+
+
+def test_git_head_none_without_commits(tmp_path: Path) -> None:
+    _git_init(tmp_path)  # a repo, but zero commits
+    assert gate.git_head(str(tmp_path)) is None
+
+
+def test_discover_includes_c_committed_since_baseline(tmp_path: Path) -> None:
+    # The review's bypass: a Bash command writes AND commits a C file in one shot,
+    # leaving a clean worktree that `git status` cannot see. The committed-since
+    # scan recovers it; without the baseline (porcelain only) it is missed.
+    _git_init(tmp_path)
+    (tmp_path / "seed.txt").write_text("x")
+    _git_commit_all(tmp_path)
+    base = gate.git_head(str(tmp_path))
+
+    (tmp_path / "committed.c").write_text("int f(void){return 0;}\n")
+    _git_commit_all(tmp_path)  # written + committed, worktree now clean
+
+    assert gate.discover_changed_c_sources(str(tmp_path)) == []  # porcelain misses it
+    found = gate.discover_changed_c_sources(str(tmp_path), baseline_head=base)
+    assert found is not None
+    assert [os.path.basename(f) for f in found] == ["committed.c"]
+
+
+def test_discover_committed_unchanged_is_deduped_by_stale(tmp_path: Path) -> None:
+    # A pre-existing dirty file committed *unchanged* is discovered but filtered
+    # back out by content-hash freshness — no over-gating of untouched C.
+    _git_init(tmp_path)
+    (tmp_path / "seed.txt").write_text("x")
+    _git_commit_all(tmp_path)
+    base = gate.git_head(str(tmp_path))
+    wip = tmp_path / "wip.c"
+    wip.write_text("int w(void){return 0;}\n")
+    state = gate.load_state(str(tmp_path))
+    state["scanned"]["wip.c"] = gate.content_hash(str(wip))  # baselined while dirty
+    _git_commit_all(tmp_path)  # committed with the SAME content
+
+    found = gate.discover_changed_c_sources(str(tmp_path), baseline_head=base)
+    assert found is not None
+    assert [os.path.basename(f) for f in found] == ["wip.c"]  # discovered...
+    assert gate.stale_sources(str(tmp_path), state, found) == []  # ...but not stale
+
+
+def test_discover_committed_since_scopes_to_project_subdir(tmp_path: Path) -> None:
+    # committed-since paths are repo-root-relative like porcelain, so a commit
+    # outside the project subdir is out of scope.
+    _git_init(tmp_path)
+    (tmp_path / "seed.txt").write_text("x")
+    _git_commit_all(tmp_path)
+    base = gate.git_head(str(tmp_path))
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (tmp_path / "top.c").write_text("int t(void){return 0;}\n")  # repo root
+    (sub / "inner.c").write_text("int i(void){return 0;}\n")  # under project_dir
+    _git_commit_all(tmp_path)
+
+    found = gate.discover_changed_c_sources(str(sub), baseline_head=base)
+    assert found is not None
+    assert [os.path.basename(f) for f in found] == ["inner.c"]  # top.c out of scope
+
+
+def test_baseline_scanned_records_head(tmp_path: Path) -> None:
+    _git_init(tmp_path)
+    (tmp_path / "seed.txt").write_text("x")
+    _git_commit_all(tmp_path)
+    base = gate.git_head(str(tmp_path))
+    gate.baseline_scanned(str(tmp_path))
+    assert gate.load_state(str(tmp_path))["baseline_head"] == base
+
+
 # --- deleted-source reconciliation (issue #99 review) -----------------------
 
 
@@ -275,6 +364,69 @@ def test_stop_gate_prunes_committed_deleted_unit(
     rc = _run(stop_gate.main, tmp_path, monkeypatch)
     assert rc == 0 and capsys.readouterr().out.strip() == ""  # not blocked
     assert "old.c::f" not in gate.load_state(str(tmp_path))["units"]
+
+
+def test_stop_gate_blocks_on_c_committed_in_same_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The review's bypass: a Bash command that writes AND commits a C file in one
+    # shot leaves a clean worktree; the baseline-HEAD scan must still block on it.
+    _git_init(tmp_path)
+    (tmp_path / "seed.txt").write_text("x")
+    _git_commit_all(tmp_path)
+    _run(session_start.main, tmp_path, monkeypatch, source="startup")  # baselines HEAD
+
+    (tmp_path / "committed.c").write_text("int f(void){return 0;}\n")
+    _git_commit_all(tmp_path)  # written + committed → worktree clean
+
+    _run(stop_gate.main, tmp_path, monkeypatch)
+    out = json.loads(capsys.readouterr().out)
+    assert out.get("decision") == "block"
+    assert "out-of-band" in out["reason"] and "committed.c" in out["reason"]
+
+
+def test_stop_gate_blocks_on_verified_unit_modified_then_committed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The property that actually closes the hole: a unit already VERIFIED at its
+    # last content, then changed AND committed in one Bash command, is re-gated —
+    # never a silent pass on the new, unverified content.
+    _git_init(tmp_path)
+    src = tmp_path / "u.c"
+    src.write_text("int f(void){return 0;}\n")
+    _git_commit_all(tmp_path)
+    _run(session_start.main, tmp_path, monkeypatch, source="startup")  # baselines HEAD
+
+    state = gate.load_state(str(tmp_path))  # record the current content as VERIFIED
+    state["scanned"]["u.c"] = gate.content_hash(str(src))
+    gate.record(state, gate.UnitVerdict("u.c::f", "u.c", "f", "verified", 1))
+    gate.save_state(str(tmp_path), state)
+
+    src.write_text("int f(void){return 1;}\n")  # changed...
+    _git_commit_all(tmp_path)  # ...and committed in one shot
+
+    _run(stop_gate.main, tmp_path, monkeypatch)
+    out = json.loads(capsys.readouterr().out)
+    assert out.get("decision") == "block"
+    assert "u.c" in out["reason"]
+
+
+def test_stop_gate_allows_committed_unchanged_baselined_c(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A pre-existing dirty C file committed UNCHANGED must not be gated: the
+    # content-hash baseline dedups it even though committed-since discovers it.
+    _git_init(tmp_path)
+    (tmp_path / "seed.txt").write_text("x")
+    _git_commit_all(tmp_path)
+    wip = tmp_path / "wip.c"
+    wip.write_text("int w(void){return 0;}\n")  # dirty before the baseline
+    _run(session_start.main, tmp_path, monkeypatch, source="startup")  # scanned + HEAD
+
+    _git_commit_all(tmp_path)  # commit wip.c unchanged → clean worktree
+
+    rc = _run(stop_gate.main, tmp_path, monkeypatch)
+    assert rc == 0 and capsys.readouterr().out.strip() == ""  # not gated
 
 
 def test_stop_gate_non_git_allows_but_records_skip(

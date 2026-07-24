@@ -131,7 +131,13 @@ def main() -> int:
     data = json.loads(raw) if raw.strip() else {}
     project_dir = _project_dir(data)
 
-    discovered = gate.discover_changed_c_sources(project_dir)
+    # Read state once for the baseline HEAD (so the scan also catches C committed
+    # in the same Bash command) and to pick the files that actually changed since
+    # their last verify; verify_and_record re-locks per file, so we hold no lock.
+    state = gate.load_state(project_dir)
+    discovered = gate.discover_changed_c_sources(
+        project_dir, baseline_head=state.get("baseline_head")
+    )
     if discovered is None:
         # Not a git work tree — out-of-band discovery is inactive. Never a silent
         # no-op: record the degraded scope so the gap is visible in the trace.
@@ -143,9 +149,6 @@ def main() -> int:
         )
         return 0
 
-    # Read state once to pick the files that actually changed since their last
-    # verify; verify_and_record re-locks per file, so we hold no lock here.
-    state = gate.load_state(project_dir)
     stale = gate.stale_sources(project_dir, state, discovered)
     if not stale:
         return 0
