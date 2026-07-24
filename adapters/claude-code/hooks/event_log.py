@@ -38,6 +38,7 @@ EDIT = "edit"  # a Write/Edit/MultiEdit fired on a C file
 VERIFY = "verify"  # one `forseti verify` (ESBMC) call and its verdict
 GATE = "gate"  # the PostToolUse decision for a file (pass | block)
 STOP = "stop"  # the Stop-gate decision (block | residual | allow)
+SESSION = "session"  # a SessionStart baseline of the pre-session dirty C tree
 
 
 def events_path(project_dir: str | os.PathLike[str]) -> Path:

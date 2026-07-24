@@ -51,6 +51,22 @@ def _needs_message(needs: list[dict]) -> str:
     )
 
 
+def _oob_note(project_dir: str, oob: list[str]) -> str:
+    """Loud note for C files changed out-of-band (via Bash) that are unverified.
+
+    The backstop for the ``post_bash`` PostToolUse scan (issue #99): normally that
+    hook has already verified every Bash-written C file by turn end, so this is
+    empty. If one slipped through it blocks the turn — never a silent pass — and
+    tells Claude how to get it re-checked.
+    """
+    rels = ", ".join(gate.unit_id(project_dir, f) for f in oob)
+    return (
+        f"⚠ Forseti: {len(oob)} C file(s) changed out-of-band (written via Bash, "
+        f"bypassing the edit gate) and are UNVERIFIED: {rels}. Re-verify them — edit "
+        "the file, or run any Bash command so the scan re-checks — before ending."
+    )
+
+
 def _emit(obj: dict) -> int:
     print(json.dumps(obj))
     return 0
@@ -61,16 +77,34 @@ def main() -> int:
     data = json.loads(raw) if raw.strip() else {}
     project_dir = _project_dir(data)
 
+    # Discover C files changed out-of-band (Bash) that the gate has not verified.
+    # This is an ESBMC-free, git-fast backstop — the heavy verify runs in the
+    # `post_bash` PostToolUse hook (300 s budget), never here (120 s, kill = silent
+    # allow). `None` means no git repo → out-of-band detection is inactive.
+    discovered = gate.discover_changed_c_sources(project_dir)
+
     with gate.gate_lock(project_dir):  # serialize with concurrent PostToolUse hooks
         state = gate.load_state(project_dir)
         blocking = gate.blocking_units(state)
         needs = gate.needs_contract_units(state)
-        if blocking:
-            attempts = int(state.get("stop_attempts", 0)) + 1
+        oob = gate.stale_sources(project_dir, state, discovered) if discovered else []
+        outstanding = bool(blocking) or bool(oob)
+        attempts = int(state.get("stop_attempts", 0)) + 1
+        if outstanding:
             state["stop_attempts"] = attempts
             gate.save_state(project_dir, state)
 
-    if not blocking:
+    if discovered is None:
+        # Never a silent no-op: the trace records that out-of-band writes could
+        # not be checked in this (non-git) project.
+        event_log.log_event(
+            project_dir,
+            event_log.STOP,
+            decision="oob_scan_skipped",
+            reason="not a git repository",
+        )
+
+    if not outstanding:
         # Nothing blocks. NEEDS_CONTRACT units (pointer/array, no harness yet) are
         # honestly-unverified but a source fix can't resolve them, so let the turn
         # end — loudly if any are outstanding, never silently.
@@ -88,9 +122,17 @@ def main() -> int:
         )
         return 0  # nothing outstanding — allow the turn to end
 
-    # Fold any NEEDS_CONTRACT units into the block/residual message so the human
-    # sees the full picture, but they never drive the block themselves.
-    extra = ("\n\n" + _needs_message(needs)) if needs else ""
+    # Fold the recorded-blocking residual, any out-of-band files, and any
+    # NEEDS_CONTRACT note into one message. Only blocking + oob drive the block.
+    sections = []
+    if blocking:
+        sections.append(_residual(blocking))
+    if oob:
+        sections.append(_oob_note(project_dir, oob))
+    if needs:
+        sections.append(_needs_message(needs))
+    detail = "\n\n".join(sections)
+    n_out = len(blocking) + len(oob)
 
     if attempts > gate.MAX_STOP_ATTEMPTS:
         # Allow the turn to end by OMITTING `decision` — the Stop schema only
@@ -101,14 +143,15 @@ def main() -> int:
             event_log.STOP,
             decision="residual",
             n_unverified=len(blocking),
+            n_oob=len(oob),
             attempt=attempts,
         )
         return _emit(
             {
                 "systemMessage": (
-                    "⚠ Forseti: ending the turn with UNVERIFIED unit(s) after "
+                    "⚠ Forseti: ending the turn with UNVERIFIED item(s) after "
                     f"{gate.MAX_STOP_ATTEMPTS} attempts. This is NOT a pass — "
-                    "report the residual to the human:\n" + _residual(blocking) + extra
+                    "report the residual to the human:\n" + detail
                 ),
             }
         )
@@ -118,18 +161,17 @@ def main() -> int:
         event_log.STOP,
         decision="block",
         n_unverified=len(blocking),
+        n_oob=len(oob),
         attempt=attempts,
     )
     return _emit(
         {
             "decision": "block",
             "reason": (
-                f"Forseti verify-gate: {len(blocking)} unit(s) are not VERIFIED "
-                "up to k. Do not end the turn — fix them and let the gate "
-                "re-verify, or explicitly report to the human which unit / "
-                "property / k could not be verified and why.\n\n"
-                + _residual(blocking)
-                + extra
+                f"Forseti verify-gate: {n_out} item(s) are not VERIFIED up to k. "
+                "Do not end the turn — fix/verify them and let the gate re-check, "
+                "or explicitly report to the human which unit / property / k could "
+                "not be verified and why.\n\n" + detail
             ),
         }
     )
