@@ -1,3 +1,10 @@
+# [1.2.0](https://github.com/pmatos/forseti/compare/v1.1.0...v1.2.0) (2026-07-24)
+
+
+### Features
+
+* **esbmc:** forseti list-units — signatures from ESBMC's clang frontend ([#131](https://github.com/pmatos/forseti/issues/131)) ([#132](https://github.com/pmatos/forseti/issues/132)) ([724cbbf](https://github.com/pmatos/forseti/commit/724cbbf4f8a849b57ba68923c9c21880e052aba9))
+
 # [1.1.0](https://github.com/pmatos/forseti/compare/v1.0.0...v1.1.0) (2026-07-24)
 
 
