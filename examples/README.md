@@ -75,3 +75,32 @@ Risk 1). Therefore, for every kernel whose property is checked after a loop:
 These verdicts are bounded — *verified up to k under esbmc 8.3.0* — not proofs for
 all inputs. They are pinned against ESBMC output drift by
 [`tests/esbmc/test_corpus.py`](../tests/esbmc/test_corpus.py).
+
+## Memory-precondition corpus (RFC-0003 S2)
+
+`sha1.c` / `sha1_bug.c` are a different kind of target. They have **no `main`** —
+each function is a pointer-taking unit that is *meaningless* at the function level
+(ESBMC passes each pointer an invalid object, so the first dereference soundly
+FAILS). `forseti synth` reads a **memory precondition off the type signature**,
+materialises a valid backing object per pointer in a generated sidecar (the file
+stays pristine — the sidecar `#include`s it), and reports **VERIFIED *assuming
+valid caller pointers*** — an undischarged precondition (discharge is S3), never a
+full verdict. Verification runs with **unwinding assertions on**, a **k-ladder**,
+and a **non-vacuity** check, exactly the discipline above. See RFC-0003
+(`docs/design/0003-memory-preconditions.md`).
+
+| File | Unit | L0 shape | Assessment | Run |
+|------|------|----------|------------|-----|
+| `sha1.c` | `sha1.c::sha1_init` | scalar `sha1_ctx *` | ASSUMED_VERIFIED (k=9) | `forseti synth examples/sha1.c --function sha1_init` |
+| `sha1.c` | `sha1.c::sha1_transform` | scalar `sha1_ctx *` (reads `buffer[64]`) | ASSUMED_VERIFIED (k=144) | `forseti synth examples/sha1.c --function sha1_transform` |
+| `sha1.c` | `sha1.c::sha1_update` | `(const uint8_t *, size_t len)` → `malloc(len)` | ASSUMED_VERIFIED (k=9) | `forseti synth examples/sha1.c --function sha1_update` |
+| `sha1.c` | `sha1.c::sha1_final` | fixed array `uint8_t digest[20]` | ASSUMED_VERIFIED (k=36) | `forseti synth examples/sha1.c --function sha1_final` |
+| `sha1_bug.c` | `sha1.c::sha1_update` | — (`i <= len` reads `data[len]`) | VIOLATED (array bounds) | `forseti synth examples/sha1_bug.c --function sha1_update` |
+
+These units check **memory safety per unit only** — they do *not* compose into a
+working SHA-1: `sha1_update` never flushes a full block, `sha1_final` never pads,
+and nothing calls `sha1_transform`, so `init`→`update`→`final` hashes nothing (the
+digest is the IV, independent of the input). That is fine here because S2 verifies
+each pointer *signature* in isolation, not the hash; a real digest would need a
+block/padding driver that is out of scope. Pinned by
+[`tests/esbmc/test_precond_corpus.py`](../tests/esbmc/test_precond_corpus.py).

@@ -164,6 +164,7 @@ def build_argv(
     timeout_s: float | None = None,
     extra_flags: Sequence[str] = (),
     esbmc_bin: str = "esbmc",
+    no_unwinding_assertions: bool = True,
 ) -> tuple[str, ...]:
     """The exact esbmc command line for these verification parameters.
 
@@ -175,13 +176,19 @@ def build_argv(
     place to spell a flag rather than open-coding `["--function", name]` at each
     site. `function` and `--timeout` come *after* `extra_flags` so an explicit
     passthrough flag keeps its position relative to esbmc's option precedence.
+
+    `no_unwinding_assertions` defaults True (the corpus/gate bound: a VERIFIED is
+    "up to k", an under-unwound loop is silently assumed exited). The memory-
+    precondition synthesizer (RFC-0003 S2) sets it False so unwinding assertions
+    are **on** — an under-unwound loop then reports a distinct *unwinding
+    assertion* failure (the driver escalates k on it) rather than a fake proof.
     """
     argv = [
         esbmc_bin,
         str(source),
         "--unwind",
         str(unwind),
-        "--no-unwinding-assertions",
+        *(("--no-unwinding-assertions",) if no_unwinding_assertions else ()),
         *extra_flags,
     ]
     if function is not None:
@@ -200,6 +207,7 @@ def verify(
     extra_flags: Sequence[str] = (),
     esbmc_bin: str = "esbmc",
     frontend: Frontend = Frontend.C,
+    no_unwinding_assertions: bool = True,
 ) -> EsbmcResult:
     """Run ESBMC on a `source` and return the typed verdict.
 
@@ -210,7 +218,8 @@ def verify(
     caller. When `timeout_s` is set, esbmc's own `--timeout` is used (it yields a
     clean `Timed out`), with a wall-clock backstop that maps a Python-level
     timeout to `Unknown(TIMEOUT)`. `frontend` selects the counterexample parser
-    (C only, for now).
+    (C only, for now). `no_unwinding_assertions` (default True) turns esbmc's
+    unwinding assertions off; the S2 synthesizer passes False to keep them on.
     """
     argv = build_argv(
         source,
@@ -219,6 +228,7 @@ def verify(
         timeout_s=timeout_s,
         extra_flags=extra_flags,
         esbmc_bin=esbmc_bin,
+        no_unwinding_assertions=no_unwinding_assertions,
     )
     proc_timeout = timeout_s + _GRACE_S if timeout_s is not None else None
 

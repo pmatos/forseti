@@ -24,7 +24,7 @@ import os
 import re
 import subprocess
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 # One AST node line: leading tree art, then `-Kind`, then the rest. The art is
@@ -44,13 +44,27 @@ _NAME_RE = re.compile(r"\s(\w+)\s+'")
 # so the *last* match is the canonical (typedef-resolved) type.
 _TYPE_RE = re.compile(r"'([^']*)'")
 
+# Line (`// ...`) and block (`/* ... */`) comments, stripped before harvesting an
+# array extent so a `[N]` inside a comment can never be misread as a declarator.
+_COMMENT_RE = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
+
 
 @dataclass(frozen=True)
 class Param:
-    """One parameter: its name (``""`` if unnamed) and canonical (resolved) type."""
+    """One parameter: its name, canonical type, and fixed-array extent (if any).
+
+    `array_extent` is the ``N`` of a parameter *written* as a fixed array
+    ``T p[N]`` — information clang's canonical type has already thrown away
+    (``T p[20]`` is *adjusted* to ``T *``, so the size is unrecoverable from the
+    type alone). It is harvested from the source declarator by `list_units`
+    (`annotate_array_extents`) and is ``None`` for a plain pointer, an unsized
+    ``T p[]``, a scalar, or when the source could not be read. The memory-
+    precondition synthesizer (RFC-0003 S2) uses it to size ``T p[N]`` objects.
+    """
 
     name: str
     type: str
+    array_extent: int | None = None
 
     @property
     def is_pointer(self) -> bool:
@@ -182,6 +196,80 @@ def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
     return units
 
 
+def _param_list_text(source_no_comments: str, fn_name: str) -> str | None:
+    """The parameter-list text of `fn_name`'s *definition*, or ``None``.
+
+    Scans for ``fn_name (`` and balances parentheses to the matching ``)``; the
+    occurrence whose ``)`` is followed (past whitespace) by ``{`` is the
+    definition — so a prototype (``);``) or a call site (``) ;``, ``))``) is
+    skipped. Deliberately narrow: clang already told us the canonical types and
+    which parameters are pointers, so this only has to isolate the declarator
+    text to harvest an array extent from — never to classify a type.
+    """
+    for match in re.finditer(rf"\b{re.escape(fn_name)}\s*\(", source_no_comments):
+        depth = 0
+        j = match.end() - 1  # index of the '('
+        while j < len(source_no_comments):
+            char = source_no_comments[j]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        else:
+            continue  # unbalanced — not a usable signature
+        k = j + 1
+        while k < len(source_no_comments) and source_no_comments[k].isspace():
+            k += 1
+        if k < len(source_no_comments) and source_no_comments[k] == "{":
+            return source_no_comments[match.end() : j]
+    return None
+
+
+def _array_extent(param_list: str, name: str) -> int | None:
+    """The ``N`` of ``name[N]`` in `param_list`, or ``None``.
+
+    Harvests a *single-dimension* fixed extent for the named parameter; a
+    multi-dimensional ``name[N][M]`` (a pointer-to-array, not an L0 shape) is
+    left as ``None`` so the synthesizer treats it as unresolved rather than
+    mis-sizing it.
+    """
+    if not name:
+        return None
+    match = re.search(rf"\b{re.escape(name)}\s*\[\s*(\d+)\s*\]\s*(?!\[)", param_list)
+    return int(match.group(1)) if match else None
+
+
+def annotate_array_extents(units: list[Unit], source_text: str) -> list[Unit]:
+    """Attach each pointer parameter's written fixed-array extent, from `source_text`.
+
+    Pure post-pass over `parse_units`' output: for every unit, isolate its
+    definition's parameter list (comment-stripped) and set `Param.array_extent`
+    for pointer parameters written as ``T p[N]``. Non-pointer parameters and
+    units whose parameter list cannot be isolated are returned unchanged. Kept
+    separate from the AST walk (and independently tested) because the extent
+    comes from the *source declarator*, not the clang type — which has adjusted
+    ``T p[N]`` to ``T *`` and discarded ``N``.
+    """
+    stripped = _COMMENT_RE.sub(" ", source_text)
+    annotated: list[Unit] = []
+    for unit in units:
+        param_list = _param_list_text(stripped, unit.name)
+        if param_list is None:
+            annotated.append(unit)
+            continue
+        params = tuple(
+            replace(p, array_extent=_array_extent(param_list, p.name))
+            if p.is_pointer
+            else p
+            for p in unit.params
+        )
+        annotated.append(Unit(unit.name, params))
+    return annotated
+
+
 def list_units(
     source: Path,
     *,
@@ -214,4 +302,13 @@ def list_units(
         raise ListUnitsError(f"esbmc --parse-tree-only failed ({esbmc_bin}): {detail}")
     # ESBMC prints the AST dump to stderr; combine both streams so the parser is
     # robust to which stream a given build uses.
-    return parse_units(proc.stdout + "\n" + proc.stderr, source)
+    units = parse_units(proc.stdout + "\n" + proc.stderr, source)
+    # Enrich with fixed-array extents read from the source declarators (the clang
+    # type has adjusted `T p[N]` to `T *`). Best-effort: a successful parse means
+    # esbmc read the file, so a read failure here is unexpected — degrade to the
+    # un-annotated units rather than fail a listing that already succeeded.
+    try:
+        source_text = Path(source).read_text()
+    except OSError:
+        return units
+    return annotate_array_extents(units, source_text)

@@ -33,6 +33,11 @@ class UnknownReason(Enum):
     TIMEOUT = "timeout"
     MEMOUT = "memout"
     UNCLASSIFIED = "unclassified"
+    # An unwinding assertion fired: a loop was not fully unwound at this k. Only
+    # reachable with unwinding assertions ON (the S2 synthesizer). A genuine
+    # inconclusive ("not explored to the end at this k"), never a violation — the
+    # ladder escalates k on it, exactly as it does a timeout.
+    UNDER_UNWOUND = "under_unwound"
 
 
 @dataclass(frozen=True)
