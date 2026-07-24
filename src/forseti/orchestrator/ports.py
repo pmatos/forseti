@@ -16,13 +16,13 @@ live here so the driver need not import #62/#64 directly.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 from forseti.esbmc import EsbmcResult, Violated
-from forseti.properties import Property
+from forseti.properties import Property, PropertyStatus
 
 
 class VerifyPort(Protocol):
@@ -75,9 +75,18 @@ class RenderedHarness:
 
 
 class PropertyStorePort(Protocol):
-    """Read side of the #62 store the driver needs: properties for one unit."""
+    """Read side of the #62 store the driver needs: properties for one unit.
 
-    def list_for_unit(self, unit_id: str) -> Sequence[Property]: ...
+    `statuses` scopes the read to a lifecycle subset (`None` = every row); the
+    check driver passes the valid-input subset so terminal rows never reach a
+    verdict (#84).
+    """
+
+    def list_for_unit(
+        self,
+        unit_id: str,
+        statuses: Collection[PropertyStatus] | None = None,
+    ) -> Sequence[Property]: ...
 
 
 class HarnessWriterPort(Protocol):

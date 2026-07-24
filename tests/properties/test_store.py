@@ -118,6 +118,26 @@ def test_list_for_unit_scopes_and_orders() -> None:
     assert store.list_for_unit("no/such::unit") == ()
 
 
+def test_list_for_unit_filters_by_status() -> None:
+    store = mem_store()
+    cand = make_prop(expression="a", status=PropertyStatus.CANDIDATE)
+    graded = make_prop(expression="b", status=PropertyStatus.GRADED)
+    rejected = make_prop(expression="c", status=PropertyStatus.REJECTED)
+    for prop in (cand, graded, rejected):
+        store.add(prop)
+
+    unit = "examples/abs.c::my_abs"
+    # None (the default) is unchanged: every row, in insertion order.
+    assert store.list_for_unit(unit) == (cand, graded, rejected)
+    # A status subset scopes the read, preserving insertion order.
+    assert store.list_for_unit(
+        unit, {PropertyStatus.CANDIDATE, PropertyStatus.GRADED}
+    ) == (cand, graded)
+    assert store.list_for_unit(unit, {PropertyStatus.REJECTED}) == (rejected,)
+    # An empty collection selects no status -> no rows (never an `IN ()`).
+    assert store.list_for_unit(unit, ()) == ()
+
+
 def test_update_status_applies_and_persists() -> None:
     store = mem_store()
     prop = make_prop()

@@ -10,7 +10,7 @@ projections — in isolation.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -82,13 +82,14 @@ def semantic_prop(
     unit_id: str = UNIT.unit_id,
     expression: str = "result >= 0",
     domain: tuple[str, ...] = (),
+    status: PropertyStatus = PropertyStatus.CANDIDATE,
 ) -> Property:
     return Property(
         property_id=property_id,
         unit_id=unit_id,
         kind=PropertyKind.SEMANTIC,
         expression=expression,
-        status=PropertyStatus.CANDIDATE,
+        status=status,
         provenance=Provenance("test", "v1"),
         domain=domain,
     )
@@ -106,13 +107,25 @@ def reachability_prop(property_id: str, *, unit_id: str = UNIT.unit_id) -> Prope
 
 
 class InMemoryPropertyStore:
-    """A PropertyStorePort backed by a list, filtering by unit (like the real WHERE)."""
+    """A PropertyStorePort backed by a list, filtering by unit (like the real WHERE).
+
+    `statuses` mirrors the real store: `None` returns every row, an empty
+    collection returns nothing, otherwise only rows in the set (#84).
+    """
 
     def __init__(self, props: Sequence[Property]) -> None:
         self._props = list(props)
 
-    def list_for_unit(self, unit_id: str) -> Sequence[Property]:
-        return tuple(p for p in self._props if p.unit_id == unit_id)
+    def list_for_unit(
+        self,
+        unit_id: str,
+        statuses: Collection[PropertyStatus] | None = None,
+    ) -> Sequence[Property]:
+        return tuple(
+            p
+            for p in self._props
+            if p.unit_id == unit_id and (statuses is None or p.status in statuses)
+        )
 
 
 class FakeHarnessWriter:
@@ -180,6 +193,48 @@ def test_all_held(tmp_path: Path) -> None:
     assert [e.verdict for e in verdict_events] == ["held", "held"]
     checked = [e for e in sink.events if e.type == "properties.checked"]
     assert checked[0].detail["held"] == 2
+
+
+def test_terminal_status_props_are_not_checked(tmp_path: Path) -> None:
+    # #84: a terminal ACCEPTED/REJECTED property is settled — it must not be
+    # rendered, verified, or counted into counts()/held() (which feed grading
+    # #4). Only the CANDIDATE row is checked here.
+    store = InMemoryPropertyStore(
+        [
+            semantic_prop("p_rejected", status=PropertyStatus.REJECTED),
+            semantic_prop("p_candidate", status=PropertyStatus.CANDIDATE),
+            semantic_prop("p_accepted", status=PropertyStatus.ACCEPTED),
+        ]
+    )
+    render = FakeHarnessWriter()
+    verify = FakeVerify([Verified(meta())])
+    sink = ListSink()
+
+    run = check_properties(
+        UNIT,
+        store=store,
+        render=render,
+        verify=verify,
+        work_dir=tmp_path / "work",
+        unwind=8,
+        sink=sink,
+    )
+
+    # Only the candidate produced a verdict; the terminal rows are absent.
+    assert [v.property_id for v in run.verdicts] == ["p_candidate"]
+    assert [v.property_id for v in run.held()] == ["p_candidate"]
+    assert run.counts() == {
+        "held": 1,
+        "violated": 0,
+        "unknown": 0,
+        "error": 0,
+        "skipped": 0,
+    }
+    # The terminal rows never reached the renderer or the verifier.
+    assert render.calls == 1
+    assert verify.calls == 1
+    loaded = [e for e in sink.events if e.type == "properties.loaded"]
+    assert loaded[0].detail == {"unit": "u.c::f", "count": 1}
 
 
 def test_mixed_outcomes_and_ladder_restarts(tmp_path: Path) -> None:

@@ -10,6 +10,7 @@ from forseti.properties import (
     PropertyKind,
     PropertyStatus,
     Provenance,
+    is_terminal,
     is_valid_transition,
     make_property_id,
 )
@@ -109,6 +110,17 @@ def test_invalid_transitions() -> None:
 def test_no_self_transitions() -> None:
     for status in PropertyStatus:
         assert not is_valid_transition(status, status)
+
+
+def test_is_terminal_matches_no_onward_transition() -> None:
+    assert is_terminal(PropertyStatus.ACCEPTED)
+    assert is_terminal(PropertyStatus.REJECTED)
+    assert not is_terminal(PropertyStatus.CANDIDATE)
+    assert not is_terminal(PropertyStatus.GRADED)
+    # terminal iff no valid onward transition — the property _ALLOWED encodes.
+    for status in PropertyStatus:
+        has_move = any(is_valid_transition(status, t) for t in PropertyStatus)
+        assert is_terminal(status) is not has_move
 
 
 def test_invalid_status_transition_carries_context() -> None:

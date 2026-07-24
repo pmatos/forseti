@@ -35,6 +35,7 @@ from .model import (
     PropertyKind,
     PropertyStatus,
     Provenance,
+    is_terminal,
     is_valid_transition,
     make_property_id,
 )
@@ -101,6 +102,7 @@ __all__ = [
     "SemanticSpec",
     "UnitSignature",
     "extract_signature",
+    "is_terminal",
     "is_valid_transition",
     "make_property_id",
     "parse_candidates",
