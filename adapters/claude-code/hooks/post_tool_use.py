@@ -26,6 +26,17 @@ def _project_dir(data: dict) -> str:
     return os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or os.getcwd()
 
 
+def _needs_note(needs: list[gate.UnitVerdict]) -> str:
+    """A loud, non-fixable note for NEEDS_CONTRACT units (never a silent skip)."""
+    ids = ", ".join(v.unit_id for v in needs)
+    return (
+        f"Forseti: {len(needs)} unit(s) NOT gated — {ids}. They take pointer/array "
+        "parameter(s); function-level safety is unreliable without a memory "
+        "precondition/harness, so they were NOT verified (issue #122). This is not "
+        "a pass and not a source bug to 'fix' — leave them as is."
+    )
+
+
 def main() -> int:
     raw = sys.stdin.read()
     data = json.loads(raw) if raw.strip() else {}
@@ -69,18 +80,33 @@ def main() -> int:
     if not verdicts:
         return 0  # no functions in the file; any stale units were just reconciled
 
-    failures = [v for v in verdicts if not v.passed]
+    # NEEDS_CONTRACT (pointer/array units the gate can't check without a harness)
+    # is honestly-unverified but NOT a fixable counterexample — never feed it back
+    # or block on it; report it loudly instead (issue #122).
+    needs = [v for v in verdicts if v.verdict == gate.NEEDS_CONTRACT]
+    failures = [
+        v for v in verdicts if not v.passed and v.verdict != gate.NEEDS_CONTRACT
+    ]
+
     if not failures:
-        oks = ", ".join(f"{v.unit_id} (k={v.k})" for v in verdicts)
+        verified = [v for v in verdicts if v.passed]
         event_log.log_event(
             project_dir,
             event_log.GATE,
             file=rel,
             decision="pass",
             n_failures=0,
+            n_needs_contract=len(needs),
             exit_code=0,
         )
-        print(f"Forseti: VERIFIED up to k — {oks}")
+        out = []
+        if verified:
+            oks = ", ".join(f"{v.unit_id} (k={v.k})" for v in verified)
+            out.append(f"Forseti: VERIFIED up to k — {oks}")
+        if needs:
+            out.append(_needs_note(needs))
+        if out:
+            print("\n".join(out))
         return 0
 
     lines = [
@@ -102,12 +128,15 @@ def main() -> int:
         "done until every unit is VERIFIED up to k. An UNKNOWN is not a pass — "
         "raise k (FORSETI_UNWIND) or simplify the unit."
     )
+    if needs:
+        lines += ["", _needs_note(needs)]
     event_log.log_event(
         project_dir,
         event_log.GATE,
         file=rel,
         decision="block",
         n_failures=len(failures),
+        n_needs_contract=len(needs),
         exit_code=2,
     )
     print("\n".join(lines), file=sys.stderr)
