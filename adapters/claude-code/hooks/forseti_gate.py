@@ -17,15 +17,17 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import fnmatch
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 # The safety-property profile. Bounds / pointer / div-by-zero are ESBMC defaults;
 # signed overflow is opt-in, so we add it. Unsigned overflow is intentionally
@@ -51,6 +53,19 @@ _SUBPROCESS_MARGIN_S = 15.0
 MAX_STOP_ATTEMPTS = 3
 
 C_SUFFIXES = {".c", ".h"}
+
+# Out-of-band discovery (issue #99): a C file written via the `Bash` tool
+# (`cat > f.c`, a generator script, `sed -i`) never fires the Write/Edit/MultiEdit
+# PostToolUse hook, so it is never recorded and the Stop-gate lets the turn end
+# with unverified C. Discovery uses `git status` to find changed C, keyed on a
+# content hash (no mtime `cp -p`/`tar` hole) against a `scanned` baseline that
+# `baseline_scanned` seeds at session start — so the gate fires on C changed
+# *during* the session, never on pre-existing dirty or committed/third-party C the
+# agent never touched (the over-reach a whole-tree scan couldn't avoid).
+# `FORSETI_GATE_INCLUDE`/`FORSETI_GATE_EXCLUDE` narrow it further; a bare path
+# segment (`vendor`) prunes any directory of that name, a glob (`*_generated.c`,
+# `test/*`) is matched against the project-relative path.
+_DEFAULT_EXCLUDE_GLOBS: tuple[str, ...] = ("third_party", "vendor", "node_modules")
 
 _STATE_DIR = ".forseti"
 _STATE_FILE = "gate_state.json"
@@ -191,6 +206,380 @@ def unit_id(project_dir: str, file_path: str) -> str:
         return file_path
 
 
+def content_hash(path: str | os.PathLike[str]) -> str | None:
+    """SHA-256 of a file's bytes, or ``None`` if it cannot be read.
+
+    The freshness key for the out-of-band scan: a file is re-verified only when
+    its content hash differs from the one recorded at its last verify. Content —
+    not mtime — so a `cp -p`/`tar` that preserves an old timestamp cannot sneak an
+    unverified change past the gate, and (load-bearing) an *unchanged* file is
+    never re-verified, which is what keeps the Stop-gate's `stop_attempts` counter
+    from being reset every turn.
+    """
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _globs(value: str | None) -> tuple[str, ...]:
+    """Split a ``:``/``,``-separated include/exclude setting into patterns."""
+    if not value:
+        return ()
+    return tuple(p.strip() for p in re.split(r"[:,]", value) if p.strip())
+
+
+def _matches(rel: str, patterns: Iterable[str]) -> bool:
+    """True if project-relative path `rel` matches any include/exclude `patterns`.
+
+    A pattern with a glob metacharacter or a ``/`` is matched against the whole
+    relative path (``fnmatch``); a bare name (``vendor``) matches when it is any
+    path segment, so it prunes a directory of that name at any depth.
+    """
+    parts = set(PurePosixPath(rel).parts)
+    for pat in patterns:
+        if "/" in pat or any(ch in pat for ch in "*?["):
+            if fnmatch.fnmatch(rel, pat):
+                return True
+        elif pat in parts:
+            return True
+    return False
+
+
+def _included(rel: str) -> bool:
+    """Apply the `FORSETI_GATE_INCLUDE`/`FORSETI_GATE_EXCLUDE` globs to `rel`.
+
+    Exclude wins over include. When `FORSETI_GATE_EXCLUDE` is unset the built-in
+    `_DEFAULT_EXCLUDE_GLOBS` apply; setting it replaces (not extends) them.
+    """
+    exclude = _globs(os.environ.get("FORSETI_GATE_EXCLUDE")) or _DEFAULT_EXCLUDE_GLOBS
+    if _matches(rel, exclude):
+        return False
+    include = _globs(os.environ.get("FORSETI_GATE_INCLUDE"))
+    return not include or _matches(rel, include)
+
+
+def _iter_porcelain_z(out: str) -> Iterator[tuple[str, str]]:
+    """Yield ``(XY status, path)`` for each ``git status --porcelain -z`` record.
+
+    Each record is ``XY<space>path``; a rename/copy record is followed by a second
+    NUL-separated field holding the *original* path, which we skip (the current
+    path — the first field — is what we verify). ``-z`` means paths are never
+    quoted, so no unescaping is needed.
+    """
+    tokens = out.split("\0")
+    i = 0
+    while i < len(tokens):
+        entry = tokens[i]
+        i += 1
+        if not entry or len(entry) < 4:
+            continue
+        status, path = entry[:2], entry[3:]
+        if "R" in status or "C" in status:
+            i += 1  # the following token is the rename/copy source — skip it
+        yield status, path
+
+
+def _parse_porcelain_z(out: str) -> list[str]:
+    """Relative paths from ``git status --porcelain -z`` (current path per record)."""
+    return [path for _, path in _iter_porcelain_z(out)]
+
+
+def _staged_paths_from_porcelain(out: str) -> list[str]:
+    """Paths with a STAGED change: porcelain X-status neither clean (space) nor ``?``.
+
+    An ``X`` of ``M``/``A``/``R``/``C``/… means the index holds a blob differing from
+    ``HEAD`` (a `git add` of new or modified content) — the blob a plain `git commit`
+    would ship. A clean ``X`` (space) is a worktree-only edit the porcelain scan
+    already covers; ``?`` is untracked (no index entry).
+    """
+    return [path for status, path in _iter_porcelain_z(out) if status[0] not in " ?"]
+
+
+def _git(project_dir: str, *args: str) -> str | None:
+    """Run a git subcommand in `project_dir`; its stdout, or ``None`` on failure.
+
+    ``None`` covers git being absent, `project_dir` not being a work tree, or a
+    non-zero exit — the caller treats all three as "out-of-band discovery is
+    unavailable" (distinct from a clean tree), so it can report the degraded scope
+    loudly instead of silently skipping.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", project_dir, *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def _git_bytes(project_dir: str, *args: str) -> bytes | None:
+    """Like `_git`, but return raw stdout bytes (no text decoding), or ``None``.
+
+    Used to hash a git blob (``git cat-file blob <ref>``): the hash must be taken
+    over the exact bytes so it lines up with `content_hash`'s ``read_bytes`` digest —
+    a text decode/re-encode (newline translation) would spuriously diverge.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", project_dir, *args],
+            capture_output=True,
+            timeout=30,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def git_blob_hash(project_dir: str, ref: str) -> str | None:
+    """SHA-256 of the git blob at `ref` (``:path`` = index, ``HEAD:path`` = commit).
+
+    ``None`` when the ref does not resolve to a blob — a staged deletion, a rename's
+    stale source, or a path absent from ``HEAD`` — so the caller treats "no blob
+    there" as nothing to gate rather than a divergence.
+    """
+    out = _git_bytes(project_dir, "cat-file", "blob", ref)
+    return hashlib.sha256(out).hexdigest() if out is not None else None
+
+
+def staged_source_paths(project_dir: str) -> list[str]:
+    """Repo-root-relative paths with a STAGED change in the index (best-effort).
+
+    The blobs a plain `git commit` would ship. Empty when not a git work tree.
+    """
+    out = _git(project_dir, "status", "--porcelain", "-z", "-uall")
+    return [] if out is None else _staged_paths_from_porcelain(out)
+
+
+def git_changed_files(project_dir: str) -> list[str] | None:
+    """Repo-root-relative paths `git status` reports as changed, or ``None``.
+
+    ``--untracked-files=all`` so a brand-new Bash-written C file (untracked) is
+    seen; git's own ignore rules already drop gitignored build/vendor output, so
+    the scan never sweeps generated trees. Paths are relative to the repository
+    root (git's porcelain contract), not `project_dir`.
+    """
+    out = _git(project_dir, "status", "--porcelain", "-z", "-uall")
+    return None if out is None else _parse_porcelain_z(out)
+
+
+def git_head(project_dir: str) -> str | None:
+    """The current ``HEAD`` commit SHA, or ``None``.
+
+    ``None`` when `project_dir` is not a work tree *or* the repo has no commits
+    yet (`git rev-parse HEAD` fails) — the SessionStart baseline stores this, and a
+    ``None`` baseline simply disables the committed-since scan (below).
+    """
+    out = _git(project_dir, "rev-parse", "HEAD")
+    return out.strip() if out else None
+
+
+def git_committed_files_since(project_dir: str, baseline_head: str | None) -> list[str]:
+    """Repo-root-relative paths committed since `baseline_head` (best-effort).
+
+    ``git status`` reports only working-tree/index state, so a Bash command that
+    writes a C file *and* commits it in one shot (``cat > f.c && git commit ...``)
+    leaves a clean tree the porcelain scan cannot see (issue #99 review). Diffing
+    the session baseline HEAD against the current HEAD recovers those committed
+    paths. Best-effort and purely additive: an empty list when there is no
+    baseline, HEAD has not moved, or the diff fails (e.g. the baseline commit was
+    rewritten) — the porcelain scan still covers uncommitted work either way.
+
+    ``-z`` for unquoted NUL-separated paths; ``--name-only`` emits one entry per
+    changed path (a rename's stale source, if listed, is dropped later by the
+    existence filter), so no rename bookkeeping is needed here.
+    """
+    if not baseline_head:
+        return []
+    out = _git(project_dir, "diff", "--name-only", "-z", baseline_head, "HEAD")
+    if out is None:
+        return []
+    return [p for p in out.split("\0") if p]
+
+
+def _in_scope_c_abspath(
+    project_dir: str, root: str, proj_real: str, rel: str
+) -> str | None:
+    """Absolute path for repo-root-relative `rel` if it is an in-scope, included C
+    source under `project_dir`, else ``None``.
+
+    Applies the C-suffix, project-subtree, and include/exclude-glob filters shared by
+    the worktree scan (`discover_changed_c_sources`) and the staged/committed-blob
+    scan (`divergent_blob_sources`). Deliberately does **not** check file existence —
+    a staged or committed blob can outlive its worktree file (a `git add`-then-`rm`),
+    and the blob scan must still gate it.
+    """
+    abspath = os.path.join(root, rel)
+    if not is_c_source(abspath):
+        return None
+    try:
+        if os.path.commonpath([proj_real, os.path.realpath(abspath)]) != proj_real:
+            return None  # changed outside this project subtree — out of scope
+    except ValueError:
+        return None  # different drive/root — cannot be under proj
+    if not _included(os.path.relpath(abspath, project_dir)):
+        return None
+    return abspath
+
+
+def discover_changed_c_sources(
+    project_dir: str, *, baseline_head: str | None = None
+) -> list[str] | None:
+    """Absolute paths of changed, still-present C sources under `project_dir`.
+
+    git reports paths relative to the *repository root*, which need not be
+    `project_dir`, so they are joined to the resolved root and then scoped back to
+    `project_dir` (a subdir checkout gates only its own changes). Include/exclude
+    globs are applied to the project-relative path, matching `unit_id`. ``None``
+    when discovery is unavailable (not a git repo).
+
+    Discovery is the union of the working-tree/index changes (``git status``) and
+    C committed since the session `baseline_head` (issue #99 review): a Bash
+    command that writes and commits a C file in one shot leaves a clean tree the
+    porcelain scan alone would miss. The union is deduped and content-hash
+    freshness (`stale_sources`) remains the real gate, so a file committed
+    *unchanged* since the baseline is filtered back out. A ``None`` baseline (no
+    commits yet, or SessionStart never seeded one) degrades cleanly to the
+    porcelain-only scan.
+    """
+    root = _git(project_dir, "rev-parse", "--show-toplevel")
+    rels = git_changed_files(project_dir)
+    if root is None or rels is None:
+        return None
+    root = root.strip()
+    # Both git subcommands emit repo-root-relative paths, so the committed-since
+    # set unions straight into `rels` before the shared join/scope/filter below.
+    # dict.fromkeys dedups while preserving order (a path both dirty and committed
+    # is verified once).
+    committed = git_committed_files_since(project_dir, baseline_head)
+    rels = list(dict.fromkeys([*rels, *committed]))
+    # Keep the returned path expressed relative to the raw `project_dir` so its
+    # `unit_id`/`scanned` key matches what `verify_and_record` stamps; realpath is
+    # used only to compare against the (possibly symlinked) project subtree.
+    proj_real = os.path.realpath(project_dir)
+    found: list[str] = []
+    for rel in rels:
+        abspath = _in_scope_c_abspath(project_dir, root, proj_real, rel)
+        # A path git reports changed but that is gone from disk (a Bash `rm`) is
+        # skipped here — there is nothing to *verify*. Its recorded units are
+        # reconciled separately by `prune_deleted_units`, which keys off actual
+        # file existence so it also catches an untracked file git never tracked
+        # (issue #99 review): keep discovery about "what to verify", pruning about
+        # "what no longer exists". A staged/committed blob that outlives its worktree
+        # file is gated instead by `divergent_blob_sources`.
+        if abspath is not None and os.path.isfile(abspath):
+            found.append(abspath)
+    return found
+
+
+def stale_sources(project_dir: str, state: dict, files: Iterable[str]) -> list[str]:
+    """Subset of `files` whose content differs from the last recorded verify.
+
+    A file is stale when it has never been verified (`scanned` has no entry) or
+    its current content hash differs from the recorded one — i.e. it was written
+    or modified out-of-band since the gate last saw it.
+    """
+    scanned = state.get("scanned", {})
+    stale: list[str] = []
+    for abspath in files:
+        digest = content_hash(abspath)
+        if digest is None:
+            continue
+        if scanned.get(unit_id(project_dir, abspath)) != digest:
+            stale.append(abspath)
+    return stale
+
+
+def divergent_blob_sources(
+    project_dir: str, state: dict, *, baseline_head: str | None = None
+) -> list[dict]:
+    """C whose STAGED or COMMITTED blob was never verified (issue #99 review).
+
+    `stale_sources` hashes only the worktree copy, so a Bash command that stages one
+    C blob and then reverts the worktree — ``git status`` reports ``MM`` yet the
+    worktree hashes as the last-verified content — could commit the staged blob
+    unverified; likewise a divergent blob committed while the worktree is reverted
+    leaves ``HEAD`` holding C the gate never saw, still worktree-fresh. This scans the
+    index (staged) and the committed-since-baseline (``HEAD``) blobs **directly** —
+    not `discover_changed_c_sources`, whose existence filter would drop a
+    staged/committed-then-``rm``ed path (its blob still ships) — and reports each blob
+    whose SHA-256 differs from the recorded `scanned` (last-verified) hash.
+
+    Keyed by content, so a blob equal to verified content is deduped straight out (no
+    over-gating a `git add`/commit of already-verified C). Only the staged set
+    (porcelain X-status) and the committed-since set are consulted, never every
+    tracked file, so a merely worktree-edited-but-uncommitted unit is *not* dragged in
+    by a stale ``HEAD``. Degrades to empty when not a git repo. Each entry is
+    ``{"rel": <project-relative path>, "reason": "staged" | "committed"}``.
+    """
+    root = _git(project_dir, "rev-parse", "--show-toplevel")
+    if root is None:
+        return []
+    root = root.strip()
+    proj_real = os.path.realpath(project_dir)
+    scanned = state.get("scanned", {})
+    # committed first: an already-shipped divergence is the graver of the two, and
+    # dedup keeps a single (rel, reason) entry per path.
+    candidates = [
+        (rel, f"HEAD:{rel}", "committed")
+        for rel in git_committed_files_since(project_dir, baseline_head)
+    ]
+    candidates += [
+        (rel, f":{rel}", "staged") for rel in staged_source_paths(project_dir)
+    ]
+
+    results: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for repo_rel, ref, reason in candidates:
+        abspath = _in_scope_c_abspath(project_dir, root, proj_real, repo_rel)
+        if abspath is None:
+            continue
+        rel = unit_id(project_dir, abspath)
+        key = (rel, reason)
+        if key in seen:
+            continue
+        digest = git_blob_hash(project_dir, ref)
+        if digest is None:
+            continue  # no blob at that ref (staged deletion / rename source) — skip
+        if scanned.get(rel) != digest:
+            seen.add(key)
+            results.append({"rel": rel, "reason": reason})
+    return results
+
+
+def baseline_scanned(project_dir: str) -> int | None:
+    """Mark the currently-dirty C tree as "seen" at session start (issue #99).
+
+    The out-of-band scan gates C whose content differs from the recorded
+    `scanned` hash. Without a baseline that is *everything* `git status` reports —
+    including C that was dirty before the session and the agent never touched, the
+    over-reach this issue was careful to avoid. Seeding `scanned` with each
+    pre-session dirty file's current hash scopes the gate to "changed **since
+    session start**": those files are gated only once the agent actually modifies
+    them. The baseline HEAD is recorded too, so the committed-since scan can later
+    catch C a Bash command writes *and* commits in one shot (issue #99 review).
+    Returns the number baselined, or ``None`` if not a git repo.
+    """
+    discovered = discover_changed_c_sources(project_dir)
+    if discovered is None:
+        return None
+    head = git_head(project_dir)  # resolve HEAD outside the lock (a subprocess)
+    with gate_lock(project_dir):
+        state = load_state(project_dir)
+        baseline: dict[str, str] = {}
+        for abspath in discovered:
+            digest = content_hash(abspath)
+            if digest is not None:
+                baseline[unit_id(project_dir, abspath)] = digest
+        state["scanned"] = baseline
+        state["baseline_head"] = head
+        save_state(project_dir, state)
+    return len(baseline)
+
+
 def verify_function(
     file_path: str, function: str, *, project_dir: str, k: int = DEFAULT_K
 ) -> UnitVerdict:
@@ -299,10 +688,12 @@ def load_state(project_dir: str) -> dict:
             state = json.loads(path.read_text())
             state.setdefault("units", {})
             state.setdefault("stop_attempts", 0)
+            state.setdefault("scanned", {})
+            state.setdefault("baseline_head", None)
             return state
         except (json.JSONDecodeError, OSError):
             pass
-    return {"units": {}, "stop_attempts": 0}
+    return {"units": {}, "stop_attempts": 0, "scanned": {}, "baseline_head": None}
 
 
 def save_state(project_dir: str, state: dict) -> None:
@@ -340,6 +731,41 @@ def prune_missing_units(
     ]
     for uid in stale:
         del state["units"][uid]
+
+
+def prune_deleted_units(state: dict, project_dir: str) -> list[str]:
+    """Drop recorded units whose backing C source no longer exists on disk.
+
+    `record`/`verify_and_record` only ever upsert per file, so a C source removed
+    out-of-band — `rm f.c` via Bash, whether it was committed or written earlier
+    this session — leaves its `violated`/`unknown` units in the gate state and the
+    Stop-gate would block forever (then only emit a residual after the attempt cap)
+    on a unit whose file is gone. Discovery correctly skips a missing file *for
+    verification*; this reconciles the recorded side, dropping units whose file is
+    absent and clearing each such file's `scanned` baseline (so a same-name file
+    recreated later re-verifies from scratch).
+
+    Keys off each unit's recorded `file` (project-relative), not `git status`, so
+    it also catches an untracked Bash-written file git never knew existed — the
+    case a git-scoped deletion scan would miss. Only ever *removes* already-recorded
+    units (files the agent touched), so it can never over-reach into gating C the
+    agent left alone. Returns the pruned unit ids.
+    """
+    units = state.get("units", {})
+    scanned = state.get("scanned", {})
+    pruned: list[str] = []
+    gone_rels: set[str] = set()
+    for uid, unit in list(units.items()):
+        rel = unit.get("file")
+        if not rel:
+            continue  # cannot locate the backing file — keep it, never guess
+        if not os.path.isfile(os.path.join(project_dir, rel)):
+            del units[uid]
+            pruned.append(uid)
+            gone_rels.add(rel)
+    for rel in gone_rels:
+        scanned.pop(rel, None)
+    return pruned
 
 
 _NON_BLOCKING_VERDICTS = frozenset({"verified", NEEDS_CONTRACT})
@@ -393,7 +819,7 @@ def verify_and_record(
     """
     rel = unit_id(project_dir, file_path)
     try:
-        defs = extract_function_defs(Path(file_path).read_text())
+        raw = Path(file_path).read_bytes()
     except OSError as exc:
         verdict = UnitVerdict(f"{rel}::?", rel, "?", "error", k, detail=str(exc))
         with gate_lock(project_dir):
@@ -402,6 +828,13 @@ def verify_and_record(
             state["stop_attempts"] = 0
             save_state(project_dir, state)
         return [verdict]
+
+    # Decode leniently (a stray non-UTF-8 byte must not crash the hook) and stamp
+    # the content hash so a later out-of-band scan treats this exact content as
+    # already verified — that dedup is what keeps the Stop-gate from re-blocking
+    # (and resetting its patience) on a file nothing has touched since.
+    defs = extract_function_defs(raw.decode("utf-8", "replace"))
+    digest = hashlib.sha256(raw).hexdigest()
 
     # Reconcile + record every current function BEFORE the slow verifies: drop
     # functions the file no longer defines, reset the Stop-gate's patience, and
@@ -412,6 +845,7 @@ def verify_and_record(
     with gate_lock(project_dir):
         state = load_state(project_dir)
         state["stop_attempts"] = 0
+        state.setdefault("scanned", {})[rel] = digest
         prune_missing_units(state, project_dir, file_path, {d.name for d in defs})
         for d in defs:
             if d.takes_pointer:
