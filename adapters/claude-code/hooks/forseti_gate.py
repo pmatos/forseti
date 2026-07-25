@@ -979,9 +979,16 @@ def verify_and_record(
         Scoped to a marker recording exactly `digest`, never a blanket pop: a
         concurrent run of *other* content owns its own marker, and deleting that
         would make a kill of that run read as content-fresh with nothing left to
-        retry — the very hole this closes (PR #148 review). With no `digest` at all
-        (the file could not even be read) nothing is dropped: ownership is
-        unprovable, and a surviving marker only ever costs a re-verify.
+        retry — the very hole this closes (PR #148 review).
+
+        Two callers pass no `digest` and so drop nothing, for different reasons. The
+        read failure never learned which bytes it was scanning, so ownership is
+        unprovable — and such a file also fails `content_hash`, so `stale_sources`
+        skips it entirely and no frozen counter can spin. The enumeration-race caller
+        *did* read bytes, but the interleaving it guards against (A → B → A) restores
+        them, so they may be exactly the content still awaiting a retry: that claim
+        has to survive, and the counter is bumped by the next run that gets past
+        enumeration.
         """
         verdict = UnitVerdict(f"{rel}::?", rel, "?", "error", k, detail=detail)
         with gate_lock(project_dir):
