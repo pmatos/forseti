@@ -26,7 +26,9 @@ The shapes (L0):
   signature (`Param.array_extent`, recovered by `list_units`).
 
 Anything else — ``void *`` (no pointee size), ``T **`` / pointer-to-array /
-function pointer — is **UNRESOLVED**: L0 cannot justify a precondition, so the
+function pointer, or a fixed array whose written extent is not readable from the
+source (``T p[SHA_DIGEST_LENGTH]``, which needs the preprocessor) and has no
+accompanying length — is **UNRESOLVED**: L0 cannot justify a precondition, so the
 unit is reported ``NEEDS_CONTRACT`` (loud, non-blocking) rather than materialized
 wrongly. Rendering is pure (returns C text, no ESBMC, no disk); the verify
 driver owns the effects and the honest labeling.
@@ -198,6 +200,14 @@ def plan_unit(unit: Unit) -> UnitPlan:
                 length_var[i] = _var_name(i + 1, unit.params[i + 1])
                 consumed_as_length.add(i + 1)
                 continue
+        # Written `T p[<macro or expression>]`: the declared extent needs the
+        # preprocessor, so the one-element fallback below would under-size the
+        # object and phantom-VIOLATE a unit that reads the full extent. Checked
+        # *after* length-pairing on purpose — an accompanying length sizes the
+        # object exactly, which is better than declining (issue #137).
+        if param.array_extent_unresolved:
+            roles[i] = ParamRole.UNRESOLVED
+            continue
         roles[i] = ParamRole.SCALAR_PTR
 
     # Every remaining unclassified slot is a non-pointer: a length consumed by a

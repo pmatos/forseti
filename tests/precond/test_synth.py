@@ -66,6 +66,29 @@ def test_fixed_array_extent_wins() -> None:
     assert plan.params[0].extent == 20
 
 
+def test_unreadable_fixed_array_extent_is_unresolved_not_one_element() -> None:
+    # Issue #137: `uint8_t digest[SHA_DIGEST_LENGTH]` reaches us as `uint8_t *` with
+    # an unreadable extent. Sizing it `sizeof(*digest)` would phantom-VIOLATE a unit
+    # that writes all 20 bytes, so L0 declines and the driver says NEEDS_CONTRACT.
+    unit = _unit(Param("digest", "uint8_t *", array_extent_unresolved=True))
+    plan = plan_unit(unit)
+    assert plan.params[0].role is ParamRole.UNRESOLVED
+    assert not plan.resolvable
+    assert plan.unresolved_params == ("digest",)
+
+
+def test_unreadable_extent_still_prefers_an_accompanying_length() -> None:
+    # An unreadable extent only displaces the one-element fallback: a following
+    # length sizes the object *exactly*, which beats declining to synthesise.
+    unit = _unit(
+        Param("buf", "uint8_t *", array_extent_unresolved=True),
+        Param("len", "unsigned long"),
+    )
+    plan = plan_unit(unit)
+    assert _roles(unit) == {"buf": ParamRole.PTR_BYTE_LEN, "len": ParamRole.LENGTH}
+    assert plan.resolvable
+
+
 def test_non_length_named_next_param_is_not_paired() -> None:
     # A trailing integer that is not length-named leaves the pointer a fresh
     # single object and the integer a plain scalar.

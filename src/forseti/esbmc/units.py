@@ -48,6 +48,21 @@ _TYPE_RE = re.compile(r"'([^']*)'")
 # array extent so a `[N]` inside a comment can never be misread as a declarator.
 _COMMENT_RE = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
 
+# A named parameter's array declarator: the name followed by *all* its consecutive
+# `[...]` groups, captured together (whitespace between them included) so a
+# multi-dimensional `p[2][3]` — or a spaced `p[2] [3]` — is recognised as such
+# rather than half-read as its first extent. A plain pointer has no bracket at all
+# and simply does not match. Formatted with an `re.escape`d name.
+_ARRAY_DECL_TEMPLATE = r"\b{name}((?:\s*\[[^\]]*\])+)"
+
+# The contents of a fixed-array parameter's bracket, when they state a literal
+# extent. C99 allows `static` and the cv/`restrict` qualifiers before the extent in
+# a *function parameter* declarator (`int p[static const 20]`, either order), so
+# they are skipped; anything else in the bracket is not a literal we can read.
+_EXTENT_RE = re.compile(
+    r"^\s*(?:(?:static|const|volatile|restrict|__restrict(?:__)?)\s+)*(\d+)\s*$"
+)
+
 
 @dataclass(frozen=True)
 class Param:
@@ -60,11 +75,19 @@ class Param:
     (`annotate_array_extents`) and is ``None`` for a plain pointer, an unsized
     ``T p[]``, a scalar, or when the source could not be read. The memory-
     precondition synthesizer (RFC-0003 S2) uses it to size ``T p[N]`` objects.
+
+    `array_extent_unresolved` marks the case that ``array_extent = None`` alone
+    cannot express: the parameter *is* written as a fixed array, but its extent is
+    not readable from the source — a macro or expression (``T p[SHA_DIGEST_LENGTH]``,
+    which needs the preprocessor) or a multi-dimensional declarator. Sizing such a
+    parameter as a single object would under-allocate it, so the synthesizer reports
+    ``NEEDS_CONTRACT`` instead of a phantom violation (issue #137).
     """
 
     name: str
     type: str
     array_extent: int | None = None
+    array_extent_unresolved: bool = False
 
     @property
     def is_pointer(self) -> bool:
@@ -228,18 +251,42 @@ def _param_list_text(source_no_comments: str, fn_name: str) -> str | None:
     return None
 
 
-def _array_extent(param_list: str, name: str) -> int | None:
-    """The ``N`` of ``name[N]`` in `param_list`, or ``None``.
+def _array_shape(param_list: str, name: str) -> tuple[int | None, bool]:
+    """The fixed extent of ``name`` in `param_list`, and whether it is unresolved.
 
-    Harvests a *single-dimension* fixed extent for the named parameter; a
-    multi-dimensional ``name[N][M]`` (a pointer-to-array, not an L0 shape) is
-    left as ``None`` so the synthesizer treats it as unresolved rather than
-    mis-sizing it.
+    Returns ``(N, False)`` when a single-dimension extent is recovered from
+    ``name[N]``, ``(None, True)`` when ``name`` *is* written as a fixed array whose
+    extent cannot be read from the source — a macro or expression
+    (``name[SHA_DIGEST_LENGTH]``, which needs the preprocessor) or a
+    multi-dimensional ``name[N][M]`` (a pointer-to-array, not an L0 shape) — and
+    ``(None, False)`` when there is no extent to recover in the first place: a plain
+    pointer, an unsized ``name[]`` (exactly as informative as ``T *name``), or an
+    unnamed parameter.
+
+    The unresolved flag is what keeps an unreadable extent out of the one-element
+    fallback, which would under-size the object. It says nothing about a parameter
+    list `_param_list_text` could not isolate at all — that residual case stays
+    ``(None, False)``, i.e. indistinguishable from a plain pointer.
     """
     if not name:
-        return None
-    match = re.search(rf"\b{re.escape(name)}\s*\[\s*(\d+)\s*\]\s*(?!\[)", param_list)
-    return int(match.group(1)) if match else None
+        return None, False
+    match = re.search(_ARRAY_DECL_TEMPLATE.format(name=re.escape(name)), param_list)
+    if not match:
+        return None, False
+    brackets = re.findall(r"\[([^\]]*)\]", match.group(1))
+    if len(brackets) != 1:
+        return None, True
+    inner = brackets[0]
+    if not inner.strip():
+        return None, False
+    extent = _EXTENT_RE.match(inner)
+    return (int(extent.group(1)), False) if extent else (None, True)
+
+
+def _annotated_param(param: Param, param_list: str) -> Param:
+    """`param` with its written array shape attached, read off `param_list`."""
+    extent, unresolved = _array_shape(param_list, param.name)
+    return replace(param, array_extent=extent, array_extent_unresolved=unresolved)
 
 
 def annotate_array_extents(units: list[Unit], source_text: str) -> list[Unit]:
@@ -247,7 +294,8 @@ def annotate_array_extents(units: list[Unit], source_text: str) -> list[Unit]:
 
     Pure post-pass over `parse_units`' output: for every unit, isolate its
     definition's parameter list (comment-stripped) and set `Param.array_extent`
-    for pointer parameters written as ``T p[N]``. Non-pointer parameters and
+    for pointer parameters written as ``T p[N]`` — or `Param.array_extent_unresolved`
+    when the declarator states an extent we cannot read. Non-pointer parameters and
     units whose parameter list cannot be isolated are returned unchanged. Kept
     separate from the AST walk (and independently tested) because the extent
     comes from the *source declarator*, not the clang type — which has adjusted
@@ -261,10 +309,7 @@ def annotate_array_extents(units: list[Unit], source_text: str) -> list[Unit]:
             annotated.append(unit)
             continue
         params = tuple(
-            replace(p, array_extent=_array_extent(param_list, p.name))
-            if p.is_pointer
-            else p
-            for p in unit.params
+            _annotated_param(p, param_list) if p.is_pointer else p for p in unit.params
         )
         annotated.append(Unit(unit.name, params))
     return annotated

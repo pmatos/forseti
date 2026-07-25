@@ -105,10 +105,16 @@ def test_param_is_pointer(type_str: str, is_ptr: bool) -> None:
     assert Param("p", type_str).is_pointer is is_ptr
 
 
+def _shape(source: str, param: Param, fn: str = "f") -> tuple[int | None, bool]:
+    """The array shape `annotate_array_extents` harvests for `param` in `source`."""
+    unit = Unit(fn, (param,))
+    out = annotate_array_extents([unit], source)[0].params[0]
+    return out.array_extent, out.array_extent_unresolved
+
+
 def _extent(source: str, param: Param, fn: str = "f") -> int | None:
     """The `array_extent` `annotate_array_extents` harvests for `param` in `source`."""
-    unit = Unit(fn, (param,))
-    return annotate_array_extents([unit], source)[0].params[0].array_extent
+    return _shape(source, param, fn)[0]
 
 
 @pytest.mark.parametrize(
@@ -117,13 +123,49 @@ def _extent(source: str, param: Param, fn: str = "f") -> int | None:
         ("void f(uint8_t p[20]) {}", 20),
         ("void f(uint8_t p [64]) {}", 64),  # space before bracket
         ("void f(uint8_t p[ 32 ]) {}", 32),  # spaces inside bracket
-        ("void f(uint8_t *p) {}", None),  # plain pointer, no extent
-        ("void f(uint8_t p[]) {}", None),  # unsized array
-        ("void f(int p[2][3]) {}", None),  # multi-dim (pointer-to-array) is not L0
+        # C99 `static` / cv-qualifiers may precede the extent in a parameter
+        # declarator, in either order — the literal is still readable.
+        ("void f(uint8_t p[static 20]) {}", 20),
+        ("void f(uint8_t p[static const 24]) {}", 24),
+        ("void f(uint8_t p[const static 28]) {}", 28),
+        ("void f(uint8_t p[restrict 12]) {}", 12),
+        ("void f(uint8_t p[__restrict 16]) {}", 16),
     ],
 )
-def test_annotate_array_extents_shapes(decl: str, expected: int | None) -> None:
-    assert _extent(decl, Param("p", "uint8_t *")) == expected
+def test_annotate_array_extents_recovers_literal(decl: str, expected: int) -> None:
+    assert _shape(decl, Param("p", "uint8_t *")) == (expected, False)
+
+
+@pytest.mark.parametrize(
+    "decl",
+    [
+        "void f(uint8_t *p) {}",  # plain pointer: no declarator bracket at all
+        "void f(uint8_t p[]) {}",  # unsized: exactly as informative as `uint8_t *p`
+        "void f(uint8_t p[ ]) {}",  # ... whitespace-only bracket is still unsized
+    ],
+)
+def test_annotate_array_extents_no_extent_stated(decl: str) -> None:
+    assert _shape(decl, Param("p", "uint8_t *")) == (None, False)
+
+
+@pytest.mark.parametrize(
+    "decl",
+    [
+        # A macro extent needs the preprocessor — unreadable, but the parameter is
+        # still *written* as a fixed array, so it must not read as a plain pointer.
+        "void f(uint8_t p[DLEN]) {}",
+        "void f(uint8_t p[static DLEN]) {}",
+        "void f(uint8_t p[N + 1]) {}",
+        "void f(uint8_t p[sizeof(struct s)]) {}",
+        "void f(uint8_t p[20u]) {}",  # a suffixed literal is not a bare decimal
+        "void f(uint8_t p[0x20]) {}",
+        "void f(uint8_t p[*]) {}",  # a `[*]` prototype declarator
+        "void f(int p[2][3]) {}",  # multi-dim (pointer-to-array) is not an L0 shape
+        "void f(int p[2] [3]) {}",  # ... nor when the brackets are spaced apart
+    ],
+)
+def test_annotate_array_extents_unreadable_extent_is_unresolved(decl: str) -> None:
+    assert _shape(decl, Param("p", "uint8_t *")) == (None, True)
 
 
 def test_annotate_array_extents_prefers_definition_over_prototype() -> None:
@@ -134,8 +176,10 @@ def test_annotate_array_extents_prefers_definition_over_prototype() -> None:
 
 
 def test_annotate_array_extents_ignores_bracket_in_comment() -> None:
+    # Neither a bogus extent nor a bogus "written as an array" signal: the
+    # commented-out bracket is gone before the declarator is read.
     source = "void f(uint8_t *p /* was p[99] */) {}"
-    assert _extent(source, Param("p", "uint8_t *")) is None
+    assert _shape(source, Param("p", "uint8_t *")) == (None, False)
 
 
 def test_annotate_array_extents_only_named_pointer_params() -> None:
@@ -185,6 +229,29 @@ def test_list_units_recovers_fixed_array_extent(tmp_path: Path) -> None:
     f = next(u for u in list_units(src) if u.name == "f")
     extents = {p.name: p.array_extent for p in f.params}
     assert extents == {"digest": 20, "data": None, "len": None}
+    assert not any(p.array_extent_unresolved for p in f.params)
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_marks_macro_extent_unresolved(tmp_path: Path) -> None:
+    # End-to-end (issue #137): clang adjusts both parameters to `uint8_t *`, so the
+    # macro extent is unrecoverable from the type *and* from the source declarator
+    # (it needs the preprocessor) — it must be flagged, not read as a plain pointer.
+    # A `[static N]` extent in the same signature is still recovered.
+    src = tmp_path / "sig.c"
+    src.write_text(
+        "#include <stdint.h>\n"
+        "#define DLEN 20\n"
+        "void f(uint8_t digest[DLEN], uint8_t tag[static 16], uint8_t *raw) {\n"
+        "  (void)digest; (void)tag; (void)raw;\n}\n"
+    )
+    f = next(u for u in list_units(src) if u.name == "f")
+    shapes = {p.name: (p.array_extent, p.array_extent_unresolved) for p in f.params}
+    assert shapes == {
+        "digest": (None, True),
+        "tag": (16, False),
+        "raw": (None, False),
+    }
 
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")

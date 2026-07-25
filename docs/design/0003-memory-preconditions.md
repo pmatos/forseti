@@ -175,6 +175,14 @@ undischarged"), never a full verdict (D3). The `examples/sha1.c` units verify as
 `sha1_bug.c` off‑by‑one is VIOLATED non‑vacuously. Under‑unwound loops (assertions ON) are told from
 real out‑of‑bounds structurally and *escalate the k‑ladder*, never masquerade as a violation.
 
+**Extent recovery is honest about its limits** ([#137](https://github.com/pmatos/forseti/issues/137)):
+`T p[static N]` (with cv‑qualifiers, either order) is read like a bare `T p[N]`, but an extent that
+needs the preprocessor or an expression (`T p[SHA_DIGEST_LENGTH]`, `T p[N+1]`) is **not guessable
+from the source** — so it is *flagged* (`Param.array_extent_unresolved`) rather than left
+indistinguishable from a plain `T *p`, and the unit is `NEEDS_CONTRACT` instead of being backed by a
+one‑element object that phantom‑VIOLATES code reading the declared extent. An accompanying length
+parameter still wins: it sizes the object exactly.
+
 ## Decisions (recommended) & open questions
 
 - **D1 — Structural, not functional.** Memory preconditions are synthesized by a dedicated
