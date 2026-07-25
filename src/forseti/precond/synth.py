@@ -24,9 +24,14 @@ The shapes (L0):
   off-by-one ``p[len]`` is out of bounds (a constant ``buf[MAX]`` would hide it).
 - **fixed array ``T p[N]``** → ``malloc(N * sizeof(*p))``, ``N`` from the
   signature (`Param.array_extent`, recovered by `list_units`).
+- **``T p[static N]`` next to a length** → ``malloc(max(length, N))``. C99's
+  ``static N`` is a *minimum* the caller must supply, not the object's size, so a
+  valid caller satisfies both it and the length convention.
 
 Anything else — ``void *`` (no pointee size), ``T **`` / pointer-to-array /
-function pointer — is **UNRESOLVED**: L0 cannot justify a precondition, so the
+function pointer, or a fixed array whose written extent is not readable from the
+source (``T p[SHA_DIGEST_LENGTH]``, which needs the preprocessor) and has no
+accompanying length — is **UNRESOLVED**: L0 cannot justify a precondition, so the
 unit is reported ``NEEDS_CONTRACT`` (loud, non-blocking) rather than materialized
 wrongly. Rendering is pure (returns C text, no ESBMC, no disk); the verify
 driver owns the effects and the honest labeling.
@@ -63,6 +68,14 @@ NON_VACUITY_LABEL = "forseti:non-vacuity"
 _BYTE_LEN_NAMES = frozenset({"len", "length", "size", "nbytes", "n_bytes", "buflen"})
 _ELEM_COUNT_NAMES = frozenset({"n", "count", "nmemb", "num", "nelem"})
 
+# C11's atomic types keep a functional spelling in clang's canonical type:
+# `void *_Atomic p` prints as `_Atomic(void *)`, `_Atomic int *p` as
+# `_Atomic(int) *`. Unwrapping it leaves the type it qualifies, so the pointer
+# shape below is read off `void *` / `int *` rather than off a token soup in
+# which a `void` pointee hides. Innermost-first (no nested parens), so an atomic
+# function pointer keeps its `(*` and is rejected as one.
+_ATOMIC_WRAPPER_RE = re.compile(r"\b_Atomic\s*\(([^()]*)\)")
+
 # Canonical-type tokens that mark an integer (a length must be integral, so a
 # `double len` is not mistaken for a size). Pointers are excluded before this.
 _INT_TOKENS = ("int", "long", "short", "char", "size_t", "unsigned", "signed")
@@ -93,6 +106,9 @@ class ParamPlan:
     role: ParamRole
     length_var: str | None = None  # for PTR_*_LEN: the length variable to size by
     extent: int | None = None  # for FIXED_ARRAY: N
+    # For a length-sized pointer also written `T p[static N]`: the element floor
+    # the *caller* is bound to supply, so the allocation is never smaller than it.
+    static_min_extent: int | None = None
 
 
 @dataclass(frozen=True)
@@ -149,17 +165,19 @@ def _is_pointee_materialisable(type_str: str) -> bool:
     size). Everything else — ``T *``, ``struct S *``, ``const uint8_t *`` — is a
     single object of ``sizeof(*p)``.
     """
-    stripped = type_str.strip()
+    stripped = _ATOMIC_WRAPPER_RE.sub(r"\1", type_str.strip())
     if "(*" in stripped:  # function pointer / pointer-to-array
         return False
     if stripped.count("*") != 1:  # only single-level pointers
         return False
-    # Scrub the cv/`restrict` qualifiers clang keeps on the canonical type
-    # (`void *restrict`, `const void *restrict`) so a `void` pointee is detected
-    # whatever qualifies it — otherwise the qualifier survives and a `void *`
-    # would be mis-sized `malloc(sizeof(void))` instead of falling to UNRESOLVED.
+    # Scrub the cv/`restrict`/`_Atomic` qualifiers clang keeps on the canonical
+    # type (`void *restrict`, `const void *restrict`) so a `void` pointee is
+    # detected whatever qualifies it — otherwise the qualifier survives and a
+    # `void *` would be mis-sized `malloc(sizeof(void))` instead of falling to
+    # UNRESOLVED.
     without_ptr = re.sub(
-        r"\bconst\b|\bvolatile\b|\b__restrict__\b|\b__restrict\b|\brestrict\b|\*|\s",
+        r"\bconst\b|\bvolatile\b|\b__restrict__\b|\b__restrict\b|\brestrict\b"
+        r"|\b_Atomic\b|\*|\s",
         "",
         stripped,
     )
@@ -169,16 +187,23 @@ def _is_pointee_materialisable(type_str: str) -> bool:
 def plan_unit(unit: Unit) -> UnitPlan:
     """Classify each parameter into its L0 materialisation plan (pure).
 
-    Pointers are classified first (a fixed extent wins over length-pairing, which
-    wins over a lone fresh object); a following integer consumed as a pointer's
-    length is then marked ``LENGTH``; every remaining non-pointer is a plain
-    ``SCALAR``. The pairing looks only at the *next* parameter — the dominant
-    ``(ptr, len)`` idiom (RFC-0003 OQ2 flags richer pairing as L1).
+    Pointers are classified first (a conventional fixed extent wins over
+    length-pairing, which wins over a lone fresh object); a following integer
+    consumed as a pointer's length is then marked ``LENGTH``; every remaining
+    non-pointer is a plain ``SCALAR``. The pairing looks only at the *next*
+    parameter — the dominant ``(ptr, len)`` idiom (RFC-0003 OQ2 flags richer
+    pairing as L1).
+
+    A ``T p[static N]`` extent is the one that does *not* win outright: it binds
+    the caller to at least ``N`` elements without capping the object, so it pairs
+    with a companion length and becomes that plan's `static_min_extent` floor,
+    falling back to `FIXED_ARRAY` only when there is no length to pair with.
     """
     n = len(unit.params)
     roles: list[ParamRole | None] = [None] * n
     length_var: list[str | None] = [None] * n
     extents: list[int | None] = [None] * n
+    static_mins: list[int | None] = [None] * n
     consumed_as_length: set[int] = set()
 
     for i, param in enumerate(unit.params):
@@ -187,17 +212,42 @@ def plan_unit(unit: Unit) -> UnitPlan:
         if not _is_pointee_materialisable(param.type):
             roles[i] = ParamRole.UNRESOLVED
             continue
-        if param.array_extent is not None:
+        # A *conventional* `T p[N]` states the only size the signature carries, so
+        # it wins outright. `T p[static N]` falls through to length-pairing below:
+        # its `N` is a floor the caller must meet, not the object's whole size.
+        if param.array_extent is not None and not param.array_static_min:
             roles[i] = ParamRole.FIXED_ARRAY
             extents[i] = param.array_extent
+            continue
+        # `T p[static <macro>]`: the caller *must* give access to the declared
+        # extent, so the function may touch all of it however small a companion
+        # length is — and with `N` unreadable there is no floor to raise that
+        # length to, so L0 declines rather than under-allocating.
+        if param.array_extent_unresolved and param.array_static_min:
+            roles[i] = ParamRole.UNRESOLVED
             continue
         if i + 1 < n and (i + 1) not in consumed_as_length:
             kind = _length_kind(unit.params[i + 1])
             if kind is not None:
                 roles[i] = kind
                 length_var[i] = _var_name(i + 1, unit.params[i + 1])
+                static_mins[i] = param.array_extent if param.array_static_min else None
                 consumed_as_length.add(i + 1)
                 continue
+        # A readable `T p[static N]` with no length to pair with: the weakest valid
+        # caller supplies exactly `N`, which is the fixed-array shape.
+        if param.array_extent is not None:
+            roles[i] = ParamRole.FIXED_ARRAY
+            extents[i] = param.array_extent
+            continue
+        # Written `T p[<macro or expression>]`: the declared extent needs the
+        # preprocessor, so the one-element fallback below would under-size the
+        # object and phantom-VIOLATE a unit that reads the full extent. Checked
+        # *after* length-pairing on purpose — an accompanying length sizes the
+        # object exactly, which is better than declining (issue #137).
+        if param.array_extent_unresolved:
+            roles[i] = ParamRole.UNRESOLVED
+            continue
         roles[i] = ParamRole.SCALAR_PTR
 
     # Every remaining unclassified slot is a non-pointer: a length consumed by a
@@ -216,6 +266,7 @@ def plan_unit(unit: Unit) -> UnitPlan:
             role=final_roles[i],
             length_var=length_var[i],
             extent=extents[i],
+            static_min_extent=static_mins[i],
         )
         for i, param in enumerate(unit.params)
     )
@@ -234,14 +285,34 @@ def _length_bound(plan: ParamPlan, max_len: int) -> str:
     return f"__ESBMC_assume({lo}{plan.var} <= {max_len});"
 
 
+def _at_least(size: str, floor: str) -> str:
+    """`size` raised to `floor` — C has no `max`, so a conditional expression."""
+    return f"({size} > {floor} ? {size} : {floor})"
+
+
 def _pointer_alloc(plan: ParamPlan) -> str:
-    """The `malloc(...)` size expression for a pointer/array plan."""
+    """The `malloc(...)` size expression for a pointer/array plan.
+
+    A length-sized pointer that also carries a `[static N]` floor is allocated
+    ``max(length, N)``: a valid caller has to satisfy *both* the pointer/length
+    convention and the C99 obligation, so the weakest one supplies whichever is
+    larger. Sizing by the length alone would phantom-VIOLATE a body that reads all
+    ``N``; sizing by ``N`` alone would phantom-VIOLATE one that reads ``length``
+    elements when ``length > N`` (issue #137).
+    """
     if plan.role is ParamRole.SCALAR_PTR:
         return f"sizeof(*{plan.var})"
     if plan.role is ParamRole.PTR_BYTE_LEN:
-        return f"(size_t){plan.length_var}"
+        nbytes = f"(size_t){plan.length_var}"
+        if plan.static_min_extent is None:
+            return nbytes
+        floor = f"(size_t){plan.static_min_extent} * sizeof(*{plan.var})"
+        return _at_least(nbytes, floor)
     if plan.role is ParamRole.PTR_ELEM_COUNT:
-        return f"(size_t){plan.length_var} * sizeof(*{plan.var})"
+        count = f"(size_t){plan.length_var}"
+        if plan.static_min_extent is not None:
+            count = _at_least(count, f"(size_t){plan.static_min_extent}")
+        return f"{count} * sizeof(*{plan.var})"
     if plan.role is ParamRole.FIXED_ARRAY:
         return f"(size_t){plan.extent} * sizeof(*{plan.var})"
     raise SynthError(f"not a pointer plan: {plan.role}")  # pragma: no cover
