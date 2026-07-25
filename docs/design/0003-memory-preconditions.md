@@ -95,7 +95,9 @@ flowchart TB
   `is_fresh(p, n * sizeof(*p))` / `malloc(n * sizeof(*p))` (equal only when `sizeof(*p) == 1`,
   e.g. sha1's `uint8_t*`; conflating them for a wide `T` reintroduces the phantom VIOLATED this
   gate exists to remove); fixed array `T p[N]` →
-  size `N` straight from the signature. Covers most real C **and all of sha1's one‑shot + digest**.
+  size `N` straight from the signature, and C99's `T p[static N]` beside such a length →
+  `max(length, N)`, since that `N` is a caller *minimum* rather than a capacity (see the S2‑landed
+  note below). Covers most real C **and all of sha1's one‑shot + digest**.
 - **L1 — structural inference (LLM fallback, still automatic + transparent).** Reachable context
   (construct `ctx` by calling `sha1_init`, *not* a nondet blob), ambiguous pointer/length pairing,
   aliasing intent, NUL‑terminated sentinels. This is **structural** inference, kept separate from
