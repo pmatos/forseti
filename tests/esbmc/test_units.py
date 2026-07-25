@@ -149,6 +149,14 @@ def test_annotate_array_extents_recovers_literal(decl: str, expected: int) -> No
         "void f(uint8_t *p) {}",  # plain pointer: no declarator bracket at all
         "void f(uint8_t p[]) {}",  # unsized: exactly as informative as `uint8_t *p`
         "void f(uint8_t p[ ]) {}",  # ... whitespace-only bracket is still unsized
+        # A qualifier-only bracket qualifies the adjusted pointer (`uint8_t *const p`)
+        # and states no extent — as unsized as `p[]`, not an unreadable extent.
+        "void f(uint8_t p[const]) {}",
+        "void f(uint8_t p[restrict]) {}",
+        "void f(uint8_t p[__restrict]) {}",
+        "void f(uint8_t p[ volatile ]) {}",
+        "void f(uint8_t p[_Atomic]) {}",
+        "void f(uint8_t p[const volatile]) {}",
     ],
 )
 def test_annotate_array_extents_no_extent_stated(decl: str) -> None:
@@ -167,6 +175,10 @@ def test_annotate_array_extents_no_extent_stated(decl: str) -> None:
         "void f(uint8_t p[20u]) {}",  # a suffixed literal is not a bare decimal
         "void f(uint8_t p[0x20]) {}",
         "void f(uint8_t p[*]) {}",  # a `[*]` prototype declarator
+        # C's grammar requires a size expression after `static`, so a bracket that
+        # has `static` but no readable extent is never read as merely unsized.
+        "void f(uint8_t p[static]) {}",
+        "void f(uint8_t p[static const]) {}",
         "void f(int p[2][3]) {}",  # multi-dim (pointer-to-array) is not an L0 shape
         "void f(int p[2] [3]) {}",  # ... nor when the brackets are spaced apart
     ],

@@ -55,13 +55,23 @@ _COMMENT_RE = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
 # and simply does not match. Formatted with an `re.escape`d name.
 _ARRAY_DECL_TEMPLATE = r"\b{name}((?:\s*\[[^\]]*\])+)"
 
+# The type qualifiers C allows inside a *function parameter*'s array bracket
+# (C99 adds them there; C11 adds `_Atomic`). They qualify the adjusted pointer —
+# `int p[const]` is `int *const p` — and say nothing about an extent.
+_BRACKET_QUALIFIER = r"const|volatile|restrict|_Atomic|__restrict(?:__)?"
+
 # The contents of a fixed-array parameter's bracket, when they state a literal
-# extent. C99 allows `static` and any type qualifier before the extent in a
-# *function parameter* declarator (`int p[static const 20]`, either order) —
-# C11 adds `_Atomic` to that qualifier set (`int p[_Atomic 20]`) — so they are
-# skipped; anything else in the bracket is not a literal we can read.
-_EXTENT_RE = re.compile(
-    r"^\s*(?:(?:static|const|volatile|restrict|_Atomic|__restrict(?:__)?)\s+)*(\d+)\s*$"
+# extent. C99's `static` and any qualifier may precede the extent, in either
+# order (`int p[static const 20]`), so they are skipped; anything else in the
+# bracket is not a literal we can read.
+_EXTENT_RE = re.compile(rf"^\s*(?:(?:static|{_BRACKET_QUALIFIER})\s+)*(\d+)\s*$")
+
+# A bracket holding qualifiers and nothing else (`int p[const]`, `int p[restrict]`):
+# valid C that declares no extent at all. `static` is excluded on purpose — C's
+# grammar requires a size expression after it, so a bracket that has `static` but
+# no readable extent stays unresolved rather than passing as unsized.
+_QUALIFIER_ONLY_RE = re.compile(
+    rf"^\s*(?:{_BRACKET_QUALIFIER})(?:\s+(?:{_BRACKET_QUALIFIER}))*\s*$"
 )
 
 # C99's `[static N]`, whose `N` binds the *caller*: the argument must give access to
@@ -281,9 +291,10 @@ def _array_shape(param_list: str, name: str) -> _ArrayShape:
     read from the source — a macro or expression (``name[SHA_DIGEST_LENGTH]``, which
     needs the preprocessor) or a multi-dimensional ``name[N][M]`` (a
     pointer-to-array, not an L0 shape); and neither when there is no extent to
-    recover in the first place: a plain pointer, an unsized ``name[]`` (exactly as
-    informative as ``T *name``), or an unnamed parameter. `static_min` is set
-    independently, for C99's ``name[static N]``.
+    recover in the first place: a plain pointer, an unsized ``name[]`` or
+    qualifier-only ``name[const]`` (both exactly as informative as ``T *name``),
+    or an unnamed parameter. `static_min` is set independently, for C99's
+    ``name[static N]``.
 
     The unresolved flag is what keeps an unreadable extent out of the one-element
     fallback, which would under-size the object. It says nothing about a parameter
@@ -300,7 +311,7 @@ def _array_shape(param_list: str, name: str) -> _ArrayShape:
     if len(brackets) != 1:
         return _ArrayShape(unresolved=True, static_min=static_min)
     inner = brackets[0]
-    if not inner.strip():
+    if not inner.strip() or _QUALIFIER_ONLY_RE.match(inner):
         return _ArrayShape(static_min=static_min)
     extent = _EXTENT_RE.match(inner)
     if extent is None:
