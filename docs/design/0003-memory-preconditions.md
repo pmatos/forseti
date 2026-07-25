@@ -183,8 +183,12 @@ indistinguishable from a plain `T *p`, and the unit is `NEEDS_CONTRACT` instead 
 one‑element object that phantom‑VIOLATES code reading the declared extent. For a *conventional*
 `T p[MACRO]` an accompanying length parameter still wins — the written extent binds nobody (C adjusts
 the parameter to `T *`), so the length is the better authority and sizes the object exactly. C99's
-`T p[static MACRO]` is the exception: there the extent is a **caller obligation**, so the function may
-touch all of it however small the length is, and L0 declines rather than sizing by the length.
+`T p[static N]` is the exception: there the extent is a **caller obligation**, a *minimum* rather than
+a capacity. A valid caller satisfies both it and the length convention, so the object is sized
+`max(length, N)` when `N` is readable — sizing by the length alone would phantom‑VIOLATE a body that
+touches all of `N`, and sizing at exactly `N` would phantom‑VIOLATE one that touches `length`
+elements when `length > N`. With `N` unreadable (`T p[static MACRO]`) there is no floor to raise the
+length to, so L0 declines instead.
 
 ## Decisions (recommended) & open questions
 

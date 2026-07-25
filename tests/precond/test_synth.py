@@ -112,11 +112,38 @@ def test_unreadable_static_minimum_outranks_an_accompanying_length() -> None:
     assert plan.unresolved_params == ("buf",)
 
 
-def test_readable_static_minimum_is_sized_by_its_extent() -> None:
-    # A *readable* `[static 20]` needs no such caution: the exact extent wins, and
-    # the neighbouring length is then just a scalar.
+def test_readable_static_minimum_floors_an_accompanying_length() -> None:
+    # A *readable* `[static 20]` is a caller obligation, not a capacity: a valid
+    # caller may pass a far larger buffer with `len` to match. Sizing the object at
+    # exactly 20 while `len` roams free phantom-VIOLATES a body that reads `len`
+    # elements, so the length sizes the object with 20 as its floor.
     unit = _unit(
         Param("buf", "uint8_t *", array_extent=20, array_static_min=True),
+        Param("len", "unsigned long"),
+    )
+    plan = plan_unit(unit)
+    assert plan.params[0].role is ParamRole.PTR_BYTE_LEN
+    assert plan.params[0].length_var == "len"
+    assert plan.params[0].static_min_extent == 20
+    assert plan.params[1].role is ParamRole.LENGTH
+
+
+def test_readable_static_minimum_without_a_length_is_its_extent() -> None:
+    # With no length to pair with, the weakest valid caller supplies exactly the
+    # declared minimum — the plain fixed-array shape.
+    unit = _unit(Param("buf", "uint8_t *", array_extent=20, array_static_min=True))
+    plan = plan_unit(unit)
+    assert plan.params[0].role is ParamRole.FIXED_ARRAY
+    assert plan.params[0].extent == 20
+    assert plan.params[0].static_min_extent is None
+
+
+def test_conventional_extent_still_outranks_an_accompanying_length() -> None:
+    # Without `static` the bracket binds nobody, so #134's rule is unchanged: the
+    # written extent is the only size the signature states and the neighbouring
+    # length stays a plain scalar.
+    unit = _unit(
+        Param("buf", "uint8_t *", array_extent=20),
         Param("len", "unsigned long"),
     )
     plan = plan_unit(unit)
@@ -221,6 +248,37 @@ def test_render_fixed_array_scales_by_extent() -> None:
     unit = _unit(Param("digest", "uint8_t *", array_extent=20), name="sha1_final")
     text = render_sidecar(plan_unit(unit), "s.c")
     assert "uint8_t * digest = malloc((size_t)20 * sizeof(*digest));" in text
+
+
+def test_render_static_minimum_floors_a_byte_length() -> None:
+    # `uint8_t p[static 20], size_t len` — bytes on both sides, so the floor is
+    # `20 * sizeof(*p)`; the object is whichever of the two is larger.
+    unit = _unit(
+        Param("p", "uint8_t *", array_extent=20, array_static_min=True),
+        Param("len", "unsigned long"),
+        name="g",
+    )
+    text = render_sidecar(plan_unit(unit), "s.c", max_len=8)
+    assert (
+        "uint8_t * p = malloc(((size_t)len > (size_t)20 * sizeof(*p) "
+        "? (size_t)len : (size_t)20 * sizeof(*p)));" in text
+    )
+    # the length is still symbolic and bounded — the floor does not pin it.
+    assert "__ESBMC_assume(len <= 8);" in text
+
+
+def test_render_static_minimum_floors_an_element_count() -> None:
+    # An element count meets the floor in elements, before scaling by `sizeof`.
+    unit = _unit(
+        Param("p", "int *", array_extent=4, array_static_min=True),
+        Param("count", "int"),
+        name="g",
+    )
+    text = render_sidecar(plan_unit(unit), "s.c")
+    assert (
+        "int * p = malloc(((size_t)count > (size_t)4 ? (size_t)count : (size_t)4) "
+        "* sizeof(*p));" in text
+    )
 
 
 def test_render_non_vacuity_appends_assert_after_call() -> None:
