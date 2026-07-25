@@ -251,8 +251,13 @@ turns a verdict into an error.
 - **Very slow, many-function files.** Verdicts persist incrementally so a hook
   kill can't cause a silent pass, but a file whose *total* verification exceeds
   the PostToolUse hook timeout can have its last, still-running function cut off
-  before its verdict lands. Raise the hook timeout (and `FORSETI_UNWIND` budget)
-  for such files.
+  before its verdict lands. The scan retries such a file — an interrupted verify is
+  recorded as unfinished, so the file is re-verified on the next scan even though
+  its content hash is unchanged ([#140](https://github.com/pmatos/forseti/issues/140)) —
+  but only 3 times per unchanged content: a file that can *never* finish inside the
+  budget would otherwise reset the Stop-gate's patience every round and loop
+  forever. After that its pending units block their way to the loud residual.
+  Raise the hook timeout (and `FORSETI_UNWIND` budget) for such files.
 - **Out-of-band gating needs a git repo.** C files written via the `Bash` tool
   are gated by a `git status`-scoped scan (the `Bash` PostToolUse hook, plus the
   Stop-gate backstop). In a project that is **not** a git repository that scan is
@@ -264,18 +269,19 @@ turns a verdict into an error.
   blobs, so a session opening at `MM foo.c` (staged WIP, worktree reverted) is not
   blocked on the user's own pre-session index, issue
   [#139](https://github.com/pmatos/forseti/issues/139) — *and* the current HEAD, so
-  the scan catches this session's Bash writes — including a C file written **and committed in one shot**
-  (a clean worktree `git status` alone would miss), recovered by diffing the
-  baseline HEAD against the current one — while never gating pre-existing
-  uncommitted or committed/third-party C the agent never touched. Two documented
-  bounds of the HEAD-diff: (1) a HEAD movement that brings in C without the agent
-  authoring it (a `git checkout`/`merge`/`rebase` run via Bash) is conservatively
-  gated — an over-gate that blocks loudly, never a silent pass; (2) in a repo with
-  **no commits** at session start there is no baseline HEAD, so the very first
-  commit's C is caught only if it is also left dirty. It relies on content changes
-  git can see; a change git cannot (a file outside the work tree, or one matched by
-  `.gitignore`) is not scanned. A file changed *between* sessions is re-baselined
-  on the next fresh start, so it is treated as pre-existing rather than gated.
+  the scan catches this session's Bash writes — including a C file written **and
+  committed in one shot** (a clean worktree `git status` alone would miss),
+  recovered by diffing the baseline HEAD against the current one — while never
+  gating pre-existing uncommitted or committed/third-party C the agent never
+  touched. Two documented bounds of the HEAD-diff: (1) a HEAD movement that
+  brings in C without the agent authoring it (a `git checkout`/`merge`/`rebase`
+  run via Bash) is conservatively gated — an over-gate that blocks loudly, never
+  a silent pass; (2) in a repo with **no commits** at session start there is no
+  baseline HEAD, so the very first commit's C is caught only if it is also left
+  dirty. It relies on content changes git can see; a change git cannot (a file
+  outside the work tree, or one matched by `.gitignore`) is not scanned. A file
+  changed *between* sessions is re-baselined on the next fresh start, so it is
+  treated as pre-existing rather than gated.
 - **Staged/committed-blob freshness is single-hash and content-literal.** The gate
   records one last-verified hash per file, so if you stage a *previously* verified
   blob and then keep editing to a newer verified version, the now-superseded staged

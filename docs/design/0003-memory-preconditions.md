@@ -95,7 +95,9 @@ flowchart TB
   `is_fresh(p, n * sizeof(*p))` / `malloc(n * sizeof(*p))` (equal only when `sizeof(*p) == 1`,
   e.g. sha1's `uint8_t*`; conflating them for a wide `T` reintroduces the phantom VIOLATED this
   gate exists to remove); fixed array `T p[N]` →
-  size `N` straight from the signature. Covers most real C **and all of sha1's one‑shot + digest**.
+  size `N` straight from the signature, and C99's `T p[static N]` beside such a length →
+  `max(length, N)`, since that `N` is a caller *minimum* rather than a capacity (see the S2‑landed
+  note below). Covers most real C **and all of sha1's one‑shot + digest**.
 - **L1 — structural inference (LLM fallback, still automatic + transparent).** Reachable context
   (construct `ctx` by calling `sha1_init`, *not* a nondet blob), ambiguous pointer/length pairing,
   aliasing intent, NUL‑terminated sentinels. This is **structural** inference, kept separate from
@@ -174,6 +176,21 @@ are **honestly labelled** — `ASSUMED_VERIFIED` ("VERIFIED assuming valid calle
 undischarged"), never a full verdict (D3). The `examples/sha1.c` units verify assumed; the
 `sha1_bug.c` off‑by‑one is VIOLATED non‑vacuously. Under‑unwound loops (assertions ON) are told from
 real out‑of‑bounds structurally and *escalate the k‑ladder*, never masquerade as a violation.
+
+**Extent recovery is honest about its limits** ([#137](https://github.com/pmatos/forseti/issues/137)):
+`T p[static N]` (with cv‑qualifiers, either order) is read like a bare `T p[N]`, but an extent that
+needs the preprocessor or an expression (`T p[SHA_DIGEST_LENGTH]`, `T p[N+1]`) is **not guessable
+from the source** — so it is *flagged* (`Param.array_extent_unresolved`) rather than left
+indistinguishable from a plain `T *p`, and the unit is `NEEDS_CONTRACT` instead of being backed by a
+one‑element object that phantom‑VIOLATES code reading the declared extent. For a *conventional*
+`T p[MACRO]` an accompanying length parameter still wins — the written extent binds nobody (C adjusts
+the parameter to `T *`), so the length is the better authority and sizes the object exactly. C99's
+`T p[static N]` is the exception: there the extent is a **caller obligation**, a *minimum* rather than
+a capacity. A valid caller satisfies both it and the length convention, so the object is sized
+`max(length, N)` when `N` is readable — sizing by the length alone would phantom‑VIOLATE a body that
+touches all of `N`, and sizing at exactly `N` would phantom‑VIOLATE one that touches `length`
+elements when `length > N`. With `N` unreadable (`T p[static MACRO]`) there is no floor to raise the
+length to, so L0 declines instead.
 
 ## Decisions (recommended) & open questions
 

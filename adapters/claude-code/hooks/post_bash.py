@@ -140,16 +140,21 @@ def main() -> int:
     )
     if discovered is None:
         # Not a git work tree — out-of-band discovery is inactive. Never a silent
-        # no-op: record the degraded scope so the gap is visible in the trace.
+        # no-op: record the degraded scope so the gap is visible in the trace. The
+        # scan still runs: a verify interrupted before its verdicts landed is named
+        # by the gate's own `pending` marker, not by git, so it is retried even here
+        # (PR #148 review).
         event_log.log_event(
             project_dir,
             event_log.GATE,
             decision="oob_scan_skipped",
-            reason="not a git repository; out-of-band Bash writes are not gated",
+            reason=(
+                "not a git repository; C written out-of-band via Bash is not gated "
+                "(an interrupted verify is still retried from its pending marker)"
+            ),
         )
-        return 0
 
-    stale = gate.stale_sources(project_dir, state, discovered)
+    stale = gate.sources_needing_verify(project_dir, state, discovered)
     if not stale:
         return 0
 

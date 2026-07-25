@@ -104,6 +104,16 @@ LIST_UNITS_TIMEOUT_S = float(os.environ.get("FORSETI_LIST_UNITS_TIMEOUT_S", "30"
 # loop either).
 MAX_STOP_ATTEMPTS = 3
 
+# How many times the same file content may be *started* through `verify_and_record`
+# without its verdicts landing — a mid-run hook kill, or a scan that ended in a
+# blocking `error` — before the scan stops retrying it (issue #140). The same trade
+# as MAX_STOP_ATTEMPTS, one layer down: retrying is what recovers a killed verify,
+# but an unbounded retry of a file that can never finish inside the hook budget
+# would reset `stop_attempts` every round and loop forever. Once exhausted, the
+# file's still-pending `unknown` units keep blocking and reach the loud residual
+# via MAX_STOP_ATTEMPTS.
+MAX_PENDING_VERIFY_ATTEMPTS = 3
+
 C_SUFFIXES = {".c", ".h"}
 
 # Out-of-band discovery (issue #99): a C file written via the `Bash` tool
@@ -742,22 +752,119 @@ def discover_changed_c_sources(
     return found
 
 
-def stale_sources(project_dir: str, state: dict, files: Iterable[str]) -> list[str]:
-    """Subset of `files` whose content differs from the last recorded verify.
+def _pending_attempts(entry: object, digest: str) -> int | None:
+    """Unfinished-verify count `entry` records for `digest`, else ``None``.
 
-    A file is stale when it has never been verified (`scanned` has no entry) or
-    its current content hash differs from the recorded one — i.e. it was written
-    or modified out-of-band since the gate last saw it.
+    ``None`` means "no unfinished verify of this content" — the entry is absent,
+    malformed, or records different bytes. A present entry with an unreadable
+    counter reads as ``0`` (retry) rather than as exhausted, and the retry rewrites
+    the counter as an int, so a corrupt value can never loop.
+    """
+    if not isinstance(entry, dict) or entry.get("hash") != digest:
+        return None
+    attempts = entry.get("attempts")
+    return attempts if isinstance(attempts, int) and attempts > 0 else 0
+
+
+def _pending_owner(entry: object) -> tuple[object, object] | None:
+    """Which run created marker `entry`: its content and its process, else ``None``.
+
+    The ownership test for the *success* cleanup — a run may clear only the marker it
+    stored itself. `hash` separates runs on different content; `pid` separates two
+    live runs of the *same* content, and separates a cleared-then-recreated marker
+    from the byte-identical one it replaced.
+
+    `attempts` is deliberately excluded. It is a shared budget, not identity: an
+    erroring run charges an attempt to a marker it does not own (`_blocking_error`),
+    so counting it here would let that charge orphan the owner's own claim.
+    """
+    if not isinstance(entry, dict):
+        return None
+    return entry.get("hash"), entry.get("pid")
+
+
+def stale_sources(project_dir: str, state: dict, files: Iterable[str]) -> list[str]:
+    """Subset of `files` needing a (re-)verify: changed content, or a killed verify.
+
+    A file is stale when it has never been verified (`scanned` has no entry), when
+    its current content hash differs from the recorded one — i.e. it was written or
+    modified out-of-band since the gate last saw it — or when an **unfinished**
+    verify of exactly this content is on record (issue #140).
+
+    That last case closes the kill hole: `verify_and_record` stamps `scanned[rel]`
+    up front (the dedup that protects `stop_attempts`), so a hook killed after the
+    pre-record but before the verdicts landed leaves the file content-*fresh* while
+    its units sit at pending `unknown`. The scan would then skip the file forever
+    and the gate could only keep blocking on units nothing would ever retry, until
+    the attempt cap turned them into a residual. `pending` marks such a file for
+    retry — bounded by `MAX_PENDING_VERIFY_ATTEMPTS`, after which the pending units
+    reach that loud residual rather than the retry looping forever. Keyed on the
+    recorded hash, so it is a pending verify *of this content*, never a blanket
+    "any `unknown` unit is stale" (a genuine ESBMC-timeout `unknown` is a final
+    verdict — re-verifying it every scan would never terminate).
     """
     scanned = state.get("scanned", {})
+    pending = state.get("pending", {})
     stale: list[str] = []
     for abspath in files:
         digest = content_hash(abspath)
         if digest is None:
             continue
-        if scanned.get(unit_id(project_dir, abspath)) != digest:
+        rel = unit_id(project_dir, abspath)
+        attempts = _pending_attempts(pending.get(rel), digest)
+        unfinished = attempts is not None and attempts < MAX_PENDING_VERIFY_ATTEMPTS
+        if scanned.get(rel) != digest or unfinished:
             stale.append(abspath)
     return stale
+
+
+def pending_retry_sources(project_dir: str, state: dict) -> list[str]:
+    """Absolute paths whose bytes *now on disk* have an unfinished verify on record.
+
+    A discovery source in its own right, and the one git cannot provide (PR #148
+    review). Retrying an interrupted verify only works if some scan offers the file
+    to `stale_sources`, and both scans feed on `discover_changed_c_sources` — so a
+    file git never reports as changed (a non-git project, a gitignored path, one
+    edited back to its `HEAD` blob) was never even a candidate, and the `unknown`
+    units its killed run pre-recorded could only block their way to a residual. The
+    `pending` marker *is* the record of "a run started verifying exactly these bytes
+    and never finished", so it names the file without git's help.
+
+    Deliberately not narrowed by the include/exclude globs or the git scope those
+    scans apply: a marker exists only for a file `verify_and_record` already ran on,
+    and its half-recorded units block the Stop-gate however the file was first
+    found — leaving them unretryable because a glob hides the file from *out-of-band*
+    discovery is the same hole one layer over. Returns every file whose current
+    content matches its marker; whether that unfinished verify still has attempts
+    left stays `stale_sources`' single decision.
+    """
+    found: list[str] = []
+    for rel, entry in state.get("pending", {}).items():
+        abspath = os.path.join(project_dir, rel)
+        digest = content_hash(abspath)
+        if digest is not None and _pending_attempts(entry, digest) is not None:
+            found.append(abspath)
+    return found
+
+
+def sources_needing_verify(
+    project_dir: str, state: dict, discovered: Iterable[str] | None
+) -> list[str]:
+    """Everything a scan must (re-)verify: stale discovered C + interrupted verifies.
+
+    The one call both the ``post_bash`` PostToolUse scan and the Stop-gate make.
+    `discovered` is `discover_changed_c_sources`' result — ``None`` when this is not
+    a git work tree, which disables out-of-band *discovery* but not the pending
+    retries, whose files are named by the gate's own state.
+    """
+    files = [*(discovered or []), *pending_retry_sources(project_dir, state)]
+    # Discovery joins the *git root* and the pending scan joins `project_dir`, so one
+    # file can arrive under two spellings; dedup on the id both resolve to, keeping
+    # the first (discovery's) spelling.
+    unique: dict[str, str] = {}
+    for abspath in files:
+        unique.setdefault(unit_id(project_dir, abspath), abspath)
+    return stale_sources(project_dir, state, unique.values())
 
 
 def _baselined_blobs(baseline: object, rel: str) -> tuple[str, ...]:
@@ -1040,6 +1147,7 @@ def load_state(project_dir: str) -> dict:
             state.setdefault("units", {})
             state.setdefault("stop_attempts", 0)
             state.setdefault("scanned", {})
+            state.setdefault("pending", {})
             state.setdefault("baseline_blobs", {})
             state.setdefault("baseline_head", None)
             return state
@@ -1049,6 +1157,7 @@ def load_state(project_dir: str) -> dict:
         "units": {},
         "stop_attempts": 0,
         "scanned": {},
+        "pending": {},
         "baseline_blobs": {},
         "baseline_head": None,
     }
@@ -1100,10 +1209,11 @@ def prune_deleted_units(state: dict, project_dir: str) -> list[str]:
     Stop-gate would block forever (then only emit a residual after the attempt cap)
     on a unit whose file is gone. Discovery correctly skips a missing file *for
     verification*; this reconciles the recorded side, dropping units whose file is
-    absent and clearing each such file's `scanned` **and** `baseline_blobs` baseline
-    (so a same-name file recreated later re-verifies from scratch — the two baselines
-    are cleared together, or content matching a dropped one could still slip past the
-    blob scan).
+    absent and clearing every record keyed on such a file: its `scanned` **and**
+    `baseline_blobs` baselines (so a same-name file recreated later re-verifies from
+    scratch — the two are cleared together, or content matching a dropped one could
+    still slip past the blob scan) and its `pending` marker (a deleted file leaves
+    nothing to retry).
 
     Keys off each unit's recorded `file` (project-relative), not `git status`, so
     it also catches an untracked Bash-written file git never knew existed — the
@@ -1113,6 +1223,7 @@ def prune_deleted_units(state: dict, project_dir: str) -> list[str]:
     """
     units = state.get("units", {})
     scanned = state.get("scanned", {})
+    pending = state.get("pending", {})
     baseline_blobs = state.get("baseline_blobs", {})
     pruned: list[str] = []
     gone_rels: set[str] = set()
@@ -1126,6 +1237,7 @@ def prune_deleted_units(state: dict, project_dir: str) -> list[str]:
             gone_rels.add(rel)
     for rel in gone_rels:
         scanned.pop(rel, None)
+        pending.pop(rel, None)  # nothing left to retry — the file is gone
         if isinstance(baseline_blobs, dict):
             baseline_blobs.pop(rel, None)
     return pruned
@@ -1178,22 +1290,64 @@ def verify_and_record(
     overwrites its entry the moment it lands. So a hook kill at any point leaves
     the not-yet-verified functions as `unknown` — which the Stop-gate blocks on —
     rather than absent; it can never drop an already-found or still-pending
-    violation and pass silently.
+    violation and pass silently. The same up-front block marks the file's scan
+    unfinished in `pending`, cleared only once every verdict is final — and only by
+    the run that recorded that marker, never by one that finds a concurrent run's —
+    so a killed run is *retried* by the next scan instead of being skipped as
+    content-fresh (issue #140), bounded by `MAX_PENDING_VERIFY_ATTEMPTS`.
     """
     rel = unit_id(project_dir, file_path)
 
-    def _blocking_error(detail: str) -> list[UnitVerdict]:
+    def _blocking_error(detail: str, *, digest: str | None = None) -> list[UnitVerdict]:
         """Record a blocking `error` verdict for the whole file and return it.
 
-        Neither caller stamps `scanned`: a file we could not read or enumerate
-        must not be recorded as already-scanned, or the out-of-band scan would
-        treat it as handled and the edit would pass unverified.
+        No caller stamps `scanned`: a file we could not read or enumerate must not
+        be recorded as already-scanned, or the out-of-band scan would treat it as
+        handled and the edit would pass unverified.
+
+        An unfinished-verify marker for `digest` is *spent one attempt*, never
+        deleted (PR #148 review). Deleting is what the ownership rule forbids: this
+        path can never own the marker — an error caller either returns before the
+        block that creates one or (the post-verify drift caller) has already
+        released its own claim, and `pending` holds a single claim per file — so the
+        marker it would drop always belongs to another run, whose pre-recorded `unknown`
+        units would then sit content-fresh (that run stamped `scanned` with these
+        same bytes) with nothing left to retry, the exact hole issue #140 closes.
+        Bumping keeps that retry claim alive while still making progress: leaving the
+        counter untouched would let a persistently-erroring file re-verify on every
+        scan forever — each error resets `stop_attempts` — instead of going quiet at
+        `MAX_PENDING_VERIFY_ATTEMPTS` and blocking its way to the loud residual. The
+        bump goes through `_pending_attempts`, so a corrupt counter normalizes to 1
+        rather than freezing, and stops at the cap so a marker no scan will retry
+        again cannot count up forever. `hash`/`pid` are left as the creating run
+        wrote them: this run owns nothing and will never clear the marker — and
+        because those two fields alone are `_pending_owner`'s identity, the charge
+        leaves the creating run still able to clear it.
+
+        Only a marker recording exactly `digest` is charged: a concurrent run of
+        *other* content is verifying bytes this error says nothing about.
+
+        Three callers pass no `digest` and so touch nothing. The read failure never
+        learned which bytes it was scanning, so it cannot name the claim to charge —
+        and such a file also fails `content_hash`, so `stale_sources` skips it
+        entirely and no frozen counter can spin. The other two are the drift checks,
+        around the enumeration and around the verify loop, and they share a reason:
+        each fires precisely *because* the file no longer hashes to `digest`, so
+        charging that content's retry budget would spend a claim on bytes this run is
+        no longer speaking for. The counter is bumped by the next run that scans
+        whatever the file now holds.
         """
         verdict = UnitVerdict(f"{rel}::?", rel, "?", "error", k, detail=detail)
         with gate_lock(project_dir):
             state = load_state(project_dir)
             record(state, verdict)
             state["stop_attempts"] = 0
+            pending = state.setdefault("pending", {})
+            attempts = _pending_attempts(pending.get(rel), digest) if digest else None
+            if attempts is not None:
+                pending[rel]["attempts"] = min(
+                    attempts + 1, MAX_PENDING_VERIFY_ATTEMPTS
+                )
             save_state(project_dir, state)
         return [verdict]
 
@@ -1201,6 +1355,11 @@ def verify_and_record(
         raw = Path(file_path).read_bytes()
     except OSError as exc:
         return _blocking_error(str(exc))
+
+    # Hash the bytes we read before anything else can fail: every path below needs
+    # to name the content it operated on, both to stamp `scanned` and to tell its
+    # own unfinished-verify marker from a concurrent run's.
+    digest = hashlib.sha256(raw).hexdigest()
 
     try:
         # `content=raw` — enumerate a snapshot of the very bytes we are about to
@@ -1216,12 +1375,7 @@ def verify_and_record(
         # Couldn't enumerate the file's units (esbmc missing, C parse error, …).
         # Record a blocking `error` verdict rather than skip: a file that was
         # edited but can't be parsed must not pass silently.
-        return _blocking_error(str(exc)[:800])
-
-    # Stamp the content hash so a later out-of-band scan treats this exact content
-    # as already verified — that dedup is what keeps the Stop-gate from re-blocking
-    # (and resetting its patience) on a file nothing has touched since.
-    digest = hashlib.sha256(raw).hexdigest()
+        return _blocking_error(str(exc)[:800], digest=digest)
 
     # The snapshot guarantees we enumerated `raw`; this guarantees `raw` is still
     # what the file holds. Together they give the stamping invariant: if
@@ -1247,7 +1401,22 @@ def verify_and_record(
     with gate_lock(project_dir):
         state = load_state(project_dir)
         state["stop_attempts"] = 0
+        # Stamp the content hash so a later out-of-band scan treats this exact content
+        # as already verified — that dedup is what keeps the Stop-gate from re-blocking
+        # (and resetting its patience) on a file nothing has touched since.
         state.setdefault("scanned", {})[rel] = digest
+        # Mark this content's scan unfinished, counting the start. The stamp above
+        # makes the file content-fresh, so without this marker a kill before the
+        # verdicts land would leave the pending `unknown` units unretryable
+        # (issue #140). Cleared once every verdict is final.
+        #
+        # The marker doubles as this run's ownership token so the cleanup below can
+        # tell it from one a *concurrent* run stored — see `_pending_owner` for what
+        # identifies it. The counter is bumped under the lock, so a concurrent run of
+        # the same content still reads this start when it computes its own.
+        prior = _pending_attempts(state.setdefault("pending", {}).get(rel), digest)
+        marker = {"hash": digest, "attempts": (prior or 0) + 1, "pid": os.getpid()}
+        state["pending"][rel] = marker
         prune_missing_units(state, project_dir, file_path, {d.name for d in defs})
         for d in defs:
             if d.takes_pointer:
@@ -1313,6 +1482,7 @@ def verify_and_record(
     # So the invariant is precisely: if `scanned[rel]` is H, the units were
     # enumerated from content hashing to H and the file hashed to H both then and
     # after the loop — NOT that every verdict was computed against H.
+    withdrawn = False
     if content_hash(file_path) != digest:
         with gate_lock(project_dir):
             state = load_state(project_dir)
@@ -1327,13 +1497,45 @@ def verify_and_record(
             # stamp, so the out-of-band scan reads it as fresh and never re-runs
             # the reconcile that prunes `?`, and the Stop-gate would block on a
             # file a newer run legitimately verified.
-            ours = scanned.get(rel) == digest
-            if ours:
+            withdrawn = scanned.get(rel) == digest
+            if withdrawn:
                 scanned.pop(rel, None)
                 save_state(project_dir, state)
-        if ours:
-            return _blocking_error(
-                "source changed while its units were being verified; the verdicts "
-                "describe content that is no longer on disk — re-edit to re-verify"
-            )
+
+    # Every verdict for this content is final — or, on the drift path just above,
+    # this run has concluded that none of them can be trusted. Either way the run
+    # *finished*: clear THIS RUN's unfinished-verify marker so later scans trust
+    # the up-front `scanned` stamp again. Only a kill should leave a claim behind,
+    # because a claim is precisely what makes the next scan retry (issue #140).
+    #
+    # Only this run's — the gate explicitly supports concurrent PostToolUse hooks
+    # on the same path across successive edits, so an older run can reach this
+    # point after a newer one has stamped `scanned` with *its* digest and stored
+    # its own marker. Popping that newer marker would leave the file hashing fresh
+    # with nothing to retry, so a kill of the newer run would never be re-verified
+    # — the exact hole this closes (PR #148 review) — and its pre-recorded
+    # `unknown` units, which this run's verdicts for the older bytes overwrote,
+    # would never be re-decided either. A kill in the sliver between the last
+    # verdict and this write just costs one redundant re-verify — the safe
+    # direction. Ownership is `_pending_owner`, not whole-marker equality: a
+    # concurrent `_blocking_error` may have charged this marker an attempt, which
+    # changes its bytes without changing whose claim it is.
+    with gate_lock(project_dir):
+        state = load_state(project_dir)
+        pending = state.setdefault("pending", {})
+        if _pending_owner(pending.get(rel)) == _pending_owner(marker):
+            del pending[rel]
+        save_state(project_dir, state)
+
+    # Blocking comes *after* releasing the claim, which is what keeps
+    # `_blocking_error`'s no-ownership rule true for this caller too: by the time
+    # it looks, any marker under `rel` belongs to a concurrent run. (It is passed
+    # no `digest` regardless — the bytes it would name are no longer the ones on
+    # disk, so charging their retry budget would spend a claim on content this
+    # run is no longer speaking for.)
+    if withdrawn:
+        return _blocking_error(
+            "source changed while its units were being verified; the verdicts "
+            "describe content that is no longer on disk — re-edit to re-verify"
+        )
     return verdicts

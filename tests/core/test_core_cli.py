@@ -101,6 +101,24 @@ def test_synth_needs_contract_exits_five(
     assert "NEEDS_CONTRACT" in capsys.readouterr().out
 
 
+def test_synth_macro_array_extent_needs_contract_not_violated(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Issue #137, the outcome that matters: this function is *correct* for the
+    # extent it declares, but the macro extent needs the preprocessor. Backing it
+    # with a single element made the write to `digest[1]` a phantom VIOLATED (1);
+    # the honest answer is NEEDS_CONTRACT (5).
+    src = tmp_path / "macro_extent.c"
+    src.write_text(
+        "#define DLEN 20\n"
+        "void fill(unsigned char digest[DLEN]) {\n"
+        "  for (unsigned i = 0; i < DLEN; i++) digest[i] = (unsigned char)i;\n}\n"
+    )
+    code = main(["synth", str(src), "--function", "fill"])
+    assert code == 5
+    assert "NEEDS_CONTRACT" in capsys.readouterr().out
+
+
 # --- forseti list-units (authoritative unit enumeration, #131) ---------------
 
 
@@ -144,7 +162,41 @@ def test_list_units_json_payload(
             "type": "void (*)(void)",
             "is_pointer": True,
             "array_extent": None,
+            "array_extent_unresolved": False,
+            "array_static_min": False,
         }
+    ]
+
+
+def test_list_units_json_reports_array_shape(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The `--json` surface carries both halves of a parameter's written array shape:
+    # the recovered extent, and (issue #137) whether an unreadable one was declared.
+    src = tmp_path / "shapes.c"
+    src.write_text(
+        "#define DLEN 20\n"
+        "void f(unsigned char digest[DLEN], unsigned char tag[16], "
+        "unsigned char *raw, unsigned char mac[static DLEN]) {\n"
+        "  (void)digest; (void)tag; (void)raw; (void)mac;\n}\n"
+    )
+    code = main(["list-units", str(src), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    unit = next(u for u in payload["units"] if u["function"] == "f")
+    assert [
+        (
+            p["name"],
+            p["array_extent"],
+            p["array_extent_unresolved"],
+            p["array_static_min"],
+        )
+        for p in unit["params"]
+    ] == [
+        ("digest", None, True, False),
+        ("tag", 16, False, False),
+        ("raw", None, False, False),
+        ("mac", None, True, True),
     ]
 
 

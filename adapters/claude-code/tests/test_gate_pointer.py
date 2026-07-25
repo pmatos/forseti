@@ -765,6 +765,54 @@ def test_persistent_rewrite_during_verify_withdraws_the_stamp_and_blocks(
     assert "x.c" not in after["scanned"]  # the up-front stamp was withdrawn
     assert after["scanned"]["sentinel.c"] == "deadbeef"
     assert gate.blocking_units(after)  # not left passing on a stale `verified`
+    # The unfinished-verify marker (#140) is released too. A claim means "a run
+    # started verifying these bytes and never finished", which is what makes the
+    # next scan retry; this run *did* finish — it concluded the verdicts cannot
+    # be trusted and said so with a blocking `error`. Only a kill should leave a
+    # claim behind.
+    assert "x.c" not in after["pending"]
+
+
+def test_rewrite_during_verify_releases_the_claim_when_deferring(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The other drift exit: a concurrent run owns the stamp, so this run neither
+    # withdraws nor blocks. It has still finished, so its own claim must be
+    # released — while `_pending_owner` keeps it from touching the *other* run's.
+    src = tmp_path / "x.c"
+    src.write_text("alpha\n")
+    _seed_scanned(tmp_path)
+    state_file = tmp_path / ".forseti" / "gate_state.json"
+    beta_digest = hashlib.sha256(b"beta\n").hexdigest()
+
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            verdict="verified",
+            during_verify=(
+                f"open({str(src)!r}, 'w').write('beta\\n')\n"
+                "import json, pathlib\n"
+                f"_p = pathlib.Path({str(state_file)!r})\n"
+                "_st = json.loads(_p.read_text())\n"
+                f"_st['scanned']['x.c'] = {beta_digest!r}\n"
+                # The concurrent run's own claim, which this run must not clear.
+                f"_st['pending']['x.c'] = {{'hash': {beta_digest!r}, "
+                "'attempts': 1, 'pid': 999999}\n"
+                "_p.write_text(json.dumps(_st))"
+            ),
+        ),
+    )
+    gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    after = gate.load_state(str(tmp_path))
+    assert after["scanned"]["x.c"] == beta_digest  # the other run's stamp survives
+    assert after["pending"]["x.c"] == {  # ...and so does its claim, untouched
+        "hash": beta_digest,
+        "attempts": 1,
+        "pid": 999999,
+    }
 
 
 def test_transient_rewrite_during_verify_is_a_known_residual(

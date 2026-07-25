@@ -6,7 +6,9 @@ on:
   pull_request:
     branches: [main]
 
-# Least privilege: this job only reads the checkout; it posts nothing.
+# Least privilege: this job only reads the checkout. The one thing it sends out
+# is the coverage report, which authenticates with CODECOV_TOKEN rather than the
+# workflow token — so no write scope is needed here.
 permissions:
   contents: read
 
@@ -80,4 +82,30 @@ jobs:
         run: mypy src tests
 
       - name: Tests (pytest)
-        run: pytest -q --cov=forseti --cov-report=term-missing --cov-report=xml --cov-fail-under=85
+        # 96, not 95, and the two numbers measure the same report: pytest-cov's
+        # branch formula credits a partially-taken branch, Codecov's
+        # hits/(hits+misses+partials) does not, so pytest-cov reads ~0.8pp high
+        # (96.49 here vs Codecov's 95.68). Gating at 95 both sides would leave a
+        # band — pytest-cov 95.3, Codecov 94.5 — where CI is green and
+        # codecov/project is red. 96 keeps this fast in-job check the stricter
+        # of the two, so it always trips first. The 95% bar itself lives in
+        # codecov.yml; move them together.
+        run: pytest -q --cov=forseti --cov-report=term-missing --cov-report=xml --cov-fail-under=96
+
+      - name: Upload coverage to Codecov
+        # Upload whenever a report exists, including when the step above failed
+        # the job on coverage — that is exactly when it is most worth seeing.
+        # `!cancelled()` alone is too broad: it is also true when an *earlier*
+        # step fails (ruff, mypy, pip install, the ESBMC SHA check), which skips
+        # pytest via its implicit success() and leaves no coverage.xml. The
+        # action would then hard-fail on "no reports found" under
+        # fail_ci_if_error, adding a red herring next to the real failure.
+        # hashFiles is the precondition itself, so it also covers pytest dying
+        # before it writes the XML (e.g. a collection error).
+        if: ${{ !cancelled() && hashFiles('coverage.xml') != '' }}
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: pmatos/forseti
+          files: ./coverage.xml
+          fail_ci_if_error: true

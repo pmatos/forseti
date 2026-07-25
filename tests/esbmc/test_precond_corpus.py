@@ -55,3 +55,63 @@ def test_offbyone_twin_is_violated_non_vacuously() -> None:
     assert result.esbmc_result is not None
     raw = getattr(result.esbmc_result, "raw_counterexample", "")
     assert "array bounds violated" in raw
+
+
+_STATIC_MIN_AND_LEN = """\
+#include <stddef.h>
+
+void fill(unsigned char p[static 4], size_t len) {
+  for (size_t i = 0; i < len; i++) p[i] = 0;
+  p[3] = 1;
+}
+
+void fill_bug(unsigned char p[static 4], size_t len) {
+  for (size_t i = 0; i <= len; i++) p[i] = 0;
+}
+
+void over_minimum(unsigned char p[static 4], size_t len) {
+  (void)len;
+  p[4] = 0;
+}
+"""
+
+
+def test_static_minimum_with_length_is_not_a_phantom(tmp_path: Path) -> None:
+    # Issue #137: `p[static 4]` binds the caller to *at least* 4 elements, and the
+    # companion `len` says the buffer holds `len` — a valid caller satisfies both,
+    # so a body that touches `len` elements *and* `p[3]` is correct code. Sizing
+    # the object at exactly 4 phantom-VIOLATED it for every `len > 4`.
+    src = tmp_path / "static_min.c"
+    src.write_text(_STATIC_MIN_AND_LEN)
+    result = verify_precondition(src, function="fill", max_len=MAX_LEN)
+    assert result.assessment is Assessment.ASSUMED_VERIFIED, result.label
+
+
+def test_static_minimum_with_length_still_catches_the_off_by_one(
+    tmp_path: Path,
+) -> None:
+    # The floor must not blunt the detector: `i <= len` reads `p[len]`, which is
+    # out of bounds for every `len >= 4`, and stays a real VIOLATED.
+    src = tmp_path / "static_min.c"
+    src.write_text(_STATIC_MIN_AND_LEN)
+    result = verify_precondition(src, function="fill_bug", max_len=MAX_LEN)
+    assert result.assessment is Assessment.VIOLATED, result.label
+    assert result.esbmc_result is not None
+    raw = getattr(result.esbmc_result, "raw_counterexample", "")
+    assert "array bounds violated" in raw
+
+
+def test_static_minimum_floor_still_explores_the_weakest_caller(
+    tmp_path: Path,
+) -> None:
+    # The floor raises the object's *ceiling*, it does not pin the length: `len`
+    # stays symbolic down to 0, so a caller giving exactly the declared 4 elements
+    # is still explored and `p[4]` — over the minimum, with nothing else to justify
+    # it — remains a real VIOLATED rather than being swallowed by the max.
+    src = tmp_path / "static_min.c"
+    src.write_text(_STATIC_MIN_AND_LEN)
+    result = verify_precondition(src, function="over_minimum", max_len=MAX_LEN)
+    assert result.assessment is Assessment.VIOLATED, result.label
+    assert result.esbmc_result is not None
+    raw = getattr(result.esbmc_result, "raw_counterexample", "")
+    assert "array bounds violated" in raw
