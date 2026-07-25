@@ -1,3 +1,10 @@
+## [1.6.1](https://github.com/pmatos/forseti/compare/v1.6.0...v1.6.1) (2026-07-25)
+
+
+### Bug Fixes
+
+* **claude-adapter:** baseline staged/index C blobs at SessionStart ([#146](https://github.com/pmatos/forseti/issues/146)) ([3242274](https://github.com/pmatos/forseti/commit/3242274e99b2eacc6be52a3a8e1d05e0ac2ca6ec))
+
 # [1.6.0](https://github.com/pmatos/forseti/compare/v1.5.0...v1.6.0) (2026-07-25)
 
 
