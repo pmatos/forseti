@@ -286,6 +286,22 @@ def content_hash(path: str | os.PathLike[str]) -> str | None:
         return None
 
 
+def _source_fingerprint(path: str | os.PathLike[str]) -> tuple[int, ...] | None:
+    """Identity + change stamp for `path`, or ``None`` if it cannot be stat'd.
+
+    Pairs with `content_hash` to detect a rewrite that happened *while* we were
+    enumerating. A digest alone cannot: the dangerous interleaving restores the
+    original bytes afterwards (A → B → A), so the content compares equal even
+    though the enumeration saw B. `st_mtime_ns`/`st_ctime_ns` still move for that
+    rewrite, and `st_dev`/`st_ino` catch a replace-by-rename.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
 def _globs(value: str | None) -> tuple[str, ...]:
     """Split a ``:``/``,``-separated include/exclude setting into patterns."""
     if not value:
@@ -898,6 +914,7 @@ def verify_and_record(
             save_state(project_dir, state)
         return [verdict]
 
+    before = _source_fingerprint(file_path)
     try:
         raw = Path(file_path).read_bytes()
     except OSError as exc:
@@ -915,6 +932,19 @@ def verify_and_record(
     # as already verified — that dedup is what keeps the Stop-gate from re-blocking
     # (and resetting its patience) on a file nothing has touched since.
     digest = hashlib.sha256(raw).hexdigest()
+
+    # `list-units` re-reads the file, so it may have enumerated bytes other than
+    # the ones we hashed. Fail closed on any sign of that: an *empty* `.c`
+    # enumerates as a successful empty list (exit 0), so the zero-byte instant a
+    # `> f.c`/heredoc rewrite passes through would prune every unit this file has
+    # — dropping an already-recorded blocking verdict — and then stamp `scanned`
+    # with the final content's digest, leaving the Stop-gate and the out-of-band
+    # scan both satisfied. The block clears on the next edit's reconcile.
+    if before is None or _source_fingerprint(file_path) != before:
+        return _blocking_error(
+            "source changed while its units were being enumerated; not recording "
+            "a scan of content that was not enumerated — re-edit to re-verify"
+        )
 
     # Reconcile + record every current function BEFORE the slow verifies: drop
     # functions the file no longer defines, reset the Stop-gate's patience, and

@@ -298,6 +298,41 @@ def test_extract_function_defs_empty_units_is_a_clean_pass(
     )
 
 
+def test_rewrite_during_enumeration_does_not_prune_or_stamp(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The A -> B -> A interleaving: `list-units` re-reads the file, so a concurrent
+    # `> f.c` rewrite can have it enumerate the zero-byte instant (a *successful*
+    # empty list) before the original bytes are restored. Left unchecked that
+    # prunes every unit the file has — dropping an already-recorded blocking
+    # verdict — and stamps `scanned` with the restored content's digest, so the
+    # Stop-gate and the out-of-band scan both see a handled file. Note a byte
+    # comparison alone cannot catch this: the content is identical afterwards.
+    src = tmp_path / "x.c"
+    original = "int f(int a) { return a; }\n"
+    src.write_text(original)
+
+    state = gate.load_state(str(tmp_path))
+    gate.record(state, gate.UnitVerdict("x.c::f", "x.c", "f", "violated", 4))
+    gate.save_state(str(tmp_path), state)
+    _seed_scanned(tmp_path)
+
+    def _enumerate_a_rewritten_file(file_path, *, project_dir):
+        src.write_text("")  # the transient truncation the rewrite passes through
+        src.write_text(original)  # ...restored, so the bytes compare equal again
+        return []
+
+    monkeypatch.setattr(gate, "extract_function_defs", _enumerate_a_rewritten_file)
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert [v.verdict for v in verdicts] == ["error"]
+    after = gate.load_state(str(tmp_path))
+    assert "x.c" not in after["scanned"]  # never stamped as handled
+    assert after["scanned"]["sentinel.c"] == "deadbeef"
+    assert gate.blocking_units(after)  # the pre-existing violation survived
+    assert any(u.get("verdict") == "violated" for u in after["units"].values())
+
+
 def test_units_absent_payload_records_blocking_error(
     tmp_path: Path, monkeypatch
 ) -> None:
