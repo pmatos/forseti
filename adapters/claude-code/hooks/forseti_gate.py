@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,27 @@ from pathlib import Path, PurePosixPath
 # left OFF — wraparound is legal and common (hashes, counters) and enabling it
 # yields false positives. Tune here; this is the one knob that defines "safe".
 SAFETY_FLAGS: tuple[str, ...] = ("--overflow-check",)
+
+
+def _build_flags() -> tuple[str, ...]:
+    """The project's build flags (`-I`, `-D`, ...) from ``FORSETI_BUILD_FLAGS``.
+
+    Read per call, not once at import, so a hook process that sets the variable
+    after this module loads still sees it. Split with `shlex` (stdlib — the hooks
+    stay dependency-free) so a quoted path with spaces survives as one argument.
+
+    Kept separate from `SAFETY_FLAGS` because the two have different destinations:
+    build flags describe how the *translation unit* is constructed, so they must
+    reach the `list-units` parse as well as the verify, while `--overflow-check`
+    is a property-checking flag that means nothing to a `--parse-tree-only` run.
+    Passing the wrong set to either is the failure this split exists to prevent —
+    without its `-I` the enumeration fails outright (a blocking `error` on every
+    edited file), and a missing `-D` silently changes *which* functions the file
+    even defines, so the gate would verify a different unit list than the project
+    builds.
+    """
+    return tuple(shlex.split(os.environ.get("FORSETI_BUILD_FLAGS", "")))
+
 
 # The default loop-unwind bound k. A VERIFIED is only ever "verified up to k".
 # Override per project with FORSETI_UNWIND; functions with loops need a higher k
@@ -216,6 +238,14 @@ def extract_function_defs(
         "--timeout",
         str(LIST_UNITS_TIMEOUT_S),
     ]
+    # The parse needs the project's own `-I`/`-D` — a translation unit whose
+    # `#include` cannot be resolved makes esbmc exit nonzero, which is a blocking
+    # `error` on every edited file rather than a listing. Only the build flags go
+    # here: `SAFETY_FLAGS` is for the verify, and a property flag on a
+    # `--parse-tree-only` run is at best inert.
+    build_flags = _build_flags()
+    if build_flags:
+        argv += ["--", *build_flags]
     try:
         proc = subprocess.run(
             argv,
@@ -679,6 +709,9 @@ def verify_function(
         "--json",
         "--",
         *SAFETY_FLAGS,
+        # Same build flags the enumeration parsed with, so the verify sees the
+        # same translation unit the unit list was taken from.
+        *_build_flags(),
     ]
     try:
         proc = subprocess.run(

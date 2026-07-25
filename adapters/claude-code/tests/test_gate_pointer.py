@@ -552,3 +552,118 @@ def test_mixed_file_scalar_gated_pointer_needs_contract(tmp_path: Path) -> None:
     }
     assert verdicts["deref"] == gate.NEEDS_CONTRACT
     assert verdicts["my_abs"] == "violated"  # real scalar verdict still produced
+
+
+# --- FORSETI_BUILD_FLAGS reaches both the enumeration and the verify (#131) ---
+
+
+def _captured_verify_argv(monkeypatch, tmp_path: Path) -> list[str]:
+    """Run `verify_function` against a stubbed subprocess and return its argv."""
+    seen: list[str] = []
+
+    class _Proc:
+        stdout = '{"verdict": "verified"}'
+        stderr = ""
+        returncode = 0
+
+    def _fake_run(argv, **kwargs):
+        seen.extend(argv)
+        return _Proc()
+
+    monkeypatch.setattr(gate.subprocess, "run", _fake_run)
+    monkeypatch.setattr(gate, "resolve_forseti_cmd", lambda: ["forseti"])
+    gate.verify_function("x.c", "f", project_dir=str(tmp_path))
+    return seen
+
+
+def test_build_flags_reach_the_list_units_parse(tmp_path: Path, monkeypatch) -> None:
+    # A TU that only parses with the project's `-I` must be enumerated with it:
+    # otherwise esbmc exits nonzero and *every* edited file blocks with an
+    # `error`, which is the gate refusing to work rather than gating.
+    monkeypatch.setenv("FORSETI_BUILD_FLAGS", "-Iinclude -DNDEBUG")
+    dest = tmp_path / "argv.json"
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _argv_capturing_forseti_cmd(tmp_path, dest)
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    assert gate.extract_function_defs(str(src), project_dir=str(tmp_path)) == []
+    argv = json.loads(dest.read_text())
+    assert argv[argv.index("--") + 1 :] == ["-Iinclude", "-DNDEBUG"]
+
+
+def test_build_flags_are_shell_split_not_split_on_spaces(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A quoted include path with a space must survive as ONE argument; naive
+    # `.split()` would hand esbmc `-I/opt/my` and a stray `sdk/include`, and the
+    # parse would fail exactly where the knob was meant to make it succeed.
+    monkeypatch.setenv("FORSETI_BUILD_FLAGS", "'-I/opt/my sdk/include' -DX=1")
+    dest = tmp_path / "argv.json"
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _argv_capturing_forseti_cmd(tmp_path, dest)
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    gate.extract_function_defs(str(src), project_dir=str(tmp_path))
+    argv = json.loads(dest.read_text())
+    assert argv[argv.index("--") + 1 :] == ["-I/opt/my sdk/include", "-DX=1"]
+
+
+def test_no_build_flags_adds_no_separator(tmp_path: Path, monkeypatch) -> None:
+    # The default path stays exactly as it was: no `--`, no empty passthrough.
+    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
+    dest = tmp_path / "argv.json"
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _argv_capturing_forseti_cmd(tmp_path, dest)
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    gate.extract_function_defs(str(src), project_dir=str(tmp_path))
+    assert "--" not in json.loads(dest.read_text())
+
+
+def test_build_flags_reach_the_verify_too(tmp_path: Path, monkeypatch) -> None:
+    # The verify must see the same translation unit the unit list came from —
+    # enumerating with `-DFOO` and verifying without it would gate a different
+    # set of functions than the ones that were found.
+    monkeypatch.setenv("FORSETI_BUILD_FLAGS", "-Iinclude -DNDEBUG")
+    argv = _captured_verify_argv(monkeypatch, tmp_path)
+    assert argv[argv.index("--") + 1 :] == [
+        *gate.SAFETY_FLAGS,
+        "-Iinclude",
+        "-DNDEBUG",
+    ]
+
+
+def test_safety_flags_do_not_leak_into_the_parse(tmp_path: Path, monkeypatch) -> None:
+    # `--overflow-check` is a property-checking flag; a `--parse-tree-only` run
+    # has no properties to check. Keeping the two sets apart is the point of the
+    # split — the enumeration gets build flags only.
+    monkeypatch.setenv("FORSETI_BUILD_FLAGS", "-Iinclude")
+    dest = tmp_path / "argv.json"
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _argv_capturing_forseti_cmd(tmp_path, dest)
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    gate.extract_function_defs(str(src), project_dir=str(tmp_path))
+    argv = json.loads(dest.read_text())
+    for flag in gate.SAFETY_FLAGS:
+        assert flag not in argv
+
+
+def test_build_flags_are_read_per_call_not_at_import(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Read at call time, so a hook process that sets the variable after this
+    # module is imported still gets its flags forwarded.
+    dest = tmp_path / "argv.json"
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _argv_capturing_forseti_cmd(tmp_path, dest)
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    monkeypatch.setenv("FORSETI_BUILD_FLAGS", "-DLATE")
+    gate.extract_function_defs(str(src), project_dir=str(tmp_path))
+    assert "-DLATE" in json.loads(dest.read_text())

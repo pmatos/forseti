@@ -27,7 +27,11 @@ from .result import (
 )
 from .runner import build_argv, classify, verify
 from .units import ListUnitsError, Param, Unit, list_units, parse_units
-from .verify_cli import add_verify_arguments, verify_kwargs
+from .verify_cli import (
+    add_esbmc_invocation_arguments,
+    add_verify_arguments,
+    verify_kwargs,
+)
 
 __all__ = [
     "EXIT_CODES",
@@ -48,6 +52,7 @@ __all__ = [
     "Verified",
     "Violated",
     "ViolatedProperty",
+    "add_esbmc_invocation_arguments",
     "add_verify_arguments",
     "build_argv",
     "classify",
