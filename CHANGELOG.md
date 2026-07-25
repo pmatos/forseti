@@ -1,3 +1,11 @@
+## [1.6.2](https://github.com/pmatos/forseti/compare/v1.6.1...v1.6.2) (2026-07-25)
+
+
+### Bug Fixes
+
+* **claude-adapter:** retry a killed verify instead of trusting the up-front scan stamp ([#140](https://github.com/pmatos/forseti/issues/140)) ([#148](https://github.com/pmatos/forseti/issues/148)) ([5c9fc2c](https://github.com/pmatos/forseti/commit/5c9fc2cdec8db6b5bc564a66c3f25b71a28f282e))
+* **precond:** flag unreadable fixed-array extents instead of sizing one element ([#137](https://github.com/pmatos/forseti/issues/137)) ([#144](https://github.com/pmatos/forseti/issues/144)) ([97f8a85](https://github.com/pmatos/forseti/commit/97f8a85c280eb373ed23bd43e8c29507def66d4d))
+
 ## [1.6.1](https://github.com/pmatos/forseti/compare/v1.6.0...v1.6.1) (2026-07-25)
 
 
