@@ -1202,8 +1202,19 @@ def verify_and_record(
         verdicts.append(verdict)
         with gate_lock(project_dir):  # overwrite the pending entry
             state = load_state(project_dir)
-            record(state, verdict)
-            save_state(project_dir, state)
+            # Ownership-scoped, exactly like the stamp withdrawal below: a
+            # concurrent hook that has re-stamped `scanned` for this file owns
+            # its units too — it re-enumerated and pre-recorded them. This run's
+            # verdict describes content that hook has already superseded, so
+            # writing it could replace that run's fresh `violated` with a stale
+            # `verified`, after which the file hashes fresh and nothing blocks.
+            # Dropping it is safe in the other direction: the owner pre-records
+            # every unit as pending `unknown`, so an un-overwritten unit still
+            # blocks. (The stale verdict stays in the returned list — the
+            # PostToolUse message — but the Stop-gate reads state, not this.)
+            if state.get("scanned", {}).get(rel) == digest:
+                record(state, verdict)
+                save_state(project_dir, state)
 
     # The verifies read the *real* path, not the snapshot: a verdict has to
     # describe the translation unit that actually ships, and the snapshot's

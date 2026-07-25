@@ -674,8 +674,14 @@ def test_rewrite_during_verify_defers_to_a_concurrent_runs_stamp(
     # legitimately verified, and blocking anyway would strand a `x.c::?` error
     # nothing can clear: the file now hashes equal to the surviving stamp, so the
     # out-of-band scan reads it as fresh and never re-runs the reconcile that
-    # prunes `?`. Here the fake CLI both rewrites the source and stamps the new
-    # digest, standing in for that concurrent hook.
+    # prunes `?`.
+    #
+    # The *per-function* write has to be scoped the same way, and that is the
+    # sharper half: this run verified A and says `verified`; the other run
+    # verified the B now on disk and says `violated`. Writing ours last would
+    # replace a live violation with a stale pass on a file that hashes fresh —
+    # nothing would block. Here the fake CLI stands in for that concurrent hook,
+    # rewriting the source and recording both its stamp and its verdict.
     src = tmp_path / "x.c"
     src.write_text("alpha\n")
     _seed_scanned(tmp_path)
@@ -687,12 +693,16 @@ def test_rewrite_during_verify_defers_to_a_concurrent_runs_stamp(
         "resolve_forseti_cmd",
         lambda: _echoing_forseti_cmd(
             tmp_path,
+            verdict="verified",  # ...for content the other run has superseded
             during_verify=(
                 f"open({str(src)!r}, 'w').write('beta\\n')\n"
                 "import json, pathlib\n"
                 f"_p = pathlib.Path({str(state_file)!r})\n"
                 "_st = json.loads(_p.read_text())\n"
                 f"_st['scanned']['x.c'] = {beta_digest!r}\n"
+                "_st['units']['x.c::alpha'] = {'unit_id': 'x.c::alpha', "
+                "'file': 'x.c', 'function': 'alpha', 'verdict': 'violated', "
+                "'k': 1}\n"
                 "_p.write_text(json.dumps(_st))"
             ),
         ),
@@ -703,6 +713,9 @@ def test_rewrite_during_verify_defers_to_a_concurrent_runs_stamp(
     after = gate.load_state(str(tmp_path))
     assert after["scanned"]["x.c"] == beta_digest  # the other run's stamp survives
     assert "x.c::?" not in after["units"]  # ...and no stranded, unclearable block
+    # ...and the stale `verified` never displaced the live violation.
+    assert after["units"]["x.c::alpha"]["verdict"] == "violated"
+    assert gate.blocking_units(after)
 
 
 def test_units_absent_payload_records_blocking_error(
