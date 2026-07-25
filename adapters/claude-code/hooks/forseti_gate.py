@@ -255,10 +255,25 @@ def _enumerable_source(
         yield str(file_path), []
         return
     target = os.path.abspath(os.path.join(project_dir, os.fspath(file_path)))
-    with tempfile.TemporaryDirectory(prefix="forseti-units-") as tmp:
-        snapshot = Path(tmp) / os.path.basename(target)
-        snapshot.write_bytes(content)
-        yield str(snapshot), [f"-I{os.path.dirname(target)}"]
+    # Every `OSError` the snapshot can raise — an unwritable/missing `TMPDIR`,
+    # `ENOSPC`, `EDQUOT`, a failed cleanup — has to land as `UnitsUnavailable`,
+    # the one exception `verify_and_record` turns into a blocking `error`. Left
+    # bare it escapes to the hook, which installs no handler: the process dies
+    # with a traceback and exit 1 (not the blocking exit 2) before any verdict or
+    # `scanned` stamp is written, so the edit passes with the file unverified.
+    # Outside a git work tree nothing backstops that — the same reason the
+    # post-verify drift check blocks rather than deferring to the out-of-band
+    # scan. Mirrors how `_list_units` already converts `OSError` from the spawn.
+    try:
+        with tempfile.TemporaryDirectory(prefix="forseti-units-") as tmp:
+            snapshot = Path(tmp) / os.path.basename(target)
+            snapshot.write_bytes(content)
+            yield str(snapshot), [f"-I{os.path.dirname(target)}"]
+    except OSError as exc:
+        raise UnitsUnavailable(
+            f"could not stage a snapshot of {os.path.basename(target)} for "
+            f"enumeration (check TMPDIR and free space): {exc}"
+        ) from exc
 
 
 def extract_function_defs(

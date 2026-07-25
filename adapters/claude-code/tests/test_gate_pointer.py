@@ -482,6 +482,52 @@ def test_in_place_enumeration_uses_no_snapshot(tmp_path: Path, monkeypatch) -> N
     assert "--" not in argv
 
 
+def _unstageable_snapshot(monkeypatch, message: str = "No space left") -> None:
+    """Make staging the snapshot fail with a bare `OSError`: ENOSPC, bad TMPDIR, ..."""
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise OSError(message)
+
+    monkeypatch.setattr(gate.tempfile, "TemporaryDirectory", _boom)
+
+
+def test_unstageable_snapshot_raises_units_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # An unwritable/missing TMPDIR, ENOSPC or EDQUOT must surface as the one
+    # exception the gate knows how to block on. A bare OSError escapes to the
+    # hook, which installs no handler — the process would die with a traceback
+    # and exit 1 rather than the blocking exit 2.
+    _unstageable_snapshot(monkeypatch)
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    with pytest.raises(gate.UnitsUnavailable, match="snapshot"):
+        gate.extract_function_defs(
+            str(src), project_dir=str(tmp_path), content=b"int f(void){return 0;}\n"
+        )
+
+
+def test_unstageable_snapshot_blocks_and_does_not_stamp(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # End to end, the fail-closed half: a file whose snapshot could not be staged
+    # is never enumerated, so it must record a blocking `error` and must NOT be
+    # stamped `scanned` — a stamp would let the out-of-band scan dedup the edit
+    # as already handled, and outside a git work tree there is no scan at all.
+    _unstageable_snapshot(monkeypatch)
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    _seed_scanned(tmp_path)
+
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert [v.verdict for v in verdicts] == ["error"]
+    after = gate.load_state(str(tmp_path))
+    assert "x.c" not in after["scanned"]
+    assert after["scanned"]["sentinel.c"] == "deadbeef"
+    assert gate.blocking_units(after)
+
+
 def test_transient_rewrite_during_enumeration_is_enumerated_faithfully(
     tmp_path: Path, monkeypatch
 ) -> None:
