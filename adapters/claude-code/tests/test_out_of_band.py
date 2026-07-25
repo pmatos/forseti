@@ -661,6 +661,40 @@ def test_errored_retries_are_capped_then_residual(
     assert "cursed.c" in out["systemMessage"]
 
 
+def test_recovered_enumeration_clears_the_error_and_the_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The other direction: `forseti`/esbmc was briefly unavailable. Charging the
+    # marker keeps the file a retry candidate, so the scan that finds the CLI again
+    # re-verifies it — and the whole-file `error` unit is reconciled away by the
+    # up-front prune (`?` is not a function the file defines), so a transient
+    # failure cannot leave the turn blocked forever.
+    _git_init(tmp_path)
+    src = tmp_path / "flaky.c"
+    src.write_text("int f(void){return 0;}\n")
+    _enumerate_one_unit(monkeypatch)
+    _kill_during_verify(monkeypatch, [])
+    with contextlib.suppress(_Killed):
+        _run(post_bash.main, tmp_path, monkeypatch)
+
+    def _unavailable(file_path, *, project_dir):
+        raise gate.UnitsUnavailable("forseti CLI could not be launched")
+
+    monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
+    _run(post_bash.main, tmp_path, monkeypatch)
+    assert gate.load_state(str(tmp_path))["units"]["flaky.c::?"]["verdict"] == "error"
+
+    _enumerate_one_unit(monkeypatch)  # the CLI is back
+    monkeypatch.setattr(gate, "verify_function", _verified_verdict("flaky.c"))
+    assert _run(post_bash.main, tmp_path, monkeypatch) == 0
+
+    state = gate.load_state(str(tmp_path))
+    assert state["units"]["flaky.c::f"]["verdict"] == "verified"
+    assert "flaky.c::?" not in state["units"]  # the error is reconciled away
+    assert state["pending"] == {}
+    assert not gate.blocking_units(state)
+
+
 def test_unreadable_file_leaves_the_pending_marker_alone(tmp_path: Path) -> None:
     # A run that cannot even read the file never learns which bytes it was scanning,
     # so it cannot name the claim to charge and leaves the marker exactly as it is.
@@ -777,7 +811,8 @@ def test_sources_needing_verify_reports_a_file_once(
         gate.verify_and_record(str(src), project_dir=str(tmp_path))
 
     state = gate.load_state(str(tmp_path))
-    discovered = [os.path.join(str(tmp_path), ".", "dup.c")]  # same file, other spell
+    # The same file under discovery's spelling.
+    discovered = [os.path.join(str(tmp_path), ".", "dup.c")]
     assert gate.sources_needing_verify(str(tmp_path), state, discovered) == discovered
 
 
