@@ -1101,7 +1101,12 @@ def test_rewrite_during_verify_defers_to_a_concurrent_runs_stamp(
     )
     verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
 
-    assert [v.function for v in verdicts] == ["alpha"]  # no blocking `?` verdict
+    # No blocking `?` verdict — and no stale `verified` either. The returned list
+    # is what the PostToolUse hook reports and acts on, so handing back a verdict
+    # for content the other run has replaced would report a pass for bytes this
+    # run never saw (or, the other way round, feed Claude a counterexample for
+    # code no longer on disk).
+    assert verdicts == []
     after = gate.load_state(str(tmp_path))
     assert after["scanned"]["x.c"] == beta_digest  # the other run's stamp survives
     assert "x.c::?" not in after["units"]  # ...and no stranded, unclearable block
@@ -1515,6 +1520,51 @@ def test_symlink_out_of_the_project_blocks_rather_than_switching_headers(
         gate.extract_function_defs(
             "link/src/x.c", project_dir=str(proj), content=src.read_bytes()
         )
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+@pytest.mark.parametrize("alias", ["symlink", "hardlink"])
+def test_a_source_alias_leads_back_into_the_snapshot(
+    tmp_path: Path, alias: str
+) -> None:
+    # A sibling that is the source under *another name* is a door out of the
+    # immutable copy. Linked to the real file, a translation unit that includes
+    # itself through that name reads whatever is on disk now — and its `#define`s
+    # then decide which units the *snapshot* enumerates. That is issue #141's own
+    # race one include deep: units enumerated from a transient B, pruned and
+    # stamped against the restored A. Both names for one inode must lead to the
+    # snapshot.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    src = proj / "x.c"
+    src.write_text(
+        "#ifdef SELF\n"
+        "#define PICK 1\n"
+        "#else\n"
+        "#define SELF\n"
+        '#include "alias.c"\n'
+        "#if PICK\n"
+        "int from_the_snapshot(int x) { return x; }\n"
+        "#else\n"
+        "int from_the_live_file(int x) { return x; }\n"
+        "#endif\n"
+        "#endif\n"
+    )
+    snapshotted = src.read_bytes()
+    if alias == "symlink":
+        (proj / "alias.c").symlink_to("x.c")
+    else:
+        os.link(src, proj / "alias.c")
+    src.write_bytes(snapshotted.replace(b"#define PICK 1", b"#define PICK 0"))
+
+    names = [
+        d.name
+        for d in gate.extract_function_defs(
+            "x.c", project_dir=str(proj), content=snapshotted
+        )
+    ]
+
+    assert names == ["from_the_snapshot"]
 
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")

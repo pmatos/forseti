@@ -280,21 +280,50 @@ def _staged(tmp: str, path: str) -> str:
     return os.path.join(tmp, os.path.relpath(path, os.sep))
 
 
-def _mirror_entries(real_dir: str, into: str) -> None:
+def _file_id(path: str) -> tuple[int, int] | None:
+    """``(st_dev, st_ino)`` for `path`, links followed; ``None`` if it cannot stat."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
+
+
+def _mirror_entries(
+    real_dir: str,
+    into: str,
+    *,
+    source_id: tuple[int, int] | None = None,
+    snapshot: str | None = None,
+) -> None:
     """Symlink every entry of `real_dir` into `into` that is not already there.
 
     Whatever the caller has already put in `into` is the mirrored tree itself —
     a level of the chain down to the snapshot, a reproduced symlink component, or
     the snapshot file — and must never be overwritten by a link back to the real
     entry of the same name. `lexists`, so a *dangling* link already staged counts
-    too. Only `entry.name`/`entry.path` are touched: no `stat`, no `is_dir()`, so
-    an entry the hook cannot stat is still linked (and a directory is linked
-    whole, so ``#include "sub/h.h"`` resolves through it).
+    too. A directory is linked whole, so ``#include "sub/h.h"`` resolves through
+    it.
+
+    An entry that is **another name for the source** — a sibling
+    ``alias.c -> x.c``, or a hard link — is linked to `snapshot` instead. Left
+    pointing at the real file it would be a door back out of the immutable copy:
+    a translation unit that includes itself under that name reads whatever is on
+    disk *now*, and its ``#define``s then decide which units the snapshot
+    enumerates (issue #141's own race, one include deep). Compared by
+    ``(st_dev, st_ino)`` so a hard link counts, and an entry that cannot be
+    stat'd is still linked to the real path — one extra `stat` per entry beside
+    the `lexists` already spent.
     """
     with os.scandir(real_dir) as entries:
         for entry in entries:
             dest = os.path.join(into, entry.name)
-            if not os.path.lexists(dest):
+            if os.path.lexists(dest):
+                continue
+            checkable = snapshot is not None and source_id is not None
+            if checkable and _file_id(entry.path) == source_id:
+                os.symlink(str(snapshot), dest)  # another name for the source
+            else:
                 os.symlink(entry.path, dest)
 
 
@@ -386,7 +415,11 @@ def _enumerable_source(
     the same way. Two things make it equivalent:
 
     * **Siblings.** Every other entry of the source's directory is symlinked
-      beside the snapshot, so ``#include "sibling.h"`` resolves to the real one.
+      beside the snapshot, so ``#include "sibling.h"`` resolves to the real one —
+      except a sibling that *is* the source under another name, which leads back
+      to the snapshot (`_mirror_entries`). An **absolute** include of the source
+      is the residual there: clang opens the spelled path, so no mirror can
+      stand in for it, and a self-include written that way reads the live file.
     * **Ancestry.** The chain from `_mirror_root` down to the source's directory
       is reproduced level by level, each mirroring its own entries bar the names
       the chain itself already occupies, so ``#include "../common.h"`` — the
@@ -472,8 +505,17 @@ def _enumerable_source(
                 os.symlink(_staged(tmp, link_target), _staged(tmp, link))
             snapshot = Path(_staged(tmp, target))
             snapshot.write_bytes(content)
+            # Taken before the mirroring, off the real file: any entry that turns
+            # out to be this same inode is another name for the source and must
+            # lead to the snapshot, not back out to the live file.
+            source_id = _file_id(target)
             for real in real_dirs:
-                _mirror_entries(real, _staged(tmp, real))
+                _mirror_entries(
+                    real,
+                    _staged(tmp, real),
+                    source_id=source_id,
+                    snapshot=str(snapshot),
+                )
             yield str(snapshot)
     except OSError as exc:
         raise UnitsUnavailable(
@@ -1686,7 +1728,8 @@ def verify_and_record(
     # enumerated from content hashing to H and the file hashed to H both then and
     # after the loop — NOT that every verdict was computed against H.
     withdrawn = False
-    if content_hash(file_path) != digest:
+    drifted = content_hash(file_path) != digest
+    if drifted:
         with gate_lock(project_dir):
             state = load_state(project_dir)
             scanned = state.setdefault("scanned", {})
@@ -1748,4 +1791,14 @@ def verify_and_record(
             "describe content that is no longer on disk — re-edit to re-verify",
             unless_superseded=True,
         )
+    if drifted:
+        # Not ours to withdraw, so nothing is written — and nothing is *said*
+        # either. The returned list is the PostToolUse message, and the hooks act
+        # on it: a stale `violated` exits 2 and hands Claude a counterexample for
+        # code that is no longer on disk, a stale `verified` is logged and shown as
+        # a pass for content this run never saw. The verdicts stay out of the
+        # state by the same ownership test in the loop above, so the honest answer
+        # here is the same one every other supersession gives — say nothing, and
+        # let the run that owns the file speak.
+        return []
     return verdicts
