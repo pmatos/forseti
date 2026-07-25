@@ -93,11 +93,16 @@ jobs:
         run: pytest -q --cov=forseti --cov-report=term-missing --cov-report=xml --cov-fail-under=96
 
       - name: Upload coverage to Codecov
-        # `!cancelled()` on purpose: the step above fails the job when coverage
-        # drops, and without this the upload would be skipped exactly when the
-        # report is most worth seeing — leaving the codecov/* checks with
-        # nothing to report instead of reporting the shortfall.
-        if: ${{ !cancelled() }}
+        # Upload whenever a report exists, including when the step above failed
+        # the job on coverage — that is exactly when it is most worth seeing.
+        # `!cancelled()` alone is too broad: it is also true when an *earlier*
+        # step fails (ruff, mypy, pip install, the ESBMC SHA check), which skips
+        # pytest via its implicit success() and leaves no coverage.xml. The
+        # action would then hard-fail on "no reports found" under
+        # fail_ci_if_error, adding a red herring next to the real failure.
+        # hashFiles is the precondition itself, so it also covers pytest dying
+        # before it writes the XML (e.g. a collection error).
+        if: ${{ !cancelled() && hashFiles('coverage.xml') != '' }}
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
