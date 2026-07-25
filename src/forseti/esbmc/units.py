@@ -56,11 +56,12 @@ _COMMENT_RE = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
 _ARRAY_DECL_TEMPLATE = r"\b{name}((?:\s*\[[^\]]*\])+)"
 
 # The contents of a fixed-array parameter's bracket, when they state a literal
-# extent. C99 allows `static` and the cv/`restrict` qualifiers before the extent in
-# a *function parameter* declarator (`int p[static const 20]`, either order), so
-# they are skipped; anything else in the bracket is not a literal we can read.
+# extent. C99 allows `static` and any type qualifier before the extent in a
+# *function parameter* declarator (`int p[static const 20]`, either order) —
+# C11 adds `_Atomic` to that qualifier set (`int p[_Atomic 20]`) — so they are
+# skipped; anything else in the bracket is not a literal we can read.
 _EXTENT_RE = re.compile(
-    r"^\s*(?:(?:static|const|volatile|restrict|__restrict(?:__)?)\s+)*(\d+)\s*$"
+    r"^\s*(?:(?:static|const|volatile|restrict|_Atomic|__restrict(?:__)?)\s+)*(\d+)\s*$"
 )
 
 # C99's `[static N]`, whose `N` binds the *caller*: the argument must give access to

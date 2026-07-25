@@ -134,6 +134,9 @@ def _extent(source: str, param: Param, fn: str = "f") -> int | None:
         ("void f(uint8_t p[const static 28]) {}", 28),
         ("void f(uint8_t p[restrict 12]) {}", 12),
         ("void f(uint8_t p[__restrict 16]) {}", 16),
+        # C11 adds `_Atomic` to the qualifiers valid in that bracket.
+        ("void f(uint8_t p[_Atomic 20]) {}", 20),
+        ("void f(uint8_t p[static _Atomic 40]) {}", 40),
     ],
 )
 def test_annotate_array_extents_recovers_literal(decl: str, expected: int) -> None:
@@ -178,6 +181,7 @@ def test_annotate_array_extents_unreadable_extent_is_unresolved(decl: str) -> No
         ("void f(uint8_t p[static 20]) {}", True),
         ("void f(uint8_t p[static DLEN]) {}", True),  # meaningful even unreadable
         ("void f(uint8_t p[const static DLEN]) {}", True),
+        ("void f(uint8_t p[static _Atomic 40]) {}", True),
         ("void f(uint8_t p[20]) {}", False),  # a conventional extent, not an obligation
         ("void f(uint8_t p[DLEN]) {}", False),
         ("void f(uint8_t *p) {}", False),
