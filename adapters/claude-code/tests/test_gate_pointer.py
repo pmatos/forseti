@@ -667,3 +667,42 @@ def test_build_flags_are_read_per_call_not_at_import(
     monkeypatch.setenv("FORSETI_BUILD_FLAGS", "-DLATE")
     gate.extract_function_defs(str(src), project_dir=str(tmp_path))
     assert "-DLATE" in json.loads(dest.read_text())
+
+
+def test_malformed_build_flags_block_instead_of_crashing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Quoting IS this knob's interface (that's why it is shlex-split), so an
+    # unbalanced quote is the expected typo. It must land as the blocking `error`
+    # verdict the gate is built around — a bare ValueError escaping here is an
+    # unhandled traceback out of a PostToolUse hook, which is not a gate at all.
+    monkeypatch.setenv("FORSETI_BUILD_FLAGS", "'-I/opt/my sdk")
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    _seed_scanned(tmp_path)
+
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert [v.verdict for v in verdicts] == ["error"]
+    assert "FORSETI_BUILD_FLAGS" in (verdicts[0].detail or "")
+    # ...and it must not be mistaken for a handled file on a later scan.
+    after = gate.load_state(str(tmp_path))
+    assert "x.c" not in after["scanned"]
+    assert after["scanned"]["sentinel.c"] == "deadbeef"
+
+
+def test_malformed_build_flags_do_not_crash_a_direct_verify(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # `verify_function` is reachable without going through the enumeration, so it
+    # needs its own conversion rather than relying on failing earlier.
+    monkeypatch.setenv("FORSETI_BUILD_FLAGS", '"-Iunclosed')
+    verdict = gate.verify_function("x.c", "f", project_dir=str(tmp_path))
+    assert verdict.verdict == "error"
+    assert "FORSETI_BUILD_FLAGS" in (verdict.detail or "")
+
+
+def test_wellformed_build_flags_still_parse(tmp_path: Path, monkeypatch) -> None:
+    # The guard must not swallow valid config: balanced quoting still splits.
+    monkeypatch.setenv("FORSETI_BUILD_FLAGS", "'-I/opt/my sdk' -DX")
+    assert gate._build_flags() == ("-I/opt/my sdk", "-DX")
