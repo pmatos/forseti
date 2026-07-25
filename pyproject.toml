@@ -53,6 +53,17 @@ select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
 [tool.coverage.run]
 source = ["forseti"]
 branch = true
+# `python -m forseti.core` shims: a docstring, an import, and a __main__ guard
+# that by construction only runs out-of-process. Nothing to assert, and their
+# permanent 0% would otherwise eat ~0.3pp of the 95% gate.
+omit = ["*/__main__.py"]
 
 [tool.coverage.report]
 show_missing = true
+exclude_also = ['if __name__ == "__main__":']
+# Load-bearing, not cosmetic: coverage.py's fail-under test is
+# `round(total, precision) < fail_under`, and precision defaults to 0. At the
+# default, 95.5-95.99% rounds to 96 and passes `--cov-fail-under=96` — pytest-cov
+# even prints "FAIL ... Total coverage: 95.65%" and still exits 0. 2 makes the
+# gate mean what it says, and matches codecov.yml's own precision.
+precision = 2

@@ -1,0 +1,48 @@
+# Codecov gate for pmatos/forseti. This file is the authority on the 95% bar;
+# ci.yml carries a second, deliberately stricter check:
+#
+#   1. `pytest --cov-fail-under=96` in ci.yml reddens the CI job itself. Needs
+#      no external service, so it is the enforcement that actually works today.
+#      96 rather than 95 because pytest-cov's branch formula reads ~0.8pp above
+#      Codecov's — see the comment on that step.
+#   2. The `codecov/project` + `codecov/patch` statuses below, which add the
+#      per-line PR annotations. These only *block* a merge once listed as
+#      required status checks on main — deliberately not done, since
+#      semantic-release pushes `[skip ci]` commits that could never satisfy them.
+#
+# Posting these statuses needs the Codecov GitHub App installed on the repo;
+# CODECOV_TOKEN alone authenticates uploads but posts nothing.
+#
+# Coverage measured by Codecov is 95.68% (pytest-cov calls the same report
+# 96.49%), so the project target has ~0.7pp of headroom.
+
+coverage:
+  precision: 2
+  round: down
+  range: "85...100"
+  status:
+    project:
+      default:
+        target: 95%
+        # No slack: a PR may not drag total coverage below the bar, full stop.
+        threshold: 0%
+        if_ci_failed: error
+    patch:
+      default:
+        # Changed lines only. A small PR is unforgiving here by construction —
+        # a 4-line diff missing 1 line reads 75% and blocks. This is the first
+        # knob to relax (a threshold, or `informational: true`) if it turns
+        # noisy; leave the project gate alone.
+        target: 95%
+        threshold: 0%
+
+comment:
+  layout: "condensed_header, diff, flags, files"
+  behavior: default
+  # Don't post on PRs that touch no covered code (docs, ADRs, workflows).
+  require_changes: true
+
+# `[tool.coverage.run] omit` already drops these before upload; kept in sync
+# here so the Codecov UI agrees with the local report.
+ignore:
+  - "**/__main__.py"
