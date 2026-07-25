@@ -1,0 +1,40 @@
+# Codecov gate for pmatos/forseti. The 95% bar is enforced twice, on purpose:
+#
+#   1. `pytest --cov-fail-under=95` in ci.yml reddens the CI job itself. That
+#      needs no external service and is what actually stops a merge today.
+#   2. The `codecov/project` + `codecov/patch` statuses below, which add the
+#      per-line PR annotations. These only *block* once they are listed as
+#      required status checks on main's branch protection.
+#
+# Coverage on main sits at ~96.5%, so the project target has ~1.5pp of headroom.
+
+coverage:
+  precision: 2
+  round: down
+  range: "85...100"
+  status:
+    project:
+      default:
+        target: 95%
+        # No slack: a PR may not drag total coverage below the bar, full stop.
+        threshold: 0%
+        if_ci_failed: error
+    patch:
+      default:
+        # Changed lines only. A small PR is unforgiving here by construction —
+        # a 4-line diff missing 1 line reads 75% and blocks. This is the first
+        # knob to relax (a threshold, or `informational: true`) if it turns
+        # noisy; leave the project gate alone.
+        target: 95%
+        threshold: 0%
+
+comment:
+  layout: "condensed_header, diff, flags, files"
+  behavior: default
+  # Don't post on PRs that touch no covered code (docs, ADRs, workflows).
+  require_changes: true
+
+# `[tool.coverage.run] omit` already drops these before upload; kept in sync
+# here so the Codecov UI agrees with the local report.
+ignore:
+  - "**/__main__.py"

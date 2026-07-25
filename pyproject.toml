@@ -53,6 +53,11 @@ select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
 [tool.coverage.run]
 source = ["forseti"]
 branch = true
+# `python -m forseti.core` shims: a docstring, an import, and a __main__ guard
+# that by construction only runs out-of-process. Nothing to assert, and their
+# permanent 0% would otherwise eat ~0.3pp of the 95% gate.
+omit = ["*/__main__.py"]
 
 [tool.coverage.report]
 show_missing = true
+exclude_also = ['if __name__ == "__main__":']

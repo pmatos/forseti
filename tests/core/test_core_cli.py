@@ -48,6 +48,50 @@ def test_verify_json_payload(capsys: pytest.CaptureFixture[str]) -> None:
     assert payload["counterexample"]  # non-empty trace for the agent to fix
 
 
+# --- forseti list-units -----------------------------------------------------
+
+_TWO_UNITS = "int add(int a, int b) { return a + b; }\nvoid fill(char *p) { *p = 0; }\n"
+
+
+def test_list_units_text_marks_pointer_units(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src = tmp_path / "units.c"
+    src.write_text(_TWO_UNITS)
+    code = main(["list-units", str(src)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "add(int a, int b)" in out
+    # Only the pointer-taking unit carries the contract marker.
+    assert "[needs-contract]" in out
+    assert "add(int a, int b) [needs-contract]" not in out
+
+
+def test_list_units_json_payload(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src = tmp_path / "units.c"
+    src.write_text(_TWO_UNITS)
+    code = main(["list-units", str(src), "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["source"] == str(src)
+    by_name = {u["function"]: u for u in payload["units"]}
+    assert by_name["add"]["takes_pointer"] is False
+    assert [p["name"] for p in by_name["add"]["params"]] == ["a", "b"]
+    assert by_name["fill"]["takes_pointer"] is True
+    assert by_name["fill"]["params"][0]["is_pointer"] is True
+
+
+def test_list_units_error_exits_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Missing source → esbmc exits nonzero → ListUnitsError → exit 1 on stderr.
+    code = main(["list-units", str(tmp_path / "does_not_exist.c")])
+    assert code == 1
+    assert "forseti list-units:" in capsys.readouterr().err
+
+
 # --- forseti synth (memory-precondition gate, RFC-0003 S2) ------------------
 
 

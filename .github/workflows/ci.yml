@@ -6,7 +6,9 @@ on:
   pull_request:
     branches: [main]
 
-# Least privilege: this job only reads the checkout; it posts nothing.
+# Least privilege: this job only reads the checkout. The one thing it sends out
+# is the coverage report, which authenticates with CODECOV_TOKEN rather than the
+# workflow token — so no write scope is needed here.
 permissions:
   contents: read
 
@@ -80,4 +82,17 @@ jobs:
         run: mypy src tests
 
       - name: Tests (pytest)
-        run: pytest -q --cov=forseti --cov-report=term-missing --cov-report=xml --cov-fail-under=85
+        run: pytest -q --cov=forseti --cov-report=term-missing --cov-report=xml --cov-fail-under=95
+
+      - name: Upload coverage to Codecov
+        # `!cancelled()` on purpose: the step above fails the job when coverage
+        # drops below 95, and without this the upload would be skipped exactly
+        # when the report is most worth seeing — leaving the codecov/* required
+        # checks pending forever instead of reporting the shortfall.
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: pmatos/forseti
+          files: ./coverage.xml
+          fail_ci_if_error: true
