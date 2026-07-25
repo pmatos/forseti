@@ -225,7 +225,7 @@ def _func_def(unit: object) -> FuncDef:
 
 @contextlib.contextmanager
 def _enumerable_source(
-    file_path: str | os.PathLike[str], content: bytes | None
+    file_path: str | os.PathLike[str], content: bytes | None, *, project_dir: str
 ) -> Iterator[tuple[str, list[str]]]:
     """Yield ``(path to enumerate, extra esbmc flags)`` for `file_path`.
 
@@ -243,15 +243,22 @@ def _enumerable_source(
     ``-I`` to stand in for it. The snapshot keeps the original basename so a
     parse error names something recognisable (and so `parse_units`' path match is
     unaffected).
+
+    That directory is derived **lexically** — absolutized against `project_dir`
+    (the subprocess's cwd) but never `resolve()`d. For a symlinked source, clang
+    searches the directory of the path it was *given*, so resolving would name the
+    link target's directory instead: a header beside the link would go missing,
+    and a same-named header beside the target would be silently preferred —
+    enumerating units the in-place parse never sees.
     """
     if content is None:
         yield str(file_path), []
         return
-    src = Path(file_path).resolve()
+    target = os.path.abspath(os.path.join(project_dir, os.fspath(file_path)))
     with tempfile.TemporaryDirectory(prefix="forseti-units-") as tmp:
-        snapshot = Path(tmp) / src.name
+        snapshot = Path(tmp) / os.path.basename(target)
         snapshot.write_bytes(content)
-        yield str(snapshot), [f"-I{src.parent}"]
+        yield str(snapshot), [f"-I{os.path.dirname(target)}"]
 
 
 def extract_function_defs(
@@ -285,7 +292,10 @@ def extract_function_defs(
     """
     if Path(file_path).suffix.lower() != ".c":
         return []
-    with _enumerable_source(file_path, content) as (source, include_flags):
+    with _enumerable_source(file_path, content, project_dir=project_dir) as (
+        source,
+        include_flags,
+    ):
         return _list_units(source, include_flags, project_dir=project_dir)
 
 
@@ -1179,4 +1189,28 @@ def verify_and_record(
             state = load_state(project_dir)
             record(state, verdict)
             save_state(project_dir, state)
+
+    # The verifies read the *real* path (a snapshot would put temp paths in every
+    # counterexample the agent is asked to fix), so the same A → B → A rewrite can
+    # land a verdict for B while `scanned` holds A's digest — and the restored A
+    # then looks fresh to both gates. Re-hash once at the end and fail closed on
+    # any drift: the verdicts just recorded describe bytes we can no longer vouch
+    # for. Un-stamping is what makes the out-of-band scan re-gate the file, and
+    # the `error` is what blocks when there is no scan to fall back on (outside a
+    # git work tree). Both clear on the next edit's reconcile.
+    if content_hash(file_path) != digest:
+        with gate_lock(project_dir):
+            state = load_state(project_dir)
+            scanned = state.setdefault("scanned", {})
+            # Ownership-scoped: only drop the stamp if it is still the one *this*
+            # run wrote. A concurrent hook that has since re-stamped its own
+            # digest owns the entry, and popping it would re-gate its verified
+            # content.
+            if scanned.get(rel) == digest:
+                scanned.pop(rel, None)
+            save_state(project_dir, state)
+        return _blocking_error(
+            "source changed while its units were being verified; the verdicts "
+            "describe content that is no longer on disk — re-edit to re-verify"
+        )
     return verdicts

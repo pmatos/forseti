@@ -61,7 +61,12 @@ def _argv_capturing_forseti_cmd(tmp_path: Path, dest: Path) -> list[str]:
 
 
 def _echoing_forseti_cmd(
-    tmp_path: Path, *, before_read: str = "", after_read: str = ""
+    tmp_path: Path,
+    *,
+    before_read: str = "",
+    after_read: str = "",
+    during_verify: str = "",
+    verdict: str = "violated",
 ) -> list[str]:
     """A fake CLI: `list-units` reports one unit per word of the file it was HANDED.
 
@@ -71,7 +76,8 @@ def _echoing_forseti_cmd(
     is the seam for rewriting the original source *while* the CLI is "parsing"
     it, which is the only ordering that reproduces the issue #141 interleaving (a
     rewrite that both starts and finishes before the read is not a race at all).
-    `verify` answers `violated`, so every enumerated unit ends up blocking.
+    `during_verify` is the same seam for the `verify` call. `verify` answers
+    `verdict` (`violated` by default, so every enumerated unit ends up blocking).
     """
     script = tmp_path / "echo_forseti.py"
     body = [
@@ -84,8 +90,9 @@ def _echoing_forseti_cmd(
         "    print(json.dumps({'source': src, 'units': ["
         "{'function': n, 'takes_pointer': False} for n in names]}))",
         "else:",
+        *(f"    {line}" for line in during_verify.splitlines()),
         "    fn = sys.argv[sys.argv.index('--function') + 1]",
-        "    print(json.dumps({'verdict': 'violated', 'unwind': 1, "
+        f"    print(json.dumps({{'verdict': {verdict!r}, 'unwind': 1, "
         "'counterexample': 'cex ' + fn}))",
     ]
     script.write_text("\n".join(body) + "\n")
@@ -374,8 +381,60 @@ def test_snapshot_enumeration_keeps_relative_includes_resolvable(
     argv = json.loads(dest.read_text())
     enumerated = Path(argv[1])
     assert enumerated != src and enumerated.name == "x.c"
-    assert argv[argv.index("--") + 1 :] == [f"-I{sub.resolve()}"]
+    assert argv[argv.index("--") + 1 :] == [f"-I{sub}"]
     assert not enumerated.exists()  # the temp snapshot is cleaned up
+
+
+def test_snapshot_include_dir_is_lexical_not_symlink_resolved(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # clang searches the directory of the path it was *given*, so for a symlinked
+    # source that is the link's directory, not the target's. Resolving would name
+    # the wrong one: a header beside the link would go missing, and a same-named
+    # header beside the target would be silently preferred — enumerating units
+    # the in-place parse never sees.
+    dest = tmp_path / "argv.json"
+    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
+    )
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "x.c").write_text("int f(void) { return 0; }\n")
+    link_dir = tmp_path / "linked"
+    link_dir.mkdir()
+    link = link_dir / "x.c"
+    link.symlink_to(real / "x.c")
+
+    gate.extract_function_defs(str(link), project_dir=str(tmp_path), content=b"f\n")
+
+    argv = json.loads(dest.read_text())
+    assert argv[argv.index("--") + 1 :] == [f"-I{link_dir}"]
+
+
+def test_relative_path_include_dir_is_absolutized_against_project_dir(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The CLI subprocess runs with cwd=project_dir, so a relative `file_path` is
+    # relative to *that*, not to the hook process's cwd. A bare `os.path.abspath`
+    # would silently name whatever directory the hook happened to start in.
+    dest = tmp_path / "argv.json"
+    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
+    )
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "x.c").write_text("int f(void) { return 0; }\n")
+
+    gate.extract_function_defs("sub/x.c", project_dir=str(tmp_path), content=b"f\n")
+
+    argv = json.loads(dest.read_text())
+    assert argv[argv.index("--") + 1 :] == [f"-I{sub}"]
 
 
 def test_snapshot_include_precedes_the_projects_build_flags(
@@ -489,6 +548,73 @@ def test_persistent_rewrite_during_enumeration_does_not_prune_or_stamp(
     assert after["scanned"]["sentinel.c"] == "deadbeef"
     assert gate.blocking_units(after)  # the pre-existing violation survived
     assert any(u.get("verdict") == "violated" for u in after["units"].values())
+
+
+def test_rewrite_during_verify_withdraws_the_stamp_and_blocks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The verifies read the *real* path (a snapshot would put temp paths in every
+    # counterexample), so a rewrite landing there can attach a `verified` verdict
+    # to bytes the gate never stamped. Re-hashing once after the loop fails closed:
+    # the up-front stamp is withdrawn, so the out-of-band scan re-gates the file,
+    # and a blocking `error` covers the case where there is no such scan (outside
+    # a git work tree).
+    src = tmp_path / "x.c"
+    src.write_text("alpha\n")
+    _seed_scanned(tmp_path)
+
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            verdict="verified",  # a clean verdict — for content no longer on disk
+            during_verify=f"open({str(src)!r}, 'w').write('beta\\n')",
+        ),
+    )
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert [v.verdict for v in verdicts] == ["error"]
+    after = gate.load_state(str(tmp_path))
+    assert "x.c" not in after["scanned"]  # the up-front stamp was withdrawn
+    assert after["scanned"]["sentinel.c"] == "deadbeef"
+    assert gate.blocking_units(after)  # not left passing on a stale `verified`
+
+
+def test_rewrite_during_verify_leaves_a_concurrent_runs_stamp_alone(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Withdrawing the stamp must be ownership-scoped: concurrent hooks share
+    # gate_state.json, so a run that has since re-stamped its own digest owns the
+    # entry. Popping it unconditionally would re-gate content that other run
+    # legitimately verified. Here the fake CLI both rewrites the source and
+    # stamps the new digest, standing in for that concurrent hook.
+    src = tmp_path / "x.c"
+    src.write_text("alpha\n")
+    _seed_scanned(tmp_path)
+    state_file = tmp_path / ".forseti" / "gate_state.json"
+    beta_digest = hashlib.sha256(b"beta\n").hexdigest()
+
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            during_verify=(
+                f"open({str(src)!r}, 'w').write('beta\\n')\n"
+                "import json, pathlib\n"
+                f"_p = pathlib.Path({str(state_file)!r})\n"
+                "_st = json.loads(_p.read_text())\n"
+                f"_st['scanned']['x.c'] = {beta_digest!r}\n"
+                "_p.write_text(json.dumps(_st))"
+            ),
+        ),
+    )
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert [v.verdict for v in verdicts] == ["error"]  # still fails closed for us
+    after = gate.load_state(str(tmp_path))
+    assert after["scanned"]["x.c"] == beta_digest  # the other run's stamp survives
 
 
 def test_units_absent_payload_records_blocking_error(
