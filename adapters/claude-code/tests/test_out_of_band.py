@@ -563,6 +563,67 @@ def test_cleanup_preserves_a_concurrent_retry_of_the_same_content(
     assert gate.stale_sources(str(tmp_path), state, [str(src)]) == [str(src)]
 
 
+def test_cleanup_survives_a_concurrent_error_charging_its_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The other half of the charge: a concurrent run that fails to enumerate spends an
+    # attempt on THIS run's marker — it cannot tell whose claim it is, and dropping it
+    # would strand a killed run's units. That rewrites the counter, so identifying the
+    # marker by its whole contents would stop recognising the owner's own claim: the
+    # finished file would keep a marker nothing needs to retry and be re-verified on
+    # the next scan. Ownership is `hash` + `pid`, which the charge leaves alone.
+    src = tmp_path / "charged.c"
+    src.write_text("int f(void){return 0;}\n")
+    _enumerate_one_unit(monkeypatch)
+
+    def _verify_while_a_concurrent_scan_errors(
+        fp, fn, *, project_dir, k=gate.DEFAULT_K
+    ):
+        def _unavailable(file_path, *, project_dir):
+            raise gate.UnitsUnavailable("forseti CLI could not be launched")
+
+        monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
+        gate.verify_and_record(str(src), project_dir=project_dir)  # charges the marker
+        assert gate.load_state(project_dir)["pending"]["charged.c"]["attempts"] == 2
+        return gate.UnitVerdict("charged.c::f", "charged.c", "f", "verified", k)
+
+    monkeypatch.setattr(gate, "verify_function", _verify_while_a_concurrent_scan_errors)
+    gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    state = gate.load_state(str(tmp_path))
+    assert state["pending"] == {}  # the owner still cleared the marker it stored...
+    # ...so a file whose verdicts are all final is not re-verified for nothing.
+    assert gate.stale_sources(str(tmp_path), state, [str(src)]) == []
+
+
+def test_blocking_error_charge_stops_at_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The charge spends a retry budget, it does not keep a tally: once the budget is
+    # gone the marker is one no scan will offer again, so further errors must leave
+    # the counter at the cap rather than counting it up forever (PR #148 review).
+    src = tmp_path / "spent.c"
+    digest = _concurrent_run_starts(tmp_path, src, "int f(void){return 0;}\n")
+    with gate.gate_lock(str(tmp_path)):
+        state = gate.load_state(str(tmp_path))
+        state["pending"]["spent.c"]["attempts"] = gate.MAX_PENDING_VERIFY_ATTEMPTS
+        gate.save_state(str(tmp_path), state)
+
+    def _unavailable(file_path, *, project_dir):
+        raise gate.UnitsUnavailable("forseti CLI could not be launched")
+
+    monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
+    gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    state = gate.load_state(str(tmp_path))
+    assert state["pending"]["spent.c"] == {
+        "hash": digest,
+        "attempts": gate.MAX_PENDING_VERIFY_ATTEMPTS,
+        "pid": os.getpid() + 1,
+    }
+    assert gate.stale_sources(str(tmp_path), state, [str(src)]) == []  # still retired
+
+
 def test_blocking_error_preserves_a_newer_runs_pending_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

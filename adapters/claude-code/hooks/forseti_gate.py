@@ -579,6 +579,23 @@ def _pending_attempts(entry: object, digest: str) -> int | None:
     return attempts if isinstance(attempts, int) and attempts > 0 else 0
 
 
+def _pending_owner(entry: object) -> tuple[object, object] | None:
+    """Which run created marker `entry`: its content and its process, else ``None``.
+
+    The ownership test for the *success* cleanup — a run may clear only the marker it
+    stored itself. `hash` separates runs on different content; `pid` separates two
+    live runs of the *same* content, and separates a cleared-then-recreated marker
+    from the byte-identical one it replaced.
+
+    `attempts` is deliberately excluded. It is a shared budget, not identity: an
+    erroring run charges an attempt to a marker it does not own (`_blocking_error`),
+    so counting it here would let that charge orphan the owner's own claim.
+    """
+    if not isinstance(entry, dict):
+        return None
+    return entry.get("hash"), entry.get("pid")
+
+
 def stale_sources(project_dir: str, state: dict, files: Iterable[str]) -> list[str]:
     """Subset of `files` needing a (re-)verify: changed content, or a killed verify.
 
@@ -1021,8 +1038,11 @@ def verify_and_record(
         scan forever — each error resets `stop_attempts` — instead of going quiet at
         `MAX_PENDING_VERIFY_ATTEMPTS` and blocking its way to the loud residual. The
         bump goes through `_pending_attempts`, so a corrupt counter normalizes to 1
-        rather than freezing. `hash`/`pid` are left as the creating run wrote them:
-        this run owns nothing and will never clear the marker.
+        rather than freezing, and stops at the cap so a marker no scan will retry
+        again cannot count up forever. `hash`/`pid` are left as the creating run
+        wrote them: this run owns nothing and will never clear the marker — and
+        because those two fields alone are `_pending_owner`'s identity, the charge
+        leaves the creating run still able to clear it.
 
         Only a marker recording exactly `digest` is charged: a concurrent run of
         *other* content is verifying bytes this error says nothing about.
@@ -1044,7 +1064,9 @@ def verify_and_record(
             pending = state.setdefault("pending", {})
             attempts = _pending_attempts(pending.get(rel), digest) if digest else None
             if attempts is not None:
-                pending[rel]["attempts"] = attempts + 1
+                pending[rel]["attempts"] = min(
+                    attempts + 1, MAX_PENDING_VERIFY_ATTEMPTS
+                )
             save_state(project_dir, state)
         return [verdict]
 
@@ -1099,10 +1121,9 @@ def verify_and_record(
         # (issue #140). Cleared once every verdict is final.
         #
         # The marker doubles as this run's ownership token so the cleanup below can
-        # tell it from one a *concurrent* run stored: the counter is bumped under the
-        # lock (two live runs of identical content never write the same count) and the
-        # pid separates runs that a cleared-then-recreated marker would otherwise let
-        # share one. Freshness reads back only `hash`/`attempts` — the pid is identity.
+        # tell it from one a *concurrent* run stored — see `_pending_owner` for what
+        # identifies it. The counter is bumped under the lock, so a concurrent run of
+        # the same content still reads this start when it computes its own.
         prior = _pending_attempts(state.setdefault("pending", {}).get(rel), digest)
         marker = {"hash": digest, "attempts": (prior or 0) + 1, "pid": os.getpid()}
         state["pending"][rel] = marker
@@ -1150,11 +1171,13 @@ def verify_and_record(
     # (PR #148 review) — and its pre-recorded `unknown` units, which this run's
     # verdicts for the older bytes overwrote, would never be re-decided either.
     # A kill in the sliver between the last verdict and this write just costs one
-    # redundant re-verify — the safe direction.
+    # redundant re-verify — the safe direction. Ownership is `_pending_owner`, not
+    # whole-marker equality: a concurrent `_blocking_error` may have charged this
+    # marker an attempt, which changes its bytes without changing whose claim it is.
     with gate_lock(project_dir):
         state = load_state(project_dir)
         pending = state.setdefault("pending", {})
-        if pending.get(rel) == marker:
+        if _pending_owner(pending.get(rel)) == _pending_owner(marker):
             del pending[rel]
         save_state(project_dir, state)
     return verdicts
