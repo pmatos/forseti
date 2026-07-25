@@ -290,9 +290,18 @@ def _enumerable_source(
     at ``<tmp>/a/b/x.c``), with the levels above the mirror root real but empty.
     A ``..`` chain that climbs past the root then lands on an empty private
     directory instead of on ``/tmp``, where a same-named file — anyone's, the
-    directory is world-writable — would silently be included. So an include
-    reaching above the root fails to resolve, which fails closed as a blocking
-    `error`; it does not enumerate a different translation unit.
+    directory is world-writable — would silently be included.
+
+    Above the mirror root, resolution is **not** reproduced, and the miss is not
+    the end of it: clang falls through to the ``-I`` search with the *spelled*
+    path, so ``#include "../above.h"`` from a file at the project root ends at
+    whatever ``<-I dir>/../above.h`` finds — a blocking `error` when there is no
+    such flag, and otherwise a header the in-place parse need not have picked.
+    ``-I.`` is the spelling that reproduces it (the CLI runs with
+    ``cwd=project_dir``). Unchanged from the siblings-only staging this replaces;
+    what the padding removes is the far worse variant where the miss landed in
+    ``/tmp`` itself. Pinned by
+    ``test_include_above_the_mirror_root_is_a_known_residual``.
 
     An ``-I <source dir>`` looks like a cheaper substitute for all this and is not
     one: ``-I`` also joins the **angle-bracket** search, and it appends *after*

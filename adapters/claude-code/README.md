@@ -203,9 +203,13 @@ turns a verdict into an error.
   lands after any `-iquote`, so `#include <config.h>` next to a generated
   `config.h` would pick the wrong one, flip an `#if`, and hide a unit from the
   gate.) A quoted include that climbs *above* the project root is the one shape
-  the mirror does not reproduce: it fails to resolve, which is a blocking ERROR
-  like any other unresolvable include, and `FORSETI_BUILD_FLAGS` is the fix
-  (`-I.` puts the spelled path back in the search).
+  the mirror does not reproduce: it misses there, and clang then falls through to
+  the `-I` search with the *spelled* path — a blocking ERROR when no such flag is
+  set, and otherwise whatever `<-I dir>/../above.h` finds, which need not be the
+  header an in-place parse picks. `FORSETI_BUILD_FLAGS="-I."` is the spelling
+  that reproduces the in-place answer (the CLI runs with `cwd` = project dir).
+  This is unchanged from mirroring the siblings alone; the padded depth only
+  removes the worse variant, where the miss landed in `/tmp` itself.
 - **The verify step runs on the real path, so its own freshness is guarded, not
   guaranteed.** A verdict has to describe the translation unit that actually
   ships, and the snapshot reproduces include resolution only up to its mirror

@@ -1047,6 +1047,43 @@ def test_relative_include_resolves_through_the_snapshot(
 
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_include_above_the_mirror_root_is_a_known_residual(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Characterization, not an endorsement. Mirroring stops at the project dir,
+    # so `#include "../common.h"` from a file *at* the root misses in the mirror
+    # — and clang then falls through to the `-I` search with the spelled path,
+    # which here resolves `sub/../common.h` to the project's own header instead
+    # of the one above it. Different `VARIANT`, so the `#if` hides a function the
+    # in-place parse enumerates: a wrong translation unit, not a block. Pinned so
+    # a future fix flips this test rather than quietly widening the guarantee.
+    # It is not a regression — the siblings-only staging did exactly this; what
+    # the padded depth removes is the worse variant where the miss landed in
+    # `/tmp` itself, where any user's `common.h` would have won.
+    (tmp_path / "common.h").write_text("#define VARIANT 2\n")  # the in-place pick
+    proj = tmp_path / "proj"
+    (proj / "sub").mkdir(parents=True)
+    (proj / "common.h").write_text("#define VARIANT 1\n")  # what the `-I` finds
+    src = proj / "x.c"
+    src.write_text(
+        '#include "../common.h"\n'
+        "int f(int x) { return x; }\n"
+        "#if VARIANT == 2\n"
+        "int only_above(int x) { return x; }\n"
+        "#endif\n"
+    )
+    monkeypatch.setenv("FORSETI_BUILD_FLAGS", "-Isub")
+
+    in_place = gate.extract_function_defs("x.c", project_dir=str(proj))
+    snapshotted = gate.extract_function_defs(
+        "x.c", project_dir=str(proj), content=src.read_bytes()
+    )
+
+    assert sorted(d.name for d in in_place) == ["f", "only_above"]
+    assert sorted(d.name for d in snapshotted) == ["f"]  # the residual
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
 def test_function_like_macro_not_enumerated(tmp_path: Path) -> None:
     # A function-like macro is not a definition — the authoritative parse ignores
     # it, where the regex could false-match its `NAME(args)` shape.
