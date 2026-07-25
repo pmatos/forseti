@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,52 @@ from pathlib import Path, PurePosixPath
 # left OFF — wraparound is legal and common (hashes, counters) and enabling it
 # yields false positives. Tune here; this is the one knob that defines "safe".
 SAFETY_FLAGS: tuple[str, ...] = ("--overflow-check",)
+
+
+class UnitsUnavailable(RuntimeError):
+    """A file's function definitions could not be enumerated.
+
+    Distinct from "the file defines no functions" (an empty list): a failed
+    enumeration must surface as a blocking `error` verdict, never be mistaken for
+    a clean pass (kill-safety — a not-verified unit can't silently slip through).
+    Raised when `forseti list-units` cannot be run or its payload is unusable, and
+    when the gate's own configuration is (`FORSETI_BUILD_FLAGS`).
+    """
+
+
+def _build_flags() -> tuple[str, ...]:
+    """The project's build flags (`-I`, `-D`, ...) from ``FORSETI_BUILD_FLAGS``.
+
+    Read per call, not once at import, so a hook process that sets the variable
+    after this module loads still sees it. Split with `shlex` (stdlib — the hooks
+    stay dependency-free) so a quoted path with spaces survives as one argument.
+
+    Kept separate from `SAFETY_FLAGS` because the two have different destinations:
+    build flags describe how the *translation unit* is constructed, so they must
+    reach the `list-units` parse as well as the verify, while `--overflow-check`
+    is a property-checking flag that means nothing to a `--parse-tree-only` run.
+    Passing the wrong set to either is the failure this split exists to prevent —
+    without its `-I` the enumeration fails outright (a blocking `error` on every
+    edited file), and a missing `-D` silently changes *which* functions the file
+    even defines, so the gate would verify a different unit list than the project
+    builds.
+
+    Unbalanced quoting raises `UnitsUnavailable` rather than escaping as a bare
+    `ValueError`: quoting *is* this knob's interface (that is the whole reason for
+    `shlex`), so a typo is the expected user error, and it has to land as the
+    blocking verdict the gate is built around instead of a hook traceback.
+    Degrading to no flags would be worse than either — it drops the `-I` and
+    resurfaces as a baffling `PARSING ERROR` on a file that is perfectly fine.
+    """
+    raw = os.environ.get("FORSETI_BUILD_FLAGS", "")
+    try:
+        return tuple(shlex.split(raw))
+    except ValueError as exc:
+        raise UnitsUnavailable(
+            f"FORSETI_BUILD_FLAGS is not parseable as a shell word list ({exc}): "
+            f"{raw!r} — check for an unbalanced quote"
+        ) from exc
+
 
 # The default loop-unwind bound k. A VERIFIED is only ever "verified up to k".
 # Override per project with FORSETI_UNWIND; functions with loops need a higher k
@@ -65,7 +112,12 @@ C_SUFFIXES = {".c", ".h"}
 # content hash (no mtime `cp -p`/`tar` hole) against a `scanned` baseline that
 # `baseline_scanned` seeds at session start — so the gate fires on C changed
 # *during* the session, never on pre-existing dirty or committed/third-party C the
-# agent never touched (the over-reach a whole-tree scan couldn't avoid).
+# agent never touched (the over-reach a whole-tree scan couldn't avoid). The
+# baseline has two halves, because the gate reads C from two places: `scanned`
+# holds each dirty file's *worktree* bytes, and `baseline_blobs` holds the *index*
+# and `HEAD` blob hashes the blob scan (`divergent_blob_sources`) compares against
+# — without the second half a session opening at `MM foo.c` (staged WIP, worktree
+# reverted) would block on the user's own pre-session staged blob (issue #139).
 # `FORSETI_GATE_INCLUDE`/`FORSETI_GATE_EXCLUDE` narrow it further; a bare path
 # segment (`vendor`) prunes any directory of that name, a glob (`*_generated.c`,
 # `test/*`) is matched against the project-relative path.
@@ -140,15 +192,6 @@ class FuncDef:
     takes_pointer: bool
 
 
-class UnitsUnavailable(RuntimeError):
-    """`forseti list-units` could not enumerate a file's function definitions.
-
-    Distinct from "the file defines no functions" (an empty list): a failed
-    enumeration must surface as a blocking `error` verdict, never be mistaken for
-    a clean pass (kill-safety — a not-verified unit can't silently slip through).
-    """
-
-
 def _func_def(unit: object) -> FuncDef:
     """One `units` entry → `FuncDef`, with both fields type-checked, never coerced.
 
@@ -216,6 +259,14 @@ def extract_function_defs(
         "--timeout",
         str(LIST_UNITS_TIMEOUT_S),
     ]
+    # The parse needs the project's own `-I`/`-D` — a translation unit whose
+    # `#include` cannot be resolved makes esbmc exit nonzero, which is a blocking
+    # `error` on every edited file rather than a listing. Only the build flags go
+    # here: `SAFETY_FLAGS` is for the verify, and a property flag on a
+    # `--parse-tree-only` run is at best inert.
+    build_flags = _build_flags()
+    if build_flags:
+        argv += ["--", *build_flags]
     try:
         proc = subprocess.run(
             argv,
@@ -573,6 +624,22 @@ def stale_sources(project_dir: str, state: dict, files: Iterable[str]) -> list[s
     return stale
 
 
+def _baselined_blobs(baseline: object, rel: str) -> tuple[str, ...]:
+    """The session-start blob hashes recorded for `rel` — empty if unusable.
+
+    Reads the `baseline_blobs` half of the SessionStart baseline defensively: a
+    hand-edited or truncated `gate_state.json` yields ``()``, which *gates* the blob
+    rather than exempting it. The unusable-input direction has to be the blocking
+    one here — an exemption is the only thing this map can grant.
+    """
+    if not isinstance(baseline, dict):
+        return ()
+    entry = baseline.get(rel)
+    if not isinstance(entry, list):
+        return ()
+    return tuple(h for h in entry if isinstance(h, str))
+
+
 def divergent_blob_sources(
     project_dir: str, state: dict, *, baseline_head: str | None = None
 ) -> list[dict]:
@@ -589,10 +656,15 @@ def divergent_blob_sources(
     whose SHA-256 differs from the recorded `scanned` (last-verified) hash.
 
     Keyed by content, so a blob equal to verified content is deduped straight out (no
-    over-gating a `git add`/commit of already-verified C). Only the staged set
-    (porcelain X-status) and the committed-since set are consulted, never every
-    tracked file, so a merely worktree-edited-but-uncommitted unit is *not* dragged in
-    by a stale ``HEAD``. Degrades to empty when not a git repo. Each entry is
+    over-gating a `git add`/commit of already-verified C). A blob equal to one the
+    SessionStart baseline recorded (`baseline_blobs` — the index/``HEAD`` blobs of the
+    pre-session dirty tree) dedups out the same way, and stays exempt for the whole
+    session: it is the user's own WIP, unchanged since session start, which is exactly
+    what the baseline exists to keep out of scope (issue #139). The agent staging or
+    committing *different* bytes yields a hash no baseline holds, so it still gates.
+    Only the staged set (porcelain X-status) and the committed-since set are consulted,
+    never every tracked file, so a merely worktree-edited-but-uncommitted unit is *not*
+    dragged in by a stale ``HEAD``. Degrades to empty when not a git repo. Each entry is
     ``{"rel": <project-relative path>, "reason": "staged" | "committed"}``.
     """
     root = _git(project_dir, "rev-parse", "--show-toplevel")
@@ -601,6 +673,7 @@ def divergent_blob_sources(
     root = root.strip()
     proj_real = os.path.realpath(project_dir)
     scanned = state.get("scanned", {})
+    baseline = state.get("baseline_blobs", {})
     # committed first: an already-shipped divergence is the graver of the two, and
     # dedup keeps a single (rel, reason) entry per path.
     candidates = [
@@ -624,10 +697,51 @@ def divergent_blob_sources(
         digest = git_blob_hash(project_dir, ref)
         if digest is None:
             continue  # no blob at that ref (staged deletion / rename source) — skip
-        if scanned.get(rel) != digest:
-            seen.add(key)
-            results.append({"rel": rel, "reason": reason})
+        if digest == scanned.get(rel) or digest in _baselined_blobs(baseline, rel):
+            continue  # already-verified content, or the pre-session baseline
+        seen.add(key)
+        results.append({"rel": rel, "reason": reason})
     return results
+
+
+def baseline_blob_hashes(project_dir: str) -> dict[str, list[str]] | None:
+    """Session-start hashes of the INDEX and ``HEAD`` blobs of the dirty C tree.
+
+    The blob half of the SessionStart baseline (issue #139), companion to the
+    worktree hashes `baseline_scanned` seeds into `scanned`. `divergent_blob_sources`
+    compares the index (``:path``) and ``HEAD`` (``HEAD:path``) blobs, which the
+    worktree bytes need not equal: a repo opening at ``MM foo.c`` (or ``MD`` — staged,
+    worktree deleted) holds a staged blob that `content_hash` never sees, so the Stop
+    check would fire on the user's pre-existing WIP the moment the session began.
+
+    Enumerated from `git_changed_files` — every porcelain-reported path — rather than
+    `discover_changed_c_sources`, whose existence filter drops exactly the
+    staged-then-deleted case this fixes. Paths run through the same
+    `_in_scope_c_abspath` filter (and are keyed by the same `unit_id`) as the consumer,
+    so the two sets cannot drift apart into a hole or a permanent over-gate. Refs that
+    hold no blob are skipped, so an untracked path (neither ref resolves) records
+    nothing and a pre-session rename records just its index blob. ``None`` when not a
+    git work tree. Costs two ``git cat-file`` calls per dirty C path, once per session.
+    """
+    root = _git(project_dir, "rev-parse", "--show-toplevel")
+    rels = git_changed_files(project_dir)
+    if root is None or rels is None:
+        return None
+    root = root.strip()
+    proj_real = os.path.realpath(project_dir)
+    baseline: dict[str, list[str]] = {}
+    for repo_rel in dict.fromkeys(rels):
+        abspath = _in_scope_c_abspath(project_dir, root, proj_real, repo_rel)
+        if abspath is None:
+            continue
+        digests: list[str] = []
+        for ref in (f":{repo_rel}", f"HEAD:{repo_rel}"):
+            digest = git_blob_hash(project_dir, ref)
+            if digest is not None and digest not in digests:
+                digests.append(digest)
+        if digests:
+            baseline[unit_id(project_dir, abspath)] = digests
+    return baseline
 
 
 def baseline_scanned(project_dir: str) -> int | None:
@@ -641,12 +755,22 @@ def baseline_scanned(project_dir: str) -> int | None:
     session start**": those files are gated only once the agent actually modifies
     them. The baseline HEAD is recorded too, so the committed-since scan can later
     catch C a Bash command writes *and* commits in one shot (issue #99 review).
-    Returns the number baselined, or ``None`` if not a git repo.
+
+    The worktree bytes are only half of it: the blob scan reads the index and ``HEAD``,
+    so `baseline_blob_hashes` seeds those hashes into `baseline_blobs` in the same
+    write (issue #139) — otherwise a session opening at ``MM``/``MD foo.c`` blocks
+    immediately on the user's pre-existing staged blob, which `content_hash` never saw.
+    Returns the number of files whose worktree content was baselined (the `scanned`
+    entries), or ``None`` if not a git repo.
     """
     discovered = discover_changed_c_sources(project_dir)
     if discovered is None:
         return None
-    head = git_head(project_dir)  # resolve HEAD outside the lock (a subprocess)
+    # Both resolve outside the lock — they spawn git subprocesses. A `None` blob
+    # baseline (the work tree vanished between the two calls) records nothing, which
+    # over-gates pre-session staged WIP rather than exempting a blob we never hashed.
+    head = git_head(project_dir)
+    blobs = baseline_blob_hashes(project_dir) or {}
     with gate_lock(project_dir):
         state = load_state(project_dir)
         baseline: dict[str, str] = {}
@@ -655,6 +779,7 @@ def baseline_scanned(project_dir: str) -> int | None:
             if digest is not None:
                 baseline[unit_id(project_dir, abspath)] = digest
         state["scanned"] = baseline
+        state["baseline_blobs"] = blobs
         state["baseline_head"] = head
         save_state(project_dir, state)
     return len(baseline)
@@ -666,6 +791,15 @@ def verify_function(
     """Run ``forseti verify`` on one function and map its JSON payload to a verdict."""
     rel = unit_id(project_dir, file_path)
     uid = f"{rel}::{function}"
+    try:
+        # Same build flags the enumeration parsed with, so the verify sees the
+        # same translation unit the unit list was taken from. Unparseable config
+        # becomes this unit's `error` verdict rather than a hook traceback — a
+        # direct caller (not coming through `verify_and_record`, which fails at
+        # enumeration first) must still get a verdict back.
+        build_flags = _build_flags()
+    except UnitsUnavailable as exc:
+        return UnitVerdict(uid, rel, function, "error", k, detail=str(exc))
     argv = [
         *resolve_forseti_cmd(),
         "verify",
@@ -679,6 +813,7 @@ def verify_function(
         "--json",
         "--",
         *SAFETY_FLAGS,
+        *build_flags,
     ]
     try:
         proc = subprocess.run(
@@ -769,11 +904,18 @@ def load_state(project_dir: str) -> dict:
             state.setdefault("units", {})
             state.setdefault("stop_attempts", 0)
             state.setdefault("scanned", {})
+            state.setdefault("baseline_blobs", {})
             state.setdefault("baseline_head", None)
             return state
         except (json.JSONDecodeError, OSError):
             pass
-    return {"units": {}, "stop_attempts": 0, "scanned": {}, "baseline_head": None}
+    return {
+        "units": {},
+        "stop_attempts": 0,
+        "scanned": {},
+        "baseline_blobs": {},
+        "baseline_head": None,
+    }
 
 
 def save_state(project_dir: str, state: dict) -> None:
@@ -822,8 +964,10 @@ def prune_deleted_units(state: dict, project_dir: str) -> list[str]:
     Stop-gate would block forever (then only emit a residual after the attempt cap)
     on a unit whose file is gone. Discovery correctly skips a missing file *for
     verification*; this reconciles the recorded side, dropping units whose file is
-    absent and clearing each such file's `scanned` baseline (so a same-name file
-    recreated later re-verifies from scratch).
+    absent and clearing each such file's `scanned` **and** `baseline_blobs` baseline
+    (so a same-name file recreated later re-verifies from scratch — the two baselines
+    are cleared together, or content matching a dropped one could still slip past the
+    blob scan).
 
     Keys off each unit's recorded `file` (project-relative), not `git status`, so
     it also catches an untracked Bash-written file git never knew existed — the
@@ -833,6 +977,7 @@ def prune_deleted_units(state: dict, project_dir: str) -> list[str]:
     """
     units = state.get("units", {})
     scanned = state.get("scanned", {})
+    baseline_blobs = state.get("baseline_blobs", {})
     pruned: list[str] = []
     gone_rels: set[str] = set()
     for uid, unit in list(units.items()):
@@ -845,6 +990,8 @@ def prune_deleted_units(state: dict, project_dir: str) -> list[str]:
             gone_rels.add(rel)
     for rel in gone_rels:
         scanned.pop(rel, None)
+        if isinstance(baseline_blobs, dict):
+            baseline_blobs.pop(rel, None)
     return pruned
 
 

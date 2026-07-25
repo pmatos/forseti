@@ -291,6 +291,137 @@ def test_list_units_marks_macro_extent_unresolved(tmp_path: Path) -> None:
     }
 
 
+# The brittleness class from issue #131: every shape a regex over the source text
+# gets wrong. Each case is `(source, {function: takes_pointer})` — the *full*
+# expected unit list, so a case also pins which functions are enumerated at all
+# (a `#if 0` body must not appear; a function-like macro is not a unit).
+_BRITTLE_CASES: list[tuple[str, str, dict[str, bool]]] = [
+    (
+        "comment_in_params",
+        # The false negative that motivated #131 (caught by the Codex reviewer on
+        # #130): the `*` of `/* input */` made the regex read a pointer, parking a
+        # scalar unit in non-blocking NEEDS_CONTRACT with its ESBMC run skipped.
+        "int neg(int x /* input */) { return -x; }\n",
+        {"neg": False},
+    ),
+    (
+        "adjusted_function_type_param",
+        # C adjusts a function-type parameter to pointer-to-function. No `*`, `[`
+        # or `(` appears in `int cb(void)`'s param text, so a regex sees a scalar
+        # and the gate would then hit a phantom pointer failure at verify time.
+        "void reg_adj(int cb(void)) { (void)cb; }\n",
+        {"reg_adj": True},
+    ),
+    (
+        "typedefd_function_pointer_param",
+        # The form a `(`-based regex patch still could not catch (#131 comment).
+        "typedef void (*cb_t)(void);\nvoid reg_td(cb_t cb) { cb(); }\n",
+        {"reg_td": True},
+    ),
+    (
+        "typedefd_pointer_param",
+        # The issue body's example: `str` hides the `*` behind a typedef.
+        "typedef char *str;\nvoid takes_str(str s) { (void)s; }\n",
+        {"takes_str": True},
+    ),
+    (
+        "knr_definition",
+        # K&R: the parameter *types* are not in the parenthesised list at all.
+        "int knr(a, b)\nint a;\nchar *b;\n{ return a + (b ? 1 : 0); }\n",
+        {"knr": True},
+    ),
+    (
+        "return_type_on_its_own_line",
+        "static unsigned long\nown_line(unsigned long n)\n{ return n; }\n",
+        {"own_line": False},
+    ),
+    (
+        "multi_line_signature",
+        "int multi(\n    int a,\n    char *b\n) { return a + (b ? 1 : 0); }\n",
+        {"multi": True},
+    ),
+    (
+        "function_like_macro",
+        # `SQUARE(x)` looks exactly like a definition to a regex; it is not a unit,
+        # and the function that *uses* it stays scalar.
+        "#define SQUARE(x) ((x) * (x))\nint use_macro(int v) { return SQUARE(v); }\n",
+        {"use_macro": False},
+    ),
+    (
+        "preprocessor_conditional",
+        # A regex has no preprocessor: it would enumerate the `#if 0` body and gate
+        # a function that does not exist in this translation unit.
+        "#if 0\nvoid never_defined(char *p) { (void)p; }\n#endif\n"
+        "#if 1\nint only_in_if(int x) { return x; }\n#endif\n",
+        {"only_in_if": False},
+    ),
+    (
+        "attribute_decorated",
+        "__attribute__((noinline)) int attr_fn(int x) { return x; }\n"
+        "int attr_ptr(char *p) __attribute__((nonnull));\n"
+        "int attr_ptr(char *p) { return *p; }\n",
+        {"attr_fn": False, "attr_ptr": True},
+    ),
+    (
+        "star_in_string_and_char_literal",
+        'const char *g;\nint lit(int n) { g = "a * b"; return n; }\n'
+        "int lit_char(int n) { char c = '*'; return n + c; }\n",
+        {"lit": False, "lit_char": False},
+    ),
+    (
+        "array_param",
+        # Clang adjusts `int p[10]` to `int *`; the unit still takes a pointer.
+        "void arr(int p[10]) { (void)p; }\n",
+        {"arr": True},
+    ),
+]
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+@pytest.mark.parametrize(
+    "name, source, expected", _BRITTLE_CASES, ids=[c[0] for c in _BRITTLE_CASES]
+)
+def test_list_units_classifies_the_brittleness_class(
+    tmp_path: Path, name: str, source: str, expected: dict[str, bool]
+) -> None:
+    # Issue #131's acceptance list, end-to-end through the real frontend: each of
+    # these is a shape the old adapter regex misread. Asserting the *whole* mapping
+    # (not just the pointer flags) also pins the enumerated set, so a macro or a
+    # `#if 0` body appearing as a unit fails here too.
+    src = tmp_path / f"{name}.c"
+    src.write_text(source)
+    assert {u.name: u.takes_pointer for u in list_units(src)} == expected
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_forwards_build_flags(tmp_path: Path) -> None:
+    # `extra_flags` is what makes a real project's C parseable at all. Without the
+    # `-I` this source cannot resolve its `#include` and esbmc exits nonzero (see
+    # the companion assertion below); with it, `-DWIDGET` further changes *which*
+    # functions the translation unit defines — so the flags are load-bearing for
+    # the unit list, not a convenience.
+    inc = tmp_path / "inc"
+    inc.mkdir()
+    (inc / "mytypes.h").write_text("typedef unsigned char byte_t;\n")
+    src = tmp_path / "u.c"
+    src.write_text(
+        '#include "mytypes.h"\n'
+        "int scal(byte_t b) { return b; }\n"
+        "void ptr(byte_t *p) { (void)p; }\n"
+        "#ifdef WIDGET\n"
+        "int only_with_define(int x) { return x; }\n"
+        "#endif\n"
+    )
+    units = list_units(src, extra_flags=("-I", str(inc), "-DWIDGET"))
+    assert {u.name: u.takes_pointer for u in units} == {
+        "scal": False,
+        "ptr": True,
+        "only_with_define": False,
+    }
+    with pytest.raises(ListUnitsError):
+        list_units(src)  # the same source without its include path
+
+
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
 def test_list_units_raises_on_failed_parse(tmp_path: Path) -> None:
     # A failed esbmc run (nonzero exit) must raise, never return [] — [] is
