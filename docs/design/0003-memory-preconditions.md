@@ -180,8 +180,11 @@ real out‑of‑bounds structurally and *escalate the k‑ladder*, never masquer
 needs the preprocessor or an expression (`T p[SHA_DIGEST_LENGTH]`, `T p[N+1]`) is **not guessable
 from the source** — so it is *flagged* (`Param.array_extent_unresolved`) rather than left
 indistinguishable from a plain `T *p`, and the unit is `NEEDS_CONTRACT` instead of being backed by a
-one‑element object that phantom‑VIOLATES code reading the declared extent. An accompanying length
-parameter still wins: it sizes the object exactly.
+one‑element object that phantom‑VIOLATES code reading the declared extent. For a *conventional*
+`T p[MACRO]` an accompanying length parameter still wins — the written extent binds nobody (C adjusts
+the parameter to `T *`), so the length is the better authority and sizes the object exactly. C99's
+`T p[static MACRO]` is the exception: there the extent is a **caller obligation**, so the function may
+touch all of it however small the length is, and L0 declines rather than sizing by the length.
 
 ## Decisions (recommended) & open questions
 

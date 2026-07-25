@@ -63,6 +63,11 @@ _EXTENT_RE = re.compile(
     r"^\s*(?:(?:static|const|volatile|restrict|__restrict(?:__)?)\s+)*(\d+)\s*$"
 )
 
+# C99's `[static N]`, whose `N` binds the *caller*: the argument must give access to
+# at least N elements. Read separately from the extent because it stays meaningful
+# even when N itself is not (`[static SHA_DIGEST_LENGTH]`).
+_STATIC_MIN_RE = re.compile(r"\bstatic\b")
+
 
 @dataclass(frozen=True)
 class Param:
@@ -82,12 +87,19 @@ class Param:
     which needs the preprocessor) or a multi-dimensional declarator. Sizing such a
     parameter as a single object would under-allocate it, so the synthesizer reports
     ``NEEDS_CONTRACT`` instead of a phantom violation (issue #137).
+
+    `array_static_min` records that the declarator used C99's ``T p[static N]``,
+    where ``N`` is a *caller obligation*: the argument must give access to at least
+    ``N`` elements, so the function may touch all of them no matter what any other
+    parameter says. That makes it distinct from the merely conventional ``T p[N]``,
+    and it is set whether or not ``N`` itself was readable.
     """
 
     name: str
     type: str
     array_extent: int | None = None
     array_extent_unresolved: bool = False
+    array_static_min: bool = False
 
     @property
     def is_pointer(self) -> bool:
@@ -251,42 +263,59 @@ def _param_list_text(source_no_comments: str, fn_name: str) -> str | None:
     return None
 
 
-def _array_shape(param_list: str, name: str) -> tuple[int | None, bool]:
-    """The fixed extent of ``name`` in `param_list`, and whether it is unresolved.
+@dataclass(frozen=True)
+class _ArrayShape:
+    """What a parameter's source declarator says about its extent."""
 
-    Returns ``(N, False)`` when a single-dimension extent is recovered from
-    ``name[N]``, ``(None, True)`` when ``name`` *is* written as a fixed array whose
-    extent cannot be read from the source — a macro or expression
-    (``name[SHA_DIGEST_LENGTH]``, which needs the preprocessor) or a
-    multi-dimensional ``name[N][M]`` (a pointer-to-array, not an L0 shape) — and
-    ``(None, False)`` when there is no extent to recover in the first place: a plain
-    pointer, an unsized ``name[]`` (exactly as informative as ``T *name``), or an
-    unnamed parameter.
+    extent: int | None = None
+    unresolved: bool = False
+    static_min: bool = False
+
+
+def _array_shape(param_list: str, name: str) -> _ArrayShape:
+    """What ``name``'s declarator in `param_list` says about its array extent.
+
+    Yields `extent` when a single-dimension literal is recovered from ``name[N]``;
+    `unresolved` when ``name`` *is* written as a fixed array whose extent cannot be
+    read from the source — a macro or expression (``name[SHA_DIGEST_LENGTH]``, which
+    needs the preprocessor) or a multi-dimensional ``name[N][M]`` (a
+    pointer-to-array, not an L0 shape); and neither when there is no extent to
+    recover in the first place: a plain pointer, an unsized ``name[]`` (exactly as
+    informative as ``T *name``), or an unnamed parameter. `static_min` is set
+    independently, for C99's ``name[static N]``.
 
     The unresolved flag is what keeps an unreadable extent out of the one-element
     fallback, which would under-size the object. It says nothing about a parameter
-    list `_param_list_text` could not isolate at all — that residual case stays
-    ``(None, False)``, i.e. indistinguishable from a plain pointer.
+    list `_param_list_text` could not isolate at all — that residual case yields a
+    default shape, i.e. one indistinguishable from a plain pointer.
     """
     if not name:
-        return None, False
+        return _ArrayShape()
     match = re.search(_ARRAY_DECL_TEMPLATE.format(name=re.escape(name)), param_list)
     if not match:
-        return None, False
+        return _ArrayShape()
     brackets = re.findall(r"\[([^\]]*)\]", match.group(1))
+    static_min = any(_STATIC_MIN_RE.search(b) for b in brackets)
     if len(brackets) != 1:
-        return None, True
+        return _ArrayShape(unresolved=True, static_min=static_min)
     inner = brackets[0]
     if not inner.strip():
-        return None, False
+        return _ArrayShape(static_min=static_min)
     extent = _EXTENT_RE.match(inner)
-    return (int(extent.group(1)), False) if extent else (None, True)
+    if extent is None:
+        return _ArrayShape(unresolved=True, static_min=static_min)
+    return _ArrayShape(extent=int(extent.group(1)), static_min=static_min)
 
 
 def _annotated_param(param: Param, param_list: str) -> Param:
     """`param` with its written array shape attached, read off `param_list`."""
-    extent, unresolved = _array_shape(param_list, param.name)
-    return replace(param, array_extent=extent, array_extent_unresolved=unresolved)
+    shape = _array_shape(param_list, param.name)
+    return replace(
+        param,
+        array_extent=shape.extent,
+        array_extent_unresolved=shape.unresolved,
+        array_static_min=shape.static_min,
+    )
 
 
 def annotate_array_extents(units: list[Unit], source_text: str) -> list[Unit]:

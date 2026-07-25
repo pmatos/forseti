@@ -60,17 +60,27 @@ def test_list_units_json_reports_array_shape(
     src.write_text(
         "#define DLEN 20\n"
         "void f(unsigned char digest[DLEN], unsigned char tag[16], "
-        "unsigned char *raw) {\n"
-        "  (void)digest; (void)tag; (void)raw;\n}\n"
+        "unsigned char *raw, unsigned char mac[static DLEN]) {\n"
+        "  (void)digest; (void)tag; (void)raw; (void)mac;\n}\n"
     )
     code = main(["list-units", str(src), "--json"])
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
     unit = next(u for u in payload["units"] if u["function"] == "f")
     assert [
-        (p["name"], p["array_extent"], p["array_extent_unresolved"])
+        (
+            p["name"],
+            p["array_extent"],
+            p["array_extent_unresolved"],
+            p["array_static_min"],
+        )
         for p in unit["params"]
-    ] == [("digest", None, True), ("tag", 16, False), ("raw", None, False)]
+    ] == [
+        ("digest", None, True, False),
+        ("tag", 16, False, False),
+        ("raw", None, False, False),
+        ("mac", None, True, True),
+    ]
 
 
 # --- forseti synth (memory-precondition gate, RFC-0003 S2) ------------------

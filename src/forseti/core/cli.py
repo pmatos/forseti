@@ -145,6 +145,7 @@ def _run_list_units(args: argparse.Namespace) -> int:
                             "is_pointer": p.is_pointer,
                             "array_extent": p.array_extent,
                             "array_extent_unresolved": p.array_extent_unresolved,
+                            "array_static_min": p.array_static_min,
                         }
                         for p in u.params
                     ],

@@ -105,10 +105,14 @@ def test_param_is_pointer(type_str: str, is_ptr: bool) -> None:
     assert Param("p", type_str).is_pointer is is_ptr
 
 
+def _annotated(source: str, param: Param, fn: str = "f") -> Param:
+    """`param` as `annotate_array_extents` annotates it from `source`."""
+    return annotate_array_extents([Unit(fn, (param,))], source)[0].params[0]
+
+
 def _shape(source: str, param: Param, fn: str = "f") -> tuple[int | None, bool]:
     """The array shape `annotate_array_extents` harvests for `param` in `source`."""
-    unit = Unit(fn, (param,))
-    out = annotate_array_extents([unit], source)[0].params[0]
+    out = _annotated(source, param, fn)
     return out.array_extent, out.array_extent_unresolved
 
 
@@ -166,6 +170,23 @@ def test_annotate_array_extents_no_extent_stated(decl: str) -> None:
 )
 def test_annotate_array_extents_unreadable_extent_is_unresolved(decl: str) -> None:
     assert _shape(decl, Param("p", "uint8_t *")) == (None, True)
+
+
+@pytest.mark.parametrize(
+    "decl, expected",
+    [
+        ("void f(uint8_t p[static 20]) {}", True),
+        ("void f(uint8_t p[static DLEN]) {}", True),  # meaningful even unreadable
+        ("void f(uint8_t p[const static DLEN]) {}", True),
+        ("void f(uint8_t p[20]) {}", False),  # a conventional extent, not an obligation
+        ("void f(uint8_t p[DLEN]) {}", False),
+        ("void f(uint8_t *p) {}", False),
+    ],
+)
+def test_annotate_array_static_min(decl: str, expected: bool) -> None:
+    # C99 `[static N]` binds the caller to supply at least N elements, so it is
+    # tracked separately from whether N itself could be read.
+    assert _annotated(decl, Param("p", "uint8_t *")).array_static_min is expected
 
 
 def test_annotate_array_extents_prefers_definition_over_prototype() -> None:

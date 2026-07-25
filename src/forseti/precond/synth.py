@@ -193,6 +193,14 @@ def plan_unit(unit: Unit) -> UnitPlan:
             roles[i] = ParamRole.FIXED_ARRAY
             extents[i] = param.array_extent
             continue
+        # `T p[static <macro>]`: the caller *must* give access to the declared
+        # extent, so the function may touch all of it however small a companion
+        # length is — sizing by that length could under-allocate and phantom-VIOLATE
+        # valid code. Unlike the conventional `T p[<macro>]` below, this one cannot
+        # defer to length-pairing.
+        if param.array_extent_unresolved and param.array_static_min:
+            roles[i] = ParamRole.UNRESOLVED
+            continue
         if i + 1 < n and (i + 1) not in consumed_as_length:
             kind = _length_kind(unit.params[i + 1])
             if kind is not None:

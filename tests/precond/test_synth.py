@@ -78,8 +78,10 @@ def test_unreadable_fixed_array_extent_is_unresolved_not_one_element() -> None:
 
 
 def test_unreadable_extent_still_prefers_an_accompanying_length() -> None:
-    # An unreadable extent only displaces the one-element fallback: a following
-    # length sizes the object *exactly*, which beats declining to synthesise.
+    # A conventional `T buf[MACRO]` extent only displaces the one-element fallback:
+    # a following length sizes the object *exactly*, which beats declining. The
+    # written extent is documentation — C adjusts the parameter to `T *` and binds
+    # nobody — so the length is the better authority.
     unit = _unit(
         Param("buf", "uint8_t *", array_extent_unresolved=True),
         Param("len", "unsigned long"),
@@ -87,6 +89,33 @@ def test_unreadable_extent_still_prefers_an_accompanying_length() -> None:
     plan = plan_unit(unit)
     assert _roles(unit) == {"buf": ParamRole.PTR_BYTE_LEN, "len": ParamRole.LENGTH}
     assert plan.resolvable
+
+
+def test_unreadable_static_minimum_outranks_an_accompanying_length() -> None:
+    # `T buf[static MACRO]` *does* bind the caller to at least MACRO elements, so
+    # the function may touch all of them whatever `len` says. Sizing by `len` could
+    # under-allocate and phantom-VIOLATE valid code, so L0 declines instead.
+    unit = _unit(
+        Param("buf", "uint8_t *", array_extent_unresolved=True, array_static_min=True),
+        Param("len", "unsigned long"),
+    )
+    plan = plan_unit(unit)
+    assert plan.params[0].role is ParamRole.UNRESOLVED
+    assert not plan.resolvable
+    assert plan.unresolved_params == ("buf",)
+
+
+def test_readable_static_minimum_is_sized_by_its_extent() -> None:
+    # A *readable* `[static 20]` needs no such caution: the exact extent wins, and
+    # the neighbouring length is then just a scalar.
+    unit = _unit(
+        Param("buf", "uint8_t *", array_extent=20, array_static_min=True),
+        Param("len", "unsigned long"),
+    )
+    plan = plan_unit(unit)
+    assert plan.params[0].role is ParamRole.FIXED_ARRAY
+    assert plan.params[0].extent == 20
+    assert plan.params[1].role is ParamRole.SCALAR
 
 
 def test_non_length_named_next_param_is_not_paired() -> None:
