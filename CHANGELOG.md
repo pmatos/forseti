@@ -1,3 +1,10 @@
+# [1.4.0](https://github.com/pmatos/forseti/compare/v1.3.0...v1.4.0) (2026-07-25)
+
+
+### Features
+
+* **claude-adapter:** gate C files written out-of-band via Bash ([#99](https://github.com/pmatos/forseti/issues/99)) ([#135](https://github.com/pmatos/forseti/issues/135)) ([452f22c](https://github.com/pmatos/forseti/commit/452f22cb6aca36276e2ade7e76610260b9e938a3))
+
 # [1.3.0](https://github.com/pmatos/forseti/compare/v1.2.1...v1.3.0) (2026-07-24)
 
 
