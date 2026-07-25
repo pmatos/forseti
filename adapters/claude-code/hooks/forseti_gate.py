@@ -578,6 +578,16 @@ def _pending_attempts(entry: object, digest: str) -> int | None:
     return attempts if isinstance(attempts, int) and attempts > 0 else 0
 
 
+def _pending_records(entry: object, digest: str | None) -> bool:
+    """True when `entry` is an unfinished-verify marker for exactly `digest` bytes.
+
+    The ownership test for the *error* cleanup path: only a marker recording the
+    content this run actually read may be dropped. `digest is None` (the file could
+    not even be read) is never ownership — nothing is dropped then.
+    """
+    return digest is not None and _pending_attempts(entry, digest) is not None
+
+
 def stale_sources(project_dir: str, state: dict, files: Iterable[str]) -> list[str]:
     """Subset of `files` needing a (re-)verify: changed content, or a killed verify.
 
@@ -945,32 +955,42 @@ def verify_and_record(
     the not-yet-verified functions as `unknown` — which the Stop-gate blocks on —
     rather than absent; it can never drop an already-found or still-pending
     violation and pass silently. The same up-front block marks the file's scan
-    unfinished in `pending`, cleared only once every verdict is final, so a killed
-    run is *retried* by the next scan instead of being skipped as content-fresh
-    (issue #140) — bounded by `MAX_PENDING_VERIFY_ATTEMPTS`.
+    unfinished in `pending`, cleared only once every verdict is final — and only by
+    the run that recorded that marker, never by one that finds a concurrent run's —
+    so a killed run is *retried* by the next scan instead of being skipped as
+    content-fresh (issue #140), bounded by `MAX_PENDING_VERIFY_ATTEMPTS`.
     """
     rel = unit_id(project_dir, file_path)
 
-    def _blocking_error(detail: str) -> list[UnitVerdict]:
+    def _blocking_error(detail: str, *, digest: str | None = None) -> list[UnitVerdict]:
         """Record a blocking `error` verdict for the whole file and return it.
 
         Neither caller stamps `scanned`: a file we could not read or enumerate
         must not be recorded as already-scanned, or the out-of-band scan would
         treat it as handled and the edit would pass unverified.
 
-        The `error` verdict *is* this scan's final outcome, so the unfinished-verify
-        marker must not survive it: every error path returns before the up-front
-        block that bumps the retry counter, so leaving a previous attempt's marker
-        in place would make a persistently-erroring file re-verify forever with the
-        counter frozen (issue #140). Dropping it makes the recorded `error` block
-        its way to the loud residual instead.
+        The `error` verdict *is* this scan's final outcome for the bytes it read, so
+        that content's unfinished-verify marker must not survive it: every error path
+        returns before the up-front block that bumps the retry counter, so leaving
+        the marker in place would make a persistently-erroring file re-verify forever
+        with the counter frozen (issue #140). Dropping it makes the recorded `error`
+        block its way to the loud residual instead.
+
+        Scoped to a marker recording exactly `digest`, never a blanket pop: a
+        concurrent run of *other* content owns its own marker, and deleting that
+        would make a kill of that run read as content-fresh with nothing left to
+        retry — the very hole this closes (PR #148 review). With no `digest` at all
+        (the file could not even be read) nothing is dropped: ownership is
+        unprovable, and a surviving marker only ever costs a re-verify.
         """
         verdict = UnitVerdict(f"{rel}::?", rel, "?", "error", k, detail=detail)
         with gate_lock(project_dir):
             state = load_state(project_dir)
             record(state, verdict)
             state["stop_attempts"] = 0
-            state.setdefault("pending", {}).pop(rel, None)
+            pending = state.setdefault("pending", {})
+            if _pending_records(pending.get(rel), digest):
+                del pending[rel]
             save_state(project_dir, state)
         return [verdict]
 
@@ -980,18 +1000,18 @@ def verify_and_record(
     except OSError as exc:
         return _blocking_error(str(exc))
 
+    # Hash the bytes we read before anything else can fail: every path below needs
+    # to name the content it operated on, both to stamp `scanned` and to tell its
+    # own unfinished-verify marker from a concurrent run's.
+    digest = hashlib.sha256(raw).hexdigest()
+
     try:
         defs = extract_function_defs(file_path, project_dir=project_dir)
     except UnitsUnavailable as exc:
         # Couldn't enumerate the file's units (esbmc missing, C parse error, …).
         # Record a blocking `error` verdict rather than skip: a file that was
         # edited but can't be parsed must not pass silently.
-        return _blocking_error(str(exc)[:800])
-
-    # Stamp the content hash so a later out-of-band scan treats this exact content
-    # as already verified — that dedup is what keeps the Stop-gate from re-blocking
-    # (and resetting its patience) on a file nothing has touched since.
-    digest = hashlib.sha256(raw).hexdigest()
+        return _blocking_error(str(exc)[:800], digest=digest)
 
     # `list-units` re-reads the file, so it may have enumerated bytes other than
     # the ones we hashed. Fail closed on any sign of that: an *empty* `.c`
@@ -1015,13 +1035,23 @@ def verify_and_record(
     with gate_lock(project_dir):
         state = load_state(project_dir)
         state["stop_attempts"] = 0
+        # Stamp the content hash so a later out-of-band scan treats this exact content
+        # as already verified — that dedup is what keeps the Stop-gate from re-blocking
+        # (and resetting its patience) on a file nothing has touched since.
         state.setdefault("scanned", {})[rel] = digest
         # Mark this content's scan unfinished, counting the start. The stamp above
         # makes the file content-fresh, so without this marker a kill before the
         # verdicts land would leave the pending `unknown` units unretryable
         # (issue #140). Cleared once every verdict is final.
+        #
+        # The marker doubles as this run's ownership token so the cleanup below can
+        # tell it from one a *concurrent* run stored: the counter is bumped under the
+        # lock (two live runs of identical content never write the same count) and the
+        # pid separates runs that a cleared-then-recreated marker would otherwise let
+        # share one. Freshness reads back only `hash`/`attempts` — the pid is identity.
         prior = _pending_attempts(state.setdefault("pending", {}).get(rel), digest)
-        state["pending"][rel] = {"hash": digest, "attempts": (prior or 0) + 1}
+        marker = {"hash": digest, "attempts": (prior or 0) + 1, "pid": os.getpid()}
+        state["pending"][rel] = marker
         prune_missing_units(state, project_dir, file_path, {d.name for d in defs})
         for d in defs:
             if d.takes_pointer:
@@ -1056,12 +1086,21 @@ def verify_and_record(
             record(state, verdict)
             save_state(project_dir, state)
 
-    # Every verdict for this content is final: clear the unfinished-verify marker
-    # so later scans trust the up-front `scanned` stamp again. A kill in the sliver
-    # between the last verdict and this write just costs one redundant re-verify —
-    # the safe direction.
+    # Every verdict for this content is final: clear THIS RUN's unfinished-verify
+    # marker so later scans trust the up-front `scanned` stamp again. Only this run's
+    # — the gate explicitly supports concurrent PostToolUse hooks on the same path
+    # across successive edits, so an older run can reach this point after a newer one
+    # has stamped `scanned` with *its* digest and stored its own marker. Popping that
+    # newer marker would leave the file hashing fresh with nothing to retry, so a kill
+    # of the newer run would never be re-verified — the exact hole this closes
+    # (PR #148 review) — and its pre-recorded `unknown` units, which this run's
+    # verdicts for the older bytes overwrote, would never be re-decided either.
+    # A kill in the sliver between the last verdict and this write just costs one
+    # redundant re-verify — the safe direction.
     with gate_lock(project_dir):
         state = load_state(project_dir)
-        state.setdefault("pending", {}).pop(rel, None)
+        pending = state.setdefault("pending", {})
+        if pending.get(rel) == marker:
+            del pending[rel]
         save_state(project_dir, state)
     return verdicts

@@ -463,6 +463,153 @@ def test_killed_verify_retries_are_capped_then_residual(
     assert "endless.c::f" in out["systemMessage"]
 
 
+# --- concurrent runs own their own retry marker (PR #148 review) ------------
+
+
+def _concurrent_run_starts(project_dir: Path, path: Path, content: str) -> str:
+    """Replay a *second* `verify_and_record` run's up-front block, then "get killed".
+
+    Writes `content`, stamps `scanned`, stores that run's own unfinished-verify
+    marker (counter bumped exactly as the real block does) and pre-records the unit
+    as pending `unknown` — the state a concurrent PostToolUse hook leaves behind
+    when it is killed before its verdicts land. Returns the content's digest.
+    """
+    path.write_text(content)
+    rel = gate.unit_id(str(project_dir), str(path))
+    digest = gate.content_hash(str(path))
+    assert digest is not None
+    with gate.gate_lock(str(project_dir)):
+        state = gate.load_state(str(project_dir))
+        state["scanned"][rel] = digest
+        prior = gate._pending_attempts(state["pending"].get(rel), digest)
+        state["pending"][rel] = {
+            "hash": digest,
+            "attempts": (prior or 0) + 1,
+            "pid": os.getpid() + 1,
+        }
+        gate.record(
+            state,
+            gate.UnitVerdict(
+                f"{rel}::f",
+                rel,
+                "f",
+                "unknown",
+                gate.DEFAULT_K,
+                detail="verification pending",
+            ),
+        )
+        gate.save_state(str(project_dir), state)
+    return digest
+
+
+def test_cleanup_preserves_a_newer_runs_pending_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The gate supports concurrent PostToolUse hooks on one path across successive
+    # edits, so an older run can reach its cleanup after a NEWER-content run stored
+    # its own marker. Dropping that marker leaves the file hashing fresh (the newer
+    # run stamped `scanned` with its own digest) with nothing left to retry, so a
+    # kill of the newer run would never be re-verified.
+    src = tmp_path / "race.c"
+    src.write_text("int f(void){return 0;}\n")
+    _enumerate_one_unit(monkeypatch)
+    newer: dict[str, str] = {}
+
+    def _verify_while_a_newer_run_starts(fp, fn, *, project_dir, k=gate.DEFAULT_K):
+        newer["digest"] = _concurrent_run_starts(
+            tmp_path, src, "int f(void){return 1;}\n"
+        )
+        return gate.UnitVerdict("race.c::f", "race.c", "f", "verified", k)
+
+    monkeypatch.setattr(gate, "verify_function", _verify_while_a_newer_run_starts)
+    gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    state = gate.load_state(str(tmp_path))
+    entry = state["pending"]["race.c"]  # the newer run's marker survives
+    assert entry["hash"] == newer["digest"]
+    # ...so its killed verify is still retried instead of being skipped as fresh.
+    assert state["scanned"]["race.c"] == newer["digest"]  # content-fresh by hash
+    assert gate.stale_sources(str(tmp_path), state, [str(src)]) == [str(src)]
+
+
+def test_cleanup_preserves_a_concurrent_retry_of_the_same_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Same bytes, two live runs: the second bumps the counter under the lock and its
+    # pre-record puts the units back to pending `unknown`. Matching on content alone
+    # would let this run pop that marker, leaving those `unknown` units content-fresh
+    # and unretryable if the second run is killed — hence the ownership token.
+    src = tmp_path / "same.c"
+    src.write_text("int f(void){return 0;}\n")
+    digest = gate.content_hash(str(src))
+    _enumerate_one_unit(monkeypatch)
+
+    def _verify_while_same_content_retries(fp, fn, *, project_dir, k=gate.DEFAULT_K):
+        _concurrent_run_starts(tmp_path, src, src.read_text())  # identical bytes
+        return gate.UnitVerdict("same.c::f", "same.c", "f", "verified", k)
+
+    monkeypatch.setattr(gate, "verify_function", _verify_while_same_content_retries)
+    gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    state = gate.load_state(str(tmp_path))
+    assert state["pending"]["same.c"] == {
+        "hash": digest,
+        "attempts": 2,
+        "pid": os.getpid() + 1,
+    }
+    assert gate.stale_sources(str(tmp_path), state, [str(src)]) == [str(src)]
+
+
+def test_blocking_error_preserves_a_newer_runs_pending_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The error cleanup is scoped the same way: it drops only a marker recording the
+    # bytes THIS run read. `raw` is read before the units are enumerated, so a newer
+    # run's marker for the content now on disk must survive the error — otherwise
+    # that run's kill reads as content-fresh with nothing to retry.
+    src = tmp_path / "err.c"
+    src.write_text("int f(void){return 0;}\n")
+    newer: dict[str, str] = {}
+
+    def _newer_run_starts_then_enumeration_fails(file_path, *, project_dir):
+        newer["digest"] = _concurrent_run_starts(
+            tmp_path, src, "int f(void){return 1;}\n"
+        )
+        raise gate.UnitsUnavailable("forseti CLI could not be launched")
+
+    monkeypatch.setattr(
+        gate, "extract_function_defs", _newer_run_starts_then_enumeration_fails
+    )
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert [v.verdict for v in verdicts] == ["error"]  # this scan still blocks
+    state = gate.load_state(str(tmp_path))
+    assert state["pending"]["err.c"]["hash"] == newer["digest"]
+    assert gate.stale_sources(str(tmp_path), state, [str(src)]) == [str(src)]
+
+
+def test_unreadable_file_leaves_the_pending_marker_alone(tmp_path: Path) -> None:
+    # A run that cannot even read the file never learns which bytes it was scanning,
+    # so it can never prove a marker is its own and drops nothing. A surviving marker
+    # only ever costs a re-verify; deleting another run's costs the retry itself.
+    # (Such a file also stops being scanned at all — `content_hash` fails, so
+    # `stale_sources` skips it and the frozen counter cannot loop.)
+    target = tmp_path / "dir.c"
+    target.mkdir()  # read_bytes → IsADirectoryError, an OSError
+    marker = {"hash": "deadbeef", "attempts": 1}
+    with gate.gate_lock(str(tmp_path)):
+        state = gate.load_state(str(tmp_path))
+        state["pending"]["dir.c"] = dict(marker)
+        gate.save_state(str(tmp_path), state)
+
+    verdicts = gate.verify_and_record(str(target), project_dir=str(tmp_path))
+
+    assert [v.verdict for v in verdicts] == ["error"]
+    state = gate.load_state(str(tmp_path))
+    assert state["pending"]["dir.c"] == marker
+    assert gate.stale_sources(str(tmp_path), state, [str(target)]) == []
+
+
 # --- staged / committed blob freshness (issue #99 review) -------------------
 
 
