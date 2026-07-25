@@ -1,3 +1,10 @@
+# [1.6.0](https://github.com/pmatos/forseti/compare/v1.5.0...v1.6.0) (2026-07-25)
+
+
+### Features
+
+* **esbmc:** forward --esbmc-bin and build flags through `list-units` ([#131](https://github.com/pmatos/forseti/issues/131)) ([#143](https://github.com/pmatos/forseti/issues/143)) ([85208cf](https://github.com/pmatos/forseti/commit/85208cf41fbde052866e70abe787452837094816))
+
 # [1.5.0](https://github.com/pmatos/forseti/compare/v1.4.1...v1.5.0) (2026-07-25)
 
 
