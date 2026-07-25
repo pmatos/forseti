@@ -356,7 +356,7 @@ def _mirror_plan(
     """
     real_dirs: list[str] = []
     links: list[tuple[str, str]] = []
-    hopped: set[str] = set()
+    hopped: set[tuple[str, tuple[str, ...]]] = set()
     base = _mirror_root(src_dir, project_dir)
     steps = [] if src_dir == base else os.path.relpath(src_dir, base).split(os.sep)
     while True:
@@ -378,11 +378,25 @@ def _mirror_plan(
         # `os.path.realpath` reports ELOOP by giving up and returning the path
         # unchanged, so the guard has to be ours. The source could not have been
         # read through such a chain anyway; block rather than spin.
-        if link in hopped:
+        #
+        # Keyed on the *state* — the link plus what is left to walk — not on the
+        # link alone. Each hop consumes at least one of `rest`, and a resolved
+        # target contributes no further links, so the only way to spin is for the
+        # whole state to recur; a repeat is therefore a cycle by construction. The
+        # spelled link alone is not: `self -> .` walked as `self/self/x.c` reaches
+        # the same component twice with a shorter `rest` each time, terminates,
+        # and must not be turned into a blocking `error` on a path the kernel
+        # resolves fine.
+        state = (link, tuple(rest))
+        if state in hopped:
             raise OSError(errno.ELOOP, "symlinked directory component loops", link)
-        hopped.add(link)
+        hopped.add(state)
         target = os.path.realpath(link)
-        links.append((link, target))
+        # Deduped: the same component can legitimately be reached twice (the
+        # `self -> .` walk again), and staging one plan entry twice would raise
+        # `FileExistsError` at `os.symlink` — a blocking `error` by another route.
+        if (link, target) not in links:
+            links.append((link, target))
         # Against the *resolved* project dir: `target` is fully resolved, so that
         # is the apples-to-apples comparison, and a link that lands back inside a
         # project which is itself reached through a symlink keeps its full

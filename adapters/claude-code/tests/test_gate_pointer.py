@@ -16,6 +16,7 @@ broken launcher elsewhere is shadowed)::
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -1565,6 +1566,51 @@ def test_a_source_alias_leads_back_into_the_snapshot(
     ]
 
     assert names == ["from_the_snapshot"]
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_a_component_walked_twice_is_not_a_loop(tmp_path: Path) -> None:
+    # `self -> .` is a real idiom, and `self/self/x.c` is a perfectly ordinary path
+    # the kernel resolves in two hops. The loop guard keyed on the spelled link
+    # alone called that a cycle and turned an innocuous layout into a blocking
+    # `error` on every edit. Keyed on the walk *state*, the second visit has a
+    # shorter `rest` and is allowed — and the plan is deduped, since staging the
+    # same component twice would raise `FileExistsError` and block by another
+    # route.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "self").symlink_to(".")
+    (proj / "common.h").write_text("#define COMMON 1\n")
+    (proj / "x.c").write_text(
+        '#include "common.h"\nint f(int x) { return x + COMMON; }\n'
+    )
+    given = "self/self/x.c"
+
+    in_place = gate.extract_functions(given, project_dir=str(proj))
+    snapshotted = [
+        d.name
+        for d in gate.extract_function_defs(
+            given, project_dir=str(proj), content=(proj / "x.c").read_bytes()
+        )
+    ]
+
+    assert in_place == ["f"]
+    assert snapshotted == in_place
+
+
+def test_a_genuine_symlink_cycle_still_blocks(tmp_path: Path) -> None:
+    # The guard the fix above must not remove: `a -> b`, `b -> a`. `realpath` gives
+    # up and hands back the link unchanged, so the walk would revisit the identical
+    # state forever. Blocking is the honest answer — the kernel cannot read a
+    # source through that chain either.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "a").symlink_to(proj / "b")
+    (proj / "b").symlink_to(proj / "a")
+
+    with pytest.raises(OSError) as excinfo:
+        gate._mirror_plan(str(proj / "a"), str(proj))
+    assert excinfo.value.errno == errno.ELOOP
 
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
