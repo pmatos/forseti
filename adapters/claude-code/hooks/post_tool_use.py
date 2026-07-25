@@ -79,10 +79,11 @@ def main() -> int:
 
     if not verdicts:
         # Either the file defines no functions (any stale units were just
-        # reconciled), or a concurrent run superseded the bytes this one enumerated
-        # and owns the file's stamp, so `verify_and_record` deferred to it and wrote
-        # nothing. Both pass here: the owning run records — and blocks on — its own
-        # units. The `edit` event above logs an empty `functions` list either way.
+        # reconciled), or a concurrent run superseded the bytes this one gated —
+        # before the reconcile or during the verifies — and owns the file's stamp,
+        # so `verify_and_record` deferred to it and wrote nothing. Both pass here:
+        # the owning run records — and blocks on — its own units. The `edit` event
+        # above logs an empty `functions` list either way.
         return 0
 
     # NEEDS_CONTRACT (pointer/array units the gate can't check without a harness)

@@ -1384,15 +1384,43 @@ def verify_and_record(
     a `stop_attempts` reset. An empty return is therefore not by itself "the file
     defines no functions"; see the deferral below for why blocking instead would
     strand a `rel::?` nothing can clear.
+
+    The same deference applies at the far end of the run: if the post-verify drift
+    check withdraws this run's stamp and a concurrent run has stamped what is on
+    disk by the time the resulting block would be published, that block is
+    suppressed too — atomically with the record, see `unless_superseded`.
     """
     rel = unit_id(project_dir, file_path)
 
-    def _blocking_error(detail: str, *, digest: str | None = None) -> list[UnitVerdict]:
+    def _blocking_error(
+        detail: str, *, digest: str | None = None, unless_superseded: bool = False
+    ) -> list[UnitVerdict]:
         """Record a blocking `error` verdict for the whole file and return it.
 
         No caller stamps `scanned`: a file we could not read or enumerate must not
         be recorded as already-scanned, or the out-of-band scan would treat it as
         handled and the edit would pass unverified.
+
+        `unless_superseded` makes that record conditional, and the condition has to
+        be tested *here* rather than by the caller: testing it outside would only
+        move the gap to between the test and this lock. Set by the post-verify
+        drift caller, which has already given up its own stamp — so a stamp
+        vouching for the bytes on disk *now* can only be a concurrent run's, and
+        that run pre-recorded every unit of that content as blocking under the same
+        lock that stamped it. Publishing anyway would strand a `rel::?` nothing can
+        clear: the file hashes equal to the surviving stamp, so `stale_sources`
+        reads it as fresh, never re-offers it, and the reconcile that prunes `?`
+        never runs — the Stop-gate would then block its way to a loud residual on a
+        file that run legitimately verified. So on that path this writes nothing at
+        all, not even the `stop_attempts` reset, and returns no verdicts.
+
+        The test is "a stamp equal to what is on disk", deliberately not "a stamp
+        exists": a stamp that does *not* match disk leaves the file stale, so its
+        `?` is clearable by the next scan and suppressing it would drop a real
+        block on content nobody has gated. Nor is a stamp carrying *this* run's
+        `digest` excluded — after an A -> B -> A a concurrent run can re-stamp
+        byte-identical content, and it owns the file exactly as any other stamper
+        does.
 
         An unfinished-verify marker for `digest` is *spent one attempt*, never
         deleted (PR #148 review). Deleting is what the ownership rule forbids: this
@@ -1429,6 +1457,11 @@ def verify_and_record(
         verdict = UnitVerdict(f"{rel}::?", rel, "?", "error", k, detail=detail)
         with gate_lock(project_dir):
             state = load_state(project_dir)
+            if unless_superseded:
+                on_disk_now = content_hash(file_path)
+                stamp = state.get("scanned", {}).get(rel)
+                if on_disk_now is not None and stamp == on_disk_now:
+                    return []
             record(state, verdict)
             state["stop_attempts"] = 0
             pending = state.setdefault("pending", {})
@@ -1647,9 +1680,16 @@ def verify_and_record(
     # no `digest` regardless — the bytes it would name are no longer the ones on
     # disk, so charging their retry budget would spend a claim on content this
     # run is no longer speaking for.)
+    #
+    # The withdrawal above released the lock, so a concurrent hook can stamp and
+    # fully verify what is on disk before this block lands — after which a
+    # `rel::?` would be unclearable. `unless_superseded` re-tests ownership under
+    # the same lock that records the verdict; a test out here would only shrink
+    # that window, not close it.
     if withdrawn:
         return _blocking_error(
             "source changed while its units were being verified; the verdicts "
-            "describe content that is no longer on disk — re-edit to re-verify"
+            "describe content that is no longer on disk — re-edit to re-verify",
+            unless_superseded=True,
         )
     return verdicts

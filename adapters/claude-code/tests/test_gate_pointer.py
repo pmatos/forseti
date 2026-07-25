@@ -1060,6 +1060,113 @@ def test_rewrite_during_verify_defers_to_a_concurrent_runs_stamp(
     assert gate.blocking_units(after)
 
 
+def test_drift_block_defers_to_a_stamp_taken_after_the_withdrawal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The sibling above catches the concurrent run *before* the withdrawal; this
+    # one catches it after. Withdrawing releases the lock, so a hook for the newer
+    # content can stamp it and verify it through before the block is published.
+    # Published unconditionally, that `x.c::?` can never be cleared: the file
+    # hashes equal to the surviving stamp and no claim is left pending, so
+    # `stale_sources` never re-offers the file, the reconcile that prunes `?`
+    # never runs, and the Stop-gate blocks its way to a residual on a file the
+    # other run legitimately verified. The lock is the seam — the concurrent run's
+    # work lands on the first acquisition taken after this run gave up its stamp.
+    src = tmp_path / "x.c"
+    src.write_text("alpha\n")
+    _seed_scanned(tmp_path)
+    beta_digest = hashlib.sha256(b"beta\n").hexdigest()
+
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            verdict="verified",  # a clean verdict — for content no longer on disk
+            during_verify=f"open({str(src)!r}, 'w').write('beta\\n')",
+        ),
+    )
+    real_lock, landed = gate.gate_lock, []
+
+    @contextlib.contextmanager
+    def lock_a_concurrent_run_finished_in(project_dir: str):
+        with real_lock(project_dir):
+            state = gate.load_state(project_dir)
+            gave_up_the_stamp = "x.c" not in state["scanned"]
+            if not landed and gave_up_the_stamp and "x.c::alpha" in state["units"]:
+                landed.append(True)
+                state["scanned"]["x.c"] = beta_digest
+                gate.record(
+                    state,
+                    gate.UnitVerdict("x.c::beta", "x.c", "beta", "violated", 1),
+                )
+                gate.save_state(project_dir, state)
+            yield
+
+    monkeypatch.setattr(gate, "gate_lock", lock_a_concurrent_run_finished_in)
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert landed  # the interleaving under test really happened
+    assert verdicts == []  # deferred to the run that owns the file
+    after = gate.load_state(str(tmp_path))
+    assert "x.c::?" not in after["units"]  # no stranded, unclearable block
+    assert after["scanned"]["x.c"] == beta_digest  # the other run's stamp survives
+    assert after["units"]["x.c::beta"]["verdict"] == "violated"  # ...and its verdict
+    assert gate.blocking_units(after)  # which is what gates the Stop hook now
+    # Why an unconditional block would have stuck: nothing marks the file for a
+    # re-scan, so no later run would reach the reconcile that prunes the `?`.
+    assert gate.stale_sources(str(tmp_path), after, [str(src)]) == []
+
+
+def test_drift_block_still_lands_when_no_stamp_vouches_for_the_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The other half of that test: "a stamp exists" is not the condition — "a stamp
+    # equal to what is on disk" is. Here a concurrent run stamps a third content
+    # that never reaches disk, so nothing vouches for the bytes sitting there. The
+    # block must land, and it is clearable precisely because the file reads stale.
+    src = tmp_path / "x.c"
+    src.write_text("alpha\n")
+    _seed_scanned(tmp_path)
+    gamma_digest = hashlib.sha256(b"gamma\n").hexdigest()
+
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            verdict="verified",
+            during_verify=f"open({str(src)!r}, 'w').write('beta\\n')",
+        ),
+    )
+    real_lock, landed = gate.gate_lock, []
+
+    @contextlib.contextmanager
+    def lock_a_concurrent_run_stamped_other_content_in(project_dir: str):
+        with real_lock(project_dir):
+            state = gate.load_state(project_dir)
+            gave_up_the_stamp = "x.c" not in state["scanned"]
+            if not landed and gave_up_the_stamp and "x.c::alpha" in state["units"]:
+                landed.append(True)
+                state["scanned"]["x.c"] = gamma_digest
+                gate.save_state(project_dir, state)
+            yield
+
+    monkeypatch.setattr(
+        gate, "gate_lock", lock_a_concurrent_run_stamped_other_content_in
+    )
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert landed
+    assert [v.verdict for v in verdicts] == ["error"]  # not suppressed
+    after = gate.load_state(str(tmp_path))
+    assert after["units"]["x.c::?"]["verdict"] == "error"
+    assert gate.blocking_units(after)
+    # ...and it can be cleared: the file hashes to neither stamp, so the next scan
+    # re-offers it and the reconcile drops the `?`.
+    assert gate.stale_sources(str(tmp_path), after, [str(src)]) == [str(src)]
+
+
 def test_units_absent_payload_records_blocking_error(
     tmp_path: Path, monkeypatch
 ) -> None:
