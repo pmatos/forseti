@@ -1212,15 +1212,23 @@ def verify_and_record(
         with gate_lock(project_dir):
             state = load_state(project_dir)
             scanned = state.setdefault("scanned", {})
-            # Ownership-scoped: only drop the stamp if it is still the one *this*
-            # run wrote. A concurrent hook that has since re-stamped its own
-            # digest owns the entry, and popping it would re-gate its verified
-            # content.
-            if scanned.get(rel) == digest:
+            # Ownership-scoped, and the *whole* response hinges on it. A stamp
+            # that is still ours means nothing else vouches for this file, so
+            # withdraw it (that is what makes the out-of-band scan re-gate) and
+            # block. A stamp some concurrent hook has replaced belongs to that
+            # run: it stamped content it is itself reconciling, so leave it be
+            # AND do not block. Blocking anyway would strand a `rel::?` error
+            # that nothing can clear — the file now hashes equal to the surviving
+            # stamp, so the out-of-band scan reads it as fresh and never re-runs
+            # the reconcile that prunes `?`, and the Stop-gate would block on a
+            # file a newer run legitimately verified.
+            ours = scanned.get(rel) == digest
+            if ours:
                 scanned.pop(rel, None)
-            save_state(project_dir, state)
-        return _blocking_error(
-            "source changed while its units were being verified; the verdicts "
-            "describe content that is no longer on disk — re-edit to re-verify"
-        )
+                save_state(project_dir, state)
+        if ours:
+            return _blocking_error(
+                "source changed while its units were being verified; the verdicts "
+                "describe content that is no longer on disk — re-edit to re-verify"
+            )
     return verdicts

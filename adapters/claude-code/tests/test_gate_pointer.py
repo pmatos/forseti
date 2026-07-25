@@ -619,14 +619,17 @@ def test_transient_rewrite_during_verify_is_a_known_residual(
     assert gate.blocking_units(after) == []  # the residual: A passes on B's verdict
 
 
-def test_rewrite_during_verify_leaves_a_concurrent_runs_stamp_alone(
+def test_rewrite_during_verify_defers_to_a_concurrent_runs_stamp(
     tmp_path: Path, monkeypatch
 ) -> None:
-    # Withdrawing the stamp must be ownership-scoped: concurrent hooks share
-    # gate_state.json, so a run that has since re-stamped its own digest owns the
-    # entry. Popping it unconditionally would re-gate content that other run
-    # legitimately verified. Here the fake CLI both rewrites the source and
-    # stamps the new digest, standing in for that concurrent hook.
+    # Withdrawing the stamp must be ownership-scoped, and so must the block.
+    # Concurrent hooks share gate_state.json, so a run that has since re-stamped
+    # its own digest owns the entry — popping it would re-gate content that run
+    # legitimately verified, and blocking anyway would strand a `x.c::?` error
+    # nothing can clear: the file now hashes equal to the surviving stamp, so the
+    # out-of-band scan reads it as fresh and never re-runs the reconcile that
+    # prunes `?`. Here the fake CLI both rewrites the source and stamps the new
+    # digest, standing in for that concurrent hook.
     src = tmp_path / "x.c"
     src.write_text("alpha\n")
     _seed_scanned(tmp_path)
@@ -650,9 +653,10 @@ def test_rewrite_during_verify_leaves_a_concurrent_runs_stamp_alone(
     )
     verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
 
-    assert [v.verdict for v in verdicts] == ["error"]  # still fails closed for us
+    assert [v.function for v in verdicts] == ["alpha"]  # no blocking `?` verdict
     after = gate.load_state(str(tmp_path))
     assert after["scanned"]["x.c"] == beta_digest  # the other run's stamp survives
+    assert "x.c::?" not in after["units"]  # ...and no stranded, unclearable block
 
 
 def test_units_absent_payload_records_blocking_error(
