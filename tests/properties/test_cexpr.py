@@ -133,3 +133,69 @@ class TestDerefsOrSubscripts:
 
     def test_other_name_untouched(self) -> None:
         assert derefs_or_subscripts("*cp == 0", "count") is False
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            "result * cp >= 0",  # scalar output as the right factor -- #106
+            "result * (cp + 1) >= 0",  # parenthesized factor, not a deref
+            "result*cp >= 0",  # no whitespace around the binary `*`
+            "cp * result >= 0",  # left factor -- the form that never tripped it
+            "2 * cp >= 0",  # a numeric left operand precedes the `*`
+            "(a + b) * cp >= 0",  # a value group `)` precedes the `*`
+            "(a * b) * cp >= 0",  # a value group with an inner `*`, still not a cast
+            "arr[i] * cp >= 0",  # a closing `]` precedes the `*`
+            "sizeof(int) * cp >= 0",  # `name(...)` is a call, not a cast: a value `)`
+            "sizeof x * cp >= 0",  # `(sizeof x) * cp`: `x`, not `sizeof`, precedes `*`
+            "(x * volatile_flag) * cp >= 0",  # non-qualifier word: a value group
+        ],
+    )
+    def test_multiplication_is_not_a_pointer_use(self, expr: str) -> None:
+        # A binary `*` -- an operand (identifier, number, `)`, `]`) immediately
+        # before it -- multiplies the scalar-bound output; only a *unary* `*`
+        # dereferences it. A closing `)` counts as an operand only for a value
+        # group `(a + b)` or a call `f(x)`, never for a cast (see below).
+        assert derefs_or_subscripts(expr, "cp") is False
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            "(int)*cp == 0",  # a cast's `)`, not an operand -- unary deref
+            "(uint32_t) * cp == 0",  # whitespace around both the cast and the `*`
+            "(char *)*cp == 0",  # a pointer-type cast
+            "(const unsigned int)*cp == 0",  # a multi-word type cast
+            "(char * const)*cp == 0",  # a qualified pointer cast (`* const`)
+            "(char *const)*cp == 0",  # the same, no space before the qualifier
+            "(char * *)*cp == 0",  # a pointer-to-pointer cast (`* *`)
+            "(char * volatile)*cp == 0",  # `volatile`, like `const`, is a qualifier
+        ],
+    )
+    def test_casted_dereference_is_a_pointer_use(self, expr: str) -> None:
+        # A closing cast `)` before `*` does not make the `*` binary
+        # multiplication: `(int)*cp` unary-dereferences the scalar-bound `cp`.
+        # Missing this lets an invalid `*cp` on a scalar reach the emitted harness
+        # (the regression `_OPERAND_TAIL` reopened, caught on PR #136). Qualified
+        # (`* const`) and pointer-to-pointer (`* *`) spellings are casts too -- the
+        # word after a pointer `*` is a type qualifier, never an operand (PR #136).
+        assert derefs_or_subscripts(expr, "cp") is True
+
+    @pytest.mark.parametrize("expr", ["sizeof *cp >= 4", "x + sizeof *cp >= 4"])
+    def test_sizeof_before_star_is_a_dereference(self, expr: str) -> None:
+        # `sizeof` is a unary-operator keyword, so a `*` opening its operand is a
+        # dereference: `sizeof *cp` is `sizeof(*cp)`, not `(sizeof) * cp`. Reading
+        # the `f` of `sizeof` as an operand tail would emit `sizeof *cp` on a scalar
+        # (PR #136). Contrast `sizeof(int) * cp` / `sizeof x * cp` above, where a
+        # value `)` or a distinct operand -- not `sizeof` itself -- precedes the `*`.
+        assert derefs_or_subscripts(expr, "cp") is True
+
+    def test_parenthesized_single_name_reads_as_a_cast(self) -> None:
+        # `(result)` is lexically indistinguishable from a typedef-name cast, so a
+        # `*` after it is read as a unary deref -- the conservative reject side.
+        # Over-rejecting this exotic multiply is safe; emitting `*cp` on a scalar
+        # (were `result` really a type) is not.
+        assert derefs_or_subscripts("(result) * cp >= 0", "cp") is True
+
+    def test_multiplication_beside_a_genuine_deref_still_flags(self) -> None:
+        # The second `*` in `a * *cp` is unary (an operator, not an operand,
+        # precedes it), so the deref is still caught despite the multiplication.
+        assert derefs_or_subscripts("a * *cp >= 0", "cp") is True
