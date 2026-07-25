@@ -59,11 +59,11 @@ MAX_STOP_ATTEMPTS = 3
 # How many times the same file content may be *started* through `verify_and_record`
 # without its verdicts landing — a mid-run hook kill, or a scan that ended in a
 # blocking `error` — before the scan stops retrying it (issue #140). The same trade
-# as MAX_STOP_ATTEMPTS, one layer down: retrying is
-# what recovers a killed verify, but an unbounded retry of a file that can never
-# finish inside the hook budget would reset `stop_attempts` every round and loop
-# forever. Once exhausted, the file's still-pending `unknown` units keep blocking
-# and reach the loud residual via MAX_STOP_ATTEMPTS.
+# as MAX_STOP_ATTEMPTS, one layer down: retrying is what recovers a killed verify,
+# but an unbounded retry of a file that can never finish inside the hook budget
+# would reset `stop_attempts` every round and loop forever. Once exhausted, the
+# file's still-pending `unknown` units keep blocking and reach the loud residual
+# via MAX_STOP_ATTEMPTS.
 MAX_PENDING_VERIFY_ATTEMPTS = 3
 
 C_SUFFIXES = {".c", ".h"}
@@ -1005,9 +1005,9 @@ def verify_and_record(
     def _blocking_error(detail: str, *, digest: str | None = None) -> list[UnitVerdict]:
         """Record a blocking `error` verdict for the whole file and return it.
 
-        No caller stamps `scanned`: a file we could not read or enumerate
-        must not be recorded as already-scanned, or the out-of-band scan would
-        treat it as handled and the edit would pass unverified.
+        No caller stamps `scanned`: a file we could not read or enumerate must not
+        be recorded as already-scanned, or the out-of-band scan would treat it as
+        handled and the edit would pass unverified.
 
         An unfinished-verify marker for `digest` is *spent one attempt*, never
         deleted (PR #148 review). Deleting is what the ownership rule forbids: this
