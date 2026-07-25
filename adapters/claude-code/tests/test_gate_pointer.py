@@ -1468,6 +1468,48 @@ def test_symlink_out_of_the_project_blocks_rather_than_switching_headers(
 
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_dotdot_in_the_given_path_stages_where_the_kernel_lands(
+    tmp_path: Path,
+) -> None:
+    # The same divergence one level earlier: not a `..` inside an `#include`, but
+    # one in the path the hook was handed. `abspath` collapses `proj/link/../x.c`
+    # to `proj/x.c` lexically, while the read and the verify both go through the
+    # kernel, which resolves `link` first and lands on `vendor/x.c`. Staged at the
+    # collapsed path, the snapshot would wrap the *other* file's bytes in the
+    # project's headers — a different `#if` branch, so enumeration reports a unit
+    # the verify never sees, prunes the rest, and stamps the file.
+    proj = tmp_path / "proj"
+    vendor = tmp_path / "vendor"
+    (vendor / "pkg").mkdir(parents=True)
+    proj.mkdir()
+    (proj / "link").symlink_to(vendor / "pkg")
+    (vendor / "selector.h").write_text("#define PICK_TARGET 1\n")
+    (proj / "selector.h").write_text("#define PICK_SPELLED 1\n")
+    src = vendor / "x.c"
+    src.write_text(
+        '#include "selector.h"\n'
+        "#ifdef PICK_TARGET\n"
+        "int target_won(int x) { return x; }\n"
+        "#endif\n"
+        "#ifdef PICK_SPELLED\n"
+        "int spelled_won(int x) { return x; }\n"
+        "#endif\n"
+    )
+    given = "link/../x.c"
+
+    in_place = gate.extract_functions(given, project_dir=str(proj))
+    snapshotted = [
+        d.name
+        for d in gate.extract_function_defs(
+            given, project_dir=str(proj), content=src.read_bytes()
+        )
+    ]
+
+    assert in_place == ["target_won"]  # what the kernel — and so the verify — sees
+    assert snapshotted == in_place
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
 def test_function_like_macro_not_enumerated(tmp_path: Path) -> None:
     # A function-like macro is not a definition — the authoritative parse ignores
     # it, where the regex could false-match its `NAME(args)` shape.

@@ -234,6 +234,33 @@ def _func_def(unit: object) -> FuncDef:
     return FuncDef(name, takes_pointer)
 
 
+def _kernel_dir(path: str) -> str:
+    """`path` with each ``..`` resolved the way the kernel walks it, nothing else.
+
+    `os.path.abspath` collapses ``a/link/..`` to ``a`` lexically, but the kernel
+    resolves ``link`` before it climbs, landing on the parent of the link's
+    *target*. Since the gate reads and verifies through that same kernel walk, a
+    snapshot staged at the collapsed path would stand in for a different file's
+    neighbourhood — or a different file altogether.
+
+    Only ``..`` forces a resolution. A symlinked component *not* followed by one
+    stays spelled, so `_mirror_plan` still sees it and reproduces it as a symlink
+    — which is what keeps the two ways of resolving a ``..`` inside an ``#include``
+    agreeing (see there). Paths without ``..`` come back untouched.
+    """
+    cur = os.sep if os.path.isabs(path) else os.getcwd()
+    for part in path.split(os.sep):
+        if not part or part == os.curdir:
+            continue
+        if part == os.pardir:
+            # `dirname` of the *resolved* path: ``/`` is its own parent, which is
+            # also what a climb past the root does in place.
+            cur = os.path.dirname(os.path.realpath(cur))
+        else:
+            cur = os.path.join(cur, part)
+    return cur
+
+
 def _mirror_root(src_dir: str, project_dir: str) -> str:
     """The highest ancestor of `src_dir` whose entries the snapshot mirrors.
 
@@ -397,21 +424,28 @@ def _enumerable_source(
     clang's ``-iquote``, exposing only ``-I``/``--idirafter``.) Mirroring needs no
     flag at all and leaves every search path exactly as it was.
 
-    The source's own path is derived **lexically** — absolutized against
+    The source's own path is derived **as spelled** — absolutized against
     `project_dir` (the subprocess's cwd) but never `resolve()`d — and the
-    snapshot is staged at that spelled path. clang searches the directory of the
-    path it was *given*, so for a symlinked source file resolving would mirror
-    the link target's directory instead: a header beside the link would go
-    missing, and a same-named header beside the target would be silently
-    preferred. Directory *components* of that path are a separate question and
-    are resolved, because the kernel resolves them when it walks a ``..``; see
-    `_mirror_plan`.
+    snapshot is staged there. clang searches the directory of the path it was
+    *given*, so for a symlinked source file resolving would mirror the link
+    target's directory instead: a header beside the link would go missing, and a
+    same-named header beside the target would be silently preferred.
+
+    One part of it is not spelled: a ``..`` in the given path is resolved the way
+    the kernel walks it (`_kernel_dir`). The kernel is what picked the file whose
+    bytes were hashed and what will pick it again for the verify, so collapsing
+    ``proj/link/../x.c`` lexically to ``proj/x.c`` would surround content read
+    from the link target's parent with the *project's* headers — a different
+    translation unit, which is the failure this staging exists to prevent.
+    Symlinked directory components not followed by a ``..`` stay spelled and are
+    reproduced as symlinks; see `_mirror_plan`.
     """
     if content is None:
         yield str(file_path)
         return
-    target = os.path.abspath(os.path.join(project_dir, os.fspath(file_path)))
-    src_dir, name = os.path.dirname(target), os.path.basename(target)
+    spelled = os.path.join(project_dir, os.fspath(file_path))
+    src_dir, name = _kernel_dir(os.path.dirname(spelled)), os.path.basename(spelled)
+    target = os.path.join(src_dir, name)
     # Every `OSError` the staging can raise — an unwritable/missing `TMPDIR`,
     # `ENOSPC`, `EDQUOT`, an unreadable directory anywhere on the mirrored chain,
     # a failed cleanup — has to land as `UnitsUnavailable`, the one exception
