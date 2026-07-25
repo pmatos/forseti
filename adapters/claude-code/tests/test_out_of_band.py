@@ -376,9 +376,14 @@ def test_blocking_error_on_a_retry_spends_an_attempt(
 ) -> None:
     # Every error path returns BEFORE the block that bumps the retry counter, so a
     # marker left behind by a previous kill would make a persistently-erroring file
-    # re-verify forever with the counter frozen (each error resets stop_attempts).
-    # The error charges the marker one attempt instead — the killed run's units stay
-    # retryable, and the retries still run out.
+    # re-verify forever with the counter frozen. The error charges the marker one
+    # attempt instead — the killed run's units stay retryable, and the retries still
+    # run out.
+    #
+    # The charge happens even though the verdict is *not* recorded here: the killed
+    # run stamped these bytes, so a `?` would be unclearable the moment that run's
+    # successor finishes, while the retry budget still has to shrink. What keeps the
+    # turn blocked is that run's own pending `unknown`.
     src = tmp_path / "broken.c"
     src.write_text("int f(void){return 0;}\n")
     _enumerate_one_unit(monkeypatch)
@@ -392,10 +397,11 @@ def test_blocking_error_on_a_retry_spends_an_attempt(
     monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
     verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
 
-    assert [v.verdict for v in verdicts] == ["error"]
+    assert verdicts == []
     state = gate.load_state(str(tmp_path))
+    assert "broken.c::?" not in state["units"]
     assert state["pending"]["broken.c"]["attempts"] == 2  # charged, not frozen
-    assert gate.blocking_units(state)  # the error itself keeps the turn blocked
+    assert gate.blocking_units(state)  # the killed run's unit keeps the turn blocked
     # The kill's pending `unknown` unit is still retryable — the point of the marker.
     assert gate.stale_sources(str(tmp_path), state, [str(src)]) == [str(src)]
 
@@ -641,11 +647,10 @@ def test_blocking_error_preserves_a_newer_runs_pending_marker(
     # newer run's marker — a claim on content this error says nothing about — must
     # come through the error unchanged, counter included.
     #
-    # The error *is* published here, even though a newer stamp matches disk: that
-    # run left an unfinished claim, so the file still reads stale and the `?` is
-    # clearable by the scan that claim triggers. Suppression is only for a file
-    # nothing would ever offer again — see
-    # `test_enumeration_failure_defers_to_a_run_that_already_finished`.
+    # It comes through untouched here in the strongest way — nothing is written at
+    # all. The newer run's stamp vouches for what is on disk, so this error is
+    # deferred, and the claim it would otherwise charge records *other* bytes than
+    # the ones this run read.
     src = tmp_path / "err.c"
     src.write_text("int f(void){return 0;}\n")
     newer: dict[str, str] = {}
@@ -663,8 +668,9 @@ def test_blocking_error_preserves_a_newer_runs_pending_marker(
     )
     verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
 
-    assert [v.verdict for v in verdicts] == ["error"]  # this scan still blocks
+    assert verdicts == []  # deferred to the run that owns what is on disk
     state = gate.load_state(str(tmp_path))
+    assert "err.c::?" not in state["units"]
     assert state["pending"]["err.c"] == {
         "hash": newer["digest"],
         "attempts": 1,
@@ -792,12 +798,12 @@ def test_blocking_error_preserves_a_concurrent_same_content_marker(
     monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
     verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
 
-    assert [v.verdict for v in verdicts] == ["error"]
+    assert verdicts == []  # the killed run stamped these bytes; it owns the file
     state = gate.load_state(str(tmp_path))
     assert state["pending"]["shared.c"] == {
         "hash": digest,
-        "attempts": 2,  # charged...
-        "pid": os.getpid() + 1,  # ...but still the creating run's marker
+        "attempts": 2,  # charged anyway — the budget shrinks even when quiet...
+        "pid": os.getpid() + 1,  # ...and it is still the creating run's marker
     }
     assert state["units"]["shared.c::f"]["verdict"] == "unknown"  # still pending
     assert state["scanned"]["shared.c"] == digest  # content-fresh by hash...
@@ -845,9 +851,11 @@ def test_recovered_enumeration_clears_the_error_and_the_marker(
 ) -> None:
     # The other direction: `forseti`/esbmc was briefly unavailable. Charging the
     # marker keeps the file a retry candidate, so the scan that finds the CLI again
-    # re-verifies it — and the whole-file `error` unit is reconciled away by the
-    # up-front prune (`?` is not a function the file defines), so a transient
-    # failure cannot leave the turn blocked forever.
+    # re-verifies it — and a transient failure cannot leave the turn blocked
+    # forever. Two things make that true: the failing scan records no `?` at all
+    # while the killed run's stamp still vouches for these bytes, and any `?` that
+    # *was* recorded (a scan of content nothing vouches for) is reconciled away by
+    # the up-front prune, since `?` is not a function the file defines.
     _git_init(tmp_path)
     src = tmp_path / "flaky.c"
     src.write_text("int f(void){return 0;}\n")
@@ -861,7 +869,10 @@ def test_recovered_enumeration_clears_the_error_and_the_marker(
 
     monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
     _run(post_bash.main, tmp_path, monkeypatch)
-    assert gate.load_state(str(tmp_path))["units"]["flaky.c::?"]["verdict"] == "error"
+    blocked = gate.load_state(str(tmp_path))
+    assert "flaky.c::?" not in blocked["units"]  # nothing stranded to clear
+    assert gate.blocking_units(blocked)  # ...and the turn is blocked regardless
+    assert blocked["pending"]["flaky.c"]["attempts"] == 2  # the budget still shrank
 
     _enumerate_one_unit(monkeypatch)  # the CLI is back
     monkeypatch.setattr(gate, "verify_function", _verified_verdict("flaky.c"))
