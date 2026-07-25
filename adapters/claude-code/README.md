@@ -175,6 +175,7 @@ turns a verdict into an error.
 | Unwind bound *k* | `FORSETI_UNWIND` env | `1` | a `VERIFIED` is only "up to k"; **loops need a higher k** |
 | Verify timeout | `FORSETI_VERIFY_TIMEOUT_S` env | `110` | per-function budget, passed to `forseti verify --timeout` so ESBMC honors it (the subprocess is bounded ~15 s higher). Each verdict is persisted the moment it lands, so the `300` s PostToolUse hook timeout must stay above this per-function budget — raise both together for very slow units. |
 | List-units timeout | `FORSETI_LIST_UNITS_TIMEOUT_S` env | `30` | budget for the one `forseti list-units` parse per edited file; a `--parse-tree-only` run does no solving, so this rarely needs raising |
+| Build flags | `FORSETI_BUILD_FLAGS` env | *(none)* | the project's own `-I`/`-D`, shell-quoted (`-Iinclude -Ivendor/tls -DNDEBUG`). Forwarded to **both** `forseti list-units` and `forseti verify`, so the enumeration and the verify see the same translation unit. Set this if your C only compiles with include paths: without them ESBMC cannot resolve an `#include`, the enumeration fails, and every edited file blocks with an `error`. Unlike `SAFETY_FLAGS` these are build-time, not property-checking, flags. |
 | Stop-gate attempts | `MAX_STOP_ATTEMPTS` in `forseti_gate.py` | `3` | blocks then lets the turn end with a loud residual |
 | Out-of-band include | `FORSETI_GATE_INCLUDE` env | *(all C files)* | `:`/`,`-separated globs; if set, only changed C files matching one are scanned. A bare name (`src`) matches any path segment; a glob (`kernels/*.c`) matches the project-relative path. |
 | Out-of-band exclude | `FORSETI_GATE_EXCLUDE` env | `third_party`, `vendor`, `node_modules` | same syntax; excludes win over includes. Setting it **replaces** the defaults. Git's own ignore rules already drop gitignored build output before this applies. |
@@ -187,7 +188,9 @@ turns a verdict into an error.
   all classified correctly (no regex, issue #131). Each edited `.c` file gets one
   extra `--parse-tree-only` parse (no solving, fast); if enumeration fails (esbmc
   missing, C parse error) the file's units are recorded as a blocking ERROR
-  verdict rather than silently skipped.
+  verdict rather than silently skipped. A file that only parses with the
+  project's include paths needs `FORSETI_BUILD_FLAGS` set — an unresolvable
+  `#include` is such a failure.
 - **Only `.c` translation units are verified; header definitions are out of
   scope.** ESBMC cannot parse a `.h` standalone (`forseti verify`/`list-units`
   both error with "failed to figure out type of file"), and a function defined in

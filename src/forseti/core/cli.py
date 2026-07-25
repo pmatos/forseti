@@ -6,6 +6,11 @@ Subcommands:
   for the same payload the MCP tool returns). Its exit code follows Core's
   verdict contract (:data:`forseti.core.EXIT_CODES`): VERIFIED=0, VIOLATED=1,
   UNKNOWN=2, ERROR=3 — an inconclusive run is never a silent pass.
+- ``forseti list-units <source>`` — enumerate the source's function definitions
+  and their canonical (typedef-resolved) parameter types from ESBMC's own clang
+  frontend (``--json`` for a machine-readable payload). The harness adapters call
+  this instead of pattern-matching signatures themselves, so the frontend that
+  *verifies* a unit is also the one that finds it (#131).
 - ``forseti synth <source> --function NAME`` — synthesise an L0 memory
   precondition for that pointer-taking unit (RFC-0003 S2) and verify against it,
   reporting an honestly-labelled assessment (``--emit-only`` prints the generated
@@ -32,6 +37,7 @@ from pathlib import Path
 from forseti.esbmc import (
     ListUnitsError,
     Violated,
+    add_esbmc_invocation_arguments,
     add_verify_arguments,
     list_units,
     render_result,
@@ -96,6 +102,14 @@ def _run_verify(args: argparse.Namespace) -> int:
     return EXIT_CODES[result.verdict]
 
 
+_LIST_UNITS_PASSTHROUGH_HELP = (
+    "flags forwarded verbatim to the esbmc parse; place them after a `--` "
+    "separator, e.g. `... file.c -- -Iinclude -DNDEBUG`. Use this for the build "
+    "flags the translation unit needs to parse at all — a missing `-I` makes "
+    "esbmc exit nonzero and the listing fail rather than report no units"
+)
+
+
 def _add_list_units_parser(
     sub: argparse._SubParsersAction[argparse.ArgumentParser],
 ) -> None:
@@ -123,11 +137,23 @@ def _add_list_units_parser(
         action="store_true",
         help="emit the units as a JSON object",
     )
+    # Same `--esbmc-bin` + `--` passthrough surface as `forseti verify`, so a
+    # translation unit that only *parses* with build flags can be enumerated at
+    # all: without its `-I`, esbmc exits nonzero on the `#include` and the listing
+    # raises rather than returning units. `-D` goes further than convenience —
+    # it changes *which* functions exist, so a gate that enumerates without the
+    # project's defines would miss units the verify then has to check.
+    add_esbmc_invocation_arguments(p, passthrough_help=_LIST_UNITS_PASSTHROUGH_HELP)
 
 
 def _run_list_units(args: argparse.Namespace) -> int:
     try:
-        units = list_units(args.source, timeout_s=args.timeout)
+        units = list_units(
+            args.source,
+            esbmc_bin=args.esbmc_bin,
+            timeout_s=args.timeout,
+            extra_flags=tuple(args.esbmc_args),
+        )
     except ListUnitsError as exc:
         print(f"forseti list-units: {exc}", file=sys.stderr)
         return 1

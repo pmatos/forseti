@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,52 @@ from pathlib import Path, PurePosixPath
 # left OFF — wraparound is legal and common (hashes, counters) and enabling it
 # yields false positives. Tune here; this is the one knob that defines "safe".
 SAFETY_FLAGS: tuple[str, ...] = ("--overflow-check",)
+
+
+class UnitsUnavailable(RuntimeError):
+    """A file's function definitions could not be enumerated.
+
+    Distinct from "the file defines no functions" (an empty list): a failed
+    enumeration must surface as a blocking `error` verdict, never be mistaken for
+    a clean pass (kill-safety — a not-verified unit can't silently slip through).
+    Raised when `forseti list-units` cannot be run or its payload is unusable, and
+    when the gate's own configuration is (`FORSETI_BUILD_FLAGS`).
+    """
+
+
+def _build_flags() -> tuple[str, ...]:
+    """The project's build flags (`-I`, `-D`, ...) from ``FORSETI_BUILD_FLAGS``.
+
+    Read per call, not once at import, so a hook process that sets the variable
+    after this module loads still sees it. Split with `shlex` (stdlib — the hooks
+    stay dependency-free) so a quoted path with spaces survives as one argument.
+
+    Kept separate from `SAFETY_FLAGS` because the two have different destinations:
+    build flags describe how the *translation unit* is constructed, so they must
+    reach the `list-units` parse as well as the verify, while `--overflow-check`
+    is a property-checking flag that means nothing to a `--parse-tree-only` run.
+    Passing the wrong set to either is the failure this split exists to prevent —
+    without its `-I` the enumeration fails outright (a blocking `error` on every
+    edited file), and a missing `-D` silently changes *which* functions the file
+    even defines, so the gate would verify a different unit list than the project
+    builds.
+
+    Unbalanced quoting raises `UnitsUnavailable` rather than escaping as a bare
+    `ValueError`: quoting *is* this knob's interface (that is the whole reason for
+    `shlex`), so a typo is the expected user error, and it has to land as the
+    blocking verdict the gate is built around instead of a hook traceback.
+    Degrading to no flags would be worse than either — it drops the `-I` and
+    resurfaces as a baffling `PARSING ERROR` on a file that is perfectly fine.
+    """
+    raw = os.environ.get("FORSETI_BUILD_FLAGS", "")
+    try:
+        return tuple(shlex.split(raw))
+    except ValueError as exc:
+        raise UnitsUnavailable(
+            f"FORSETI_BUILD_FLAGS is not parseable as a shell word list ({exc}): "
+            f"{raw!r} — check for an unbalanced quote"
+        ) from exc
+
 
 # The default loop-unwind bound k. A VERIFIED is only ever "verified up to k".
 # Override per project with FORSETI_UNWIND; functions with loops need a higher k
@@ -140,15 +187,6 @@ class FuncDef:
     takes_pointer: bool
 
 
-class UnitsUnavailable(RuntimeError):
-    """`forseti list-units` could not enumerate a file's function definitions.
-
-    Distinct from "the file defines no functions" (an empty list): a failed
-    enumeration must surface as a blocking `error` verdict, never be mistaken for
-    a clean pass (kill-safety — a not-verified unit can't silently slip through).
-    """
-
-
 def _func_def(unit: object) -> FuncDef:
     """One `units` entry → `FuncDef`, with both fields type-checked, never coerced.
 
@@ -216,6 +254,14 @@ def extract_function_defs(
         "--timeout",
         str(LIST_UNITS_TIMEOUT_S),
     ]
+    # The parse needs the project's own `-I`/`-D` — a translation unit whose
+    # `#include` cannot be resolved makes esbmc exit nonzero, which is a blocking
+    # `error` on every edited file rather than a listing. Only the build flags go
+    # here: `SAFETY_FLAGS` is for the verify, and a property flag on a
+    # `--parse-tree-only` run is at best inert.
+    build_flags = _build_flags()
+    if build_flags:
+        argv += ["--", *build_flags]
     try:
         proc = subprocess.run(
             argv,
@@ -666,6 +712,15 @@ def verify_function(
     """Run ``forseti verify`` on one function and map its JSON payload to a verdict."""
     rel = unit_id(project_dir, file_path)
     uid = f"{rel}::{function}"
+    try:
+        # Same build flags the enumeration parsed with, so the verify sees the
+        # same translation unit the unit list was taken from. Unparseable config
+        # becomes this unit's `error` verdict rather than a hook traceback — a
+        # direct caller (not coming through `verify_and_record`, which fails at
+        # enumeration first) must still get a verdict back.
+        build_flags = _build_flags()
+    except UnitsUnavailable as exc:
+        return UnitVerdict(uid, rel, function, "error", k, detail=str(exc))
     argv = [
         *resolve_forseti_cmd(),
         "verify",
@@ -679,6 +734,7 @@ def verify_function(
         "--json",
         "--",
         *SAFETY_FLAGS,
+        *build_flags,
     ]
     try:
         proc = subprocess.run(

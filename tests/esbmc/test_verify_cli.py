@@ -87,6 +87,53 @@ def test_verify_kwargs_extra_flags_is_a_tuple() -> None:
     assert isinstance(verify_cli.verify_kwargs(args)["extra_flags"], tuple)
 
 
+def _parse_invocation_only(
+    *argv: str, help_text: str | None = None
+) -> argparse.Namespace:
+    """Parse against a parser carrying *only* the shared esbmc-invocation surface."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("source")
+    if help_text is None:
+        verify_cli.add_esbmc_invocation_arguments(parser)
+    else:
+        verify_cli.add_esbmc_invocation_arguments(parser, passthrough_help=help_text)
+    return parser.parse_args(list(argv))
+
+
+def test_invocation_arguments_stand_alone_without_the_verify_surface() -> None:
+    # `forseti list-units` drives esbmc for a `--parse-tree-only` parse, which has
+    # no k and no entry function — so the binary selector and the passthrough must
+    # be usable without dragging in `-k`/`--function`.
+    args = _parse_invocation_only("f.c", "--esbmc-bin", "/opt/esbmc", "--", "-Iinc")
+    assert args.esbmc_bin == "/opt/esbmc"
+    assert args.esbmc_args == ["-Iinc"]
+    assert not hasattr(args, "unwind")
+    assert not hasattr(args, "function")
+
+
+def test_invocation_arguments_defaults() -> None:
+    args = _parse_invocation_only("f.c")
+    assert args.esbmc_bin == "esbmc"
+    assert args.esbmc_args == []
+
+
+def test_invocation_passthrough_help_is_caller_specific() -> None:
+    # The `--` mechanism is shared, the *example* is not: `--overflow-check` is
+    # the verify's, `-I`/`-D` the parse's. A caller-supplied help string is what
+    # keeps one shared registration from documenting the wrong flags.
+    parser = argparse.ArgumentParser(prog="p")
+    parser.add_argument("source")
+    verify_cli.add_esbmc_invocation_arguments(parser, passthrough_help="use -Iinc")
+    assert "use -Iinc" in parser.format_help()
+    assert "--overflow-check" not in parser.format_help()
+
+
+def test_verify_surface_keeps_the_default_passthrough_help() -> None:
+    parser = argparse.ArgumentParser(prog="p")
+    verify_cli.add_verify_arguments(parser)
+    assert "--overflow-check" in parser.format_help()
+
+
 def test_core_verify_reuses_the_same_default_constants() -> None:
     # core's library/MCP defaults re-source the shared CLI defaults rather than
     # defining their own copy, so the two entry points can never drift on k or

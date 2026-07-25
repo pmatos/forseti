@@ -40,13 +40,44 @@ _PASSTHROUGH_HELP = (
 )
 
 
+def add_esbmc_invocation_arguments(
+    parser: argparse.ArgumentParser, *, passthrough_help: str = _PASSTHROUGH_HELP
+) -> None:
+    """Register the ``--esbmc-bin`` selector and the trailing esbmc passthrough.
+
+    The half of the esbmc argument surface that is *not* verify-specific: which
+    binary to run and which flags to forward to it. Split out so a subcommand that
+    drives esbmc for something other than a verify — ``forseti list-units``, whose
+    ``--parse-tree-only`` run has no ``k`` and no entry function — gets the same
+    ``--esbmc-bin`` spelling and the same ``--`` convention without inheriting
+    ``-k``/``--function``. `passthrough_help` is the one part worth varying: the
+    flags that matter differ per subcommand (``--overflow-check`` for a verify,
+    ``-I``/``-D`` for a parse).
+
+    Registers ``esbmc_args`` as a trailing positional, so call it *after* the
+    caller's own positionals — argparse binds positionals in declaration order.
+    """
+    parser.add_argument(
+        "--esbmc-bin",
+        default="esbmc",
+        help="esbmc binary to invoke (default: esbmc on PATH)",
+    )
+    parser.add_argument(
+        "esbmc_args",
+        nargs="*",
+        metavar="ESBMC_ARG",
+        help=passthrough_help,
+    )
+
+
 def add_verify_arguments(parser: argparse.ArgumentParser) -> None:
     """Register the shared verify argument surface on `parser`.
 
-    Adds ``source``, ``-k/--unwind``, ``-t/--timeout``, ``--function``,
-    ``--esbmc-bin``, and the trailing ``esbmc_args`` passthrough — the exact set
-    both CLIs need. Callers layer their own extras on top (``forseti verify`` adds
-    ``--json``); everything shared is spelled here once.
+    Adds ``source``, ``-k/--unwind``, ``-t/--timeout``, ``--function``, and (via
+    `add_esbmc_invocation_arguments`) ``--esbmc-bin`` plus the trailing
+    ``esbmc_args`` passthrough — the exact set both CLIs need. Callers layer their
+    own extras on top (``forseti verify`` adds ``--json``); everything shared is
+    spelled here once.
     """
     parser.add_argument("source", type=Path, help="source file to verify")
     parser.add_argument(
@@ -72,17 +103,7 @@ def add_verify_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="NAME",
         help="entry function to verify (default: ESBMC's, i.e. main)",
     )
-    parser.add_argument(
-        "--esbmc-bin",
-        default="esbmc",
-        help="esbmc binary to invoke (default: esbmc on PATH)",
-    )
-    parser.add_argument(
-        "esbmc_args",
-        nargs="*",
-        metavar="ESBMC_ARG",
-        help=_PASSTHROUGH_HELP,
-    )
+    add_esbmc_invocation_arguments(parser)
 
 
 def verify_kwargs(args: argparse.Namespace) -> dict[str, Any]:
