@@ -56,6 +56,15 @@ LIST_UNITS_TIMEOUT_S = float(os.environ.get("FORSETI_LIST_UNITS_TIMEOUT_S", "30"
 # loop either).
 MAX_STOP_ATTEMPTS = 3
 
+# How many times the same file content may be *started* through `verify_and_record`
+# without its verdicts landing (a mid-run hook kill) before the scan stops retrying
+# it (issue #140). The same trade as MAX_STOP_ATTEMPTS, one layer down: retrying is
+# what recovers a killed verify, but an unbounded retry of a file that can never
+# finish inside the hook budget would reset `stop_attempts` every round and loop
+# forever. Once exhausted, the file's still-pending `unknown` units keep blocking
+# and reach the loud residual via MAX_STOP_ATTEMPTS.
+MAX_PENDING_VERIFY_ATTEMPTS = 3
+
 C_SUFFIXES = {".c", ".h"}
 
 # Out-of-band discovery (issue #99): a C file written via the `Bash` tool
@@ -555,20 +564,51 @@ def discover_changed_c_sources(
     return found
 
 
-def stale_sources(project_dir: str, state: dict, files: Iterable[str]) -> list[str]:
-    """Subset of `files` whose content differs from the last recorded verify.
+def _pending_attempts(entry: object, digest: str) -> int | None:
+    """Unfinished-verify count `entry` records for `digest`, else ``None``.
 
-    A file is stale when it has never been verified (`scanned` has no entry) or
-    its current content hash differs from the recorded one — i.e. it was written
-    or modified out-of-band since the gate last saw it.
+    ``None`` means "no unfinished verify of this content" — the entry is absent,
+    malformed, or records different bytes. A present entry with an unreadable
+    counter reads as ``0`` (retry) rather than as exhausted, and the retry rewrites
+    the counter as an int, so a corrupt value can never loop.
+    """
+    if not isinstance(entry, dict) or entry.get("hash") != digest:
+        return None
+    attempts = entry.get("attempts")
+    return attempts if isinstance(attempts, int) and attempts > 0 else 0
+
+
+def stale_sources(project_dir: str, state: dict, files: Iterable[str]) -> list[str]:
+    """Subset of `files` needing a (re-)verify: changed content, or a killed verify.
+
+    A file is stale when it has never been verified (`scanned` has no entry), when
+    its current content hash differs from the recorded one — i.e. it was written or
+    modified out-of-band since the gate last saw it — or when an **unfinished**
+    verify of exactly this content is on record (issue #140).
+
+    That last case closes the kill hole: `verify_and_record` stamps `scanned[rel]`
+    up front (the dedup that protects `stop_attempts`), so a hook killed after the
+    pre-record but before the verdicts landed leaves the file content-*fresh* while
+    its units sit at pending `unknown`. The scan would then skip the file forever
+    and the gate could only keep blocking on units nothing would ever retry, until
+    the attempt cap turned them into a residual. `pending` marks such a file for
+    retry — bounded by `MAX_PENDING_VERIFY_ATTEMPTS`, after which the pending units
+    reach that loud residual rather than the retry looping forever. Keyed on the
+    recorded hash, so it is a pending verify *of this content*, never a blanket
+    "any `unknown` unit is stale" (a genuine ESBMC-timeout `unknown` is a final
+    verdict — re-verifying it every scan would never terminate).
     """
     scanned = state.get("scanned", {})
+    pending = state.get("pending", {})
     stale: list[str] = []
     for abspath in files:
         digest = content_hash(abspath)
         if digest is None:
             continue
-        if scanned.get(unit_id(project_dir, abspath)) != digest:
+        rel = unit_id(project_dir, abspath)
+        attempts = _pending_attempts(pending.get(rel), digest)
+        unfinished = attempts is not None and attempts < MAX_PENDING_VERIFY_ATTEMPTS
+        if scanned.get(rel) != digest or unfinished:
             stale.append(abspath)
     return stale
 
@@ -769,11 +809,18 @@ def load_state(project_dir: str) -> dict:
             state.setdefault("units", {})
             state.setdefault("stop_attempts", 0)
             state.setdefault("scanned", {})
+            state.setdefault("pending", {})
             state.setdefault("baseline_head", None)
             return state
         except (json.JSONDecodeError, OSError):
             pass
-    return {"units": {}, "stop_attempts": 0, "scanned": {}, "baseline_head": None}
+    return {
+        "units": {},
+        "stop_attempts": 0,
+        "scanned": {},
+        "pending": {},
+        "baseline_head": None,
+    }
 
 
 def save_state(project_dir: str, state: dict) -> None:
@@ -833,6 +880,7 @@ def prune_deleted_units(state: dict, project_dir: str) -> list[str]:
     """
     units = state.get("units", {})
     scanned = state.get("scanned", {})
+    pending = state.get("pending", {})
     pruned: list[str] = []
     gone_rels: set[str] = set()
     for uid, unit in list(units.items()):
@@ -845,6 +893,7 @@ def prune_deleted_units(state: dict, project_dir: str) -> list[str]:
             gone_rels.add(rel)
     for rel in gone_rels:
         scanned.pop(rel, None)
+        pending.pop(rel, None)  # nothing left to retry — the file is gone
     return pruned
 
 
@@ -895,7 +944,10 @@ def verify_and_record(
     overwrites its entry the moment it lands. So a hook kill at any point leaves
     the not-yet-verified functions as `unknown` — which the Stop-gate blocks on —
     rather than absent; it can never drop an already-found or still-pending
-    violation and pass silently.
+    violation and pass silently. The same up-front block marks the file's scan
+    unfinished in `pending`, cleared only once every verdict is final, so a killed
+    run is *retried* by the next scan instead of being skipped as content-fresh
+    (issue #140) — bounded by `MAX_PENDING_VERIFY_ATTEMPTS`.
     """
     rel = unit_id(project_dir, file_path)
 
@@ -905,12 +957,20 @@ def verify_and_record(
         Neither caller stamps `scanned`: a file we could not read or enumerate
         must not be recorded as already-scanned, or the out-of-band scan would
         treat it as handled and the edit would pass unverified.
+
+        The `error` verdict *is* this scan's final outcome, so the unfinished-verify
+        marker must not survive it: every error path returns before the up-front
+        block that bumps the retry counter, so leaving a previous attempt's marker
+        in place would make a persistently-erroring file re-verify forever with the
+        counter frozen (issue #140). Dropping it makes the recorded `error` block
+        its way to the loud residual instead.
         """
         verdict = UnitVerdict(f"{rel}::?", rel, "?", "error", k, detail=detail)
         with gate_lock(project_dir):
             state = load_state(project_dir)
             record(state, verdict)
             state["stop_attempts"] = 0
+            state.setdefault("pending", {}).pop(rel, None)
             save_state(project_dir, state)
         return [verdict]
 
@@ -956,6 +1016,12 @@ def verify_and_record(
         state = load_state(project_dir)
         state["stop_attempts"] = 0
         state.setdefault("scanned", {})[rel] = digest
+        # Mark this content's scan unfinished, counting the start. The stamp above
+        # makes the file content-fresh, so without this marker a kill before the
+        # verdicts land would leave the pending `unknown` units unretryable
+        # (issue #140). Cleared once every verdict is final.
+        prior = _pending_attempts(state.setdefault("pending", {}).get(rel), digest)
+        state["pending"][rel] = {"hash": digest, "attempts": (prior or 0) + 1}
         prune_missing_units(state, project_dir, file_path, {d.name for d in defs})
         for d in defs:
             if d.takes_pointer:
@@ -989,4 +1055,13 @@ def verify_and_record(
             state = load_state(project_dir)
             record(state, verdict)
             save_state(project_dir, state)
+
+    # Every verdict for this content is final: clear the unfinished-verify marker
+    # so later scans trust the up-front `scanned` stamp again. A kill in the sliver
+    # between the last verdict and this write just costs one redundant re-verify —
+    # the safe direction.
+    with gate_lock(project_dir):
+        state = load_state(project_dir)
+        state.setdefault("pending", {}).pop(rel, None)
+        save_state(project_dir, state)
     return verdicts

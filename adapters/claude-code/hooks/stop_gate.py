@@ -52,18 +52,22 @@ def _needs_message(needs: list[dict]) -> str:
 
 
 def _oob_note(project_dir: str, oob: list[str]) -> str:
-    """Loud note for C files changed out-of-band (via Bash) that are unverified.
+    """Loud note for C files the scan says still need a verify.
 
     The backstop for the ``post_bash`` PostToolUse scan (issue #99): normally that
     hook has already verified every Bash-written C file by turn end, so this is
-    empty. If one slipped through it blocks the turn — never a silent pass — and
-    tells Claude how to get it re-checked.
+    empty. Two things land here — a file written out-of-band (via Bash, bypassing
+    the edit gate) whose content the gate never saw, and a file whose verify was
+    interrupted before its verdicts landed (issue #140). Both are unverified and
+    both are cleared the same way, so they share one note; either blocks the turn —
+    never a silent pass — and tells Claude how to get it re-checked.
     """
     rels = ", ".join(gate.unit_id(project_dir, f) for f in oob)
     return (
-        f"⚠ Forseti: {len(oob)} C file(s) changed out-of-band (written via Bash, "
-        f"bypassing the edit gate) and are UNVERIFIED: {rels}. Re-verify them — edit "
-        "the file, or run any Bash command so the scan re-checks — before ending."
+        f"⚠ Forseti: {len(oob)} C file(s) are UNVERIFIED — changed out-of-band "
+        "(written via Bash, bypassing the edit gate), or left by an interrupted "
+        f"verify whose verdicts never landed: {rels}. Re-verify them — edit the "
+        "file, or run any Bash command so the scan re-checks — before ending."
     )
 
 

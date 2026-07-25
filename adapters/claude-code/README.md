@@ -215,8 +215,13 @@ turns a verdict into an error.
 - **Very slow, many-function files.** Verdicts persist incrementally so a hook
   kill can't cause a silent pass, but a file whose *total* verification exceeds
   the PostToolUse hook timeout can have its last, still-running function cut off
-  before its verdict lands. Raise the hook timeout (and `FORSETI_UNWIND` budget)
-  for such files.
+  before its verdict lands. The scan retries such a file — an interrupted verify is
+  recorded as unfinished, so the file is re-verified on the next scan even though
+  its content hash is unchanged ([#140](https://github.com/pmatos/forseti/issues/140)) —
+  but only 3 times per unchanged content: a file that can *never* finish inside the
+  budget would otherwise reset the Stop-gate's patience every round and loop
+  forever. After that its pending units block their way to the loud residual.
+  Raise the hook timeout (and `FORSETI_UNWIND` budget) for such files.
 - **Out-of-band gating needs a git repo.** C files written via the `Bash` tool
   are gated by a `git status`-scoped scan (the `Bash` PostToolUse hook, plus the
   Stop-gate backstop). In a project that is **not** a git repository that scan is
