@@ -417,9 +417,19 @@ def _enumerable_source(
     * **Siblings.** Every other entry of the source's directory is symlinked
       beside the snapshot, so ``#include "sibling.h"`` resolves to the real one —
       except a sibling that *is* the source under another name, which leads back
-      to the snapshot (`_mirror_entries`). An **absolute** include of the source
-      is the residual there: clang opens the spelled path, so no mirror can
-      stand in for it, and a self-include written that way reads the live file.
+      to the snapshot (`_mirror_entries`).
+
+    Immutability is the *top-level* file's, and two ways of naming the source
+    still reach the live one: an **absolute** include (clang opens the spelled
+    path, which no mirrored neighbourhood can stand in for) and an alias *below*
+    a mirrored directory (``sub/alias.c -> ../x.c``, since a directory is linked
+    whole). A translation unit that includes itself that way, during a transient
+    A -> B -> A, can enumerate B — the same residual the verify loop already
+    carries, and the same fix: enumeration of content the parser cannot reach
+    around, which means a Core CLI taking content on stdin with an explicit
+    include root, not a deeper mirror. Mirroring subdirectories entry-by-entry
+    instead would `scandir` and `stat` the source's whole subtree on every edit.
+    Pinned by ``test_a_nested_source_alias_is_a_known_residual``.
     * **Ancestry.** The chain from `_mirror_root` down to the source's directory
       is reproduced level by level, each mirroring its own entries bar the names
       the chain itself already occupies, so ``#include "../common.h"`` — the

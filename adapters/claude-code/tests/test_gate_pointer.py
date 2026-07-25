@@ -1568,6 +1568,51 @@ def test_a_source_alias_leads_back_into_the_snapshot(
 
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_a_nested_source_alias_is_a_known_residual(tmp_path: Path) -> None:
+    # Characterization, not an endorsement, and the boundary of the guarantee the
+    # test above establishes. A directory is mirrored by linking it *whole*, so an
+    # alias one level down (`sub/alias.c -> ../x.c`) is never compared with the
+    # source and leads back to the live file — as does an absolute include of the
+    # source, which no mirrored neighbourhood can intercept at all. Immutability is
+    # the top-level file's; a self-include reaching around it lands back in the
+    # A -> B -> A residual the verify loop already carries.
+    #
+    # Closing it by mirroring subdirectories entry-by-entry would `scandir` and
+    # `stat` the source's whole subtree on every edit — disproportionate to a
+    # translation unit that includes itself through a nested alias. The real fix
+    # is the one the verify loop needs too: enumeration of content the parser
+    # cannot reach around (Core CLI, content on stdin, explicit include root).
+    proj = tmp_path / "proj"
+    (proj / "sub").mkdir(parents=True)
+    src = proj / "x.c"
+    src.write_text(
+        "#ifdef SELF\n"
+        "#define PICK 1\n"
+        "#else\n"
+        "#define SELF\n"
+        '#include "sub/alias.c"\n'
+        "#if PICK\n"
+        "int from_the_snapshot(int x) { return x; }\n"
+        "#else\n"
+        "int from_the_live_file(int x) { return x; }\n"
+        "#endif\n"
+        "#endif\n"
+    )
+    snapshotted = src.read_bytes()
+    (proj / "sub" / "alias.c").symlink_to("../x.c")
+    src.write_bytes(snapshotted.replace(b"#define PICK 1", b"#define PICK 0"))
+
+    names = [
+        d.name
+        for d in gate.extract_function_defs(
+            "x.c", project_dir=str(proj), content=snapshotted
+        )
+    ]
+
+    assert names == ["from_the_live_file"]  # the residual: not the snapshot's branch
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
 def test_dotdot_in_the_given_path_stages_where_the_kernel_lands(
     tmp_path: Path,
 ) -> None:
