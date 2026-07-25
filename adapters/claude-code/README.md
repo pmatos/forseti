@@ -193,10 +193,13 @@ turns a verdict into an error.
   `#include` is such a failure. What gets parsed is an **immutable snapshot** of
   the exact bytes the gate hashed, written to a private temp directory (issue
   #141), so a rewrite concurrent with the parse cannot make the gate enumerate
-  one version of the file while stamping another. The snapshot is listed with an
-  `-I` naming the original's directory — clang searches the *including file's
-  own* directory first, so without it a sibling `#include "helper.h"` that
-  needed no flag in place would go missing.
+  one version of the file while stamping another. That directory is made to
+  stand in for the source's own — every entry beside the source is symlinked
+  into it — so include resolution is byte-for-byte what an in-place parse would
+  do, with no extra flag. (Naming the directory with `-I` instead would be
+  wrong: `-I` also joins the *angle-bracket* search and lands after any
+  `-iquote`, so `#include <config.h>` next to a generated `config.h` would pick
+  the wrong one, flip an `#if`, and hide a unit from the gate.)
 - **The verify step runs on the real path, so its own freshness is guarded, not
   guaranteed.** A verdict has to describe the translation unit that actually
   ships, and a snapshot's `-I` stand-in only approximates in-place include

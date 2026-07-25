@@ -226,8 +226,8 @@ def _func_def(unit: object) -> FuncDef:
 @contextlib.contextmanager
 def _enumerable_source(
     file_path: str | os.PathLike[str], content: bytes | None, *, project_dir: str
-) -> Iterator[tuple[str, list[str]]]:
-    """Yield ``(path to enumerate, extra esbmc flags)`` for `file_path`.
+) -> Iterator[str]:
+    """Yield the path to enumerate for `file_path` — itself, or an immutable copy.
 
     With `content` ``None`` the file is enumerated where it lies. Given `content`,
     those exact bytes are written to a snapshot in a private temp directory and
@@ -236,43 +236,61 @@ def _enumerable_source(
     it (issue #141). Write the bytes; never `shutil.copy` or re-read `file_path`,
     or the race walks straight back in.
 
-    A snapshot is not where the source lives, and clang searches the *including
-    file's own* directory first for a quoted ``#include "sibling.h"`` — so a
-    header that needed no ``-I`` in place would go missing, turning every such
-    `.c` into a blocking `error`. The original's directory is handed back as an
-    ``-I`` to stand in for it. The snapshot keeps the original basename so a
-    parse error names something recognisable (and so `parse_units`' path match is
-    unaffected).
+    The temp directory is then made to **stand in for the source's own
+    directory**: every other entry beside the source is symlinked into it. clang
+    resolves a quoted ``#include "sibling.h"`` against the directory of the file
+    it is reading, so the snapshot has to *be* in an equivalent directory —
+    including for headers reached through it, which clang opens by their linked
+    path and whose own quoted includes therefore resolve the same way.
 
-    That directory is derived **lexically** — absolutized against `project_dir`
+    An ``-I <source dir>`` looks like a cheaper substitute and is not one: ``-I``
+    also joins the **angle-bracket** search, and it appends *after* any ``-iquote``
+    from `FORSETI_BUILD_FLAGS` instead of taking the source directory's
+    first-place precedence. Either one silently selects a different header than
+    the in-place parse would — ``#include <config.h>`` next to a generated
+    ``config.h`` is the standard shape — which flips ``#if`` branches, so
+    enumeration reports units the verify never sees, prunes the rest, and stamps
+    the file. (ESBMC 8.3.0 offers no quoted-only include flag: it rejects clang's
+    ``-iquote``, exposing only ``-I``/``--idirafter``.) Mirroring the directory
+    needs no flag at all and leaves every search path exactly as it was.
+
+    The directory is derived **lexically** — absolutized against `project_dir`
     (the subprocess's cwd) but never `resolve()`d. For a symlinked source, clang
-    searches the directory of the path it was *given*, so resolving would name the
-    link target's directory instead: a header beside the link would go missing,
-    and a same-named header beside the target would be silently preferred —
-    enumerating units the in-place parse never sees.
+    searches the directory of the path it was *given*, so resolving would mirror
+    the link target's directory instead: a header beside the link would go
+    missing, and a same-named header beside the target would be silently
+    preferred.
     """
     if content is None:
-        yield str(file_path), []
+        yield str(file_path)
         return
     target = os.path.abspath(os.path.join(project_dir, os.fspath(file_path)))
-    # Every `OSError` the snapshot can raise — an unwritable/missing `TMPDIR`,
-    # `ENOSPC`, `EDQUOT`, a failed cleanup — has to land as `UnitsUnavailable`,
-    # the one exception `verify_and_record` turns into a blocking `error`. Left
-    # bare it escapes to the hook, which installs no handler: the process dies
-    # with a traceback and exit 1 (not the blocking exit 2) before any verdict or
-    # `scanned` stamp is written, so the edit passes with the file unverified.
-    # Outside a git work tree nothing backstops that — the same reason the
-    # post-verify drift check blocks rather than deferring to the out-of-band
-    # scan. Mirrors how `_list_units` already converts `OSError` from the spawn.
+    src_dir, name = os.path.dirname(target), os.path.basename(target)
+    # Every `OSError` the staging can raise — an unwritable/missing `TMPDIR`,
+    # `ENOSPC`, `EDQUOT`, an unreadable source directory, a failed cleanup — has
+    # to land as `UnitsUnavailable`, the one exception `verify_and_record` turns
+    # into a blocking `error`. Left bare it escapes to the hook, which installs
+    # no handler: the process dies with a traceback and exit 1 (not the blocking
+    # exit 2) before any verdict or `scanned` stamp is written, so the edit
+    # passes with the file unverified. Outside a git work tree nothing backstops
+    # that — the same reason the post-verify drift check blocks rather than
+    # deferring to the out-of-band scan. Mirrors how `_list_units` already
+    # converts `OSError` from the spawn.
     try:
         with tempfile.TemporaryDirectory(prefix="forseti-units-") as tmp:
-            snapshot = Path(tmp) / os.path.basename(target)
+            with os.scandir(src_dir) as entries:
+                for entry in entries:
+                    # The snapshot takes the source's own place; a directory is
+                    # linked whole, so `#include "sub/h.h"` resolves too.
+                    if entry.name != name:
+                        os.symlink(entry.path, os.path.join(tmp, entry.name))
+            snapshot = Path(tmp) / name
             snapshot.write_bytes(content)
-            yield str(snapshot), [f"-I{os.path.dirname(target)}"]
+            yield str(snapshot)
     except OSError as exc:
         raise UnitsUnavailable(
-            f"could not stage a snapshot of {os.path.basename(target)} for "
-            f"enumeration (check TMPDIR and free space): {exc}"
+            f"could not stage a snapshot of {name} for enumeration (check "
+            f"TMPDIR, free space, and read access to {src_dir}): {exc}"
         ) from exc
 
 
@@ -307,16 +325,11 @@ def extract_function_defs(
     """
     if Path(file_path).suffix.lower() != ".c":
         return []
-    with _enumerable_source(file_path, content, project_dir=project_dir) as (
-        source,
-        include_flags,
-    ):
-        return _list_units(source, include_flags, project_dir=project_dir)
+    with _enumerable_source(file_path, content, project_dir=project_dir) as source:
+        return _list_units(source, project_dir=project_dir)
 
 
-def _list_units(
-    source: str, include_flags: list[str], *, project_dir: str
-) -> list[FuncDef]:
+def _list_units(source: str, *, project_dir: str) -> list[FuncDef]:
     """Run ``forseti list-units`` on `source` and map its payload to `FuncDef`s."""
     argv = [
         *resolve_forseti_cmd(),
@@ -336,12 +349,12 @@ def _list_units(
     # `#include` cannot be resolved makes esbmc exit nonzero, which is a blocking
     # `error` on every edited file rather than a listing. Only the build flags go
     # here: `SAFETY_FLAGS` is for the verify, and a property flag on a
-    # `--parse-tree-only` run is at best inert. `include_flags` rides the same
-    # passthrough and goes *first*: it stands in for the search directory the
-    # source would have had in place, which clang consults ahead of any `-I`.
-    esbmc_flags = [*include_flags, *_build_flags()]
-    if esbmc_flags:
-        argv += ["--", *esbmc_flags]
+    # `--parse-tree-only` run is at best inert. Nothing is added for a snapshot —
+    # `_enumerable_source` mirrors the source's directory precisely so the search
+    # paths stay identical to the in-place parse.
+    build_flags = _build_flags()
+    if build_flags:
+        argv += ["--", *build_flags]
     try:
         proc = subprocess.run(
             argv,

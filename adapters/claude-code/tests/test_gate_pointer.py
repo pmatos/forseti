@@ -50,11 +50,21 @@ def _fake_forseti_cmd(
 
 
 def _argv_capturing_forseti_cmd(tmp_path: Path, dest: Path) -> list[str]:
-    """A fake CLI that records its argv to `dest` and reports no units."""
+    """A fake CLI recording its argv and the source's *neighbourhood* to `dest`.
+
+    `siblings` maps each entry beside the file it was handed to that entry's
+    real path — which is how a test checks that a snapshot's temp directory
+    stands in for the source's own directory (`_enumerable_source` mirrors it
+    with symlinks, so quoted `#include`s resolve exactly as they would in place).
+    """
     script = tmp_path / "argv_forseti.py"
     script.write_text(
-        "import json, sys\n"
-        f"open({str(dest)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
+        "import json, os, sys\n"
+        "src = sys.argv[2]\n"
+        "d = os.path.dirname(src)\n"
+        "sib = {e: os.path.realpath(os.path.join(d, e)) for e in os.listdir(d)}\n"
+        f"open({str(dest)!r}, 'w').write("
+        "json.dumps({'argv': sys.argv[1:], 'siblings': sib}))\n"
         "sys.stdout.write('{\"units\": []}')\n"
     )
     return [sys.executable, str(script)]
@@ -166,7 +176,7 @@ def test_list_units_timeout_reaches_the_cli_unrounded(
     src = tmp_path / "x.c"
     src.write_text("int f(void) { return 0; }\n")
     assert gate.extract_function_defs(str(src), project_dir=str(tmp_path)) == []
-    argv = json.loads(dest.read_text())
+    argv = json.loads(dest.read_text())["argv"]
     assert argv[argv.index("--timeout") + 1] == expected
 
 
@@ -357,42 +367,80 @@ def test_enumeration_parses_the_given_content_not_a_re_read(
     assert src.read_text() == "ondisk\n"
 
 
-def test_snapshot_enumeration_keeps_relative_includes_resolvable(
+def test_snapshot_directory_stands_in_for_the_sources_own(
     tmp_path: Path, monkeypatch
 ) -> None:
-    # The snapshot is not where the source lives, so clang would search the wrong
-    # directory first for a quoted `#include "sibling.h"`. The original's
-    # directory must reach esbmc as an `-I` (absolute — the subprocess runs with
-    # cwd=project_dir), and the snapshot must keep the original basename so a
-    # parse error names something recognisable.
+    # clang resolves a quoted `#include "sibling.h"` against the directory of the
+    # file it is reading, so the snapshot has to sit in an equivalent directory:
+    # every entry beside the source is mirrored into the temp dir. Crucially this
+    # needs NO `-I` — see the next test for why a flag is not a substitute.
     dest = tmp_path / "argv.json"
+    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
     monkeypatch.setattr(
         gate,
         "resolve_forseti_cmd",
         lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
     )
     sub = tmp_path / "sub"
-    sub.mkdir()
+    (sub / "nested").mkdir(parents=True)
+    (sub / "helper.h").write_text("#define HELP 1\n")
+    (sub / "nested" / "deep.h").write_text("#define DEEP 2\n")
     src = sub / "x.c"
     src.write_text("int f(void) { return 0; }\n")
 
     gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
 
-    argv = json.loads(dest.read_text())
-    enumerated = Path(argv[1])
-    assert enumerated != src and enumerated.name == "x.c"
-    assert argv[argv.index("--") + 1 :] == [f"-I{sub}"]
-    assert not enumerated.exists()  # the temp snapshot is cleaned up
+    captured = json.loads(dest.read_text())
+    enumerated = Path(captured["argv"][1])
+    assert enumerated != src and enumerated.name == "x.c"  # a recognisable name
+    # The sibling header and the subdirectory both resolve to the real ones...
+    assert captured["siblings"]["helper.h"] == str((sub / "helper.h").resolve())
+    assert captured["siblings"]["nested"] == str((sub / "nested").resolve())
+    # ...and the source's own name is the snapshot, not a link back to the file.
+    assert captured["siblings"]["x.c"] != str(src.resolve())
+    assert "--" not in captured["argv"]  # no include flag invented
+    assert not enumerated.exists()  # the temp mirror is cleaned up
 
 
-def test_snapshot_include_dir_is_lexical_not_symlink_resolved(
+def test_snapshot_does_not_disturb_angle_include_or_iquote_precedence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Why the directory is mirrored rather than named with `-I`: `-I` also joins
+    # the *angle-bracket* search, and lands after any `-iquote` from
+    # FORSETI_BUILD_FLAGS instead of taking the source directory's first-place
+    # precedence. With `#include <config.h>` next to a generated `config.h` —
+    # the standard shape — either one selects a different header than the
+    # in-place parse, flipping `#if` branches so enumeration reports units the
+    # verify never sees. The build flags must reach esbmc untouched and alone.
+    dest = tmp_path / "argv.json"
+    monkeypatch.setenv("FORSETI_BUILD_FLAGS", "-Igenerated -iquote quoted -DWIDGET")
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+    argv = json.loads(dest.read_text())["argv"]
+    assert argv[argv.index("--") + 1 :] == [
+        "-Igenerated",
+        "-iquote",
+        "quoted",
+        "-DWIDGET",
+    ]
+
+
+def test_snapshot_mirrors_the_lexical_directory_not_the_symlink_target(
     tmp_path: Path, monkeypatch
 ) -> None:
     # clang searches the directory of the path it was *given*, so for a symlinked
-    # source that is the link's directory, not the target's. Resolving would name
-    # the wrong one: a header beside the link would go missing, and a same-named
-    # header beside the target would be silently preferred — enumerating units
-    # the in-place parse never sees.
+    # source that is the link's directory, not the target's. Mirroring the
+    # resolved one would drop a header beside the link and silently prefer a
+    # same-named header beside the target — enumerating units the in-place parse
+    # never sees.
     dest = tmp_path / "argv.json"
     monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
     monkeypatch.setattr(
@@ -403,23 +451,26 @@ def test_snapshot_include_dir_is_lexical_not_symlink_resolved(
     real = tmp_path / "real"
     real.mkdir()
     (real / "x.c").write_text("int f(void) { return 0; }\n")
+    (real / "config.h").write_text("#define WHICH 2\n")  # must NOT be mirrored
     link_dir = tmp_path / "linked"
     link_dir.mkdir()
-    link = link_dir / "x.c"
-    link.symlink_to(real / "x.c")
+    (link_dir / "config.h").write_text("#define WHICH 1\n")  # this one must be
+    (link_dir / "x.c").symlink_to(real / "x.c")
 
-    gate.extract_function_defs(str(link), project_dir=str(tmp_path), content=b"f\n")
+    gate.extract_function_defs(
+        str(link_dir / "x.c"), project_dir=str(tmp_path), content=b"f\n"
+    )
 
-    argv = json.loads(dest.read_text())
-    assert argv[argv.index("--") + 1 :] == [f"-I{link_dir}"]
+    siblings = json.loads(dest.read_text())["siblings"]
+    assert siblings["config.h"] == str((link_dir / "config.h").resolve())
 
 
-def test_relative_path_include_dir_is_absolutized_against_project_dir(
+def test_snapshot_mirrors_the_dir_resolved_against_project_dir(
     tmp_path: Path, monkeypatch
 ) -> None:
     # The CLI subprocess runs with cwd=project_dir, so a relative `file_path` is
     # relative to *that*, not to the hook process's cwd. A bare `os.path.abspath`
-    # would silently name whatever directory the hook happened to start in.
+    # would mirror whatever directory the hook happened to start in.
     dest = tmp_path / "argv.json"
     monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
     monkeypatch.setattr(
@@ -430,43 +481,17 @@ def test_relative_path_include_dir_is_absolutized_against_project_dir(
     sub = tmp_path / "sub"
     sub.mkdir()
     (sub / "x.c").write_text("int f(void) { return 0; }\n")
+    (sub / "helper.h").write_text("#define HELP 1\n")
 
     gate.extract_function_defs("sub/x.c", project_dir=str(tmp_path), content=b"f\n")
 
-    argv = json.loads(dest.read_text())
-    assert argv[argv.index("--") + 1 :] == [f"-I{sub}"]
-
-
-def test_snapshot_include_precedes_the_projects_build_flags(
-    tmp_path: Path, monkeypatch
-) -> None:
-    # The snapshot's `-I` stands in for the search directory the source would
-    # have had *in place*, which clang consults ahead of any `-I`. So it has to
-    # come first, and it must not displace `FORSETI_BUILD_FLAGS` — a project that
-    # needs `-Iinclude -DWIDGET` to parse at all still needs them here.
-    dest = tmp_path / "argv.json"
-    monkeypatch.setenv("FORSETI_BUILD_FLAGS", "-Iinclude -DWIDGET")
-    monkeypatch.setattr(
-        gate,
-        "resolve_forseti_cmd",
-        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
-    )
-    src = tmp_path / "x.c"
-    src.write_text("int f(void) { return 0; }\n")
-
-    gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
-
-    argv = json.loads(dest.read_text())
-    assert argv[argv.index("--") + 1 :] == [
-        f"-I{tmp_path.resolve()}",
-        "-Iinclude",
-        "-DWIDGET",
-    ]
+    siblings = json.loads(dest.read_text())["siblings"]
+    assert siblings["helper.h"] == str((sub / "helper.h").resolve())
 
 
 def test_in_place_enumeration_uses_no_snapshot(tmp_path: Path, monkeypatch) -> None:
-    # Without `content=` nothing is copied and no include dir is invented — the
-    # file is parsed where it lies, exactly as before.
+    # Without `content=` nothing is staged — the file is parsed where it lies,
+    # exactly as before.
     dest = tmp_path / "argv.json"
     monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
     monkeypatch.setattr(
@@ -477,7 +502,7 @@ def test_in_place_enumeration_uses_no_snapshot(tmp_path: Path, monkeypatch) -> N
     src = tmp_path / "x.c"
     src.write_text("int f(void) { return 0; }\n")
     gate.extract_function_defs(str(src), project_dir=str(tmp_path))
-    argv = json.loads(dest.read_text())
+    argv = json.loads(dest.read_text())["argv"]
     assert argv[1] == str(src)
     assert "--" not in argv
 
@@ -973,7 +998,7 @@ def test_build_flags_reach_the_list_units_parse(tmp_path: Path, monkeypatch) -> 
     src = tmp_path / "x.c"
     src.write_text("int f(void) { return 0; }\n")
     assert gate.extract_function_defs(str(src), project_dir=str(tmp_path)) == []
-    argv = json.loads(dest.read_text())
+    argv = json.loads(dest.read_text())["argv"]
     assert argv[argv.index("--") + 1 :] == ["-Iinclude", "-DNDEBUG"]
 
 
@@ -991,7 +1016,7 @@ def test_build_flags_are_shell_split_not_split_on_spaces(
     src = tmp_path / "x.c"
     src.write_text("int f(void) { return 0; }\n")
     gate.extract_function_defs(str(src), project_dir=str(tmp_path))
-    argv = json.loads(dest.read_text())
+    argv = json.loads(dest.read_text())["argv"]
     assert argv[argv.index("--") + 1 :] == ["-I/opt/my sdk/include", "-DX=1"]
 
 
@@ -1005,7 +1030,7 @@ def test_no_build_flags_adds_no_separator(tmp_path: Path, monkeypatch) -> None:
     src = tmp_path / "x.c"
     src.write_text("int f(void) { return 0; }\n")
     gate.extract_function_defs(str(src), project_dir=str(tmp_path))
-    assert "--" not in json.loads(dest.read_text())
+    assert "--" not in json.loads(dest.read_text())["argv"]
 
 
 def test_build_flags_reach_the_verify_too(tmp_path: Path, monkeypatch) -> None:
@@ -1033,7 +1058,7 @@ def test_safety_flags_do_not_leak_into_the_parse(tmp_path: Path, monkeypatch) ->
     src = tmp_path / "x.c"
     src.write_text("int f(void) { return 0; }\n")
     gate.extract_function_defs(str(src), project_dir=str(tmp_path))
-    argv = json.loads(dest.read_text())
+    argv = json.loads(dest.read_text())["argv"]
     for flag in gate.SAFETY_FLAGS:
         assert flag not in argv
 
@@ -1051,7 +1076,7 @@ def test_build_flags_are_read_per_call_not_at_import(
     src.write_text("int f(void) { return 0; }\n")
     monkeypatch.setenv("FORSETI_BUILD_FLAGS", "-DLATE")
     gate.extract_function_defs(str(src), project_dir=str(tmp_path))
-    assert "-DLATE" in json.loads(dest.read_text())
+    assert "-DLATE" in json.loads(dest.read_text())["argv"]
 
 
 def test_malformed_build_flags_block_instead_of_crashing(
@@ -1091,3 +1116,44 @@ def test_wellformed_build_flags_still_parse(tmp_path: Path, monkeypatch) -> None
     # The guard must not swallow valid config: balanced quoting still splits.
     monkeypatch.setenv("FORSETI_BUILD_FLAGS", "'-I/opt/my sdk' -DX")
     assert gate._build_flags() == ("-I/opt/my sdk", "-DX")
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_snapshot_enumeration_matches_the_in_place_parse(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # End to end against the real frontend, on the shape an include flag gets
+    # wrong: `#include <config.h>` with a same-named header sitting beside the
+    # source and the real one reached through FORSETI_BUILD_FLAGS. The two
+    # `config.h` select different `#if` branches, so a snapshot that disturbed
+    # the search order would enumerate a different unit list than the in-place
+    # parse — and the gate would prune and stamp on the strength of it.
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    (generated / "config.h").write_text("#define WIDGET 1\n")
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    (src_dir / "config.h").write_text("#define WIDGET 0\n")  # the decoy sibling
+    (src_dir / "helper.h").write_text("#define HELP 1\n")  # a genuine quoted sibling
+    body = (
+        '#include <config.h>\n#include "helper.h"\n'
+        "int scal(int a) { return a + HELP; }\n"
+        "#if WIDGET\n"
+        "int only_with_widget(int x) { return x; }\n"
+        "#endif\n"
+    )
+    src = src_dir / "x.c"
+    src.write_text(body)
+    monkeypatch.setenv("FORSETI_BUILD_FLAGS", f"-I{generated}")
+
+    in_place = gate.extract_functions(str(src), project_dir=str(tmp_path))
+    snapshot = [
+        d.name
+        for d in gate.extract_function_defs(
+            str(src), project_dir=str(tmp_path), content=body.encode()
+        )
+    ]
+
+    # The generated header wins in both, so the guarded unit is present in both.
+    assert in_place == ["scal", "only_with_widget"]
+    assert snapshot == in_place
