@@ -48,6 +48,18 @@ def _fake_forseti_cmd(
     return [sys.executable, str(script)]
 
 
+def _seed_scanned(tmp_path: Path) -> None:
+    """Put a sentinel in `scanned` so a later "not stamped" assertion has teeth.
+
+    Without it, `"x.c" not in state["scanned"]` would also hold when the key was
+    never created at all, and the test would pass against an implementation that
+    stamps unconditionally.
+    """
+    state = gate.load_state(str(tmp_path))
+    state.setdefault("scanned", {})["sentinel.c"] = "deadbeef"
+    gate.save_state(str(tmp_path), state)
+
+
 def _units_payload(*units: tuple[str, bool]) -> str:
     """A `forseti list-units --json` payload for the given (name, takes_pointer)."""
     return json.dumps(
@@ -212,6 +224,50 @@ def test_enumeration_failure_records_blocking_error(
     state = gate.load_state(str(tmp_path))
     assert gate.blocking_units(state)  # non-empty → the Stop-gate blocks
     assert gate.needs_contract_units(state) == []
+
+
+def test_enumeration_failure_does_not_stamp_scanned(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Interaction between the out-of-band scan (#99) and list-units enumeration
+    # (#131): a file whose units could not be enumerated must NOT be recorded in
+    # `scanned`. Stamping it would let a later out-of-band scan dedup the edit as
+    # already handled, so the blocking `error` would be the only thing standing
+    # between an unparseable edit and a silent pass.
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _fake_forseti_cmd(tmp_path, stderr="ERROR: boom", exit_code=1),
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    _seed_scanned(tmp_path)
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+    assert verdicts[0].verdict == "error"
+    state = gate.load_state(str(tmp_path))
+    assert "x.c" not in state["scanned"]
+    assert state["scanned"]["sentinel.c"] == "deadbeef"  # untouched, so the key exists
+    assert gate.blocking_units(state)
+
+
+def test_unreadable_file_does_not_stamp_scanned(tmp_path: Path, monkeypatch) -> None:
+    # Same invariant on the sibling failure path: an unreadable file records a
+    # blocking `error` and stays out of `scanned`. Enumeration must not even be
+    # attempted, so the fake CLI is armed to fail if it is called.
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _fake_forseti_cmd(tmp_path, stderr="ERROR: must not run", exit_code=1),
+    )
+    src = tmp_path / "gone.c"  # never created → read_bytes raises OSError
+    _seed_scanned(tmp_path)
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+    assert len(verdicts) == 1
+    assert verdicts[0].verdict == "error"
+    state = gate.load_state(str(tmp_path))
+    assert "gone.c" not in state["scanned"]
+    assert state["scanned"]["sentinel.c"] == "deadbeef"  # untouched, so the key exists
+    assert gate.blocking_units(state)
 
 
 def test_pointer_unit_recorded_needs_contract(tmp_path: Path, monkeypatch) -> None:
