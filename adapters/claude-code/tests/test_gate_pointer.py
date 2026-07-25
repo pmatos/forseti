@@ -15,6 +15,7 @@ broken launcher elsewhere is shadowed)::
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -792,6 +793,100 @@ def test_persistent_rewrite_during_enumeration_does_not_prune_or_stamp(
     assert after["scanned"]["sentinel.c"] == "deadbeef"
     assert gate.blocking_units(after)  # the pre-existing violation survived
     assert any(u.get("verdict") == "violated" for u in after["units"].values())
+
+
+def test_stamp_is_not_reclaimed_from_a_run_that_already_finished(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Taking the stamp is a claim to be authoritative, so the content check has to
+    # happen under the same lock that writes it. Checked before the lock, this run
+    # (version A) could pass, pause, and resume after a concurrent run (version B)
+    # had verified and stamped B — then reclaim the entry with A's digest, prune
+    # and overwrite B's verdicts against content nobody has on disk, and finally
+    # withdraw the stamp on the post-verify re-hash, leaving a blocking `x.c::?`
+    # despite B having succeeded. Here the fake CLI stands in for that concurrent
+    # run, landing entirely within this run's `list-units`.
+    src = tmp_path / "x.c"
+    src.write_text("alpha\n")
+    _seed_scanned(tmp_path)
+    state_file = tmp_path / ".forseti" / "gate_state.json"
+    beta_digest = hashlib.sha256(b"beta\n").hexdigest()
+
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            after_read=(
+                f"open({str(src)!r}, 'w').write('beta\\n')\n"
+                "import json, pathlib\n"
+                f"_p = pathlib.Path({str(state_file)!r})\n"
+                "_st = json.loads(_p.read_text())\n"
+                f"_st['scanned']['x.c'] = {beta_digest!r}\n"
+                "_st['units']['x.c::beta'] = {'unit_id': 'x.c::beta', "
+                "'file': 'x.c', 'function': 'beta', 'verdict': 'violated', "
+                "'k': 1}\n"
+                "_p.write_text(json.dumps(_st))"
+            ),
+        ),
+    )
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert verdicts == []  # deferred to the run that owns the file
+    after = gate.load_state(str(tmp_path))
+    assert after["scanned"]["x.c"] == beta_digest  # never reclaimed for A
+    assert after["units"]["x.c::beta"]["verdict"] == "violated"  # B's verdict stands
+    assert "x.c::alpha" not in after["units"]  # ...and A's units were not recorded
+    # No stranded, unclearable block: the file hashes equal to the surviving
+    # stamp, so nothing would ever re-run the reconcile that prunes a `?`.
+    assert "x.c::?" not in after["units"]
+    assert gate.blocking_units(after)  # B's violation still gates the Stop hook
+
+
+def test_stamp_is_not_reclaimed_after_losing_the_lock_race(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The sharper half of the same race: the window that matters is between this
+    # run's content check and its stamp, and waiting for the gate lock is what
+    # opens it. Patching the lock so another run's work is already done when this
+    # one gets in models exactly that — B rewrote the source, stamped its digest
+    # and recorded its verdict while A queued. Checked before the lock, A would
+    # then reclaim the entry with a digest matching nothing on disk, prune B's
+    # units, and end by withdrawing the stamp and blocking on a file B had
+    # legitimately verified.
+    src = tmp_path / "x.c"
+    src.write_text("alpha\n")
+    _seed_scanned(tmp_path)
+    beta_digest = hashlib.sha256(b"beta\n").hexdigest()
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+    real_lock, landed = gate.gate_lock, []
+
+    @contextlib.contextmanager
+    def lock_a_concurrent_run_got_first(project_dir: str):
+        with real_lock(project_dir):
+            if not landed:
+                landed.append(True)
+                src.write_text("beta\n")
+                state = gate.load_state(project_dir)
+                state["scanned"]["x.c"] = beta_digest
+                gate.record(
+                    state,
+                    gate.UnitVerdict("x.c::beta", "x.c", "beta", "violated", 1),
+                )
+                gate.save_state(project_dir, state)
+            yield
+
+    monkeypatch.setattr(gate, "gate_lock", lock_a_concurrent_run_got_first)
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert verdicts == []
+    after = gate.load_state(str(tmp_path))
+    assert after["scanned"]["x.c"] == beta_digest  # B's stamp, not reclaimed
+    assert after["units"]["x.c::beta"]["verdict"] == "violated"  # nor B's units
+    assert "x.c::alpha" not in after["units"]  # A's stale reconcile never ran
+    assert "x.c::?" not in after["units"]  # and B was not blocked on afterwards
 
 
 def test_persistent_rewrite_during_verify_withdraws_the_stamp_and_blocks(

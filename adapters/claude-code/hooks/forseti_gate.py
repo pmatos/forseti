@@ -1458,63 +1458,88 @@ def verify_and_record(
         # edited but can't be parsed must not pass silently.
         return _blocking_error(str(exc)[:800], digest=digest)
 
-    # The snapshot guarantees we enumerated `raw`; this guarantees `raw` is still
-    # what the file holds. Together they give the stamping invariant: if
-    # `scanned[rel]` was set to H, the units recorded alongside it were enumerated
-    # from content hashing to H *and* the file still hashed to H right after. A
-    # rewrite that lands and stays (A → B) fails closed here rather than relying
-    # on the out-of-band scan to re-gate B later — which it cannot do at all
-    # outside a git work tree. Compared by content, not by `stat` metadata, so it
-    # holds on a filesystem with coarse timestamp granularity too. The block
-    # clears on the next edit's reconcile.
-    if content_hash(file_path) != digest:
+    # Acquiring the stamp is a claim to be authoritative for this file, so the
+    # check that we *are* happens under the same lock that writes it — a
+    # concurrent hook can stamp in any gap left between the two. The snapshot
+    # guarantees we enumerated `raw`; the re-hash guarantees `raw` is still what
+    # the file holds at the instant we claim it. Together they give the stamping
+    # invariant: if `scanned[rel]` was set to H, the units recorded alongside it
+    # were enumerated from content hashing to H *and* the file still hashed to H
+    # when the stamp was taken. A rewrite that lands and stays (A → B) fails
+    # closed here rather than relying on the out-of-band scan to re-gate B later —
+    # which it cannot do at all outside a git work tree. Compared by content, not
+    # by `stat` metadata, so it holds on a filesystem with coarse timestamp
+    # granularity too. The block clears on the next edit's reconcile.
+    #
+    # It is also the ownership test. Hashing equal means the bytes we enumerated
+    # are the bytes on disk *now*, so re-stamping over a concurrent run's entry is
+    # correct — that run's content has been superseded. Hashing unequal means it
+    # has superseded ours, and the reconcile below would then prune and pre-record
+    # against content nobody has on disk.
+    marker: dict[str, object] = {}  # only ever read on the path that fills it
+    with gate_lock(project_dir):
+        state = load_state(project_dir)
+        on_disk = content_hash(file_path)
+        stamped = state.get("scanned", {}).get(rel)
+        if on_disk == digest:
+            # Reconcile + record every current function BEFORE the slow verifies:
+            # drop functions the file no longer defines, reset the Stop-gate's
+            # patience, and pre-record each — a pointer/array-taking unit as its
+            # final `needs_contract` (we skip its meaningless function-level
+            # verify), every other as pending `unknown` so a mid-run kill leaves
+            # the not-yet-verified ones blocking rather than absent.
+            state["stop_attempts"] = 0
+            # Stamp the content hash so a later out-of-band scan treats this exact
+            # content as already verified — that dedup is what keeps the Stop-gate
+            # from re-blocking (and resetting its patience) on a file nothing has
+            # touched since.
+            state.setdefault("scanned", {})[rel] = digest
+            # Mark this content's scan unfinished, counting the start. The stamp
+            # above makes the file content-fresh, so without this marker a kill
+            # before the verdicts land would leave the pending `unknown` units
+            # unretryable (issue #140). Cleared once every verdict is final.
+            #
+            # The marker doubles as this run's ownership token so the cleanup below
+            # can tell it from one a *concurrent* run stored — see `_pending_owner`
+            # for what identifies it. The counter is bumped under the lock, so a
+            # concurrent run of the same content still reads this start when it
+            # computes its own.
+            prior = _pending_attempts(state.setdefault("pending", {}).get(rel), digest)
+            marker = {"hash": digest, "attempts": (prior or 0) + 1, "pid": os.getpid()}
+            state["pending"][rel] = marker
+            prune_missing_units(state, project_dir, file_path, {d.name for d in defs})
+            for d in defs:
+                if d.takes_pointer:
+                    record(state, _needs_contract_verdict(rel, d.name, k))
+                else:
+                    record(
+                        state,
+                        UnitVerdict(
+                            f"{rel}::{d.name}",
+                            rel,
+                            d.name,
+                            "unknown",
+                            k,
+                            detail="verification pending",
+                        ),
+                    )
+            save_state(project_dir, state)
+
+    if on_disk != digest:
+        # Someone else's content is on disk. If a stamp already vouches for
+        # exactly that content, a concurrent run owns this file: it enumerated
+        # what is there and pre-recorded every unit as blocking until it verifies
+        # them, so defer to it — silently. Blocking anyway would strand a `rel::?`
+        # error nothing can clear, the same trap the post-verify withdrawal below
+        # avoids: the file hashes equal to the surviving stamp, so the out-of-band
+        # scan reads it as fresh and never re-runs the reconcile that prunes `?`.
+        # With nothing vouching for it, nobody has gated what is on disk — block.
+        if on_disk is not None and stamped == on_disk:
+            return []
         return _blocking_error(
             "source changed while its units were being enumerated; not recording "
             "a scan of content that was not enumerated — re-edit to re-verify"
         )
-
-    # Reconcile + record every current function BEFORE the slow verifies: drop
-    # functions the file no longer defines, reset the Stop-gate's patience, and
-    # pre-record each — a pointer/array-taking unit as its final `needs_contract`
-    # (we skip its meaningless function-level verify), every other as pending
-    # `unknown` so a mid-run kill leaves the not-yet-verified ones blocking
-    # rather than absent.
-    with gate_lock(project_dir):
-        state = load_state(project_dir)
-        state["stop_attempts"] = 0
-        # Stamp the content hash so a later out-of-band scan treats this exact content
-        # as already verified — that dedup is what keeps the Stop-gate from re-blocking
-        # (and resetting its patience) on a file nothing has touched since.
-        state.setdefault("scanned", {})[rel] = digest
-        # Mark this content's scan unfinished, counting the start. The stamp above
-        # makes the file content-fresh, so without this marker a kill before the
-        # verdicts land would leave the pending `unknown` units unretryable
-        # (issue #140). Cleared once every verdict is final.
-        #
-        # The marker doubles as this run's ownership token so the cleanup below can
-        # tell it from one a *concurrent* run stored — see `_pending_owner` for what
-        # identifies it. The counter is bumped under the lock, so a concurrent run of
-        # the same content still reads this start when it computes its own.
-        prior = _pending_attempts(state.setdefault("pending", {}).get(rel), digest)
-        marker = {"hash": digest, "attempts": (prior or 0) + 1, "pid": os.getpid()}
-        state["pending"][rel] = marker
-        prune_missing_units(state, project_dir, file_path, {d.name for d in defs})
-        for d in defs:
-            if d.takes_pointer:
-                record(state, _needs_contract_verdict(rel, d.name, k))
-            else:
-                record(
-                    state,
-                    UnitVerdict(
-                        f"{rel}::{d.name}",
-                        rel,
-                        d.name,
-                        "unknown",
-                        k,
-                        detail="verification pending",
-                    ),
-                )
-        save_state(project_dir, state)
 
     verdicts: list[UnitVerdict] = []
     for d in defs:

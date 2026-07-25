@@ -230,7 +230,11 @@ turns a verdict into an error.
   equal. So the guarantee is precisely: if `scanned` records digest `H`, the
   units were enumerated from content hashing to `H` and the file hashed to `H`
   both then and after the loop — *not* that every verdict was computed against
-  `H`.
+  `H`. Taking that stamp is itself ownership-scoped: the re-hash happens under
+  the same lock that writes it, so concurrent hooks cannot interleave between the
+  two, and a run whose bytes have already been superseded by another run's stamp
+  defers to it silently instead of reclaiming the entry or blocking on a file
+  that run legitimately verified.
 - **Only `.c` translation units are verified; header definitions are out of
   scope.** ESBMC cannot parse a `.h` standalone (`forseti verify`/`list-units`
   both error with "failed to figure out type of file"), and a function defined in
