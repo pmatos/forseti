@@ -614,6 +614,55 @@ def stale_sources(project_dir: str, state: dict, files: Iterable[str]) -> list[s
     return stale
 
 
+def pending_retry_sources(project_dir: str, state: dict) -> list[str]:
+    """Absolute paths whose bytes *now on disk* have an unfinished verify on record.
+
+    A discovery source in its own right, and the one git cannot provide (PR #148
+    review). Retrying an interrupted verify only works if some scan offers the file
+    to `stale_sources`, and both scans feed on `discover_changed_c_sources` — so a
+    file git never reports as changed (a non-git project, a gitignored path, one
+    edited back to its `HEAD` blob) was never even a candidate, and the `unknown`
+    units its killed run pre-recorded could only block their way to a residual. The
+    `pending` marker *is* the record of "a run started verifying exactly these bytes
+    and never finished", so it names the file without git's help.
+
+    Deliberately not narrowed by the include/exclude globs or the git scope those
+    scans apply: a marker exists only for a file `verify_and_record` already ran on,
+    and its half-recorded units block the Stop-gate however the file was first
+    found — leaving them unretryable because a glob hides the file from *out-of-band*
+    discovery is the same hole one layer over. Returns every file whose current
+    content matches its marker; whether that unfinished verify still has attempts
+    left stays `stale_sources`' single decision.
+    """
+    found: list[str] = []
+    for rel, entry in state.get("pending", {}).items():
+        abspath = os.path.join(project_dir, rel)
+        digest = content_hash(abspath)
+        if digest is not None and _pending_attempts(entry, digest) is not None:
+            found.append(abspath)
+    return found
+
+
+def sources_needing_verify(
+    project_dir: str, state: dict, discovered: Iterable[str] | None
+) -> list[str]:
+    """Everything a scan must (re-)verify: stale discovered C + interrupted verifies.
+
+    The one call both the ``post_bash`` PostToolUse scan and the Stop-gate make.
+    `discovered` is `discover_changed_c_sources`' result — ``None`` when this is not
+    a git work tree, which disables out-of-band *discovery* but not the pending
+    retries, whose files are named by the gate's own state.
+    """
+    files = [*(discovered or []), *pending_retry_sources(project_dir, state)]
+    # Discovery joins the *git root* and the pending scan joins `project_dir`, so one
+    # file can arrive under two spellings; dedup on the id both resolve to, keeping
+    # the first (discovery's) spelling.
+    unique: dict[str, str] = {}
+    for abspath in files:
+        unique.setdefault(unit_id(project_dir, abspath), abspath)
+    return stale_sources(project_dir, state, unique.values())
+
+
 def divergent_blob_sources(
     project_dir: str, state: dict, *, baseline_head: str | None = None
 ) -> list[dict]:

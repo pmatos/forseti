@@ -150,7 +150,10 @@ def main() -> int:
         pruned = gate.prune_deleted_units(state, project_dir)
         blocking = gate.blocking_units(state)
         needs = gate.needs_contract_units(state)
-        oob = gate.stale_sources(project_dir, state, discovered) if discovered else []
+        # Discovered C the gate has not verified, plus any file whose verify was
+        # interrupted — the latter named by the locked state's `pending` markers, so
+        # it is reported even when git discovery never saw the file (PR #148 review).
+        oob = gate.sources_needing_verify(project_dir, state, discovered)
         outstanding = bool(blocking) or bool(oob) or bool(blob)
         attempts = int(state.get("stop_attempts", 0)) + 1
         if outstanding:

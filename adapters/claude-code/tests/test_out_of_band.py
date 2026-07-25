@@ -682,6 +682,105 @@ def test_unreadable_file_leaves_the_pending_marker_alone(tmp_path: Path) -> None
     assert gate.stale_sources(str(tmp_path), state, [str(target)]) == []
 
 
+# --- a pending marker is a discovery source of its own (PR #148 review) -----
+
+
+def _verified_verdict(rel: str, function: str = "f"):
+    """Stand-in `verify_function` whose verdict lands (the retry that finishes)."""
+
+    def _verify(fp, fn, *, project_dir, k=gate.DEFAULT_K):
+        return gate.UnitVerdict(f"{rel}::{fn}", rel, fn, "verified", k)
+
+    return _verify
+
+
+def test_pending_retry_reaches_a_file_git_never_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Both scans feed on git discovery, so a killed verify of a file `git status`
+    # never reports — committed and clean here, equally a gitignored or excluded
+    # path — was never even offered to `stale_sources`: its pending `unknown` unit
+    # could only block its way to a residual. The `pending` marker names it instead.
+    _git_init(tmp_path)
+    src = tmp_path / "clean.c"
+    src.write_text("int f(void){return 0;}\n")
+    _git_commit_all(tmp_path)
+    _enumerate_one_unit(monkeypatch)
+    _kill_during_verify(monkeypatch, [])
+    with pytest.raises(_Killed):
+        gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert gate.discover_changed_c_sources(str(tmp_path)) == []  # git sees nothing
+
+    _run(stop_gate.main, tmp_path, monkeypatch)  # named as unverified, not silent
+    blocked = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert blocked["decision"] == "block"
+    assert "clean.c" in blocked["reason"]
+
+    monkeypatch.setattr(gate, "verify_function", _verified_verdict("clean.c"))
+    assert _run(post_bash.main, tmp_path, monkeypatch) == 0  # ...and re-verified
+    state = gate.load_state(str(tmp_path))
+    assert state["units"]["clean.c::f"]["verdict"] == "verified"
+    assert state["pending"] == {}
+
+
+def test_pending_retry_runs_in_a_non_git_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Out-of-band *discovery* needs git; the retry does not — the file is named by
+    # the gate's own state — so a killed verify is still re-run where git is absent.
+    src = tmp_path / "nogit.c"
+    src.write_text("int f(void){return 0;}\n")
+    _enumerate_one_unit(monkeypatch)
+    _kill_during_verify(monkeypatch, [])
+    with pytest.raises(_Killed):
+        gate.verify_and_record(str(src), project_dir=str(tmp_path))
+    assert gate.discover_changed_c_sources(str(tmp_path)) is None  # no work tree
+
+    monkeypatch.setattr(gate, "verify_function", _verified_verdict("nogit.c"))
+    assert _run(post_bash.main, tmp_path, monkeypatch) == 0
+    state = gate.load_state(str(tmp_path))
+    assert state["units"]["nogit.c::f"]["verdict"] == "verified"
+    assert state["pending"] == {}
+
+
+def test_pending_retry_of_stale_content_is_left_to_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Only a marker recording the bytes NOW on disk is a retry candidate: once the
+    # file has been rewritten, the interrupted verify's content is gone and gating
+    # the new bytes is discovery's job, under its own scope rules.
+    src = tmp_path / "moved.c"
+    src.write_text("int f(void){return 0;}\n")
+    _enumerate_one_unit(monkeypatch)
+    _kill_during_verify(monkeypatch, [])
+    with pytest.raises(_Killed):
+        gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    state = gate.load_state(str(tmp_path))
+    assert gate.pending_retry_sources(str(tmp_path), state) == [str(src)]
+    src.write_text("int f(void){return 1;}\n")
+    assert gate.pending_retry_sources(str(tmp_path), state) == []
+
+
+def test_sources_needing_verify_reports_a_file_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Discovery joins the git root and the pending scan joins `project_dir`, so a
+    # file both scans name arrives under two spellings — verifying it twice in one
+    # scan would double the ESBMC cost and name it twice in the Stop note.
+    src = tmp_path / "dup.c"
+    src.write_text("int f(void){return 0;}\n")
+    _enumerate_one_unit(monkeypatch)
+    _kill_during_verify(monkeypatch, [])
+    with pytest.raises(_Killed):
+        gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    state = gate.load_state(str(tmp_path))
+    discovered = [os.path.join(str(tmp_path), ".", "dup.c")]  # same file, other spell
+    assert gate.sources_needing_verify(str(tmp_path), state, discovered) == discovered
+
+
 # --- staged / committed blob freshness (issue #99 review) -------------------
 
 
