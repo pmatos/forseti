@@ -633,6 +633,14 @@ def test_blocking_error_preserves_a_newer_runs_pending_marker(
     # the bytes THIS run read. `raw` is read before the units are enumerated, so a
     # newer run's marker — a claim on content this error says nothing about — must
     # come through the error unchanged, counter included.
+    #
+    # Here it comes through because nothing is written at all: the newer run has
+    # stamped what is on disk, so this error is about bytes that are gone and is
+    # deferred rather than published — the same answer the enumerate-*success*
+    # path already gives in this state, and the one that keeps a `rel::?` from
+    # stranding once that run finishes. Deferring is safe because the newer run
+    # pre-recorded its unit as pending `unknown`: the gate still blocks, and its
+    # claim still makes the file stale.
     src = tmp_path / "err.c"
     src.write_text("int f(void){return 0;}\n")
     newer: dict[str, str] = {}
@@ -650,14 +658,90 @@ def test_blocking_error_preserves_a_newer_runs_pending_marker(
     )
     verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
 
-    assert [v.verdict for v in verdicts] == ["error"]  # this scan still blocks
+    assert verdicts == []  # deferred to the run that owns what is on disk
     state = gate.load_state(str(tmp_path))
     assert state["pending"]["err.c"] == {
         "hash": newer["digest"],
         "attempts": 1,
         "pid": os.getpid() + 1,
     }
+    assert "err.c::?" not in state["units"]  # nothing to strand
+    assert gate.blocking_units(state)  # the owner's pending `unknown` still gates
     assert gate.stale_sources(str(tmp_path), state, [str(src)]) == [str(src)]
+
+
+def _newer_run_finishes(project_dir: Path, path: Path, content: str) -> str:
+    """The same second run, but one that *completed*: stamped, verified, no claim."""
+    path.write_text(content)
+    rel = gate.unit_id(str(project_dir), str(path))
+    digest = gate.content_hash(str(path))
+    assert digest is not None
+    with gate.gate_lock(str(project_dir)):
+        state = gate.load_state(str(project_dir))
+        state["scanned"][rel] = digest
+        gate.record(
+            state,
+            gate.UnitVerdict(f"{rel}::f", rel, "f", "verified", gate.DEFAULT_K),
+        )
+        gate.save_state(str(project_dir), state)
+    return digest
+
+
+def test_enumeration_failure_defers_to_a_run_that_already_finished(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The unclearable shape, one caller over from the drift error. This run reads
+    # A, a concurrent run replaces it with B and verifies B through, and then this
+    # run's enumeration of A fails. Published, `err.c::?` would never be cleared:
+    # B's stamp matches disk and B left no claim, so `stale_sources` never re-offers
+    # the file and the reconcile that prunes `?` never runs — the Stop gate would
+    # block to the cap on a file B legitimately verified.
+    src = tmp_path / "err.c"
+    src.write_text("int f(void){return 0;}\n")
+    newer: dict[str, str] = {}
+
+    def _newer_run_finishes_then_enumeration_fails(
+        file_path, *, project_dir, content=None
+    ):
+        newer["digest"] = _newer_run_finishes(tmp_path, src, "int f(void){return 1;}\n")
+        raise gate.UnitsUnavailable("forseti CLI could not be launched")
+
+    monkeypatch.setattr(
+        gate, "extract_function_defs", _newer_run_finishes_then_enumeration_fails
+    )
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert verdicts == []  # deferred to the run that owns what is on disk
+    state = gate.load_state(str(tmp_path))
+    assert "err.c::?" not in state["units"]
+    assert state["scanned"]["err.c"] == newer["digest"]  # B's stamp, untouched
+    assert gate.blocking_units(state) == []  # B verified it; nothing left to block
+    # Why publishing would have stuck: nothing marks the file for a re-scan.
+    assert gate.stale_sources(str(tmp_path), state, [str(src)]) == []
+
+
+def test_enumeration_failure_still_blocks_when_its_content_is_on_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The other half: a stamp alone must not suppress. Here esbmc has vanished from
+    # `PATH` and the file is unchanged since its last verify, so the stamp equals
+    # both the bytes on disk and the bytes this error is about — deferring would
+    # turn a loud "cannot enumerate" into a silent pass on the very content the
+    # error names.
+    src = tmp_path / "err.c"
+    src.write_text("int f(void){return 0;}\n")
+    _newer_run_finishes(tmp_path, src, "int f(void){return 0;}\n")
+
+    def _unavailable(file_path, *, project_dir, content=None):
+        raise gate.UnitsUnavailable("esbmc not found on PATH")
+
+    monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert [v.verdict for v in verdicts] == ["error"]
+    state = gate.load_state(str(tmp_path))
+    assert state["units"]["err.c::?"]["verdict"] == "error"
+    assert gate.blocking_units(state)
 
 
 def test_blocking_error_preserves_a_concurrent_same_content_marker(

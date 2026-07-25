@@ -889,6 +889,56 @@ def test_stamp_is_not_reclaimed_after_losing_the_lock_race(
     assert "x.c::?" not in after["units"]  # and B was not blocked on afterwards
 
 
+def test_enumerate_drift_block_defers_to_a_stamp_taken_after_the_check(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The enumerate-side drift check reads `scanned` under the stamp lock and then
+    # releases it, so a concurrent run can stamp what is on disk before the block
+    # is published — and that `x.c::?` is then unclearable for the usual reason.
+    # Deciding the deferral where the check ran cannot close it; it has to be
+    # re-decided under the lock that records the verdict. The rewrite lands during
+    # enumeration (nothing vouches for it yet), the other run's stamp on the lock
+    # acquisition the block itself takes.
+    src = tmp_path / "x.c"
+    src.write_text("alpha\n")
+    _seed_scanned(tmp_path)
+    beta_digest = hashlib.sha256(b"beta\n").hexdigest()
+
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path, after_read=f"open({str(src)!r}, 'w').write('beta\\n')"
+        ),
+    )
+    real_lock, locks = gate.gate_lock, []
+
+    @contextlib.contextmanager
+    def lock_a_concurrent_run_stamped_in(project_dir: str):
+        with real_lock(project_dir):
+            locks.append(1)
+            if len(locks) == 2:  # the one `_blocking_error` takes
+                state = gate.load_state(project_dir)
+                state["scanned"]["x.c"] = beta_digest
+                gate.record(
+                    state,
+                    gate.UnitVerdict("x.c::beta", "x.c", "beta", "violated", 1),
+                )
+                gate.save_state(project_dir, state)
+            yield
+
+    monkeypatch.setattr(gate, "gate_lock", lock_a_concurrent_run_stamped_in)
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert len(locks) == 2  # the stamp check, then the block — the window between
+    assert verdicts == []  # deferred to the run that owns the file
+    after = gate.load_state(str(tmp_path))
+    assert "x.c::?" not in after["units"]  # no stranded, unclearable block
+    assert after["scanned"]["x.c"] == beta_digest
+    assert gate.blocking_units(after)  # the other run's violation still gates
+    assert gate.stale_sources(str(tmp_path), after, [str(src)]) == []
+
+
 def test_persistent_rewrite_during_verify_withdraws_the_stamp_and_blocks(
     tmp_path: Path, monkeypatch
 ) -> None:
