@@ -68,6 +68,11 @@ void fill(unsigned char p[static 4], size_t len) {
 void fill_bug(unsigned char p[static 4], size_t len) {
   for (size_t i = 0; i <= len; i++) p[i] = 0;
 }
+
+void over_minimum(unsigned char p[static 4], size_t len) {
+  (void)len;
+  p[4] = 0;
+}
 """
 
 
@@ -90,6 +95,22 @@ def test_static_minimum_with_length_still_catches_the_off_by_one(
     src = tmp_path / "static_min.c"
     src.write_text(_STATIC_MIN_AND_LEN)
     result = verify_precondition(src, function="fill_bug", max_len=MAX_LEN)
+    assert result.assessment is Assessment.VIOLATED, result.label
+    assert result.esbmc_result is not None
+    raw = getattr(result.esbmc_result, "raw_counterexample", "")
+    assert "array bounds violated" in raw
+
+
+def test_static_minimum_floor_still_explores_the_weakest_caller(
+    tmp_path: Path,
+) -> None:
+    # The floor raises the object's *ceiling*, it does not pin the length: `len`
+    # stays symbolic down to 0, so a caller giving exactly the declared 4 elements
+    # is still explored and `p[4]` — over the minimum, with nothing else to justify
+    # it — remains a real VIOLATED rather than being swallowed by the max.
+    src = tmp_path / "static_min.c"
+    src.write_text(_STATIC_MIN_AND_LEN)
+    result = verify_precondition(src, function="over_minimum", max_len=MAX_LEN)
     assert result.assessment is Assessment.VIOLATED, result.label
     assert result.esbmc_result is not None
     raw = getattr(result.esbmc_result, "raw_counterexample", "")

@@ -139,9 +139,10 @@ def test_readable_static_minimum_without_a_length_is_its_extent() -> None:
 
 
 def test_conventional_extent_still_outranks_an_accompanying_length() -> None:
-    # Without `static` the bracket binds nobody, so #134's rule is unchanged: the
-    # written extent is the only size the signature states and the neighbouring
-    # length stays a plain scalar.
+    # Without `static` the bracket binds nobody, so #134's rule is unchanged here:
+    # the written extent is the only size the signature states and the neighbouring
+    # length stays a plain scalar. That leaves its own phantom for `len > N` —
+    # pre-existing, tracked in #147, and deliberately not changed by this fix.
     unit = _unit(
         Param("buf", "uint8_t *", array_extent=20),
         Param("len", "unsigned long"),
