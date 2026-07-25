@@ -26,6 +26,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
@@ -222,8 +223,42 @@ def _func_def(unit: object) -> FuncDef:
     return FuncDef(name, takes_pointer)
 
 
+@contextlib.contextmanager
+def _enumerable_source(
+    file_path: str | os.PathLike[str], content: bytes | None
+) -> Iterator[tuple[str, list[str]]]:
+    """Yield ``(path to enumerate, extra esbmc flags)`` for `file_path`.
+
+    With `content` ``None`` the file is enumerated where it lies. Given `content`,
+    those exact bytes are written to a snapshot in a private temp directory and
+    *that* is what gets parsed — so the enumeration is of the caller's bytes by
+    construction, not of whatever the file happens to hold when the CLI re-reads
+    it (issue #141). Write the bytes; never `shutil.copy` or re-read `file_path`,
+    or the race walks straight back in.
+
+    A snapshot is not where the source lives, and clang searches the *including
+    file's own* directory first for a quoted ``#include "sibling.h"`` — so a
+    header that needed no ``-I`` in place would go missing, turning every such
+    `.c` into a blocking `error`. The original's directory is handed back as an
+    ``-I`` to stand in for it. The snapshot keeps the original basename so a
+    parse error names something recognisable (and so `parse_units`' path match is
+    unaffected).
+    """
+    if content is None:
+        yield str(file_path), []
+        return
+    src = Path(file_path).resolve()
+    with tempfile.TemporaryDirectory(prefix="forseti-units-") as tmp:
+        snapshot = Path(tmp) / src.name
+        snapshot.write_bytes(content)
+        yield str(snapshot), [f"-I{src.parent}"]
+
+
 def extract_function_defs(
-    file_path: str | os.PathLike[str], *, project_dir: str
+    file_path: str | os.PathLike[str],
+    *,
+    project_dir: str,
+    content: bytes | None = None,
 ) -> list[FuncDef]:
     """Enumerate `file_path`'s function definitions via ``forseti list-units``.
 
@@ -236,6 +271,11 @@ def extract_function_defs(
     fails (missing binary, C parse error, timeout, unreadable file), so the caller
     records a blocking `error` verdict instead of silently skipping the file.
 
+    Pass `content` to enumerate exactly those bytes rather than re-reading the
+    file (`_enumerable_source`): the caller has already hashed them, and a
+    concurrent rewrite between the hash and the CLI's read is what issue #141
+    closes. Omit it to parse the file in place.
+
     Only ``.c`` translation units are enumerated: ESBMC cannot parse a header
     standalone (``forseti verify`` errors on a ``.h`` too — "failed to figure out
     type of file"), and clang's path-match keeps a header-resident definition out
@@ -245,10 +285,18 @@ def extract_function_defs(
     """
     if Path(file_path).suffix.lower() != ".c":
         return []
+    with _enumerable_source(file_path, content) as (source, include_flags):
+        return _list_units(source, include_flags, project_dir=project_dir)
+
+
+def _list_units(
+    source: str, include_flags: list[str], *, project_dir: str
+) -> list[FuncDef]:
+    """Run ``forseti list-units`` on `source` and map its payload to `FuncDef`s."""
     argv = [
         *resolve_forseti_cmd(),
         "list-units",
-        str(file_path),
+        source,
         "--json",
         # Pass the float through, don't truncate. `list-units` hands its --timeout
         # straight to `subprocess.run(timeout=...)` (esbmc's own --timeout is not
@@ -263,10 +311,12 @@ def extract_function_defs(
     # `#include` cannot be resolved makes esbmc exit nonzero, which is a blocking
     # `error` on every edited file rather than a listing. Only the build flags go
     # here: `SAFETY_FLAGS` is for the verify, and a property flag on a
-    # `--parse-tree-only` run is at best inert.
-    build_flags = _build_flags()
-    if build_flags:
-        argv += ["--", *build_flags]
+    # `--parse-tree-only` run is at best inert. `include_flags` rides the same
+    # passthrough and goes *first*: it stands in for the search directory the
+    # source would have had in place, which clang consults ahead of any `-I`.
+    esbmc_flags = [*include_flags, *_build_flags()]
+    if esbmc_flags:
+        argv += ["--", *esbmc_flags]
     try:
         proc = subprocess.run(
             argv,
@@ -335,22 +385,6 @@ def content_hash(path: str | os.PathLike[str]) -> str | None:
         return hashlib.sha256(Path(path).read_bytes()).hexdigest()
     except OSError:
         return None
-
-
-def _source_fingerprint(path: str | os.PathLike[str]) -> tuple[int, ...] | None:
-    """Identity + change stamp for `path`, or ``None`` if it cannot be stat'd.
-
-    Pairs with `content_hash` to detect a rewrite that happened *while* we were
-    enumerating. A digest alone cannot: the dangerous interleaving restores the
-    original bytes afterwards (A → B → A), so the content compares equal even
-    though the enumeration saw B. `st_mtime_ns`/`st_ctime_ns` still move for that
-    rewrite, and `st_dev`/`st_ino` catch a replace-by-rename.
-    """
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
 def _globs(value: str | None) -> tuple[str, ...]:
@@ -1061,14 +1095,21 @@ def verify_and_record(
             save_state(project_dir, state)
         return [verdict]
 
-    before = _source_fingerprint(file_path)
     try:
         raw = Path(file_path).read_bytes()
     except OSError as exc:
         return _blocking_error(str(exc))
 
     try:
-        defs = extract_function_defs(file_path, project_dir=project_dir)
+        # `content=raw` — enumerate a snapshot of the very bytes we are about to
+        # hash, never a re-read of the file. Without it `list-units` reads the
+        # path again and can land on a transient rewrite: an *empty* `.c`
+        # enumerates as a successful empty list (exit 0), so the zero-byte
+        # instant a `> f.c`/heredoc passes through would prune every unit this
+        # file has — dropping an already-recorded blocking verdict — and then
+        # stamp `scanned` with the final content's digest, leaving the Stop-gate
+        # and the out-of-band scan both satisfied (issue #141).
+        defs = extract_function_defs(file_path, project_dir=project_dir, content=raw)
     except UnitsUnavailable as exc:
         # Couldn't enumerate the file's units (esbmc missing, C parse error, …).
         # Record a blocking `error` verdict rather than skip: a file that was
@@ -1080,14 +1121,16 @@ def verify_and_record(
     # (and resetting its patience) on a file nothing has touched since.
     digest = hashlib.sha256(raw).hexdigest()
 
-    # `list-units` re-reads the file, so it may have enumerated bytes other than
-    # the ones we hashed. Fail closed on any sign of that: an *empty* `.c`
-    # enumerates as a successful empty list (exit 0), so the zero-byte instant a
-    # `> f.c`/heredoc rewrite passes through would prune every unit this file has
-    # — dropping an already-recorded blocking verdict — and then stamp `scanned`
-    # with the final content's digest, leaving the Stop-gate and the out-of-band
-    # scan both satisfied. The block clears on the next edit's reconcile.
-    if before is None or _source_fingerprint(file_path) != before:
+    # The snapshot guarantees we enumerated `raw`; this guarantees `raw` is still
+    # what the file holds. Together they give the stamping invariant: if
+    # `scanned[rel]` was set to H, the units recorded alongside it were enumerated
+    # from content hashing to H *and* the file still hashed to H right after. A
+    # rewrite that lands and stays (A → B) fails closed here rather than relying
+    # on the out-of-band scan to re-gate B later — which it cannot do at all
+    # outside a git work tree. Compared by content, not by `stat` metadata, so it
+    # holds on a filesystem with coarse timestamp granularity too. The block
+    # clears on the next edit's reconcile.
+    if content_hash(file_path) != digest:
         return _blocking_error(
             "source changed while its units were being enumerated; not recording "
             "a scan of content that was not enumerated — re-edit to re-verify"

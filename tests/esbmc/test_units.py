@@ -319,6 +319,31 @@ def test_list_units_forwards_build_flags(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_include_dir_resolves_a_relocated_copy(tmp_path: Path) -> None:
+    # The verify-gate enumerates an immutable *snapshot* of the bytes it hashed
+    # (issue #141), which lives outside the source's own directory. That is not
+    # the case above: clang searches the *including file's own* directory first
+    # for a quoted include, so a copy loses a sibling header that needed no `-I`
+    # in place. Forwarding the original's directory has to restore it, and
+    # without it the parse must genuinely fail — otherwise the gate's snapshot
+    # would turn every `.c` with a relative include into a blocking error.
+    orig = tmp_path / "orig"
+    orig.mkdir()
+    (orig / "helper.h").write_text("#define LIMIT 100\n")
+    body = '#include "helper.h"\nint g(int a) { return a < LIMIT ? a : 0; }\n'
+    (orig / "src.c").write_text(body)
+    assert [u.name for u in list_units(orig / "src.c")] == ["g"]  # resolves in place
+
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "src.c").write_text(body)
+    with pytest.raises(ListUnitsError):
+        list_units(snap / "src.c")
+    relocated = list_units(snap / "src.c", extra_flags=(f"-I{orig}",))
+    assert [u.name for u in relocated] == ["g"]
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
 def test_list_units_raises_on_failed_parse(tmp_path: Path) -> None:
     # A failed esbmc run (nonzero exit) must raise, never return [] — [] is
     # indistinguishable from a valid declaration-only file and would let the gate

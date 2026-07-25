@@ -15,6 +15,7 @@ broken launcher elsewhere is shadowed)::
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import sys
@@ -56,6 +57,38 @@ def _argv_capturing_forseti_cmd(tmp_path: Path, dest: Path) -> list[str]:
         f"open({str(dest)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
         "sys.stdout.write('{\"units\": []}')\n"
     )
+    return [sys.executable, str(script)]
+
+
+def _echoing_forseti_cmd(
+    tmp_path: Path, *, before_read: str = "", after_read: str = ""
+) -> list[str]:
+    """A fake CLI: `list-units` reports one unit per word of the file it was HANDED.
+
+    Echoing the *content back as unit names* is what lets a test assert which
+    bytes were actually enumerated — a canned payload cannot. `before_read` and
+    `after_read` are Python statements run around that read, straddling it: this
+    is the seam for rewriting the original source *while* the CLI is "parsing"
+    it, which is the only ordering that reproduces the issue #141 interleaving (a
+    rewrite that both starts and finishes before the read is not a race at all).
+    `verify` answers `violated`, so every enumerated unit ends up blocking.
+    """
+    script = tmp_path / "echo_forseti.py"
+    body = [
+        "import json, sys",
+        "if sys.argv[1] == 'list-units':",
+        "    src = sys.argv[2]",
+        *(f"    {line}" for line in before_read.splitlines()),
+        "    names = open(src).read().split()",
+        *(f"    {line}" for line in after_read.splitlines()),
+        "    print(json.dumps({'source': src, 'units': ["
+        "{'function': n, 'takes_pointer': False} for n in names]}))",
+        "else:",
+        "    fn = sys.argv[sys.argv.index('--function') + 1]",
+        "    print(json.dumps({'verdict': 'violated', 'unwind': 1, "
+        "'counterexample': 'cex ' + fn}))",
+    ]
+    script.write_text("\n".join(body) + "\n")
     return [sys.executable, str(script)]
 
 
@@ -298,31 +331,156 @@ def test_extract_function_defs_empty_units_is_a_clean_pass(
     )
 
 
-def test_rewrite_during_enumeration_does_not_prune_or_stamp(
+def test_enumeration_parses_the_given_content_not_a_re_read(
     tmp_path: Path, monkeypatch
 ) -> None:
-    # The A -> B -> A interleaving: `list-units` re-reads the file, so a concurrent
-    # `> f.c` rewrite can have it enumerate the zero-byte instant (a *successful*
-    # empty list) before the original bytes are restored. Left unchecked that
-    # prunes every unit the file has — dropping an already-recorded blocking
-    # verdict — and stamps `scanned` with the restored content's digest, so the
-    # Stop-gate and the out-of-band scan both see a handled file. Note a byte
-    # comparison alone cannot catch this: the content is identical afterwards.
+    # `content=` is the fix for issue #141: those exact bytes are what gets
+    # parsed, so no re-read of the path can substitute different ones. Here the
+    # on-disk bytes and the passed bytes disagree — the passed bytes must win,
+    # and the original must be left alone.
     src = tmp_path / "x.c"
-    original = "int f(int a) { return a; }\n"
-    src.write_text(original)
+    src.write_text("ondisk\n")
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+    defs = gate.extract_function_defs(
+        str(src), project_dir=str(tmp_path), content=b"snapshot\n"
+    )
+    assert [d.name for d in defs] == ["snapshot"]
+    assert src.read_text() == "ondisk\n"
 
+
+def test_snapshot_enumeration_keeps_relative_includes_resolvable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The snapshot is not where the source lives, so clang would search the wrong
+    # directory first for a quoted `#include "sibling.h"`. The original's
+    # directory must reach esbmc as an `-I` (absolute — the subprocess runs with
+    # cwd=project_dir), and the snapshot must keep the original basename so a
+    # parse error names something recognisable.
+    dest = tmp_path / "argv.json"
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
+    )
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    src = sub / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+    argv = json.loads(dest.read_text())
+    enumerated = Path(argv[1])
+    assert enumerated != src and enumerated.name == "x.c"
+    assert argv[argv.index("--") + 1 :] == [f"-I{sub.resolve()}"]
+    assert not enumerated.exists()  # the temp snapshot is cleaned up
+
+
+def test_snapshot_include_precedes_the_projects_build_flags(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The snapshot's `-I` stands in for the search directory the source would
+    # have had *in place*, which clang consults ahead of any `-I`. So it has to
+    # come first, and it must not displace `FORSETI_BUILD_FLAGS` — a project that
+    # needs `-Iinclude -DWIDGET` to parse at all still needs them here.
+    dest = tmp_path / "argv.json"
+    monkeypatch.setenv("FORSETI_BUILD_FLAGS", "-Iinclude -DWIDGET")
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+    argv = json.loads(dest.read_text())
+    assert argv[argv.index("--") + 1 :] == [
+        f"-I{tmp_path.resolve()}",
+        "-Iinclude",
+        "-DWIDGET",
+    ]
+
+
+def test_in_place_enumeration_uses_no_snapshot(tmp_path: Path, monkeypatch) -> None:
+    # Without `content=` nothing is copied and no include dir is invented — the
+    # file is parsed where it lies, exactly as before.
+    dest = tmp_path / "argv.json"
+    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    gate.extract_function_defs(str(src), project_dir=str(tmp_path))
+    argv = json.loads(dest.read_text())
+    assert argv[1] == str(src)
+    assert "--" not in argv
+
+
+def test_transient_rewrite_during_enumeration_is_enumerated_faithfully(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The A -> B -> A interleaving: a concurrent `> f.c` rewrite passes through a
+    # zero-byte instant, which enumerates as a *successful* empty list. Re-reading
+    # the path would prune every unit the file has — dropping an already-recorded
+    # blocking verdict — and then stamp `scanned` with the restored content's
+    # digest, leaving the Stop-gate and the out-of-band scan both satisfied.
+    # Enumerating a snapshot of the hashed bytes makes that impossible, and makes
+    # it so deterministically: the old metadata guard only noticed the rewrite
+    # when the filesystem's timestamp granularity was fine enough to resolve it.
+    src = tmp_path / "x.c"
+    original = "alpha beta\n"
+    src.write_text(original)
+    _seed_scanned(tmp_path)
+
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            before_read=f"open({str(src)!r}, 'w').write('')",  # truncated...
+            after_read=f"open({str(src)!r}, 'w').write({original!r})",  # ...restored
+        ),
+    )
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert sorted(v.function for v in verdicts) == ["alpha", "beta"]
+    after = gate.load_state(str(tmp_path))
+    assert sorted(after["units"]) == ["x.c::alpha", "x.c::beta"]
+    assert len(gate.blocking_units(after)) == 2
+    # Stamped with the digest of the content that was actually enumerated.
+    assert after["scanned"]["x.c"] == hashlib.sha256(original.encode()).hexdigest()
+
+
+def test_persistent_rewrite_during_enumeration_does_not_prune_or_stamp(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A rewrite that lands and *stays* is a different failure: we enumerated A but
+    # the file now holds B, so recording A's units against B would be a lie. The
+    # post-enumeration content re-hash fails closed on it — by content, so it
+    # holds on a coarse-timestamp filesystem, and without depending on the
+    # out-of-band scan to re-gate B later (which it cannot do outside a git tree).
+    src = tmp_path / "x.c"
+    src.write_text("alpha\n")
     state = gate.load_state(str(tmp_path))
-    gate.record(state, gate.UnitVerdict("x.c::f", "x.c", "f", "violated", 4))
+    gate.record(state, gate.UnitVerdict("x.c::alpha", "x.c", "alpha", "violated", 4))
     gate.save_state(str(tmp_path), state)
     _seed_scanned(tmp_path)
 
-    def _enumerate_a_rewritten_file(file_path, *, project_dir):
-        src.write_text("")  # the transient truncation the rewrite passes through
-        src.write_text(original)  # ...restored, so the bytes compare equal again
-        return []
-
-    monkeypatch.setattr(gate, "extract_function_defs", _enumerate_a_rewritten_file)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            before_read=f"open({str(src)!r}, 'w').write('beta\\n')",  # and left there
+        ),
+    )
     verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
 
     assert [v.verdict for v in verdicts] == ["error"]

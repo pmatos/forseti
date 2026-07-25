@@ -190,7 +190,16 @@ turns a verdict into an error.
   missing, C parse error) the file's units are recorded as a blocking ERROR
   verdict rather than silently skipped. A file that only parses with the
   project's include paths needs `FORSETI_BUILD_FLAGS` set — an unresolvable
-  `#include` is such a failure.
+  `#include` is such a failure. What gets parsed is an **immutable snapshot** of
+  the exact bytes the gate hashed, written to a private temp directory (issue
+  #141), so a rewrite concurrent with the parse cannot make the gate enumerate
+  one version of the file while stamping another. The snapshot is listed with an
+  `-I` naming the original's directory — clang searches the *including file's
+  own* directory first, so without it a sibling `#include "helper.h"` that
+  needed no flag in place would go missing. **The verify step still runs on the
+  real path** — verifying a snapshot would put temp paths in every
+  counterexample — so a file rewritten *during* its verify is caught after the
+  fact by the content-hash freshness check (`scanned`), not prevented.
 - **Only `.c` translation units are verified; header definitions are out of
   scope.** ESBMC cannot parse a `.h` standalone (`forseti verify`/`list-units`
   both error with "failed to figure out type of file"), and a function defined in
