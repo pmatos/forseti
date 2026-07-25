@@ -1,3 +1,10 @@
+## [1.4.1](https://github.com/pmatos/forseti/compare/v1.4.0...v1.4.1) (2026-07-25)
+
+
+### Bug Fixes
+
+* **properties:** distinguish multiplication from pointer deref in renderability_reason ([#106](https://github.com/pmatos/forseti/issues/106)) ([#136](https://github.com/pmatos/forseti/issues/136)) ([bd08ba3](https://github.com/pmatos/forseti/commit/bd08ba3f543279fc274a8308fcf07874d10e83d3))
+
 # [1.4.0](https://github.com/pmatos/forseti/compare/v1.3.0...v1.4.0) (2026-07-25)
 
 
