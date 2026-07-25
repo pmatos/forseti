@@ -131,6 +131,98 @@ def test_extract_function_defs_raises_on_malformed_payload(
 
 
 @pytest.mark.parametrize(
+    "takes_pointer",
+    [
+        '"false"',  # a truthy string — `bool()` would invert the classification
+        '"true"',
+        "1",  # int, not bool: `isinstance(1, bool)` is False
+        "0",
+        "null",
+        '"pointer"',
+        "[]",
+    ],
+)
+def test_extract_function_defs_raises_on_non_boolean_takes_pointer(
+    tmp_path: Path, monkeypatch, takes_pointer: str
+) -> None:
+    # `takes_pointer` decides whether a unit is verified or parked in non-blocking
+    # NEEDS_CONTRACT, so coercing it is unsafe: `bool("false")` is True, which would
+    # make a scalar function look pointer-taking and skip its ESBMC run entirely.
+    # Anything but a JSON boolean is an unusable payload → blocking UnitsUnavailable.
+    bad = f'{{"units": [{{"function": "f", "takes_pointer": {takes_pointer}}}]}}'
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _fake_forseti_cmd(tmp_path, stdout=bad)
+    )
+    with pytest.raises(gate.UnitsUnavailable, match="takes_pointer"):
+        gate.extract_function_defs(str(tmp_path / "x.c"), project_dir=str(tmp_path))
+
+
+def test_extract_function_defs_raises_on_missing_takes_pointer(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # An absent `takes_pointer` used to default to False ("scalar"), silently
+    # gating a unit whose classification the CLI never actually reported. Like an
+    # absent `units` key, absence blocks rather than picking a default.
+    bad = '{"units": [{"function": "f"}]}'
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _fake_forseti_cmd(tmp_path, stdout=bad)
+    )
+    with pytest.raises(gate.UnitsUnavailable, match="takes_pointer"):
+        gate.extract_function_defs(str(tmp_path / "x.c"), project_dir=str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "function",
+    ["123", "null", '""', '["f"]'],  # non-string or empty name
+)
+def test_extract_function_defs_raises_on_bad_function_name(
+    tmp_path: Path, monkeypatch, function: str
+) -> None:
+    # A non-string name was previously coerced with `str()`, so `123` became the
+    # unit "123" and `forseti verify --function 123` would fail downstream with a
+    # confusing error. Reject it at the payload boundary instead.
+    bad = f'{{"units": [{{"function": {function}, "takes_pointer": false}}]}}'
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _fake_forseti_cmd(tmp_path, stdout=bad)
+    )
+    with pytest.raises(gate.UnitsUnavailable, match="function"):
+        gate.extract_function_defs(str(tmp_path / "x.c"), project_dir=str(tmp_path))
+
+
+def test_extract_function_defs_raises_on_non_object_units_entry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A list-valued `units` whose entries are scalars must not crash the hook with
+    # AttributeError/TypeError — it degrades to a blocking UnitsUnavailable.
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _fake_forseti_cmd(tmp_path, stdout='{"units": ["f", 2]}'),
+    )
+    with pytest.raises(gate.UnitsUnavailable):
+        gate.extract_function_defs(str(tmp_path / "x.c"), project_dir=str(tmp_path))
+
+
+def test_non_boolean_takes_pointer_records_blocking_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # End to end: the reviewer's scenario — a list-valued `units` with the truthy
+    # string "false" — must persist a blocking `error` verdict, never a silent pass
+    # and never a non-blocking NEEDS_CONTRACT.
+    bad = '{"units": [{"function": "f", "takes_pointer": "false"}]}'
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _fake_forseti_cmd(tmp_path, stdout=bad)
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(int x) { return x; }\n")
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+    assert [v.verdict for v in verdicts] == ["error"]
+    state = gate.load_state(str(tmp_path))
+    assert gate.blocking_units(state)  # non-empty → the Stop-gate blocks
+    assert gate.needs_contract_units(state) == []
+
+
+@pytest.mark.parametrize(
     "stdout",
     [
         '{"source": "x.c"}',  # no `units` key (older/incompatible build)

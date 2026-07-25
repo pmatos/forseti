@@ -149,6 +149,36 @@ class UnitsUnavailable(RuntimeError):
     """
 
 
+def _func_def(unit: object) -> FuncDef:
+    """One `units` entry → `FuncDef`, with both fields type-checked, never coerced.
+
+    `bool()` on a non-boolean silently *inverts* the classification: the JSON
+    string `"false"` is truthy, so a scalar function reported by an incompatible
+    `forseti` build would be parked in non-blocking `NEEDS_CONTRACT` and never
+    verified — the edited file then passes the gate unchecked. A wrong type is an
+    unusable payload, not a value with a sensible default, so it blocks. A
+    *missing* `takes_pointer` blocks for the same reason (it used to default to
+    "scalar"), mirroring how an absent `units` key is treated.
+    """
+    if not isinstance(unit, dict):
+        raise UnitsUnavailable(
+            f"malformed list-units payload: units entry is not an object: {unit!r}"
+        )
+    name = unit.get("function")
+    if not isinstance(name, str) or not name:
+        raise UnitsUnavailable(
+            "malformed list-units payload: units entry has no `function` name: "
+            f"{unit!r}"
+        )
+    takes_pointer = unit.get("takes_pointer")
+    if not isinstance(takes_pointer, bool):
+        raise UnitsUnavailable(
+            f"malformed list-units payload: `takes_pointer` for {name!r} is not a "
+            f"JSON boolean: {takes_pointer!r}"
+        )
+    return FuncDef(name, takes_pointer)
+
+
 def extract_function_defs(
     file_path: str | os.PathLike[str], *, project_dir: str
 ) -> list[FuncDef]:
@@ -217,13 +247,7 @@ def extract_function_defs(
             "list-units payload has no list-valued `units` key (incompatible "
             f"`forseti` build?): {proc.stdout.strip()[:800] or '<empty>'}"
         )
-    try:
-        return [
-            FuncDef(str(u["function"]), bool(u.get("takes_pointer")))
-            for u in payload["units"]
-        ]
-    except (AttributeError, KeyError, TypeError) as exc:
-        raise UnitsUnavailable(f"malformed list-units payload: {exc}") from exc
+    return [_func_def(u) for u in payload["units"]]
 
 
 def extract_functions(
