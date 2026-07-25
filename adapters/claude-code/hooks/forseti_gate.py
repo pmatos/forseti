@@ -1475,8 +1475,16 @@ def verify_and_record(
     enumeration that failed for bytes now gone, and a post-verify drift check that
     has just withdrawn this run's own stamp. Each is re-decided atomically with the
     record it would write (`unless_superseded`) rather than by whatever the state
-    said when the lock was last held — which is also why an error about content
-    *still* on disk is never suppressed.
+    said when the lock was last held.
+
+    One more path returns nothing without deferring to anyone: a run whose content
+    drifted away and whose stamp is *not* its own to withdraw — whether a
+    concurrent run replaced it or nothing holds one at all. Its verdicts describe
+    bytes that are no longer on disk, and the returned list is what the hooks
+    report and act on, so it says nothing. Safety there is not the return value's:
+    the per-unit writes are ownership-scoped, so an un-overwritten unit is still
+    the owner's pending `unknown`, and with no stamp the file reads stale and is
+    re-offered.
     """
     rel = unit_id(project_dir, file_path)
 

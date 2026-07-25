@@ -602,28 +602,35 @@ def test_blocking_error_charge_stops_at_the_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The charge spends a retry budget, it does not keep a tally: once the budget is
-    # gone the marker is one no scan will offer again, so further errors must leave
-    # the counter at the cap rather than counting it up forever (PR #148 review).
+    # gone, a further error must leave the counter at the cap rather than counting
+    # it up forever (PR #148 review).
+    #
+    # Reaching that charge takes a spent marker on a file that is still *offered* —
+    # a capped marker alone retires the file, and then nothing is published at all
+    # (see the deferral tests). Here the stamp its killed run left has since been
+    # withdrawn by another run's drift check, so the file reads stale for the other
+    # reason while the marker for these bytes is already spent.
     src = tmp_path / "spent.c"
     digest = _concurrent_run_starts(tmp_path, src, "int f(void){return 0;}\n")
     with gate.gate_lock(str(tmp_path)):
         state = gate.load_state(str(tmp_path))
         state["pending"]["spent.c"]["attempts"] = gate.MAX_PENDING_VERIFY_ATTEMPTS
+        del state["scanned"]["spent.c"]
         gate.save_state(str(tmp_path), state)
 
     def _unavailable(file_path, *, project_dir, content=None):
         raise gate.UnitsUnavailable("forseti CLI could not be launched")
 
     monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
-    gate.verify_and_record(str(src), project_dir=str(tmp_path))
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
 
+    assert [v.verdict for v in verdicts] == ["error"]  # published, so it did charge
     state = gate.load_state(str(tmp_path))
     assert state["pending"]["spent.c"] == {
         "hash": digest,
-        "attempts": gate.MAX_PENDING_VERIFY_ATTEMPTS,
+        "attempts": gate.MAX_PENDING_VERIFY_ATTEMPTS,  # clamped, not MAX + 1
         "pid": os.getpid() + 1,
     }
-    assert gate.stale_sources(str(tmp_path), state, [str(src)]) == []  # still retired
 
 
 def test_blocking_error_preserves_a_newer_runs_pending_marker(
