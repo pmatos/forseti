@@ -196,9 +196,13 @@ turns a verdict into an error.
   one version of the file while stamping another. That temp tree is made to
   stand in for the source's own neighbourhood, with no extra flag: every entry
   beside the source is symlinked next to the snapshot, and the directory chain
-  from the project root down is reproduced as real directories mirroring their
-  own entries — so `#include "sibling.h"` *and* `#include "../common.h"` resolve
-  to the same headers an in-place parse would pick. (Naming the directory with
+  from the project root down is reproduced level by level, each mirroring its own
+  entries — so `#include "sibling.h"` *and* `#include "../common.h"` resolve to
+  the same headers an in-place parse would pick. A symlinked directory component
+  is reproduced as a **symlink**, and the chain then continues from its target:
+  the kernel resolves such a component before it applies `..`, so a climb past
+  one leaves the spelled chain, and a real directory there would silently select
+  a different header. (Naming the directory with
   `-I` instead would be wrong: `-I` also joins the *angle-bracket* search and
   lands after any `-iquote`, so `#include <config.h>` next to a generated
   `config.h` would pick the wrong one, flip an `#if`, and hide a unit from the
@@ -209,7 +213,10 @@ turns a verdict into an error.
   header an in-place parse picks. `FORSETI_BUILD_FLAGS="-I."` is the spelling
   that reproduces the in-place answer (the CLI runs with `cwd` = project dir).
   This is unchanged from mirroring the siblings alone; the padded depth only
-  removes the worse variant, where the miss landed in `/tmp` itself.
+  removes the worse variant, where the miss landed in `/tmp` itself. A symlink
+  pointing *out* of the project has the same limit one level down — the mirror
+  claims no ancestry above the link's target, exactly as it claims none above the
+  project root — so a climb past that target misses too, and blocks.
 - **The verify step runs on the real path, so its own freshness is guarded, not
   guaranteed.** A verdict has to describe the translation unit that actually
   ships, and the snapshot reproduces include resolution only up to its mirror

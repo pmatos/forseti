@@ -16,6 +16,7 @@ this gate.
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import fnmatch
 import hashlib
@@ -252,19 +253,89 @@ def _staged(tmp: str, path: str) -> str:
     return os.path.join(tmp, os.path.relpath(path, os.sep))
 
 
-def _mirror_siblings(real_dir: str, into: str, *, skip: str) -> None:
-    """Symlink every entry of `real_dir` into `into`, except `skip`.
+def _mirror_entries(real_dir: str, into: str) -> None:
+    """Symlink every entry of `real_dir` into `into` that is not already there.
 
-    `skip` is the one name on the path down to the snapshot — a real directory
-    already created, or the snapshot file itself. Only `entry.name`/`entry.path`
-    are touched: no `stat`, no `is_dir()`, so an entry the hook cannot stat is
-    still linked (and a directory is linked whole, so ``#include "sub/h.h"``
-    resolves through it).
+    Whatever the caller has already put in `into` is the mirrored tree itself —
+    a level of the chain down to the snapshot, a reproduced symlink component, or
+    the snapshot file — and must never be overwritten by a link back to the real
+    entry of the same name. `lexists`, so a *dangling* link already staged counts
+    too. Only `entry.name`/`entry.path` are touched: no `stat`, no `is_dir()`, so
+    an entry the hook cannot stat is still linked (and a directory is linked
+    whole, so ``#include "sub/h.h"`` resolves through it).
     """
     with os.scandir(real_dir) as entries:
         for entry in entries:
-            if entry.name != skip:
-                os.symlink(entry.path, os.path.join(into, entry.name))
+            dest = os.path.join(into, entry.name)
+            if not os.path.lexists(dest):
+                os.symlink(entry.path, dest)
+
+
+def _mirror_plan(
+    src_dir: str, project_dir: str
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """How to reproduce `src_dir`'s ancestry: real directories, symlink components.
+
+    Returns the directories to recreate as *real* directories (each mirroring its
+    own entries) and the ``(spelled link, its target)`` pairs to recreate as
+    *symlinks*, so that both ways of resolving a ``..`` agree with the in-place
+    parse:
+
+    * **The kernel walks it.** ``..`` from a directory reached through a symlink
+      is the parent of the link's *target*, not of the link — clang concatenates
+      the including file's directory with the spelled path and hands the result
+      to ``open``, so this is the resolution that actually happens (measured, not
+      assumed). Reproducing a symlinked component as a real directory would make
+      ``..`` climb the spelled chain instead, silently selecting a different
+      header — which flips ``#if`` branches, so enumeration reports units the
+      verify never sees, prunes the rest, and stamps the file.
+    * **The caller normalizes it lexically.** The spelled chain is reproduced
+      *as spelled*, so ``foo/../bar`` collapsed before the open lands on the
+      mirror of the same directory it lands on in place.
+
+    The walk stops at the first symlinked component, hops to its target, and
+    resumes from that target's own `_mirror_root` — so a link into the project
+    keeps the full ancestry, and a link out of it mirrors the target directory
+    (entries yes, parent no) exactly as a source outside the project does.
+    """
+    real_dirs: list[str] = []
+    links: list[tuple[str, str]] = []
+    hopped: set[str] = set()
+    base = _mirror_root(src_dir, project_dir)
+    steps = [] if src_dir == base else os.path.relpath(src_dir, base).split(os.sep)
+    while True:
+        if base not in real_dirs:
+            real_dirs.append(base)
+        cur, hop = base, None
+        for i, step in enumerate(steps):
+            nxt = os.path.join(cur, step)
+            if os.path.islink(nxt):
+                hop = (nxt, steps[i + 1 :])
+                break
+            cur = nxt
+            if cur not in real_dirs:
+                real_dirs.append(cur)
+        if hop is None:
+            return real_dirs, links
+        link, rest = hop
+        # A component that resolves back onto itself would loop here forever.
+        # `os.path.realpath` reports ELOOP by giving up and returning the path
+        # unchanged, so the guard has to be ours. The source could not have been
+        # read through such a chain anyway; block rather than spin.
+        if link in hopped:
+            raise OSError(errno.ELOOP, "symlinked directory component loops", link)
+        hopped.add(link)
+        target = os.path.realpath(link)
+        links.append((link, target))
+        # Against the *resolved* project dir: `target` is fully resolved, so that
+        # is the apples-to-apples comparison, and a link that lands back inside a
+        # project which is itself reached through a symlink keeps its full
+        # ancestry rather than being treated as foreign.
+        base = _mirror_root(target, os.path.realpath(project_dir))
+        below = [] if target == base else os.path.relpath(target, base).split(os.sep)
+        # `target` is fully resolved, so nothing in `below` can be a symlink; only
+        # the not-yet-walked `rest` can hop again.
+        steps = below + rest
 
 
 @contextlib.contextmanager
@@ -290,11 +361,13 @@ def _enumerable_source(
     * **Siblings.** Every other entry of the source's directory is symlinked
       beside the snapshot, so ``#include "sibling.h"`` resolves to the real one.
     * **Ancestry.** The chain from `_mirror_root` down to the source's directory
-      is reproduced as *real* directories, each mirroring its own entries bar the
-      one the chain continues through, so ``#include "../common.h"`` — the
-      ordinary shape for a ``src/foo.c`` — resolves too. Real directories, not
-      symlinks, at every step: ``..`` is then the mirrored parent whether the
-      caller normalizes ``foo/../bar`` lexically or lets the kernel walk it.
+      is reproduced level by level, each mirroring its own entries bar the names
+      the chain itself already occupies, so ``#include "../common.h"`` — the
+      ordinary shape for a ``src/foo.c`` — resolves too. A real directory where
+      the source has a real directory and a *symlink* where it has a symlink
+      (`_mirror_plan`): ``..`` is then the same directory the in-place parse
+      reaches whether the caller normalizes ``foo/../bar`` lexically or lets the
+      kernel walk it.
 
     The tree also reproduces the source's **absolute depth** (``/a/b/x.c`` stages
     at ``<tmp>/a/b/x.c``), with the levels above the mirror root real but empty.
@@ -324,19 +397,21 @@ def _enumerable_source(
     clang's ``-iquote``, exposing only ``-I``/``--idirafter``.) Mirroring needs no
     flag at all and leaves every search path exactly as it was.
 
-    Every path here is derived **lexically** — absolutized against `project_dir`
-    (the subprocess's cwd) but never `resolve()`d. For a symlinked source, clang
-    searches the directory of the path it was *given*, so resolving would mirror
+    The source's own path is derived **lexically** — absolutized against
+    `project_dir` (the subprocess's cwd) but never `resolve()`d — and the
+    snapshot is staged at that spelled path. clang searches the directory of the
+    path it was *given*, so for a symlinked source file resolving would mirror
     the link target's directory instead: a header beside the link would go
     missing, and a same-named header beside the target would be silently
-    preferred.
+    preferred. Directory *components* of that path are a separate question and
+    are resolved, because the kernel resolves them when it walks a ``..``; see
+    `_mirror_plan`.
     """
     if content is None:
         yield str(file_path)
         return
     target = os.path.abspath(os.path.join(project_dir, os.fspath(file_path)))
     src_dir, name = os.path.dirname(target), os.path.basename(target)
-    root = _mirror_root(src_dir, project_dir)
     # Every `OSError` the staging can raise — an unwritable/missing `TMPDIR`,
     # `ENOSPC`, `EDQUOT`, an unreadable directory anywhere on the mirrored chain,
     # a failed cleanup — has to land as `UnitsUnavailable`, the one exception
@@ -349,22 +424,28 @@ def _enumerable_source(
     # `_list_units` already converts `OSError` from the spawn.
     try:
         with tempfile.TemporaryDirectory(prefix="forseti-units-") as tmp:
-            os.makedirs(_staged(tmp, src_dir), exist_ok=True)
-            descent: list[str] = []
-            if src_dir != root:
-                descent = os.path.relpath(src_dir, root).split(os.sep)
-            real = root
-            for step in [*descent, name]:
-                _mirror_siblings(real, _staged(tmp, real), skip=step)
-                real = os.path.join(real, step)
+            real_dirs, links = _mirror_plan(src_dir, project_dir)
+            # Order is load-bearing. The whole skeleton — every level of the
+            # chain, every reproduced symlink component, and the snapshot itself
+            # — has to exist before any level mirrors its entries, because
+            # `_mirror_entries` yields to whatever is already staged. Mirror the
+            # source's directory first and its own name would become a link back
+            # to the real file, which `write_bytes` would then follow and
+            # *truncate the user's source*.
+            for real in real_dirs:
+                os.makedirs(_staged(tmp, real), exist_ok=True)
+            for link, link_target in links:
+                os.symlink(_staged(tmp, link_target), _staged(tmp, link))
             snapshot = Path(_staged(tmp, target))
             snapshot.write_bytes(content)
+            for real in real_dirs:
+                _mirror_entries(real, _staged(tmp, real))
             yield str(snapshot)
     except OSError as exc:
         raise UnitsUnavailable(
             f"could not stage a snapshot of {name} for enumeration (check "
-            f"TMPDIR, free space, and read access to {src_dir} and its "
-            f"ancestors up to {root}): {exc}"
+            f"TMPDIR, free space, and read access to {src_dir} and the "
+            f"directories `_mirror_plan` reproduces for it): {exc}"
         ) from exc
 
 

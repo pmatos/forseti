@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -56,11 +57,13 @@ def _argv_capturing_forseti_cmd(tmp_path: Path, dest: Path) -> list[str]:
     real path — which is how a test checks that a snapshot's temp directory
     stands in for the source's own directory (`_enumerable_source` mirrors it
     with symlinks, so quoted `#include`s resolve exactly as they would in place).
-    `ancestors` is the same walking upwards, one record per level from the
-    source's directory to ``/``: what a `..` in an `#include` would find, and
-    whether that level is a real directory (only then do a lexical and a kernel
-    resolution of `..` agree). A level that cannot be listed records ``None``
-    rather than aborting the capture.
+    `ancestors` is the same walking upwards *lexically*, one record per level
+    from the source's directory to ``/``: what a `..` in an `#include` would find
+    if the caller normalized the path itself. `kernel_ancestors` is the walk the
+    kernel actually performs — it resolves each component first, so a symlinked
+    one sends the chain somewhere the lexical walk never goes. `islink`/`real`
+    say which of the two a given level belongs to. A level that cannot be listed
+    records ``None`` rather than aborting the capture.
     """
     script = tmp_path / "argv_forseti.py"
     script.write_text(
@@ -76,10 +79,17 @@ def _argv_capturing_forseti_cmd(tmp_path: Path, dest: Path) -> list[str]:
         "sib = ents(d)\n"
         "anc = []\n"
         "while d and d != os.sep:\n"
-        "    anc.append({'path': d, 'islink': os.path.islink(d), 'entries': ents(d)})\n"
+        "    anc.append({'path': d, 'islink': os.path.islink(d),"
+        " 'real': os.path.realpath(d), 'entries': ents(d)})\n"
         "    d = os.path.dirname(d)\n"
+        "k = os.path.realpath(os.path.dirname(src))\n"
+        "ker = []\n"
+        "while k and k != os.sep:\n"
+        "    ker.append({'path': k, 'entries': ents(k)})\n"
+        "    k = os.path.dirname(k)\n"
         f"open({str(dest)!r}, 'w').write("
-        "json.dumps({'argv': sys.argv[1:], 'siblings': sib, 'ancestors': anc}))\n"
+        "json.dumps({'argv': sys.argv[1:], 'siblings': sib, 'ancestors': anc,"
+        " 'kernel_ancestors': ker}))\n"
         "sys.stdout.write('{\"units\": []}')\n"
     )
     return [sys.executable, str(script)]
@@ -540,6 +550,56 @@ def test_snapshot_mirrors_the_ancestry_up_to_the_project_dir(
     # Every step is a real directory, so `..` walks the mirror whether the caller
     # normalizes `foo/../bar` lexically or leaves it to the kernel.
     assert not src_level["islink"] and not proj_level["islink"]
+
+
+def test_snapshot_reproduces_a_symlinked_directory_component(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A `..` climbing past a *symlinked* component does not climb the spelled
+    # chain: the kernel resolves the component first, so `link/src/../..` lands
+    # beside the link's target. clang hands the concatenated path straight to
+    # `open`, so that is the resolution the in-place parse gets. Reproducing the
+    # component as a real directory would send the climb up the spelled chain
+    # instead and silently select a different header — a different translation
+    # unit, which enumeration then prunes and stamps against.
+    dest = tmp_path / "argv.json"
+    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
+    )
+    proj = tmp_path / "proj"
+    pkg = proj / "vendor" / "pkg"
+    (pkg / "src").mkdir(parents=True)
+    (pkg / "common.h").write_text("#define COMMON 1\n")
+    (proj / "vendor" / "selector.h").write_text("#define WHICH 1\n")  # the real pick
+    (proj / "selector.h").write_text("#define WHICH 2\n")  # the spelled-chain decoy
+    (proj / "link").symlink_to(pkg)
+    src = proj / "link" / "src" / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    gate.extract_function_defs(str(src), project_dir=str(proj), content=b"f\n")
+
+    captured = json.loads(dest.read_text())
+    src_level, link_level, proj_level = captured["ancestors"][:3]
+    kernel = captured["kernel_ancestors"]
+    # The component is a link in the mirror too, so the kernel walk leaves the
+    # spelled chain exactly where it does in place...
+    assert link_level["islink"]
+    assert os.path.dirname(src_level["real"]) == link_level["real"]
+    assert os.path.dirname(link_level["real"]) != proj_level["real"]
+    # ...landing on the target's own parent, where `../../selector.h` finds the
+    # header the in-place parse finds — not the project's decoy.
+    assert kernel[2]["entries"]["selector.h"] == str(
+        (proj / "vendor" / "selector.h").resolve()
+    )
+    # The target's entries are mirrored, so a one-level `#include "../common.h"`
+    # keeps resolving (it already did — mirroring scandirs through the link).
+    assert kernel[1]["entries"]["common.h"] == str((pkg / "common.h").resolve())
+    # And the spelled chain survives as spelled, for a caller that normalizes
+    # `foo/../bar` itself: lexically two levels up is still the project dir.
+    assert proj_level["entries"]["selector.h"] == str((proj / "selector.h").resolve())
 
 
 def test_snapshot_reproduces_the_sources_absolute_depth(
@@ -1129,6 +1189,80 @@ def test_include_above_the_mirror_root_is_a_known_residual(
 
     assert sorted(d.name for d in in_place) == ["f", "only_above"]
     assert sorted(d.name for d in snapshotted) == ["f"]  # the residual
+
+
+def _symlinked_component_tree(proj: Path, pkg: Path) -> Path:
+    """A source under a symlinked directory, with two candidate `selector.h`.
+
+    ``proj/link -> pkg``; the source sits at ``link/src/x.c`` and climbs two
+    levels. The kernel resolves `link` first, so in place it reaches the header
+    beside `pkg`; the spelled chain would reach the one beside `proj`. The two
+    select different `#if` branches, so the unit lists differ.
+    """
+    (pkg / "src").mkdir(parents=True)
+    (pkg.parent / "selector.h").write_text("#define PICK_TARGET 1\n")
+    (proj / "selector.h").write_text("#define PICK_SPELLED 1\n")
+    (pkg / "common.h").write_text("#define ONE 1\n")
+    (proj / "link").symlink_to(pkg)
+    src = pkg / "src" / "x.c"
+    src.write_text(
+        '#include "../../selector.h"\n'
+        '#include "../common.h"\n'
+        "#ifdef PICK_TARGET\n"
+        "int target_won(int x) { return x + ONE; }\n"
+        "#endif\n"
+        "#ifdef PICK_SPELLED\n"
+        "int spelled_won(int x) { return x; }\n"
+        "#endif\n"
+    )
+    return src
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_symlinked_component_enumerates_like_the_in_place_parse(tmp_path: Path) -> None:
+    # End to end against the real frontend: `..` past a symlinked component is
+    # resolved by the kernel, so the in-place parse reads the header beside the
+    # link's *target*. Mirroring the component as a real directory read the one
+    # beside the link instead — a different translation unit, enumerated as
+    # authoritative and then pruned and stamped against.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    src = _symlinked_component_tree(proj, proj / "vendor" / "pkg")
+
+    in_place = gate.extract_functions("link/src/x.c", project_dir=str(proj))
+    snapshotted = [
+        d.name
+        for d in gate.extract_function_defs(
+            "link/src/x.c", project_dir=str(proj), content=src.read_bytes()
+        )
+    ]
+
+    assert in_place == ["target_won"]
+    assert snapshotted == in_place
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_symlink_out_of_the_project_blocks_rather_than_switching_headers(
+    tmp_path: Path,
+) -> None:
+    # Characterization. When the link leaves the project the mirror can claim no
+    # ancestry above its target — the same rule that stops the walk at the
+    # project dir, and for the same reason (a `scandir` of `$HOME` on every
+    # edit). So a climb past the target lands on empty padding and the parse
+    # fails: a blocking `error`, which is the honest answer for a translation
+    # unit the gate cannot reproduce. What it must never be again is the silent
+    # one — enumerating `spelled_won`, a unit the in-place parse does not have.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    src = _symlinked_component_tree(proj, tmp_path / "external" / "pkg")
+
+    assert gate.extract_functions("link/src/x.c", project_dir=str(proj)) == [
+        "target_won"
+    ]
+    with pytest.raises(gate.UnitsUnavailable):
+        gate.extract_function_defs(
+            "link/src/x.c", project_dir=str(proj), content=src.read_bytes()
+        )
 
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
