@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -35,6 +36,52 @@ from pathlib import Path, PurePosixPath
 # yields false positives. Tune here; this is the one knob that defines "safe".
 SAFETY_FLAGS: tuple[str, ...] = ("--overflow-check",)
 
+
+class UnitsUnavailable(RuntimeError):
+    """A file's function definitions could not be enumerated.
+
+    Distinct from "the file defines no functions" (an empty list): a failed
+    enumeration must surface as a blocking `error` verdict, never be mistaken for
+    a clean pass (kill-safety — a not-verified unit can't silently slip through).
+    Raised when `forseti list-units` cannot be run or its payload is unusable, and
+    when the gate's own configuration is (`FORSETI_BUILD_FLAGS`).
+    """
+
+
+def _build_flags() -> tuple[str, ...]:
+    """The project's build flags (`-I`, `-D`, ...) from ``FORSETI_BUILD_FLAGS``.
+
+    Read per call, not once at import, so a hook process that sets the variable
+    after this module loads still sees it. Split with `shlex` (stdlib — the hooks
+    stay dependency-free) so a quoted path with spaces survives as one argument.
+
+    Kept separate from `SAFETY_FLAGS` because the two have different destinations:
+    build flags describe how the *translation unit* is constructed, so they must
+    reach the `list-units` parse as well as the verify, while `--overflow-check`
+    is a property-checking flag that means nothing to a `--parse-tree-only` run.
+    Passing the wrong set to either is the failure this split exists to prevent —
+    without its `-I` the enumeration fails outright (a blocking `error` on every
+    edited file), and a missing `-D` silently changes *which* functions the file
+    even defines, so the gate would verify a different unit list than the project
+    builds.
+
+    Unbalanced quoting raises `UnitsUnavailable` rather than escaping as a bare
+    `ValueError`: quoting *is* this knob's interface (that is the whole reason for
+    `shlex`), so a typo is the expected user error, and it has to land as the
+    blocking verdict the gate is built around instead of a hook traceback.
+    Degrading to no flags would be worse than either — it drops the `-I` and
+    resurfaces as a baffling `PARSING ERROR` on a file that is perfectly fine.
+    """
+    raw = os.environ.get("FORSETI_BUILD_FLAGS", "")
+    try:
+        return tuple(shlex.split(raw))
+    except ValueError as exc:
+        raise UnitsUnavailable(
+            f"FORSETI_BUILD_FLAGS is not parseable as a shell word list ({exc}): "
+            f"{raw!r} — check for an unbalanced quote"
+        ) from exc
+
+
 # The default loop-unwind bound k. A VERIFIED is only ever "verified up to k".
 # Override per project with FORSETI_UNWIND; functions with loops need a higher k
 # (a k below the trip count can report a spurious verdict — roadmap Risk 1).
@@ -46,6 +93,10 @@ DEFAULT_K = int(os.environ.get("FORSETI_UNWIND", "1"))
 # self-terminates with UNKNOWN before the hard kill.
 VERIFY_TIMEOUT_S = float(os.environ.get("FORSETI_VERIFY_TIMEOUT_S", "110"))
 _SUBPROCESS_MARGIN_S = 15.0
+
+# Budget for the one `forseti list-units` parse per edited file. A `--parse-tree-only`
+# run does no solving, so it is fast; keep it well under the verify budget.
+LIST_UNITS_TIMEOUT_S = float(os.environ.get("FORSETI_LIST_UNITS_TIMEOUT_S", "30"))
 
 # How many times the Stop-gate blocks before it gives up and lets the turn end
 # with a LOUD unverified residual (never a silent pass, but never an infinite
@@ -61,7 +112,12 @@ C_SUFFIXES = {".c", ".h"}
 # content hash (no mtime `cp -p`/`tar` hole) against a `scanned` baseline that
 # `baseline_scanned` seeds at session start — so the gate fires on C changed
 # *during* the session, never on pre-existing dirty or committed/third-party C the
-# agent never touched (the over-reach a whole-tree scan couldn't avoid).
+# agent never touched (the over-reach a whole-tree scan couldn't avoid). The
+# baseline has two halves, because the gate reads C from two places: `scanned`
+# holds each dirty file's *worktree* bytes, and `baseline_blobs` holds the *index*
+# and `HEAD` blob hashes the blob scan (`divergent_blob_sources`) compares against
+# — without the second half a session opening at `MM foo.c` (staged WIP, worktree
+# reverted) would block on the user's own pre-session staged blob (issue #139).
 # `FORSETI_GATE_INCLUDE`/`FORSETI_GATE_EXCLUDE` narrow it further; a bare path
 # segment (`vendor`) prunes any directory of that name, a glob (`*_generated.c`,
 # `test/*`) is matched against the project-relative path.
@@ -70,33 +126,6 @@ _DEFAULT_EXCLUDE_GLOBS: tuple[str, ...] = ("third_party", "vendor", "node_module
 _STATE_DIR = ".forseti"
 _STATE_FILE = "gate_state.json"
 _LOCK_FILE = "gate_state.lock"
-
-# Control-flow keywords that a permissive definition regex could mistake for a
-# function name; filtered out belt-and-suspenders.
-_KEYWORDS = {
-    "if",
-    "for",
-    "while",
-    "switch",
-    "do",
-    "else",
-    "return",
-    "sizeof",
-    "case",
-    "default",
-    "goto",
-}
-
-# A top-level C function *definition*: starts at column 0 with at least one
-# return-type token, then `name(params)` and an opening `{` (a trailing `;`
-# makes it a prototype, which `[^;{}]*` excludes). Heuristic, not a parser —
-# good enough for the small kernels this gate targets; documented in the README.
-_FUNC_RE = re.compile(
-    r"^[A-Za-z_][A-Za-z0-9_ \t\*]*?[ \t\*]"
-    r"([A-Za-z_][A-Za-z0-9_]*)"
-    r"[ \t]*\(([^;{}]*)\)[ \t\r\n]*\{",
-    re.MULTILINE,
-)
 
 # Verdict string for a unit the gate declines to check at the function level: it
 # takes a pointer/array parameter, so an unconstrained (havoc'd) caller makes the
@@ -155,48 +184,134 @@ class FuncDef:
 
     `takes_pointer` is true when any parameter is a pointer or array — the case
     the function-level gate cannot verify without a materialized backing object
-    (`NEEDS_CONTRACT`).
+    (`NEEDS_CONTRACT`). It is read from `forseti list-units`' canonical,
+    typedef-resolved parameter types, so a pointer hidden behind a typedef counts.
     """
 
     name: str
     takes_pointer: bool
 
 
-# C comments (block `/* ... */`, possibly multi-line, and line `// ...`) so a `*`
-# inside a comment in the parameter list is not mistaken for a pointer declarator.
-_C_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
+def _func_def(unit: object) -> FuncDef:
+    """One `units` entry → `FuncDef`, with both fields type-checked, never coerced.
 
-
-def _params_take_pointer(params: str) -> bool:
-    """True if a C parameter list has a pointer or array parameter.
-
-    Heuristic (matches the definition regex's reach, not a parser): a `*` or `[`
-    anywhere in the parameter text — after stripping comments, so `/* ... */` /
-    `// ...` don't false-positive — means at least one parameter is a pointer, or
-    an array that decays to a pointer at the function boundary. Still misses a
-    pointer hidden behind a typedef, or a `*` inside a string literal; a real C
-    parse is the robust fix (documented in the README).
+    `bool()` on a non-boolean silently *inverts* the classification: the JSON
+    string `"false"` is truthy, so a scalar function reported by an incompatible
+    `forseti` build would be parked in non-blocking `NEEDS_CONTRACT` and never
+    verified — the edited file then passes the gate unchecked. A wrong type is an
+    unusable payload, not a value with a sensible default, so it blocks. A
+    *missing* `takes_pointer` blocks for the same reason (it used to default to
+    "scalar"), mirroring how an absent `units` key is treated.
     """
-    cleaned = _C_COMMENT_RE.sub(" ", params)
-    return "*" in cleaned or "[" in cleaned
+    if not isinstance(unit, dict):
+        raise UnitsUnavailable(
+            f"malformed list-units payload: units entry is not an object: {unit!r}"
+        )
+    name = unit.get("function")
+    if not isinstance(name, str) or not name:
+        raise UnitsUnavailable(
+            "malformed list-units payload: units entry has no `function` name: "
+            f"{unit!r}"
+        )
+    takes_pointer = unit.get("takes_pointer")
+    if not isinstance(takes_pointer, bool):
+        raise UnitsUnavailable(
+            f"malformed list-units payload: `takes_pointer` for {name!r} is not a "
+            f"JSON boolean: {takes_pointer!r}"
+        )
+    return FuncDef(name, takes_pointer)
 
 
-def extract_function_defs(source_text: str) -> list[FuncDef]:
-    """Top-level function definitions in `source_text` (heuristic, deduped by name)."""
-    seen: set[str] = set()
-    defs: list[FuncDef] = []
-    for match in _FUNC_RE.finditer(source_text):
-        name = match.group(1)
-        if name in _KEYWORDS or name in seen:
-            continue
-        seen.add(name)
-        defs.append(FuncDef(name, _params_take_pointer(match.group(2))))
-    return defs
+def extract_function_defs(
+    file_path: str | os.PathLike[str], *, project_dir: str
+) -> list[FuncDef]:
+    """Enumerate `file_path`'s function definitions via ``forseti list-units``.
+
+    Shells out to the same authoritative clang-based frontend that *verifies* the
+    unit (``forseti list-units --json``) rather than a regex, so typedef'd
+    pointers, K&R and multi-line signatures, function-like macros, ``#if`` blocks,
+    and a ``*`` inside a comment are all classified correctly (issue #131). The
+    hook stays dependency-free — it only spawns the CLI, never imports the
+    package. Raises `UnitsUnavailable` when the CLI cannot be run or the parse
+    fails (missing binary, C parse error, timeout, unreadable file), so the caller
+    records a blocking `error` verdict instead of silently skipping the file.
+
+    Only ``.c`` translation units are enumerated: ESBMC cannot parse a header
+    standalone (``forseti verify`` errors on a ``.h`` too — "failed to figure out
+    type of file"), and clang's path-match keeps a header-resident definition out
+    of its includer's unit list, so functions defined in a ``.h`` are simply out
+    of gate scope. A non-``.c`` file yields ``[]`` (a clean pass) rather than an
+    unresolvable block.
+    """
+    if Path(file_path).suffix.lower() != ".c":
+        return []
+    argv = [
+        *resolve_forseti_cmd(),
+        "list-units",
+        str(file_path),
+        "--json",
+        # Pass the float through, don't truncate. `list-units` hands its --timeout
+        # straight to `subprocess.run(timeout=...)` (esbmc's own --timeout is not
+        # used on the parse-tree-only path), where `0` expires immediately rather
+        # than meaning "unbounded" — so `int(0.5)` would turn a half-second budget
+        # into a blocking `error` on every edited `.c`. `str()` round-trips exactly;
+        # argparse reparses it as the float the CLI declares.
+        "--timeout",
+        str(LIST_UNITS_TIMEOUT_S),
+    ]
+    # The parse needs the project's own `-I`/`-D` — a translation unit whose
+    # `#include` cannot be resolved makes esbmc exit nonzero, which is a blocking
+    # `error` on every edited file rather than a listing. Only the build flags go
+    # here: `SAFETY_FLAGS` is for the verify, and a property flag on a
+    # `--parse-tree-only` run is at best inert.
+    build_flags = _build_flags()
+    if build_flags:
+        argv += ["--", *build_flags]
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=LIST_UNITS_TIMEOUT_S + _SUBPROCESS_MARGIN_S,
+            cwd=project_dir,
+        )
+    except OSError as exc:  # missing CLI, etc. — resolve_forseti_cmd falls back to -m
+        raise UnitsUnavailable(
+            "forseti CLI could not be launched; install the forseti package "
+            f"(pip install -e .) so `forseti` is on PATH: {exc}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise UnitsUnavailable(
+            f"list-units exceeded {LIST_UNITS_TIMEOUT_S:g}s (raise "
+            "FORSETI_LIST_UNITS_TIMEOUT_S)"
+        ) from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()[:800] or f"exit {proc.returncode}"
+        raise UnitsUnavailable(detail)
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise UnitsUnavailable(
+            (proc.stderr or proc.stdout).strip()[:800] or "no JSON output"
+        ) from exc
+    # Require an explicit list-valued `units`. Defaulting a missing key to `[]`
+    # would let an older/incompatible `forseti` build — one that exits 0 with a
+    # JSON object that has no `units` member — read as "this file defines no
+    # functions" (a clean pass), so an edited `.c` slips through unverified. An
+    # *empty* list is still a legitimate no-functions pass; only absence blocks.
+    if not isinstance(payload, dict) or not isinstance(payload.get("units"), list):
+        raise UnitsUnavailable(
+            "list-units payload has no list-valued `units` key (incompatible "
+            f"`forseti` build?): {proc.stdout.strip()[:800] or '<empty>'}"
+        )
+    return [_func_def(u) for u in payload["units"]]
 
 
-def extract_functions(source_text: str) -> list[str]:
-    """Names of top-level functions defined in `source_text` (heuristic, deduped)."""
-    return [d.name for d in extract_function_defs(source_text)]
+def extract_functions(
+    file_path: str | os.PathLike[str], *, project_dir: str
+) -> list[str]:
+    """Names of `file_path`'s top-level functions (via ``forseti list-units``)."""
+    return [d.name for d in extract_function_defs(file_path, project_dir=project_dir)]
 
 
 def unit_id(project_dir: str, file_path: str) -> str:
@@ -220,6 +335,22 @@ def content_hash(path: str | os.PathLike[str]) -> str | None:
         return hashlib.sha256(Path(path).read_bytes()).hexdigest()
     except OSError:
         return None
+
+
+def _source_fingerprint(path: str | os.PathLike[str]) -> tuple[int, ...] | None:
+    """Identity + change stamp for `path`, or ``None`` if it cannot be stat'd.
+
+    Pairs with `content_hash` to detect a rewrite that happened *while* we were
+    enumerating. A digest alone cannot: the dangerous interleaving restores the
+    original bytes afterwards (A → B → A), so the content compares equal even
+    though the enumeration saw B. `st_mtime_ns`/`st_ctime_ns` still move for that
+    rewrite, and `st_dev`/`st_ino` catch a replace-by-rename.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
 def _globs(value: str | None) -> tuple[str, ...]:
@@ -493,6 +624,22 @@ def stale_sources(project_dir: str, state: dict, files: Iterable[str]) -> list[s
     return stale
 
 
+def _baselined_blobs(baseline: object, rel: str) -> tuple[str, ...]:
+    """The session-start blob hashes recorded for `rel` — empty if unusable.
+
+    Reads the `baseline_blobs` half of the SessionStart baseline defensively: a
+    hand-edited or truncated `gate_state.json` yields ``()``, which *gates* the blob
+    rather than exempting it. The unusable-input direction has to be the blocking
+    one here — an exemption is the only thing this map can grant.
+    """
+    if not isinstance(baseline, dict):
+        return ()
+    entry = baseline.get(rel)
+    if not isinstance(entry, list):
+        return ()
+    return tuple(h for h in entry if isinstance(h, str))
+
+
 def divergent_blob_sources(
     project_dir: str, state: dict, *, baseline_head: str | None = None
 ) -> list[dict]:
@@ -509,10 +656,15 @@ def divergent_blob_sources(
     whose SHA-256 differs from the recorded `scanned` (last-verified) hash.
 
     Keyed by content, so a blob equal to verified content is deduped straight out (no
-    over-gating a `git add`/commit of already-verified C). Only the staged set
-    (porcelain X-status) and the committed-since set are consulted, never every
-    tracked file, so a merely worktree-edited-but-uncommitted unit is *not* dragged in
-    by a stale ``HEAD``. Degrades to empty when not a git repo. Each entry is
+    over-gating a `git add`/commit of already-verified C). A blob equal to one the
+    SessionStart baseline recorded (`baseline_blobs` — the index/``HEAD`` blobs of the
+    pre-session dirty tree) dedups out the same way, and stays exempt for the whole
+    session: it is the user's own WIP, unchanged since session start, which is exactly
+    what the baseline exists to keep out of scope (issue #139). The agent staging or
+    committing *different* bytes yields a hash no baseline holds, so it still gates.
+    Only the staged set (porcelain X-status) and the committed-since set are consulted,
+    never every tracked file, so a merely worktree-edited-but-uncommitted unit is *not*
+    dragged in by a stale ``HEAD``. Degrades to empty when not a git repo. Each entry is
     ``{"rel": <project-relative path>, "reason": "staged" | "committed"}``.
     """
     root = _git(project_dir, "rev-parse", "--show-toplevel")
@@ -521,6 +673,7 @@ def divergent_blob_sources(
     root = root.strip()
     proj_real = os.path.realpath(project_dir)
     scanned = state.get("scanned", {})
+    baseline = state.get("baseline_blobs", {})
     # committed first: an already-shipped divergence is the graver of the two, and
     # dedup keeps a single (rel, reason) entry per path.
     candidates = [
@@ -544,10 +697,51 @@ def divergent_blob_sources(
         digest = git_blob_hash(project_dir, ref)
         if digest is None:
             continue  # no blob at that ref (staged deletion / rename source) — skip
-        if scanned.get(rel) != digest:
-            seen.add(key)
-            results.append({"rel": rel, "reason": reason})
+        if digest == scanned.get(rel) or digest in _baselined_blobs(baseline, rel):
+            continue  # already-verified content, or the pre-session baseline
+        seen.add(key)
+        results.append({"rel": rel, "reason": reason})
     return results
+
+
+def baseline_blob_hashes(project_dir: str) -> dict[str, list[str]] | None:
+    """Session-start hashes of the INDEX and ``HEAD`` blobs of the dirty C tree.
+
+    The blob half of the SessionStart baseline (issue #139), companion to the
+    worktree hashes `baseline_scanned` seeds into `scanned`. `divergent_blob_sources`
+    compares the index (``:path``) and ``HEAD`` (``HEAD:path``) blobs, which the
+    worktree bytes need not equal: a repo opening at ``MM foo.c`` (or ``MD`` — staged,
+    worktree deleted) holds a staged blob that `content_hash` never sees, so the Stop
+    check would fire on the user's pre-existing WIP the moment the session began.
+
+    Enumerated from `git_changed_files` — every porcelain-reported path — rather than
+    `discover_changed_c_sources`, whose existence filter drops exactly the
+    staged-then-deleted case this fixes. Paths run through the same
+    `_in_scope_c_abspath` filter (and are keyed by the same `unit_id`) as the consumer,
+    so the two sets cannot drift apart into a hole or a permanent over-gate. Refs that
+    hold no blob are skipped, so an untracked path (neither ref resolves) records
+    nothing and a pre-session rename records just its index blob. ``None`` when not a
+    git work tree. Costs two ``git cat-file`` calls per dirty C path, once per session.
+    """
+    root = _git(project_dir, "rev-parse", "--show-toplevel")
+    rels = git_changed_files(project_dir)
+    if root is None or rels is None:
+        return None
+    root = root.strip()
+    proj_real = os.path.realpath(project_dir)
+    baseline: dict[str, list[str]] = {}
+    for repo_rel in dict.fromkeys(rels):
+        abspath = _in_scope_c_abspath(project_dir, root, proj_real, repo_rel)
+        if abspath is None:
+            continue
+        digests: list[str] = []
+        for ref in (f":{repo_rel}", f"HEAD:{repo_rel}"):
+            digest = git_blob_hash(project_dir, ref)
+            if digest is not None and digest not in digests:
+                digests.append(digest)
+        if digests:
+            baseline[unit_id(project_dir, abspath)] = digests
+    return baseline
 
 
 def baseline_scanned(project_dir: str) -> int | None:
@@ -561,12 +755,22 @@ def baseline_scanned(project_dir: str) -> int | None:
     session start**": those files are gated only once the agent actually modifies
     them. The baseline HEAD is recorded too, so the committed-since scan can later
     catch C a Bash command writes *and* commits in one shot (issue #99 review).
-    Returns the number baselined, or ``None`` if not a git repo.
+
+    The worktree bytes are only half of it: the blob scan reads the index and ``HEAD``,
+    so `baseline_blob_hashes` seeds those hashes into `baseline_blobs` in the same
+    write (issue #139) — otherwise a session opening at ``MM``/``MD foo.c`` blocks
+    immediately on the user's pre-existing staged blob, which `content_hash` never saw.
+    Returns the number of files whose worktree content was baselined (the `scanned`
+    entries), or ``None`` if not a git repo.
     """
     discovered = discover_changed_c_sources(project_dir)
     if discovered is None:
         return None
-    head = git_head(project_dir)  # resolve HEAD outside the lock (a subprocess)
+    # Both resolve outside the lock — they spawn git subprocesses. A `None` blob
+    # baseline (the work tree vanished between the two calls) records nothing, which
+    # over-gates pre-session staged WIP rather than exempting a blob we never hashed.
+    head = git_head(project_dir)
+    blobs = baseline_blob_hashes(project_dir) or {}
     with gate_lock(project_dir):
         state = load_state(project_dir)
         baseline: dict[str, str] = {}
@@ -575,6 +779,7 @@ def baseline_scanned(project_dir: str) -> int | None:
             if digest is not None:
                 baseline[unit_id(project_dir, abspath)] = digest
         state["scanned"] = baseline
+        state["baseline_blobs"] = blobs
         state["baseline_head"] = head
         save_state(project_dir, state)
     return len(baseline)
@@ -586,6 +791,15 @@ def verify_function(
     """Run ``forseti verify`` on one function and map its JSON payload to a verdict."""
     rel = unit_id(project_dir, file_path)
     uid = f"{rel}::{function}"
+    try:
+        # Same build flags the enumeration parsed with, so the verify sees the
+        # same translation unit the unit list was taken from. Unparseable config
+        # becomes this unit's `error` verdict rather than a hook traceback — a
+        # direct caller (not coming through `verify_and_record`, which fails at
+        # enumeration first) must still get a verdict back.
+        build_flags = _build_flags()
+    except UnitsUnavailable as exc:
+        return UnitVerdict(uid, rel, function, "error", k, detail=str(exc))
     argv = [
         *resolve_forseti_cmd(),
         "verify",
@@ -599,6 +813,7 @@ def verify_function(
         "--json",
         "--",
         *SAFETY_FLAGS,
+        *build_flags,
     ]
     try:
         proc = subprocess.run(
@@ -689,11 +904,18 @@ def load_state(project_dir: str) -> dict:
             state.setdefault("units", {})
             state.setdefault("stop_attempts", 0)
             state.setdefault("scanned", {})
+            state.setdefault("baseline_blobs", {})
             state.setdefault("baseline_head", None)
             return state
         except (json.JSONDecodeError, OSError):
             pass
-    return {"units": {}, "stop_attempts": 0, "scanned": {}, "baseline_head": None}
+    return {
+        "units": {},
+        "stop_attempts": 0,
+        "scanned": {},
+        "baseline_blobs": {},
+        "baseline_head": None,
+    }
 
 
 def save_state(project_dir: str, state: dict) -> None:
@@ -742,8 +964,10 @@ def prune_deleted_units(state: dict, project_dir: str) -> list[str]:
     Stop-gate would block forever (then only emit a residual after the attempt cap)
     on a unit whose file is gone. Discovery correctly skips a missing file *for
     verification*; this reconciles the recorded side, dropping units whose file is
-    absent and clearing each such file's `scanned` baseline (so a same-name file
-    recreated later re-verifies from scratch).
+    absent and clearing each such file's `scanned` **and** `baseline_blobs` baseline
+    (so a same-name file recreated later re-verifies from scratch — the two baselines
+    are cleared together, or content matching a dropped one could still slip past the
+    blob scan).
 
     Keys off each unit's recorded `file` (project-relative), not `git status`, so
     it also catches an untracked Bash-written file git never knew existed — the
@@ -753,6 +977,7 @@ def prune_deleted_units(state: dict, project_dir: str) -> list[str]:
     """
     units = state.get("units", {})
     scanned = state.get("scanned", {})
+    baseline_blobs = state.get("baseline_blobs", {})
     pruned: list[str] = []
     gone_rels: set[str] = set()
     for uid, unit in list(units.items()):
@@ -765,6 +990,8 @@ def prune_deleted_units(state: dict, project_dir: str) -> list[str]:
             gone_rels.add(rel)
     for rel in gone_rels:
         scanned.pop(rel, None)
+        if isinstance(baseline_blobs, dict):
+            baseline_blobs.pop(rel, None)
     return pruned
 
 
@@ -818,10 +1045,15 @@ def verify_and_record(
     violation and pass silently.
     """
     rel = unit_id(project_dir, file_path)
-    try:
-        raw = Path(file_path).read_bytes()
-    except OSError as exc:
-        verdict = UnitVerdict(f"{rel}::?", rel, "?", "error", k, detail=str(exc))
+
+    def _blocking_error(detail: str) -> list[UnitVerdict]:
+        """Record a blocking `error` verdict for the whole file and return it.
+
+        Neither caller stamps `scanned`: a file we could not read or enumerate
+        must not be recorded as already-scanned, or the out-of-band scan would
+        treat it as handled and the edit would pass unverified.
+        """
+        verdict = UnitVerdict(f"{rel}::?", rel, "?", "error", k, detail=detail)
         with gate_lock(project_dir):
             state = load_state(project_dir)
             record(state, verdict)
@@ -829,12 +1061,37 @@ def verify_and_record(
             save_state(project_dir, state)
         return [verdict]
 
-    # Decode leniently (a stray non-UTF-8 byte must not crash the hook) and stamp
-    # the content hash so a later out-of-band scan treats this exact content as
-    # already verified — that dedup is what keeps the Stop-gate from re-blocking
+    before = _source_fingerprint(file_path)
+    try:
+        raw = Path(file_path).read_bytes()
+    except OSError as exc:
+        return _blocking_error(str(exc))
+
+    try:
+        defs = extract_function_defs(file_path, project_dir=project_dir)
+    except UnitsUnavailable as exc:
+        # Couldn't enumerate the file's units (esbmc missing, C parse error, …).
+        # Record a blocking `error` verdict rather than skip: a file that was
+        # edited but can't be parsed must not pass silently.
+        return _blocking_error(str(exc)[:800])
+
+    # Stamp the content hash so a later out-of-band scan treats this exact content
+    # as already verified — that dedup is what keeps the Stop-gate from re-blocking
     # (and resetting its patience) on a file nothing has touched since.
-    defs = extract_function_defs(raw.decode("utf-8", "replace"))
     digest = hashlib.sha256(raw).hexdigest()
+
+    # `list-units` re-reads the file, so it may have enumerated bytes other than
+    # the ones we hashed. Fail closed on any sign of that: an *empty* `.c`
+    # enumerates as a successful empty list (exit 0), so the zero-byte instant a
+    # `> f.c`/heredoc rewrite passes through would prune every unit this file has
+    # — dropping an already-recorded blocking verdict — and then stamp `scanned`
+    # with the final content's digest, leaving the Stop-gate and the out-of-band
+    # scan both satisfied. The block clears on the next edit's reconcile.
+    if before is None or _source_fingerprint(file_path) != before:
+        return _blocking_error(
+            "source changed while its units were being enumerated; not recording "
+            "a scan of content that was not enumerated — re-edit to re-verify"
+        )
 
     # Reconcile + record every current function BEFORE the slow verifies: drop
     # functions the file no longer defines, reset the Stop-gate's patience, and

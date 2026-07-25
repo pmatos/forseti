@@ -1,3 +1,24 @@
+## [1.6.1](https://github.com/pmatos/forseti/compare/v1.6.0...v1.6.1) (2026-07-25)
+
+
+### Bug Fixes
+
+* **claude-adapter:** baseline staged/index C blobs at SessionStart ([#146](https://github.com/pmatos/forseti/issues/146)) ([3242274](https://github.com/pmatos/forseti/commit/3242274e99b2eacc6be52a3a8e1d05e0ac2ca6ec))
+
+# [1.6.0](https://github.com/pmatos/forseti/compare/v1.5.0...v1.6.0) (2026-07-25)
+
+
+### Features
+
+* **esbmc:** forward --esbmc-bin and build flags through `list-units` ([#131](https://github.com/pmatos/forseti/issues/131)) ([#143](https://github.com/pmatos/forseti/issues/143)) ([85208cf](https://github.com/pmatos/forseti/commit/85208cf41fbde052866e70abe787452837094816))
+
+# [1.5.0](https://github.com/pmatos/forseti/compare/v1.4.1...v1.5.0) (2026-07-25)
+
+
+### Features
+
+* **claude-adapter:** enumerate units via `forseti list-units`, not a regex ([#131](https://github.com/pmatos/forseti/issues/131)) ([#138](https://github.com/pmatos/forseti/issues/138)) ([2d9f9ae](https://github.com/pmatos/forseti/commit/2d9f9ae3f702371aa45038398d436111299f7f9b))
+
 ## [1.4.1](https://github.com/pmatos/forseti/compare/v1.4.0...v1.4.1) (2026-07-25)
 
 

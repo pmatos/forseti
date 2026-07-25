@@ -48,50 +48,6 @@ def test_verify_json_payload(capsys: pytest.CaptureFixture[str]) -> None:
     assert payload["counterexample"]  # non-empty trace for the agent to fix
 
 
-# --- forseti list-units -----------------------------------------------------
-
-_TWO_UNITS = "int add(int a, int b) { return a + b; }\nvoid fill(char *p) { *p = 0; }\n"
-
-
-def test_list_units_text_marks_pointer_units(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    src = tmp_path / "units.c"
-    src.write_text(_TWO_UNITS)
-    code = main(["list-units", str(src)])
-    assert code == 0
-    out = capsys.readouterr().out
-    assert "add(int a, int b)" in out
-    # Only the pointer-taking unit carries the contract marker.
-    assert "[needs-contract]" in out
-    assert "add(int a, int b) [needs-contract]" not in out
-
-
-def test_list_units_json_payload(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    src = tmp_path / "units.c"
-    src.write_text(_TWO_UNITS)
-    code = main(["list-units", str(src), "--json"])
-    assert code == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["source"] == str(src)
-    by_name = {u["function"]: u for u in payload["units"]}
-    assert by_name["add"]["takes_pointer"] is False
-    assert [p["name"] for p in by_name["add"]["params"]] == ["a", "b"]
-    assert by_name["fill"]["takes_pointer"] is True
-    assert by_name["fill"]["params"][0]["is_pointer"] is True
-
-
-def test_list_units_error_exits_one(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    # Missing source → esbmc exits nonzero → ListUnitsError → exit 1 on stderr.
-    code = main(["list-units", str(tmp_path / "does_not_exist.c")])
-    assert code == 1
-    assert "forseti list-units:" in capsys.readouterr().err
-
-
 # --- forseti synth (memory-precondition gate, RFC-0003 S2) ------------------
 
 
@@ -143,3 +99,124 @@ def test_synth_needs_contract_exits_five(
     code = main(["synth", str(src), "--function", "g"])
     assert code == 5
     assert "NEEDS_CONTRACT" in capsys.readouterr().out
+
+
+# --- forseti list-units (authoritative unit enumeration, #131) ---------------
+
+
+def _unit_source(tmp_path: Path) -> Path:
+    """A TU that needs `-I` to parse at all and `-D` to define all its units."""
+    inc = tmp_path / "inc"
+    inc.mkdir()
+    (inc / "mytypes.h").write_text("typedef unsigned char byte_t;\n")
+    src = tmp_path / "u.c"
+    src.write_text(
+        '#include "mytypes.h"\n'
+        "int scal(byte_t b) { return b; }\n"
+        "void ptr(byte_t *p) { (void)p; }\n"
+        "#ifdef WIDGET\n"
+        "int only_with_define(int x) { return x; }\n"
+        "#endif\n"
+    )
+    return src
+
+
+def test_list_units_json_payload(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src = tmp_path / "sig.c"
+    src.write_text(
+        "typedef void (*cb_t)(void);\n"
+        "int scal(int x) { return x; }\n"
+        "void reg(cb_t cb) { cb(); }\n"
+    )
+    assert main(["list-units", str(src), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["source"] == str(src)
+    assert {u["function"]: u["takes_pointer"] for u in payload["units"]} == {
+        "scal": False,
+        "reg": True,  # the typedef'd function pointer, resolved
+    }
+    reg = next(u for u in payload["units"] if u["function"] == "reg")
+    assert reg["params"] == [
+        {
+            "name": "cb",
+            "type": "void (*)(void)",
+            "is_pointer": True,
+            "array_extent": None,
+        }
+    ]
+
+
+def test_list_units_human_output_marks_needs_contract(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src = tmp_path / "sig.c"
+    src.write_text("int scal(int x) { return x; }\nvoid p(char *q) { (void)q; }\n")
+    assert main(["list-units", str(src)]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    # The type is printed as clang's canonical spelling (`char *`) joined to the
+    # name, so the pointer star sits away from the identifier.
+    assert lines == ["scal(int x)", "p(char * q) [needs-contract]"]
+
+
+def test_list_units_no_params_renders_void(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src = tmp_path / "sig.c"
+    src.write_text("int nil(void) { return 0; }\n")
+    assert main(["list-units", str(src)]) == 0
+    assert capsys.readouterr().out.splitlines() == ["nil(void)"]
+
+
+def test_list_units_forwards_passthrough_build_flags(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The deferred half of #131: without the `--`-separated `-I` this source does
+    # not parse (asserted below), and `-D` decides whether `only_with_define` is a
+    # unit at all — so the passthrough is load-bearing, not cosmetic.
+    src = _unit_source(tmp_path)
+    code = main(
+        [
+            "list-units",
+            str(src),
+            "--json",
+            "--",
+            "-I",
+            str(tmp_path / "inc"),
+            "-DWIDGET",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [u["function"] for u in payload["units"]] == [
+        "scal",
+        "ptr",
+        "only_with_define",
+    ]
+
+
+def test_list_units_without_build_flags_fails_loudly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # An unresolvable `#include` must exit nonzero, never print an empty unit list
+    # — the gate reads "no units" as a clean pass, so a silent [] here would let an
+    # edited file through unverified.
+    assert main(["list-units", str(_unit_source(tmp_path)), "--json"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "forseti list-units:" in captured.err
+
+
+def test_list_units_honours_esbmc_bin(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # `--esbmc-bin` must actually select the binary: point it at a missing one and
+    # the run fails rather than falling back to `esbmc` on PATH.
+    src = tmp_path / "sig.c"
+    src.write_text("int scal(int x) { return x; }\n")
+    code = main(
+        ["list-units", str(src), "--esbmc-bin", str(tmp_path / "no-such-esbmc")]
+    )
+    assert code == 1
+    assert "no-such-esbmc" in capsys.readouterr().err
