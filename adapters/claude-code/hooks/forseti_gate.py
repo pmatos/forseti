@@ -1376,6 +1376,14 @@ def verify_and_record(
     the run that recorded that marker, never by one that finds a concurrent run's —
     so a killed run is *retried* by the next scan instead of being skipped as
     content-fresh (issue #140), bounded by `MAX_PENDING_VERIFY_ATTEMPTS`.
+
+    None of that happens when the bytes this run enumerated have already been
+    superseded on disk by a concurrent run whose `scanned` stamp vouches for what
+    is there now: that run owns the file, so this one returns **no verdicts and
+    writes nothing at all** — no stamp, no `pending` marker, no reconcile, not even
+    a `stop_attempts` reset. An empty return is therefore not by itself "the file
+    defines no functions"; see the deferral below for why blocking instead would
+    strand a `rel::?` nothing can clear.
     """
     rel = unit_id(project_dir, file_path)
 
