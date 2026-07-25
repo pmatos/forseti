@@ -82,13 +82,21 @@ jobs:
         run: mypy src tests
 
       - name: Tests (pytest)
-        run: pytest -q --cov=forseti --cov-report=term-missing --cov-report=xml --cov-fail-under=95
+        # 96, not 95, and the two numbers measure the same report: pytest-cov's
+        # branch formula credits a partially-taken branch, Codecov's
+        # hits/(hits+misses+partials) does not, so pytest-cov reads ~0.8pp high
+        # (96.49 here vs Codecov's 95.68). Gating at 95 both sides would leave a
+        # band — pytest-cov 95.3, Codecov 94.5 — where CI is green and
+        # codecov/project is red. 96 keeps this fast in-job check the stricter
+        # of the two, so it always trips first. The 95% bar itself lives in
+        # codecov.yml; move them together.
+        run: pytest -q --cov=forseti --cov-report=term-missing --cov-report=xml --cov-fail-under=96
 
       - name: Upload coverage to Codecov
         # `!cancelled()` on purpose: the step above fails the job when coverage
-        # drops below 95, and without this the upload would be skipped exactly
-        # when the report is most worth seeing — leaving the codecov/* required
-        # checks pending forever instead of reporting the shortfall.
+        # drops, and without this the upload would be skipped exactly when the
+        # report is most worth seeing — leaving the codecov/* checks with
+        # nothing to report instead of reporting the shortfall.
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v5
         with:

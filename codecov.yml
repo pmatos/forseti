@@ -1,12 +1,20 @@
-# Codecov gate for pmatos/forseti. The 95% bar is enforced twice, on purpose:
+# Codecov gate for pmatos/forseti. This file is the authority on the 95% bar;
+# ci.yml carries a second, deliberately stricter check:
 #
-#   1. `pytest --cov-fail-under=95` in ci.yml reddens the CI job itself. That
-#      needs no external service and is what actually stops a merge today.
+#   1. `pytest --cov-fail-under=96` in ci.yml reddens the CI job itself. Needs
+#      no external service, so it is the enforcement that actually works today.
+#      96 rather than 95 because pytest-cov's branch formula reads ~0.8pp above
+#      Codecov's — see the comment on that step.
 #   2. The `codecov/project` + `codecov/patch` statuses below, which add the
-#      per-line PR annotations. These only *block* once they are listed as
-#      required status checks on main's branch protection.
+#      per-line PR annotations. These only *block* a merge once listed as
+#      required status checks on main — deliberately not done, since
+#      semantic-release pushes `[skip ci]` commits that could never satisfy them.
 #
-# Coverage on main sits at ~96.5%, so the project target has ~1.5pp of headroom.
+# Posting these statuses needs the Codecov GitHub App installed on the repo;
+# CODECOV_TOKEN alone authenticates uploads but posts nothing.
+#
+# Coverage measured by Codecov is 95.68% (pytest-cov calls the same report
+# 96.49%), so the project target has ~0.7pp of headroom.
 
 coverage:
   precision: 2
