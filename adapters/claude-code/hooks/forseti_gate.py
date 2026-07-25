@@ -57,8 +57,9 @@ LIST_UNITS_TIMEOUT_S = float(os.environ.get("FORSETI_LIST_UNITS_TIMEOUT_S", "30"
 MAX_STOP_ATTEMPTS = 3
 
 # How many times the same file content may be *started* through `verify_and_record`
-# without its verdicts landing (a mid-run hook kill) before the scan stops retrying
-# it (issue #140). The same trade as MAX_STOP_ATTEMPTS, one layer down: retrying is
+# without its verdicts landing — a mid-run hook kill, or a scan that ended in a
+# blocking `error` — before the scan stops retrying it (issue #140). The same trade
+# as MAX_STOP_ATTEMPTS, one layer down: retrying is
 # what recovers a killed verify, but an unbounded retry of a file that can never
 # finish inside the hook budget would reset `stop_attempts` every round and loop
 # forever. Once exhausted, the file's still-pending `unknown` units keep blocking
@@ -578,16 +579,6 @@ def _pending_attempts(entry: object, digest: str) -> int | None:
     return attempts if isinstance(attempts, int) and attempts > 0 else 0
 
 
-def _pending_records(entry: object, digest: str | None) -> bool:
-    """True when `entry` is an unfinished-verify marker for exactly `digest` bytes.
-
-    The ownership test for the *error* cleanup path: only a marker recording the
-    content this run actually read may be dropped. `digest is None` (the file could
-    not even be read) is never ownership — nothing is dropped then.
-    """
-    return digest is not None and _pending_attempts(entry, digest) is not None
-
-
 def stale_sources(project_dir: str, state: dict, files: Iterable[str]) -> list[str]:
     """Subset of `files` needing a (re-)verify: changed content, or a killed verify.
 
@@ -965,30 +956,36 @@ def verify_and_record(
     def _blocking_error(detail: str, *, digest: str | None = None) -> list[UnitVerdict]:
         """Record a blocking `error` verdict for the whole file and return it.
 
-        Neither caller stamps `scanned`: a file we could not read or enumerate
+        No caller stamps `scanned`: a file we could not read or enumerate
         must not be recorded as already-scanned, or the out-of-band scan would
         treat it as handled and the edit would pass unverified.
 
-        The `error` verdict *is* this scan's final outcome for the bytes it read, so
-        that content's unfinished-verify marker must not survive it: every error path
-        returns before the up-front block that bumps the retry counter, so leaving
-        the marker in place would make a persistently-erroring file re-verify forever
-        with the counter frozen (issue #140). Dropping it makes the recorded `error`
-        block its way to the loud residual instead.
+        An unfinished-verify marker for `digest` is *spent one attempt*, never
+        deleted (PR #148 review). Deleting is what the ownership rule forbids: this
+        path can never own the marker — every error caller returns before the block
+        that creates one, and `pending` holds a single claim per file — so the marker
+        it would drop always belongs to another run, whose pre-recorded `unknown`
+        units would then sit content-fresh (that run stamped `scanned` with these
+        same bytes) with nothing left to retry, the exact hole issue #140 closes.
+        Bumping keeps that retry claim alive while still making progress: leaving the
+        counter untouched would let a persistently-erroring file re-verify on every
+        scan forever — each error resets `stop_attempts` — instead of going quiet at
+        `MAX_PENDING_VERIFY_ATTEMPTS` and blocking its way to the loud residual. The
+        bump goes through `_pending_attempts`, so a corrupt counter normalizes to 1
+        rather than freezing. `hash`/`pid` are left as the creating run wrote them:
+        this run owns nothing and will never clear the marker.
 
-        Scoped to a marker recording exactly `digest`, never a blanket pop: a
-        concurrent run of *other* content owns its own marker, and deleting that
-        would make a kill of that run read as content-fresh with nothing left to
-        retry — the very hole this closes (PR #148 review).
+        Only a marker recording exactly `digest` is charged: a concurrent run of
+        *other* content is verifying bytes this error says nothing about.
 
-        Two callers pass no `digest` and so drop nothing, for different reasons. The
-        read failure never learned which bytes it was scanning, so ownership is
-        unprovable — and such a file also fails `content_hash`, so `stale_sources`
+        Two callers pass no `digest` and so touch nothing, for different reasons. The
+        read failure never learned which bytes it was scanning, so it cannot name the
+        claim to charge — and such a file also fails `content_hash`, so `stale_sources`
         skips it entirely and no frozen counter can spin. The enumeration-race caller
-        *did* read bytes, but the interleaving it guards against (A → B → A) restores
-        them, so they may be exactly the content still awaiting a retry: that claim
-        has to survive, and the counter is bumped by the next run that gets past
-        enumeration.
+        *did* read bytes, but the interleaving it guards against (A → B → A) means the
+        file on disk may no longer hold them, so charging that content's retry budget
+        would spend a claim this run never really raced; the counter is bumped by the
+        next run that gets past enumeration.
         """
         verdict = UnitVerdict(f"{rel}::?", rel, "?", "error", k, detail=detail)
         with gate_lock(project_dir):
@@ -996,8 +993,9 @@ def verify_and_record(
             record(state, verdict)
             state["stop_attempts"] = 0
             pending = state.setdefault("pending", {})
-            if _pending_records(pending.get(rel), digest):
-                del pending[rel]
+            attempts = _pending_attempts(pending.get(rel), digest) if digest else None
+            if attempts is not None:
+                pending[rel]["attempts"] = attempts + 1
             save_state(project_dir, state)
         return [verdict]
 

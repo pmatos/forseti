@@ -369,13 +369,14 @@ def test_final_unknown_does_not_force_staleness(
     assert gate.stale_sources(str(tmp_path), state, [str(src)]) == []  # but not retried
 
 
-def test_blocking_error_on_a_retry_clears_the_marker(
+def test_blocking_error_on_a_retry_spends_an_attempt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Every error path returns BEFORE the block that bumps the retry counter, so a
     # marker left behind by a previous kill would make a persistently-erroring file
-    # re-verify forever with the counter frozen. The `error` verdict is final: it
-    # clears the marker and blocks its way to the residual instead.
+    # re-verify forever with the counter frozen (each error resets stop_attempts).
+    # The error charges the marker one attempt instead — the killed run's units stay
+    # retryable, and the retries still run out.
     src = tmp_path / "broken.c"
     src.write_text("int f(void){return 0;}\n")
     _enumerate_one_unit(monkeypatch)
@@ -391,8 +392,10 @@ def test_blocking_error_on_a_retry_clears_the_marker(
 
     assert [v.verdict for v in verdicts] == ["error"]
     state = gate.load_state(str(tmp_path))
-    assert state["pending"] == {}
+    assert state["pending"]["broken.c"]["attempts"] == 2  # charged, not frozen
     assert gate.blocking_units(state)  # the error itself keeps the turn blocked
+    # The kill's pending `unknown` unit is still retryable — the point of the marker.
+    assert gate.stale_sources(str(tmp_path), state, [str(src)]) == [str(src)]
 
 
 def test_prune_deleted_units_clears_the_retry_marker(tmp_path: Path) -> None:
@@ -563,10 +566,10 @@ def test_cleanup_preserves_a_concurrent_retry_of_the_same_content(
 def test_blocking_error_preserves_a_newer_runs_pending_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The error cleanup is scoped the same way: it drops only a marker recording the
-    # bytes THIS run read. `raw` is read before the units are enumerated, so a newer
-    # run's marker for the content now on disk must survive the error — otherwise
-    # that run's kill reads as content-fresh with nothing to retry.
+    # The error cleanup is scoped the same way: it touches only a marker recording
+    # the bytes THIS run read. `raw` is read before the units are enumerated, so a
+    # newer run's marker — a claim on content this error says nothing about — must
+    # come through the error unchanged, counter included.
     src = tmp_path / "err.c"
     src.write_text("int f(void){return 0;}\n")
     newer: dict[str, str] = {}
@@ -584,14 +587,83 @@ def test_blocking_error_preserves_a_newer_runs_pending_marker(
 
     assert [v.verdict for v in verdicts] == ["error"]  # this scan still blocks
     state = gate.load_state(str(tmp_path))
-    assert state["pending"]["err.c"]["hash"] == newer["digest"]
+    assert state["pending"]["err.c"] == {
+        "hash": newer["digest"],
+        "attempts": 1,
+        "pid": os.getpid() + 1,
+    }
     assert gate.stale_sources(str(tmp_path), state, [str(src)]) == [str(src)]
+
+
+def test_blocking_error_preserves_a_concurrent_same_content_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two hooks on the SAME unchanged bytes: one is killed after storing its marker,
+    # the other fails to enumerate. The failing run never created a marker of its
+    # own — every error path returns before that block — so a delete here could only
+    # drop the killed run's claim, leaving its pending `unknown` units content-fresh
+    # (that run stamped `scanned` with these bytes) and unretryable. It charges the
+    # marker one attempt instead: the claim survives, the retry budget still shrinks.
+    src = tmp_path / "shared.c"
+    digest = _concurrent_run_starts(tmp_path, src, "int f(void){return 0;}\n")
+
+    def _unavailable(file_path, *, project_dir):
+        raise gate.UnitsUnavailable("forseti CLI could not be launched")
+
+    monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert [v.verdict for v in verdicts] == ["error"]
+    state = gate.load_state(str(tmp_path))
+    assert state["pending"]["shared.c"] == {
+        "hash": digest,
+        "attempts": 2,  # charged...
+        "pid": os.getpid() + 1,  # ...but still the creating run's marker
+    }
+    assert state["units"]["shared.c::f"]["verdict"] == "unknown"  # still pending
+    assert state["scanned"]["shared.c"] == digest  # content-fresh by hash...
+    # ...and still retried, so the killed run's units are not stranded.
+    assert gate.stale_sources(str(tmp_path), state, [str(src)]) == [str(src)]
+
+
+def test_errored_retries_are_capped_then_residual(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Behavioral counterpart: a file that errors on every scan must not re-verify
+    # forever. Each error blocks and resets stop_attempts, so an uncharged marker
+    # would loop; charging it retires the retry after MAX_PENDING_VERIFY_ATTEMPTS and
+    # the recorded error + pending unit reach the LOUD residual.
+    _git_init(tmp_path)
+    src = tmp_path / "cursed.c"
+    src.write_text("int f(void){return 0;}\n")
+    _enumerate_one_unit(monkeypatch)
+    _kill_during_verify(monkeypatch, [])
+    with contextlib.suppress(_Killed):
+        _run(post_bash.main, tmp_path, monkeypatch)  # spends the first attempt
+
+    scans: list[str] = []
+
+    def _unavailable(file_path, *, project_dir):
+        scans.append(str(file_path))
+        raise gate.UnitsUnavailable("forseti CLI could not be launched")
+
+    monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
+    for _ in range(gate.MAX_PENDING_VERIFY_ATTEMPTS + 2):
+        _run(post_bash.main, tmp_path, monkeypatch)
+    assert len(scans) == gate.MAX_PENDING_VERIFY_ATTEMPTS - 1  # capped, then quiet
+
+    capsys.readouterr()
+    for _ in range(gate.MAX_STOP_ATTEMPTS + 1):
+        _run(stop_gate.main, tmp_path, monkeypatch)
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert "decision" not in out  # allowed to end...
+    assert "UNVERIFIED" in out["systemMessage"]  # ...loudly, never a silent pass
+    assert "cursed.c" in out["systemMessage"]
 
 
 def test_unreadable_file_leaves_the_pending_marker_alone(tmp_path: Path) -> None:
     # A run that cannot even read the file never learns which bytes it was scanning,
-    # so it can never prove a marker is its own and drops nothing. A surviving marker
-    # only ever costs a re-verify; deleting another run's costs the retry itself.
+    # so it cannot name the claim to charge and leaves the marker exactly as it is.
     # (Such a file also stops being scanned at all — `content_hash` fails, so
     # `stale_sources` skips it and the frozen counter cannot loop.)
     target = tmp_path / "dir.c"
