@@ -1190,14 +1190,24 @@ def verify_and_record(
             record(state, verdict)
             save_state(project_dir, state)
 
-    # The verifies read the *real* path (a snapshot would put temp paths in every
-    # counterexample the agent is asked to fix), so the same A → B → A rewrite can
-    # land a verdict for B while `scanned` holds A's digest — and the restored A
-    # then looks fresh to both gates. Re-hash once at the end and fail closed on
-    # any drift: the verdicts just recorded describe bytes we can no longer vouch
-    # for. Un-stamping is what makes the out-of-band scan re-gate the file, and
-    # the `error` is what blocks when there is no scan to fall back on (outside a
-    # git work tree). Both clear on the next edit's reconcile.
+    # The verifies read the *real* path, not the snapshot: a verdict has to
+    # describe the translation unit that actually ships, and the snapshot's
+    # `-I <original dir>` stand-in is only an approximation of in-place include
+    # resolution (a shadowing header could resolve differently) — plus every
+    # counterexample and the trace's `argv` would name a temp file that no longer
+    # exists. So this boundary is guarded, not eliminated: re-hash once after the
+    # loop and fail closed on drift. Un-stamping is what makes the out-of-band
+    # scan re-gate the file, and the `error` blocks when there is no scan to fall
+    # back on (outside a git work tree); both clear on the next edit's reconcile.
+    #
+    # What this catches: a rewrite that lands and *stays* (A → B) during the
+    # verifies. What it does NOT catch — the acknowledged residual — is a
+    # transient A → B → A: a verdict computed against B stays attached to A's
+    # stamp, because the final bytes compare equal. Detecting that needs
+    # verification of immutable content, which costs more than it buys (above).
+    # So the invariant is precisely: if `scanned[rel]` is H, the units were
+    # enumerated from content hashing to H and the file hashed to H both then and
+    # after the loop — NOT that every verdict was computed against H.
     if content_hash(file_path) != digest:
         with gate_lock(project_dir):
             state = load_state(project_dir)

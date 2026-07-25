@@ -550,15 +550,17 @@ def test_persistent_rewrite_during_enumeration_does_not_prune_or_stamp(
     assert any(u.get("verdict") == "violated" for u in after["units"].values())
 
 
-def test_rewrite_during_verify_withdraws_the_stamp_and_blocks(
+def test_persistent_rewrite_during_verify_withdraws_the_stamp_and_blocks(
     tmp_path: Path, monkeypatch
 ) -> None:
-    # The verifies read the *real* path (a snapshot would put temp paths in every
-    # counterexample), so a rewrite landing there can attach a `verified` verdict
-    # to bytes the gate never stamped. Re-hashing once after the loop fails closed:
-    # the up-front stamp is withdrawn, so the out-of-band scan re-gates the file,
-    # and a blocking `error` covers the case where there is no such scan (outside
-    # a git work tree).
+    # The verifies read the *real* path — a verdict must describe the translation
+    # unit that ships — so a rewrite landing there can attach a `verified` verdict
+    # to bytes the gate never stamped. Re-hashing once after the loop fails closed
+    # on a rewrite that lands and *stays*: the up-front stamp is withdrawn, so the
+    # out-of-band scan re-gates the file, and a blocking `error` covers the case
+    # where there is no such scan (outside a git work tree). A transient
+    # A -> B -> A during a verify is the acknowledged residual (see below) — the
+    # final bytes compare equal, so nothing here can see it.
     src = tmp_path / "x.c"
     src.write_text("alpha\n")
     _seed_scanned(tmp_path)
@@ -579,6 +581,42 @@ def test_rewrite_during_verify_withdraws_the_stamp_and_blocks(
     assert "x.c" not in after["scanned"]  # the up-front stamp was withdrawn
     assert after["scanned"]["sentinel.c"] == "deadbeef"
     assert gate.blocking_units(after)  # not left passing on a stale `verified`
+
+
+def test_transient_rewrite_during_verify_is_a_known_residual(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Characterization, not an endorsement. A transient A -> B -> A *during a
+    # verify* leaves B's verdict attached to A's stamp: the post-loop re-hash can
+    # only compare final bytes, and they are equal. Closing it would mean
+    # verifying immutable content, which changes *what* is verified — the
+    # snapshot's `-I <original dir>` only approximates in-place include
+    # resolution, so a shadowing header could resolve differently — and would put
+    # a since-deleted temp path in every counterexample and in the trace's
+    # `argv`. Pinned here so the limit is explicit in the suite, and so a future
+    # fix flips this test rather than quietly widening the guarantee.
+    src = tmp_path / "x.c"
+    original = "alpha\n"
+    src.write_text(original)
+
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            verdict="verified",
+            during_verify=(
+                f"open({str(src)!r}, 'w').write('beta\\n')\n"  # what got verified
+                f"open({str(src)!r}, 'w').write({original!r})"  # ...then restored
+            ),
+        ),
+    )
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert [v.verdict for v in verdicts] == ["verified"]
+    after = gate.load_state(str(tmp_path))
+    assert after["scanned"]["x.c"] == hashlib.sha256(original.encode()).hexdigest()
+    assert gate.blocking_units(after) == []  # the residual: A passes on B's verdict
 
 
 def test_rewrite_during_verify_leaves_a_concurrent_runs_stamp_alone(

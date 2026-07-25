@@ -196,12 +196,21 @@ turns a verdict into an error.
   one version of the file while stamping another. The snapshot is listed with an
   `-I` naming the original's directory — clang searches the *including file's
   own* directory first, so without it a sibling `#include "helper.h"` that
-  needed no flag in place would go missing. **The verify step still runs on the
-  real path** — verifying a snapshot would put temp paths in every
-  counterexample — so a rewrite landing *during* a verify is caught by a second
-  content re-hash after the loop, which fails closed: the run withdraws its
-  `scanned` stamp and records a blocking ERROR rather than let a verdict stand
-  for content no longer on disk.
+  needed no flag in place would go missing.
+- **The verify step runs on the real path, so its own freshness is guarded, not
+  guaranteed.** A verdict has to describe the translation unit that actually
+  ships, and a snapshot's `-I` stand-in only approximates in-place include
+  resolution — plus every counterexample and the trace's `argv` would name a
+  temp file that no longer exists. Instead the file is re-hashed once after the
+  verify loop and the run fails closed on drift: it withdraws its `scanned`
+  stamp and records a blocking ERROR rather than let a verdict stand for content
+  no longer on disk. That catches a rewrite that lands and **stays** during the
+  verifies. It does **not** catch a transient `A → B → A` — a verdict computed
+  against `B` stays attached to `A`'s stamp, since the final bytes compare
+  equal. So the guarantee is precisely: if `scanned` records digest `H`, the
+  units were enumerated from content hashing to `H` and the file hashed to `H`
+  both then and after the loop — *not* that every verdict was computed against
+  `H`.
 - **Only `.c` translation units are verified; header definitions are out of
   scope.** ESBMC cannot parse a `.h` standalone (`forseti verify`/`list-units`
   both error with "failed to figure out type of file"), and a function defined in
