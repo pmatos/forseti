@@ -43,6 +43,13 @@ def test_restrict_qualified_concrete_pointer_still_materialisable() -> None:
     assert _roles(unit) == {"p": ParamRole.SCALAR_PTR}
 
 
+def test_atomic_pointee_still_materialisable() -> None:
+    # Unwrapping `_Atomic(T)` to catch `_Atomic(void *)` must not demote a
+    # concrete pointee either — `_Atomic int *p` is still one fresh object.
+    unit = _unit(Param("p", "_Atomic(int) *"))
+    assert _roles(unit) == {"p": ParamRole.SCALAR_PTR}
+
+
 def test_byte_length_pairing() -> None:
     unit = _unit(Param("data", "const uint8_t *"), Param("len", "unsigned long"))
     plan = plan_unit(unit)
@@ -133,6 +140,10 @@ def test_non_length_named_next_param_is_not_paired() -> None:
         "void *restrict",  # restrict qualifier must not hide the void pointee
         "const void *restrict",
         "void *__restrict",  # GCC spelling
+        # C11 `void *_Atomic p`, which clang prints in its functional spelling —
+        # the pointee is still `void`, so it must not read as a sizeable object.
+        "_Atomic(void *)",
+        "_Atomic(const void *)",
         "int **",  # multi-level: one fresh T* still dangles
         "void (*)(void)",  # function pointer
         "int (*)[10]",  # pointer to array

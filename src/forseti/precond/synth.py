@@ -65,6 +65,14 @@ NON_VACUITY_LABEL = "forseti:non-vacuity"
 _BYTE_LEN_NAMES = frozenset({"len", "length", "size", "nbytes", "n_bytes", "buflen"})
 _ELEM_COUNT_NAMES = frozenset({"n", "count", "nmemb", "num", "nelem"})
 
+# C11's atomic types keep a functional spelling in clang's canonical type:
+# `void *_Atomic p` prints as `_Atomic(void *)`, `_Atomic int *p` as
+# `_Atomic(int) *`. Unwrapping it leaves the type it qualifies, so the pointer
+# shape below is read off `void *` / `int *` rather than off a token soup in
+# which a `void` pointee hides. Innermost-first (no nested parens), so an atomic
+# function pointer keeps its `(*` and is rejected as one.
+_ATOMIC_WRAPPER_RE = re.compile(r"\b_Atomic\s*\(([^()]*)\)")
+
 # Canonical-type tokens that mark an integer (a length must be integral, so a
 # `double len` is not mistaken for a size). Pointers are excluded before this.
 _INT_TOKENS = ("int", "long", "short", "char", "size_t", "unsigned", "signed")
@@ -151,17 +159,19 @@ def _is_pointee_materialisable(type_str: str) -> bool:
     size). Everything else — ``T *``, ``struct S *``, ``const uint8_t *`` — is a
     single object of ``sizeof(*p)``.
     """
-    stripped = type_str.strip()
+    stripped = _ATOMIC_WRAPPER_RE.sub(r"\1", type_str.strip())
     if "(*" in stripped:  # function pointer / pointer-to-array
         return False
     if stripped.count("*") != 1:  # only single-level pointers
         return False
-    # Scrub the cv/`restrict` qualifiers clang keeps on the canonical type
-    # (`void *restrict`, `const void *restrict`) so a `void` pointee is detected
-    # whatever qualifies it — otherwise the qualifier survives and a `void *`
-    # would be mis-sized `malloc(sizeof(void))` instead of falling to UNRESOLVED.
+    # Scrub the cv/`restrict`/`_Atomic` qualifiers clang keeps on the canonical
+    # type (`void *restrict`, `const void *restrict`) so a `void` pointee is
+    # detected whatever qualifies it — otherwise the qualifier survives and a
+    # `void *` would be mis-sized `malloc(sizeof(void))` instead of falling to
+    # UNRESOLVED.
     without_ptr = re.sub(
-        r"\bconst\b|\bvolatile\b|\b__restrict__\b|\b__restrict\b|\brestrict\b|\*|\s",
+        r"\bconst\b|\bvolatile\b|\b__restrict__\b|\b__restrict\b|\brestrict\b"
+        r"|\b_Atomic\b|\*|\s",
         "",
         stripped,
     )
