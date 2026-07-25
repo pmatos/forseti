@@ -207,8 +207,14 @@ def extract_function_defs(
         "list-units",
         str(file_path),
         "--json",
+        # Pass the float through, don't truncate. `list-units` hands its --timeout
+        # straight to `subprocess.run(timeout=...)` (esbmc's own --timeout is not
+        # used on the parse-tree-only path), where `0` expires immediately rather
+        # than meaning "unbounded" — so `int(0.5)` would turn a half-second budget
+        # into a blocking `error` on every edited `.c`. `str()` round-trips exactly;
+        # argparse reparses it as the float the CLI declares.
         "--timeout",
-        str(int(LIST_UNITS_TIMEOUT_S)),
+        str(LIST_UNITS_TIMEOUT_S),
     ]
     try:
         proc = subprocess.run(

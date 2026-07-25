@@ -48,6 +48,17 @@ def _fake_forseti_cmd(
     return [sys.executable, str(script)]
 
 
+def _argv_capturing_forseti_cmd(tmp_path: Path, dest: Path) -> list[str]:
+    """A fake CLI that records its argv to `dest` and reports no units."""
+    script = tmp_path / "argv_forseti.py"
+    script.write_text(
+        "import json, sys\n"
+        f"open({str(dest)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
+        "sys.stdout.write('{\"units\": []}')\n"
+    )
+    return [sys.executable, str(script)]
+
+
 def _seed_scanned(tmp_path: Path) -> None:
     """Put a sentinel in `scanned` so a later "not stamped" assertion has teeth.
 
@@ -91,6 +102,32 @@ def test_extract_functions_returns_names(tmp_path: Path, monkeypatch) -> None:
         "a",
         "b",
     ]
+
+
+@pytest.mark.parametrize(
+    "budget, expected", [(0.5, "0.5"), (2.5, "2.5"), (30.0, "30.0")]
+)
+def test_list_units_timeout_reaches_the_cli_unrounded(
+    tmp_path: Path, monkeypatch, budget: float, expected: str
+) -> None:
+    # `list-units` passes its --timeout straight to `subprocess.run(timeout=...)`,
+    # where 0 expires immediately (esbmc's own --timeout, which reads 0 as
+    # unbounded and is clamped to >=1s by the runner, is not used on the
+    # parse-tree-only path). Truncating with `int()` therefore turned a sub-second
+    # budget into a blocking `error` on every edited `.c`, so the float must
+    # survive the trip to the CLI intact.
+    dest = tmp_path / "argv.json"
+    monkeypatch.setattr(gate, "LIST_UNITS_TIMEOUT_S", budget)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    assert gate.extract_function_defs(str(src), project_dir=str(tmp_path)) == []
+    argv = json.loads(dest.read_text())
+    assert argv[argv.index("--timeout") + 1] == expected
 
 
 def test_extract_function_defs_raises_on_nonzero_exit(
