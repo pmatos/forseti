@@ -198,8 +198,10 @@ turns a verdict into an error.
   own* directory first, so without it a sibling `#include "helper.h"` that
   needed no flag in place would go missing. **The verify step still runs on the
   real path** — verifying a snapshot would put temp paths in every
-  counterexample — so a file rewritten *during* its verify is caught after the
-  fact by the content-hash freshness check (`scanned`), not prevented.
+  counterexample — so a rewrite landing *during* a verify is caught by a second
+  content re-hash after the loop, which fails closed: the run withdraws its
+  `scanned` stamp and records a blocking ERROR rather than let a verdict stand
+  for content no longer on disk.
 - **Only `.c` translation units are verified; header definitions are out of
   scope.** ESBMC cannot parse a `.h` standalone (`forseti verify`/`list-units`
   both error with "failed to figure out type of file"), and a function defined in
