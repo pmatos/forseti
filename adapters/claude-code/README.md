@@ -193,17 +193,23 @@ turns a verdict into an error.
   `#include` is such a failure. What gets parsed is an **immutable snapshot** of
   the exact bytes the gate hashed, written to a private temp directory (issue
   #141), so a rewrite concurrent with the parse cannot make the gate enumerate
-  one version of the file while stamping another. That directory is made to
-  stand in for the source's own — every entry beside the source is symlinked
-  into it — so include resolution is byte-for-byte what an in-place parse would
-  do, with no extra flag. (Naming the directory with `-I` instead would be
-  wrong: `-I` also joins the *angle-bracket* search and lands after any
-  `-iquote`, so `#include <config.h>` next to a generated `config.h` would pick
-  the wrong one, flip an `#if`, and hide a unit from the gate.)
+  one version of the file while stamping another. That temp tree is made to
+  stand in for the source's own neighbourhood, with no extra flag: every entry
+  beside the source is symlinked next to the snapshot, and the directory chain
+  from the project root down is reproduced as real directories mirroring their
+  own entries — so `#include "sibling.h"` *and* `#include "../common.h"` resolve
+  to the same headers an in-place parse would pick. (Naming the directory with
+  `-I` instead would be wrong: `-I` also joins the *angle-bracket* search and
+  lands after any `-iquote`, so `#include <config.h>` next to a generated
+  `config.h` would pick the wrong one, flip an `#if`, and hide a unit from the
+  gate.) A quoted include that climbs *above* the project root is the one shape
+  the mirror does not reproduce: it fails to resolve, which is a blocking ERROR
+  like any other unresolvable include, and `FORSETI_BUILD_FLAGS` is the fix
+  (`-I.` puts the spelled path back in the search).
 - **The verify step runs on the real path, so its own freshness is guarded, not
   guaranteed.** A verdict has to describe the translation unit that actually
-  ships, and a snapshot's `-I` stand-in only approximates in-place include
-  resolution — plus every counterexample and the trace's `argv` would name a
+  ships, and the snapshot reproduces include resolution only up to its mirror
+  root — plus every counterexample and the trace's `argv` would name a
   temp file that no longer exists. Instead the file is re-hashed once after the
   verify loop and the run fails closed on drift: it withdraws its `scanned`
   stamp and records a blocking ERROR rather than let a verdict stand for content

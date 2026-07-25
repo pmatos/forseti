@@ -56,15 +56,30 @@ def _argv_capturing_forseti_cmd(tmp_path: Path, dest: Path) -> list[str]:
     real path — which is how a test checks that a snapshot's temp directory
     stands in for the source's own directory (`_enumerable_source` mirrors it
     with symlinks, so quoted `#include`s resolve exactly as they would in place).
+    `ancestors` is the same walking upwards, one record per level from the
+    source's directory to ``/``: what a `..` in an `#include` would find, and
+    whether that level is a real directory (only then do a lexical and a kernel
+    resolution of `..` agree). A level that cannot be listed records ``None``
+    rather than aborting the capture.
     """
     script = tmp_path / "argv_forseti.py"
     script.write_text(
         "import json, os, sys\n"
+        "def ents(p):\n"
+        "    try:\n"
+        "        return {e: os.path.realpath(os.path.join(p, e))"
+        " for e in os.listdir(p)}\n"
+        "    except OSError:\n"
+        "        return None\n"
         "src = sys.argv[2]\n"
         "d = os.path.dirname(src)\n"
-        "sib = {e: os.path.realpath(os.path.join(d, e)) for e in os.listdir(d)}\n"
+        "sib = ents(d)\n"
+        "anc = []\n"
+        "while d and d != os.sep:\n"
+        "    anc.append({'path': d, 'islink': os.path.islink(d), 'entries': ents(d)})\n"
+        "    d = os.path.dirname(d)\n"
         f"open({str(dest)!r}, 'w').write("
-        "json.dumps({'argv': sys.argv[1:], 'siblings': sib}))\n"
+        "json.dumps({'argv': sys.argv[1:], 'siblings': sib, 'ancestors': anc}))\n"
         "sys.stdout.write('{\"units\": []}')\n"
     )
     return [sys.executable, str(script)]
@@ -489,6 +504,104 @@ def test_snapshot_mirrors_the_dir_resolved_against_project_dir(
     assert siblings["helper.h"] == str((sub / "helper.h").resolve())
 
 
+def test_snapshot_mirrors_the_ancestry_up_to_the_project_dir(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # `#include "../common.h"` — the ordinary shape for a `src/foo.c` — resolves
+    # against the *parent* of the source's directory. Mirroring only the siblings
+    # left it unresolvable, so `list-units` failed on a translation unit that
+    # parses perfectly in place and the gate recorded a blocking `error`. The
+    # chain from the project dir down is mirrored too: each level carries its own
+    # entries, minus the one the chain continues through.
+    dest = tmp_path / "argv.json"
+    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
+    )
+    proj = tmp_path / "proj"
+    (proj / "src").mkdir(parents=True)
+    (proj / "common.h").write_text("#define COMMON 1\n")
+    (proj / "include").mkdir()
+    src = proj / "src" / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    gate.extract_function_defs(str(src), project_dir=str(proj), content=b"f\n")
+
+    captured = json.loads(dest.read_text())
+    staged = Path(captured["argv"][1])
+    src_level, proj_level = captured["ancestors"][0], captured["ancestors"][1]
+    assert proj_level["entries"]["common.h"] == str((proj / "common.h").resolve())
+    assert proj_level["entries"]["include"] == str((proj / "include").resolve())
+    # `src` on the chain is the mirror the snapshot sits in, NOT a link back to
+    # the real directory — a link there would put the real `x.c` beside it.
+    assert proj_level["entries"]["src"] == str(staged.parent.resolve())
+    # Every step is a real directory, so `..` walks the mirror whether the caller
+    # normalizes `foo/../bar` lexically or leaves it to the kernel.
+    assert not src_level["islink"] and not proj_level["islink"]
+
+
+def test_snapshot_reproduces_the_sources_absolute_depth(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # An `#include` that climbs past the mirror root has to land somewhere
+    # private and empty. Staging at the temp root itself would make `../x.h`
+    # resolve into `/tmp` — world-writable, so anyone's same-named header would
+    # be included and the gate would enumerate a *different* translation unit.
+    # That is worse than the blocking `error` an unresolved include produces, so
+    # the source's absolute path is reproduced under the temp root and the levels
+    # above the mirror root are left empty.
+    dest = tmp_path / "argv.json"
+    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
+    )
+    proj = tmp_path / "proj"
+    (proj / "src").mkdir(parents=True)
+    src = proj / "src" / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    gate.extract_function_defs(str(src), project_dir=str(proj), content=b"f\n")
+
+    captured = json.loads(dest.read_text())
+    staged = captured["argv"][1]
+    assert staged.endswith(str(src)) and staged != str(src)  # padded, not flattened
+    above_root = captured["ancestors"][2]  # one level above the mirrored project
+    assert list(above_root["entries"]) == ["proj"]  # nothing real to climb into
+
+
+def test_snapshot_ancestry_stops_at_the_mirror_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A source outside the project has no ancestry the gate can claim, and
+    # walking to `/` would mean a `scandir` of `$HOME` on every edit (thousands
+    # of entries, and an unreadable one becomes a blocking `error`). Mirroring
+    # stops at the source's own directory: siblings yes, parent's entries no.
+    dest = tmp_path / "argv.json"
+    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
+    )
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "helper.h").write_text("#define HELP 1\n")
+    src = outside / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    gate.extract_function_defs(str(src), project_dir=str(proj), content=b"f\n")
+
+    captured = json.loads(dest.read_text())
+    assert captured["siblings"]["helper.h"] == str((outside / "helper.h").resolve())
+    assert list(captured["ancestors"][1]["entries"]) == ["outside"]  # not mirrored
+
+
 def test_in_place_enumeration_uses_no_snapshot(tmp_path: Path, monkeypatch) -> None:
     # Without `content=` nothing is staged — the file is parsed where it lies,
     # exactly as before.
@@ -661,9 +774,10 @@ def test_transient_rewrite_during_verify_is_a_known_residual(
     # verify* leaves B's verdict attached to A's stamp: the post-loop re-hash can
     # only compare final bytes, and they are equal. Closing it would mean
     # verifying immutable content, which changes *what* is verified — the
-    # snapshot's `-I <original dir>` only approximates in-place include
-    # resolution, so a shadowing header could resolve differently — and would put
-    # a since-deleted temp path in every counterexample and in the trace's
+    # snapshot reproduces include resolution only up to its mirror root, so an
+    # include reaching above that would turn a verifiable file into a blocking
+    # `error` — and would put a since-deleted temp path in every counterexample
+    # and in the trace's
     # `argv`. Pinned here so the limit is explicit in the suite, and so a future
     # fix flips this test rather than quietly widening the guarantee.
     src = tmp_path / "x.c"
@@ -906,6 +1020,30 @@ def test_pointer_param_detection(
     assert len(defs) == 1
     assert defs[0].name == name
     assert defs[0].takes_pointer is takes_pointer
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+@pytest.mark.parametrize("depth, spelled", [(1, "../common.h"), (2, "../../common.h")])
+def test_relative_include_resolves_through_the_snapshot(
+    tmp_path: Path, depth: int, spelled: str
+) -> None:
+    # The fake CLIs never resolve an `#include`, so only the real frontend can
+    # show the behaviour: a parent-relative include enumerates through the
+    # snapshot exactly as it does in place. Mirroring siblings alone, this raised
+    # `UnitsUnavailable` — a blocking `error` on a file that parses fine on disk.
+    (tmp_path / "common.h").write_text("#define COMMON 1\n")
+    src_dir = tmp_path.joinpath(*[f"d{i}" for i in range(depth)])
+    src_dir.mkdir(parents=True)
+    src = src_dir / "x.c"
+    src.write_text(f'#include "{spelled}"\nint f(int x) {{ return x + COMMON; }}\n')
+
+    in_place = gate.extract_function_defs(str(src), project_dir=str(tmp_path))
+    snapshotted = gate.extract_function_defs(
+        str(src), project_dir=str(tmp_path), content=src.read_bytes()
+    )
+
+    assert [d.name for d in in_place] == ["f"]
+    assert [d.name for d in snapshotted] == ["f"]
 
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
