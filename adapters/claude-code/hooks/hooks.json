@@ -1,6 +1,18 @@
 {
-  "description": "Forseti verify-gate: PostToolUse verifies edited C functions with ESBMC (function-level, no harness); Stop blocks the turn from ending until every touched unit is VERIFIED up to k.",
+  "description": "Forseti verify-gate: PostToolUse verifies edited C functions with ESBMC (function-level, no harness) and re-verifies C files written out-of-band via Bash; Stop blocks the turn from ending until every touched unit is VERIFIED up to k.",
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/session_start.py\"",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Write|Edit|MultiEdit",
@@ -8,6 +20,16 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/post_tool_use.py\"",
+            "timeout": 300
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/post_bash.py\"",
             "timeout": 300
           }
         ]
