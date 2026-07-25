@@ -175,6 +175,7 @@ turns a verdict into an error.
 | Unwind bound *k* | `FORSETI_UNWIND` env | `1` | a `VERIFIED` is only "up to k"; **loops need a higher k** |
 | Verify timeout | `FORSETI_VERIFY_TIMEOUT_S` env | `110` | per-function budget, passed to `forseti verify --timeout` so ESBMC honors it (the subprocess is bounded ~15 s higher). Each verdict is persisted the moment it lands, so the `300` s PostToolUse hook timeout must stay above this per-function budget — raise both together for very slow units. |
 | List-units timeout | `FORSETI_LIST_UNITS_TIMEOUT_S` env | `30` | budget for the one `forseti list-units` parse per edited file; a `--parse-tree-only` run does no solving, so this rarely needs raising |
+| Build flags | `FORSETI_BUILD_FLAGS` env | *(none)* | the project's own `-I`/`-D`, shell-quoted (`-Iinclude -Ivendor/tls -DNDEBUG`). Forwarded to **both** `forseti list-units` and `forseti verify`, so the enumeration and the verify see the same translation unit. Set this if your C only compiles with include paths: without them ESBMC cannot resolve an `#include`, the enumeration fails, and every edited file blocks with an `error`. Unlike `SAFETY_FLAGS` these are build-time, not property-checking, flags. |
 | Stop-gate attempts | `MAX_STOP_ATTEMPTS` in `forseti_gate.py` | `3` | blocks then lets the turn end with a loud residual |
 | Out-of-band include | `FORSETI_GATE_INCLUDE` env | *(all C files)* | `:`/`,`-separated globs; if set, only changed C files matching one are scanned. A bare name (`src`) matches any path segment; a glob (`kernels/*.c`) matches the project-relative path. |
 | Out-of-band exclude | `FORSETI_GATE_EXCLUDE` env | `third_party`, `vendor`, `node_modules` | same syntax; excludes win over includes. Setting it **replaces** the defaults. Git's own ignore rules already drop gitignored build output before this applies. |
@@ -187,7 +188,9 @@ turns a verdict into an error.
   all classified correctly (no regex, issue #131). Each edited `.c` file gets one
   extra `--parse-tree-only` parse (no solving, fast); if enumeration fails (esbmc
   missing, C parse error) the file's units are recorded as a blocking ERROR
-  verdict rather than silently skipped.
+  verdict rather than silently skipped. A file that only parses with the
+  project's include paths needs `FORSETI_BUILD_FLAGS` set — an unresolvable
+  `#include` is such a failure.
 - **Only `.c` translation units are verified; header definitions are out of
   scope.** ESBMC cannot parse a `.h` standalone (`forseti verify`/`list-units`
   both error with "failed to figure out type of file"), and a function defined in
@@ -229,19 +232,23 @@ turns a verdict into an error.
   recorded in the trace (`oob_scan_skipped`) rather than passing silently, but it
   is not gated. Scope is **"C changed since session start"** (issue
   [#99](https://github.com/pmatos/forseti/issues/99)): the SessionStart hook
-  baselines the already-dirty tree *and* the current HEAD, so the scan catches this
-  session's Bash writes — including a C file written **and committed in one shot**
-  (a clean worktree `git status` alone would miss), recovered by diffing the
-  baseline HEAD against the current one — while never gating pre-existing
-  uncommitted or committed/third-party C the agent never touched. Two documented
-  bounds of the HEAD-diff: (1) a HEAD movement that brings in C without the agent
-  authoring it (a `git checkout`/`merge`/`rebase` run via Bash) is conservatively
-  gated — an over-gate that blocks loudly, never a silent pass; (2) in a repo with
-  **no commits** at session start there is no baseline HEAD, so the very first
-  commit's C is caught only if it is also left dirty. It relies on content changes
-  git can see; a change git cannot (a file outside the work tree, or one matched by
-  `.gitignore`) is not scanned. A file changed *between* sessions is re-baselined
-  on the next fresh start, so it is treated as pre-existing rather than gated.
+  baselines the already-dirty tree — its worktree bytes *and* its staged/`HEAD`
+  blobs, so a session opening at `MM foo.c` (staged WIP, worktree reverted) is not
+  blocked on the user's own pre-session index, issue
+  [#139](https://github.com/pmatos/forseti/issues/139) — *and* the current HEAD, so
+  the scan catches this session's Bash writes — including a C file written **and
+  committed in one shot** (a clean worktree `git status` alone would miss),
+  recovered by diffing the baseline HEAD against the current one — while never
+  gating pre-existing uncommitted or committed/third-party C the agent never
+  touched. Two documented bounds of the HEAD-diff: (1) a HEAD movement that
+  brings in C without the agent authoring it (a `git checkout`/`merge`/`rebase`
+  run via Bash) is conservatively gated — an over-gate that blocks loudly, never
+  a silent pass; (2) in a repo with **no commits** at session start there is no
+  baseline HEAD, so the very first commit's C is caught only if it is also left
+  dirty. It relies on content changes git can see; a change git cannot (a file
+  outside the work tree, or one matched by `.gitignore`) is not scanned. A file
+  changed *between* sessions is re-baselined on the next fresh start, so it is
+  treated as pre-existing rather than gated.
 - **Staged/committed-blob freshness is single-hash and content-literal.** The gate
   records one last-verified hash per file, so if you stage a *previously* verified
   blob and then keep editing to a newer verified version, the now-superseded staged
@@ -250,6 +257,9 @@ turns a verdict into an error.
   byte-for-byte, so a git content filter (`core.autocrlf`, a clean/smudge filter)
   that rewrites the blob relative to the worktree can over-gate. Both resolve by
   bringing the index/commit to the verified content (`git add`) and re-verifying.
+  A blob the SessionStart baseline recorded stays exempt for the whole session —
+  it is the user's pre-session WIP, unchanged — so leaving it staged, or committing
+  it as-is, does not block; only *different* bytes reaching the index/HEAD gate.
 - **mtime is not used.** Freshness is keyed on a SHA-256 of file content, so a
   `cp -p`/`tar` that preserves an old timestamp cannot slip an unverified change
   past the gate, and an unchanged file is never needlessly re-verified.

@@ -1416,3 +1416,136 @@ def test_session_start_resume_does_not_rebaseline(
     _run(session_start.main, tmp_path, monkeypatch, source="resume")
     # resume left it untouched (still marked stale) → the change stays gate-able
     assert gate.load_state(str(tmp_path))["scanned"]["a.c"] == "STALE-ON-PURPOSE"
+
+
+# --- SessionStart baseline: the index/HEAD blobs too (issue #139) ------------
+
+
+def _mm_repo(tmp_path: Path) -> tuple[Path, str, str]:
+    """A repo opening at ``MM foo.c``: HEAD holds A, the index B, the worktree A.
+
+    Returns the source path and the (A, B) content hashes.
+    """
+    _git_init(tmp_path)
+    src = tmp_path / "foo.c"
+    src.write_text("int f(void){return 0;}\n")  # A
+    _git_commit_all(tmp_path)
+    a_hash = gate.content_hash(str(src))
+    src.write_text("int f(void){return 1;}\n")  # B — the user's staged WIP
+    _stage(tmp_path, "foo.c")
+    b_hash = gate.content_hash(str(src))
+    src.write_text("int f(void){return 0;}\n")  # worktree reverted to A
+    assert a_hash is not None and b_hash is not None
+    return src, a_hash, b_hash
+
+
+def test_baseline_scanned_records_index_and_head_blobs(tmp_path: Path) -> None:
+    # The worktree hash alone misses the staged blob; both refs are baselined, and
+    # they survive the JSON round-trip through gate_state.json (read back from disk,
+    # the way the Stop-gate reads them).
+    _src, a_hash, b_hash = _mm_repo(tmp_path)
+    gate.baseline_scanned(str(tmp_path))
+
+    state = gate.load_state(str(tmp_path))
+    assert state["scanned"]["foo.c"] == a_hash  # worktree bytes
+    assert state["baseline_blobs"]["foo.c"] == [b_hash, a_hash]  # index, then HEAD
+
+
+def test_preexisting_staged_blob_not_gated_after_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Issue #139: a session opening at `MM foo.c` blocked immediately on the user's
+    # pre-existing staged WIP. A pure conversational turn must end cleanly.
+    _mm_repo(tmp_path)
+    _run(session_start.main, tmp_path, monkeypatch, source="startup")
+
+    rc = _run(stop_gate.main, tmp_path, monkeypatch)
+    assert rc == 0 and capsys.readouterr().out.strip() == ""
+
+
+def test_baseline_covers_staged_blob_with_deleted_worktree(tmp_path: Path) -> None:
+    # `MD`: staged WIP whose worktree copy is gone. Discovery's existence filter
+    # drops it from `scanned`, so the blob baseline is the only thing standing
+    # between the user's staged WIP and an immediate block.
+    src, _a_hash, b_hash = _mm_repo(tmp_path)
+    src.unlink()  # worktree deleted — porcelain now reports `MD`
+
+    gate.baseline_scanned(str(tmp_path))
+    state = gate.load_state(str(tmp_path))
+    assert "foo.c" not in state["scanned"]  # nothing on disk to hash
+    assert b_hash in state["baseline_blobs"]["foo.c"]  # ...but the index blob is
+    assert gate.divergent_blob_sources(str(tmp_path), state) == []
+
+
+def test_agent_staged_blob_still_gated_after_baseline(tmp_path: Path) -> None:
+    # Fail-closed: the baseline exempts the pre-session blob only. The agent staging
+    # its OWN unverified bytes hashes to something no baseline holds, so it gates.
+    src, _a_hash, _b_hash = _mm_repo(tmp_path)
+    gate.baseline_scanned(str(tmp_path))
+
+    src.write_text("int f(void){return 2;}\n")  # C — the agent's change, staged
+    _stage(tmp_path, "foo.c")
+
+    state = gate.load_state(str(tmp_path))
+    assert gate.divergent_blob_sources(str(tmp_path), state) == [
+        {"rel": "foo.c", "reason": "staged"}
+    ]
+
+
+def test_baseline_exempts_committing_preexisting_staged_wip(tmp_path: Path) -> None:
+    # The staged baseline follows its blob into HEAD: committing the pre-session
+    # index ships bytes the baseline already recorded, so the committed-since check
+    # must not re-gate them under a different `reason`.
+    _mm_repo(tmp_path)
+    gate.baseline_scanned(str(tmp_path))
+    state = gate.load_state(str(tmp_path))
+    # commit the index as-is (not `git add -A`, which would restage the worktree)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "wip"], check=True)
+
+    divergent = gate.divergent_blob_sources(
+        str(tmp_path), state, baseline_head=state["baseline_head"]
+    )
+    assert divergent == []
+
+
+def test_baseline_blobs_skips_untracked_path(tmp_path: Path) -> None:
+    # An untracked file has neither an index nor a HEAD blob: it is baselined by its
+    # worktree bytes only, and records no phantom blob exemption.
+    _git_init(tmp_path)
+    (tmp_path / "seed.txt").write_text("x")
+    _git_commit_all(tmp_path)
+    new = tmp_path / "new.c"
+    new.write_text("int g(void){return 0;}\n")
+
+    gate.baseline_scanned(str(tmp_path))
+    state = gate.load_state(str(tmp_path))
+    assert state["scanned"]["new.c"] == gate.content_hash(str(new))
+    assert "new.c" not in state["baseline_blobs"]
+
+
+def test_divergent_blob_sources_gates_on_malformed_baseline(tmp_path: Path) -> None:
+    # A truncated/hand-edited baseline must not grant an exemption: an unusable
+    # entry reads as "nothing baselined" and the staged blob still blocks.
+    _mm_repo(tmp_path)
+    gate.baseline_scanned(str(tmp_path))
+    state = gate.load_state(str(tmp_path))
+    state["baseline_blobs"]["foo.c"] = "b7e2"  # not a list of hashes
+
+    assert gate.divergent_blob_sources(str(tmp_path), state) == [
+        {"rel": "foo.c", "reason": "staged"}
+    ]
+
+
+def test_prune_deleted_units_clears_blob_baseline(tmp_path: Path) -> None:
+    # Both halves of the baseline have the same lifetime: a file removed
+    # out-of-band drops its worktree hash AND its blob hashes, so a same-name file
+    # recreated later cannot inherit a stale exemption.
+    src, _a_hash, _b_hash = _mm_repo(tmp_path)
+    gate.baseline_scanned(str(tmp_path))
+    state = gate.load_state(str(tmp_path))
+    gate.record(state, gate.UnitVerdict("foo.c::f", "foo.c", "f", "verified", 1))
+    src.unlink()
+
+    assert gate.prune_deleted_units(state, str(tmp_path)) == ["foo.c::f"]
+    assert "foo.c" not in state["scanned"]
+    assert "foo.c" not in state["baseline_blobs"]
