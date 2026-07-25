@@ -227,8 +227,11 @@ turns a verdict into an error.
   recorded in the trace (`oob_scan_skipped`) rather than passing silently, but it
   is not gated. Scope is **"C changed since session start"** (issue
   [#99](https://github.com/pmatos/forseti/issues/99)): the SessionStart hook
-  baselines the already-dirty tree *and* the current HEAD, so the scan catches this
-  session's Bash writes — including a C file written **and committed in one shot**
+  baselines the already-dirty tree — its worktree bytes *and* its staged/`HEAD`
+  blobs, so a session opening at `MM foo.c` (staged WIP, worktree reverted) is not
+  blocked on the user's own pre-session index, issue
+  [#139](https://github.com/pmatos/forseti/issues/139) — *and* the current HEAD, so
+  the scan catches this session's Bash writes — including a C file written **and committed in one shot**
   (a clean worktree `git status` alone would miss), recovered by diffing the
   baseline HEAD against the current one — while never gating pre-existing
   uncommitted or committed/third-party C the agent never touched. Two documented
@@ -248,6 +251,9 @@ turns a verdict into an error.
   byte-for-byte, so a git content filter (`core.autocrlf`, a clean/smudge filter)
   that rewrites the blob relative to the worktree can over-gate. Both resolve by
   bringing the index/commit to the verified content (`git add`) and re-verifying.
+  A blob the SessionStart baseline recorded stays exempt for the whole session —
+  it is the user's pre-session WIP, unchanged — so leaving it staged, or committing
+  it as-is, does not block; only *different* bytes reaching the index/HEAD gate.
 - **mtime is not used.** Freshness is keyed on a SHA-256 of file content, so a
   `cp -p`/`tar` that preserves an old timestamp cannot slip an unverified change
   past the gate, and an unchanged file is never needlessly re-verified.

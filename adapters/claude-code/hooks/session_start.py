@@ -10,9 +10,14 @@ user's WIP, the first `Bash` call verifying code Claude never opened).
 
 This hook records each already-dirty C file's current content as the baseline, so
 the scan fires only once the agent actually changes a file — scoping the gate to
-"changed **since session start**". It baselines on a fresh/cleared session only;
-on resume it leaves the live ``scanned`` map untouched so a mid-session
-out-of-band change is not masked.
+"changed **since session start**". The baseline covers both places the gate reads
+C from: the worktree bytes (``scanned``) and the index/``HEAD`` blobs
+(``baseline_blobs``) the Stop-gate's blob scan compares against — a repo opening at
+``MM foo.c`` (staged WIP, worktree reverted) has a staged blob the worktree hash
+never sees, and gating it would block the session on the user's own WIP before the
+agent did anything (issue #139). It baselines on a fresh/cleared session only; on
+resume it leaves the live ``scanned``/``baseline_blobs`` maps untouched so a
+mid-session out-of-band change is not masked.
 """
 
 from __future__ import annotations
