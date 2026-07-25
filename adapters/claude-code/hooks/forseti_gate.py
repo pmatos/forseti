@@ -1479,38 +1479,40 @@ def verify_and_record(
         be recorded as already-scanned, or the out-of-band scan would treat it as
         handled and the edit would pass unverified.
 
-        `unless_superseded` makes that record conditional: it is dropped when a
-        concurrent run's stamp vouches for the bytes on disk *and* this error no
-        longer speaks for them. That run enumerated the current content and
-        pre-recorded every unit of it as blocking under the same lock that stamped
-        it, so it is both the authority and the thing that keeps the gate closed.
-        Publishing anyway would strand a `rel::?` nothing can clear: the file
-        hashes equal to the surviving stamp, so `stale_sources` reads it as fresh,
-        never re-offers it, and the reconcile that prunes `?` never runs — the
-        Stop-gate would then block its way to a loud residual on a file that run
-        legitimately verified. On that path this writes nothing at all, not even
-        the `stop_attempts` reset, and returns no verdicts.
+        `unless_superseded` makes that record conditional, on exactly one thing:
+        whether anything would ever offer this file to a scan again. That is not a
+        new predicate — it is `stale_sources`, the one the out-of-band scan itself
+        uses — and its emptiness *is* the statement "a `rel::?` recorded now can
+        never be cleared". The file hashes equal to its stamp and no unfinished
+        claim is outstanding, so nothing re-offers it, the reconcile that prunes
+        `?` never runs, and the Stop-gate blocks its way to a loud residual — on
+        content some run stamped, which (see the two writers of a stamp) means
+        content it enumerated and pre-recorded, or the session baseline's
+        deliberate "already handled". This run's failure adds nothing there, so it
+        writes nothing at all, not even the `stop_attempts` reset, and returns no
+        verdicts.
 
         The condition must be tested *here*, not by the caller: outside the lock it
         would only move the gap to between the test and this one.
 
-        Two halves, and both are load-bearing:
+        Deriving it from `stale_sources` rather than from "a stamp vouches for
+        what is on disk" is what keeps three cases straight, and each is a test:
 
-        * **A stamp equal to what is on disk**, deliberately not "a stamp exists".
-          A stamp that does *not* match disk leaves the file stale, so its `?` is
-          clearable by the next scan and suppressing it would drop a real block on
-          content nobody has gated.
-        * **`digest` — the bytes this error speaks for — is not what is on disk.**
-          The enumerate failure ("this content does not parse", "esbmc is
-          missing") stays true while those bytes are there, whoever stamped them:
-          an unchanged file re-edited after a successful verify has
-          `stamp == on_disk == digest`, and suppressing there would turn a loud
-          blocking error into a silent pass. The two drift callers name no
-          `digest` — their whole premise is that the file no longer holds it — so
-          for them any vouching stamp is enough. That also means a stamp carrying
-          *this* run's digest still suppresses a drift error: after an A -> B -> A
-          a concurrent run can re-stamp byte-identical content, and it owns the
-          file exactly as any other stamper does.
+        * a stamp for *other* content — the file reads stale, so the `?` is
+          clearable and must be published; nobody has gated what is on disk;
+        * a stamp for these bytes with an **unfinished claim** — a run started on
+          this content and may have been killed, so `stale_sources` still offers
+          the file. The block lands and *charges* that claim, which is what stops
+          a persistently-erroring file from retrying forever (issue #140/#148);
+        * a stamp for these bytes with no claim — settled. Even when the error is
+          about those same bytes (a no-op edit with `esbmc` since gone from
+          `PATH`), the run that stamped them enumerated them and its verdicts
+          still describe them. The tooling failure surfaces on the next edit that
+          *changes* the file, where no stamp matches.
+
+        A file that cannot be hashed at all is never suppressed: `stale_sources`
+        skips what it cannot read, so its silence there means "unknown", not
+        "settled".
 
         An unfinished-verify marker for `digest` is *spent one attempt*, never
         deleted (PR #148 review). Deleting is what the ownership rule forbids: this
@@ -1547,12 +1549,9 @@ def verify_and_record(
         verdict = UnitVerdict(f"{rel}::?", rel, "?", "error", k, detail=detail)
         with gate_lock(project_dir):
             state = load_state(project_dir)
-            if unless_superseded:
-                on_disk_now = content_hash(file_path)
-                stamp = state.get("scanned", {}).get(rel)
-                obsolete = digest is None or digest != on_disk_now
-                if on_disk_now is not None and stamp == on_disk_now and obsolete:
-                    return []
+            readable = unless_superseded and content_hash(file_path) is not None
+            if readable and not stale_sources(project_dir, state, [file_path]):
+                return []
             record(state, verdict)
             state["stop_attempts"] = 0
             pending = state.setdefault("pending", {})
@@ -1588,10 +1587,10 @@ def verify_and_record(
         # Couldn't enumerate the file's units (esbmc missing, C parse error, a
         # snapshot that would not stage, …). Record a blocking `error` verdict
         # rather than skip: a file that was edited but can't be parsed must not
-        # pass silently. Unless the bytes it is about are gone and a concurrent run
-        # vouches for the ones that replaced them — then the block would be both
-        # wrong and unclearable; `digest` is what keeps that from silencing an
-        # error about the content still sitting on disk.
+        # pass silently. Unless a stamp already vouches for what is on disk — then
+        # those bytes are gated by a run that *did* enumerate them, and a block
+        # here would be an unclearable one on top of a verified file, whether the
+        # bytes moved on or this is a no-op edit of content already verified.
         return _blocking_error(str(exc)[:800], digest=digest, unless_superseded=True)
 
     # Acquiring the stamp is a claim to be authoritative for this file, so the
