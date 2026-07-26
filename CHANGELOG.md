@@ -1,3 +1,10 @@
+## [1.6.3](https://github.com/pmatos/forseti/compare/v1.6.2...v1.6.3) (2026-07-26)
+
+
+### Bug Fixes
+
+* **claude-adapter:** enumerate an immutable snapshot, not a re-read ([#141](https://github.com/pmatos/forseti/issues/141)) ([#149](https://github.com/pmatos/forseti/issues/149)) ([36ffd48](https://github.com/pmatos/forseti/commit/36ffd487b95d3c903a566d246b6ad8a5f3018d3c))
+
 ## [1.6.2](https://github.com/pmatos/forseti/compare/v1.6.1...v1.6.2) (2026-07-25)
 
 
