@@ -104,6 +104,57 @@ def test_content_hash_missing_file_is_none(tmp_path: Path) -> None:
     assert gate.content_hash(tmp_path / "nope.c") is None
 
 
+# --- unit_id identity key (issue #152) --------------------------------------
+
+
+def test_unit_id_resolves_dotdot_through_a_symlink(tmp_path: Path) -> None:
+    # `link -> external/pkg`: the kernel walk `unit_id` now does resolves
+    # `link/..` to `external`, the link *target*'s parent — not to `proj`, which
+    # is what a lexical `os.path.relpath` collapses it to. Colliding on `proj`
+    # would alias this key onto a real `proj/x.c`, even though the kernel (and so
+    # the gate's read/hash/verify) opens a different file entirely.
+    proj = tmp_path / "proj"
+    external = tmp_path / "external" / "pkg"
+    external.mkdir(parents=True)
+    proj.mkdir()
+    (proj / "x.c").write_text("own\n")
+    (tmp_path / "external" / "x.c").write_text("ext\n")
+    (proj / "link").symlink_to(external)
+
+    aliased = gate.unit_id(str(proj), str(proj / "link" / ".." / "x.c"))
+    plain = gate.unit_id(str(proj), str(proj / "x.c"))
+
+    assert aliased == "../external/x.c"
+    assert aliased != plain  # the bug: both used to key as "x.c"
+    assert plain == "x.c"  # no `..` in the path: unchanged, no migration needed
+
+
+def test_stale_sources_does_not_collapse_aliased_real_files(tmp_path: Path) -> None:
+    # "Why it matters" in issue #152: `proj/x.c` and `link/../x.c` (through a
+    # symlinked component) are two REAL files. Seed `scanned` as if `proj/x.c`
+    # had just been verified, then check the aliased path — which really is
+    # `external/x.c`, holding the *same* bytes by construction — is still
+    # reported stale rather than silently read as already-fresh off the other
+    # file's stamp (the fail-open half of the bug: a collision would let unverified
+    # content slip past the gate).
+    proj = tmp_path / "proj"
+    external = tmp_path / "external" / "pkg"
+    external.mkdir(parents=True)
+    proj.mkdir()
+    content = "int f(void){return 0;}\n"
+    (proj / "x.c").write_text(content)
+    (tmp_path / "external" / "x.c").write_text(content)
+    (proj / "link").symlink_to(external)
+    aliased = str(proj / "link" / ".." / "x.c")
+
+    state = gate.load_state(str(proj))
+    state["scanned"][gate.unit_id(str(proj), str(proj / "x.c"))] = gate.content_hash(
+        str(proj / "x.c")
+    )
+
+    assert gate.stale_sources(str(proj), state, [aliased]) == [aliased]
+
+
 # --- git discovery ----------------------------------------------------------
 
 
