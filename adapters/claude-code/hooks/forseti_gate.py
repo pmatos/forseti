@@ -935,9 +935,13 @@ def discover_changed_c_sources(
     # is verified once).
     committed = git_committed_files_since(project_dir, baseline_head)
     rels = list(dict.fromkeys([*rels, *committed]))
-    # Keep the returned path expressed relative to the raw `project_dir` so its
-    # `unit_id`/`scanned` key matches what `verify_and_record` stamps; realpath is
-    # used only to compare against the (possibly symlinked) project subtree.
+    # `realpath` is used only to compare against the (possibly symlinked) project
+    # subtree; the returned path keeps git's own root, so scoping never restages a
+    # file. That is *not* the same as the `unit_id` key agreeing with the one a
+    # PostToolUse edit produces: `git rev-parse --show-toplevel` reports the root
+    # resolved, so when `project_dir` is a symlinked spelling the same file keys as
+    # `../real/src/x.c` here and `src/x.c` there — measured, and filed as #152 with
+    # the other half of that aliasing class, since the fix changes a persisted key.
     proj_real = os.path.realpath(project_dir)
     found: list[str] = []
     for rel in rels:
