@@ -275,41 +275,56 @@ def _kernel_dir(path: str) -> str:
     return cur
 
 
-def _index_ignore_snapshot(project_dir: str, prefix: str) -> None:
-    """Register `prefix*` in the project's ``.git/info/exclude``, idempotently.
+def _index_ignore_snapshot(start_dir: str, prefix: str) -> None:
+    """Register `prefix*` in `start_dir`'s own ``.git/info/exclude``, idempotently.
 
     `_enumerable_source` calls this *before* staging a snapshot, so a
     concurrent `git add -A`/`git status` never has a window in which the
     snapshot exists but is not yet excluded. ``.git/info/exclude`` — not the
     tracked `.gitignore` — is the right place: it is local, un-versioned repo
     state, exactly like the snapshot itself, so no tracked file is touched and
-    nothing needs to be undone.
+    nothing needs to be undone. `start_dir` must be the directory the snapshot
+    is actually staged in, not necessarily the Claude project root: `git
+    rev-parse` resolves upward from `start_dir` to whichever repository
+    actually contains it, which may differ from the project root's repository
+    (a submodule, a sibling checkout reached via a symlink).
 
     A no-op outside a git work tree (`_git` returns ``None``): there is no
     index there to protect against in the first place. Everywhere else, an
-    `OSError` writing the exclude file fails the same way every other one in
-    this module does — closed, as `UnitsUnavailable` — rather than silently
-    proceeding to stage the snapshot unprotected.
+    `OSError` — including one from creating a missing ``.git/info/`` (legal
+    for a repo made with an empty template, or by non-git tooling) — writing
+    the exclude file fails the same way every other one in this module does —
+    closed, as `UnitsUnavailable` — rather than silently proceeding to stage
+    the snapshot unprotected.
+
+    Read and written as bytes, never decoded: git treats exclude patterns as
+    raw bytes, and a non-UTF-8 byte sequence already in the file (e.g. a
+    non-ASCII path pattern written under a non-UTF-8 locale) is legal there.
+    Decoding it as text would raise `UnicodeDecodeError` — a `ValueError`, not
+    an `OSError` — which would escape the `except` below uncaught and crash
+    the hook process outright instead of failing closed.
     """
-    exclude_rel = _git(project_dir, "rev-parse", "--git-path", "info/exclude")
+    exclude_rel = _git(start_dir, "rev-parse", "--git-path", "info/exclude")
     if exclude_rel is None:
         return
     exclude_rel = exclude_rel.strip()
     exclude_path = (
         exclude_rel
         if os.path.isabs(exclude_rel)
-        else os.path.join(project_dir, exclude_rel)
+        else os.path.join(start_dir, exclude_rel)
     )
     pattern = f"{prefix}*"
+    pattern_bytes = pattern.encode("utf-8")
     try:
-        with open(exclude_path, "a+", encoding="utf-8") as handle:
+        os.makedirs(os.path.dirname(exclude_path), exist_ok=True)
+        with open(exclude_path, "a+b") as handle:
             handle.seek(0)
             existing = handle.read()
-            if pattern in existing.splitlines():
+            if pattern_bytes in existing.splitlines():
                 return
-            if existing and not existing.endswith("\n"):
-                handle.write("\n")
-            handle.write(f"{pattern}\n")
+            if existing and not existing.endswith(b"\n"):
+                handle.write(b"\n")
+            handle.write(pattern_bytes + b"\n")
     except OSError as exc:
         raise UnitsUnavailable(
             f"could not register {pattern!r} in {exclude_path} to keep the "
@@ -393,21 +408,25 @@ def _enumerable_source(
     unconditional. That guard only keeps the snapshot out of the *gate's own*
     scans, though; nothing about it stops a concurrent `git add -A`, IDE, or
     automation job from staging the file while it exists on disk.
-    `_index_ignore_snapshot` registers `_ENUM_SNAPSHOT_PREFIX*` in the project's
+    `_index_ignore_snapshot` registers `_ENUM_SNAPSHOT_PREFIX*` in `src_dir`'s own
     `.git/info/exclude` *before* `mkstemp` runs (below), so there is no window
     where the snapshot sits in the tree unprotected — inside a git work tree,
     `git status`/`git add -A` never see it, so a `finally`-block failure to
     clean up (or this process being killed first) cannot be committed by an
-    unrelated `git add -A` in the meantime. An explicit, forced
-    `git add -f <path>` is the one thing left that can still stage it, the same
-    residual `_verifiable_source` documents at the verify boundary (issue #150).
+    unrelated `git add -A` in the meantime. It targets `src_dir`, not
+    `project_dir`, because that is where `mkstemp` actually stages the file: when
+    the source lives in a different repository than `project_dir` (a submodule,
+    a sibling checkout reached via a symlink), `project_dir`'s exclude file is
+    the wrong one to write. An explicit, forced `git add -f <path>` is the one
+    thing left that can still stage it, the same residual `_verifiable_source`
+    documents at the verify boundary (issue #150).
     """
     if content is None:
         yield str(file_path)
         return
-    _index_ignore_snapshot(project_dir, _ENUM_SNAPSHOT_PREFIX)
     spelled = os.path.join(project_dir, os.fspath(file_path))
     src_dir = _kernel_dir(os.path.dirname(spelled))
+    _index_ignore_snapshot(src_dir, _ENUM_SNAPSHOT_PREFIX)
     # Every `OSError` the staging can raise — an unwritable directory, `ENOSPC`,
     # `EDQUOT`, a failed cleanup — has to land as `UnitsUnavailable`, the one
     # exception `verify_and_record` turns into a blocking `error`. Left bare it

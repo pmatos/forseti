@@ -633,8 +633,13 @@ def test_unregisterable_git_exclude_blocks_with_units_unavailable(
     # Every OSError this staging path can raise has to land as UnitsUnavailable
     # (fail closed) — including one from registering the exclude pattern
     # itself, or the snapshot would end up staged unprotected rather than not
-    # staged at all.
-    monkeypatch.setattr(gate, "_git", lambda project_dir, *args: "no/such/dir/exclude")
+    # staged at all. A regular file standing where a directory component of
+    # the resolved exclude path needs to be makes `os.makedirs` fail with an
+    # OSError it cannot route around (unlike a merely-missing directory, which
+    # `os.makedirs` now creates — see
+    # `test_missing_git_info_directory_is_created_before_writing_exclude`).
+    (tmp_path / "blocker").write_text("not a directory\n")
+    monkeypatch.setattr(gate, "_git", lambda start_dir, *args: "blocker/exclude")
     src = tmp_path / "x.c"
     src.write_text("int f(void) { return 0; }\n")
     with pytest.raises(gate.UnitsUnavailable, match="exclude"):
@@ -694,6 +699,117 @@ def test_snapshot_cleanup_failure_does_not_mask_a_pending_enumeration_failure(
 
     with pytest.raises(gate.UnitsUnavailable, match="boom-original-failure"):
         gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+
+def test_exclude_is_registered_against_the_source_repo_not_the_project_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A source living in a *different* repository than `project_dir` (a
+    # submodule, a sibling checkout reached via a symlink) must have the
+    # exclude pattern registered in *its own* `.git/info/exclude` — the one a
+    # `git add -A` run from inside that repo actually consults — not the
+    # project root's, which `mkstemp` never stages anything into (issue #151
+    # follow-up).
+    _git_init(tmp_path)
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    _git_init(nested)
+    src = nested / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+
+    gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+    pattern = f"{gate._ENUM_SNAPSHOT_PREFIX}*"
+    nested_exclude = (nested / ".git" / "info" / "exclude").read_text()
+    assert pattern in nested_exclude.splitlines()
+    # `git init` always seeds a commented-out `.git/info/exclude` (confirmed
+    # empirically), so this is a real assertion, not a vacuous one.
+    root_exclude = (tmp_path / ".git" / "info" / "exclude").read_text()
+    assert pattern not in root_exclude.splitlines()
+
+
+def test_exclude_is_registered_in_the_repo_root_for_a_nested_source(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The common shape: one repo at `project_dir`, source one level down (e.g.
+    # `src/x.c`). `git rev-parse --git-path info/exclude` run from a
+    # subdirectory returns a path *relative to that subdirectory*
+    # (``../.git/info/exclude``, confirmed empirically) rather than an
+    # absolute one — this pins that `os.path.join`/`os.makedirs` resolve it to
+    # the same repo root's exclude file the project-root case already covers,
+    # not a nonexistent `src/../.git/info/exclude` tree of its own.
+    _git_init(tmp_path)
+    sub = tmp_path / "src"
+    sub.mkdir()
+    src = sub / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+
+    gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+    pattern = f"{gate._ENUM_SNAPSHOT_PREFIX}*"
+    root_exclude = (tmp_path / ".git" / "info" / "exclude").read_text()
+    assert pattern in root_exclude.splitlines()
+    assert not (sub / ".git").exists()
+
+
+def test_preexisting_non_utf8_exclude_content_does_not_crash(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # `.git/info/exclude` is git's own file, read as raw bytes by git itself —
+    # a non-UTF-8 byte sequence already in it (e.g. a pattern written under a
+    # non-UTF-8 locale) is legal. Decoding it as text would raise
+    # `UnicodeDecodeError`, a `ValueError` that escapes the surrounding
+    # `except OSError` uncaught and crashes the hook process instead of
+    # failing closed.
+    _git_init(tmp_path)
+    exclude_path = tmp_path / ".git" / "info" / "exclude"
+    exclude_path.write_bytes(b"\xff\xfe not valid utf-8\n")
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    defs = gate.extract_function_defs(
+        str(src), project_dir=str(tmp_path), content=b"f\n"
+    )
+
+    assert [d.name for d in defs] == ["f"]
+    updated = exclude_path.read_bytes()
+    assert b"\xff\xfe not valid utf-8\n" in updated
+    assert f"{gate._ENUM_SNAPSHOT_PREFIX}*".encode() in updated
+
+
+def test_missing_git_info_directory_is_created_before_writing_exclude(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # `git rev-parse --git-path info/exclude` only computes a path — it does
+    # not create `.git/info/`, which is legitimately absent for a repo made
+    # with an empty template or by non-git tooling. That must not turn into a
+    # hard, total gate outage on ordinary (if uncommon) repo state.
+    _git_init(tmp_path)
+    info_dir = tmp_path / ".git" / "info"
+    shutil.rmtree(info_dir, ignore_errors=True)
+    assert not info_dir.exists()
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    defs = gate.extract_function_defs(
+        str(src), project_dir=str(tmp_path), content=b"f\n"
+    )
+
+    assert [d.name for d in defs] == ["f"]
+    exclude = (info_dir / "exclude").read_text()
+    assert f"{gate._ENUM_SNAPSHOT_PREFIX}*" in exclude.splitlines()
 
 
 def test_transient_rewrite_during_enumeration_is_enumerated_faithfully(
