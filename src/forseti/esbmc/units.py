@@ -113,8 +113,16 @@ _STATIC_MIN_RE = re.compile(r"\bstatic\b")
 # literal-digit-sequence form (a macro-valued `#line` is not handled — vanishingly
 # rare outside raw preprocessor output, which this module never sees). Matches
 # right after `#`, so `#define`/`#if`/... (which start with a non-digit, non-
-# "line" word) never do.
-_LINE_DIRECTIVE_RE = re.compile(r"^[ \t]*#[ \t]*(?:line[ \t]+)?(\d+)\b", re.MULTILINE)
+# "line" word) never do. The captured digit run also tolerates an embedded
+# backslash-continuation (PR #156 follow-up to issue #145: cpp splices `#line
+# \` + newline + `11` into one logical `#line 11` before ever reading it, so a
+# breakpoint recorded here must be too — the same splicing hazard `_IF_RE`/
+# `_ELIF_RE` already guard against for a conditional's own text). The
+# continuation is stripped from the captured group — via `_CONTINUATION_RE` —
+# before the digits are read as an `int`, in `_line_breakpoints`.
+_LINE_DIRECTIVE_RE = re.compile(
+    r"^[ \t]*#[ \t]*(?:line[ \t]+)?((?:\\\r?\n)*\d(?:\\\r?\n|\d)*)\b", re.MULTILINE
+)
 
 # A literal `#if 0`/`#elif 0` or `#if 1`/`#elif 1` (the complete condition is
 # exactly the digit `0` or `1`, nothing else) are the only conditionals this
@@ -431,10 +439,13 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
     issue #145). Splicing inside a comment is handled earlier, by
     `_COMMENT_RE`/`_blank_comment`, before this function ever sees the text —
     the exclusion here only concerns a whole *directive-shaped line* starting
-    on a continuation. A condition that is itself split across a splice (``#if
-    \\`` + newline + ``0``) is a separate case, handled by `_cond_events`
-    stripping the splice out of its captured condition text before comparing
-    it to the literal ``"0"``/``"1"``, not by this exclusion.
+    on a continuation. A *token within* a directive that is itself split
+    across a splice — an ``#if``/``#elif`` condition (``#if \\`` + newline +
+    ``0``), or a ``#line``'s own digit sequence (``#line \\`` + newline +
+    ``11``) — is a separate case: each is captured with the splice tolerated
+    inline (see `_IF_RE`/`_ELIF_RE`/`_LINE_DIRECTIVE_RE`) and stripped via
+    `_CONTINUATION_RE` before the captured text is read, not handled by this
+    exclusion.
     """
     continuation_starts = {
         m.end() for m in _CONTINUATION_RE.finditer(source_no_comments)
@@ -508,7 +519,8 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
                 stack.pop()
         elif match is not None and not any(dead for dead, _ in stack):
             physical = source_no_comments.count("\n", 0, pos) + 1
-            breakpoints.append((physical, int(match.group(1))))
+            presumed = int(_CONTINUATION_RE.sub("", match.group(1)))
+            breakpoints.append((physical, presumed))
     return breakpoints
 
 

@@ -558,6 +558,36 @@ def test_line_breakpoints_joins_a_spliced_elif_condition() -> None:
     assert _line_breakpoints(source) == []
 
 
+def test_line_breakpoints_joins_a_spliced_line_directive_digit() -> None:
+    # PR #156 follow-up: `#line \` + newline + `11` is one logical `#line 11`
+    # to cpp (line splicing runs before cpp ever reads the directive), but
+    # capturing only the first physical line's digits would see none at all
+    # and silently drop the breakpoint — not a safe failure: with no
+    # breakpoint recorded, both an active and an inactive same-named
+    # candidate translate to their own physical line, and the nearest-before
+    # tiebreak can then pick whichever sits physically closer to `def_line`,
+    # regardless of which one cpp actually compiled.
+    source = "#line \\\n11\nx\n"
+    assert _line_breakpoints(source) == [(1, 11)]
+
+
+def test_annotate_array_extents_ignores_a_line_directive_spliced_from_a_line() -> None:
+    # End-to-end, confirmed against esbmc's own parse tree: `#line \` +
+    # newline + `11` reports `f`'s definition at presumed line 12. An
+    # inactive array-shaped `f` sits behind a real `#if 0` right after it; if
+    # the spliced `#line`'s breakpoint is dropped, both candidates fall back
+    # to their physical lines (3 and 5) and the nearest-before tiebreak picks
+    # the closer, inactive one (5) over the active pointer definition (3),
+    # copying its extent onto the compiled pointer parameter.
+    source = (
+        "#line \\\n11\nvoid f(int *p) { *p = 1; }\n"
+        "#if 0\nvoid f(int p[20]) { }\n#endif\n"
+    )
+    unit = Unit("f", (Param("p", "int *"),), def_line=12)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
 def test_annotate_array_extents_ignores_a_line_directive_in_a_spliced_if_zero() -> None:
     # End-to-end: without joining the spliced condition, `#if \` + newline +
     # `0` reads as opaque/live, so the `#line 11` guarding the inactive
