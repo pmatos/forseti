@@ -79,6 +79,13 @@ _QUALIFIER_ONLY_RE = re.compile(
 # even when N itself is not (`[static SHA_DIGEST_LENGTH]`).
 _STATIC_MIN_RE = re.compile(r"\bstatic\b")
 
+# A `#line N` (ISO C) or GNU linemarker `# N "file" flags...` directive, in its
+# literal-digit-sequence form (a macro-valued `#line` is not handled — vanishingly
+# rare outside raw preprocessor output, which this module never sees). Matches
+# right after `#`, so `#define`/`#if`/... (which start with a non-digit, non-
+# "line" word) never do.
+_LINE_DIRECTIVE_RE = re.compile(r"^[ \t]*#[ \t]*(?:line[ \t]+)?(\d+)\b", re.MULTILINE)
+
 
 @dataclass(frozen=True)
 class Param:
@@ -269,6 +276,38 @@ def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
     return units
 
 
+def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
+    """``(physical_line, presumed_line)`` pairs from `source_no_comments`'s
+    ``#line``/linemarker directives, one per directive, in physical order.
+
+    Each pair says the *next* physical line reads as `presumed_line`, and every
+    physical line after it reads one higher — until the next directive — mirroring
+    how ``#line N`` (or GNU's ``# N "file"``) resets clang's own line counter.
+
+    A textual scan, not a preprocessor: a directive inside a false ``#if 0``/
+    ``#ifdef`` group is skipped by cpp (and so never seen by clang) but is still
+    picked up here, which can misalign the mapping in that narrow case.
+    """
+    return [
+        (source_no_comments.count("\n", 0, m.start()) + 1, int(m.group(1)))
+        for m in _LINE_DIRECTIVE_RE.finditer(source_no_comments)
+    ]
+
+
+def _presumed_line(physical_line: int, breakpoints: list[tuple[int, int]]) -> int:
+    """`physical_line`'s presumed line, per `breakpoints` (see `_line_breakpoints`).
+
+    Absent any directive at or before `physical_line`, presumed and physical
+    coincide.
+    """
+    presumed = physical_line
+    for directive_line, presumed_at_next in breakpoints:
+        if directive_line >= physical_line:
+            break
+        presumed = presumed_at_next + (physical_line - directive_line - 1)
+    return presumed
+
+
 def _param_list_text(
     source_no_comments: str, fn_name: str, def_line: int | None = None
 ) -> str | None:
@@ -289,6 +328,15 @@ def _param_list_text(
     line, which the ``fn_name (`` text can follow by a line or two (a return type
     on its own line). Without `def_line` the first definition-shaped occurrence is
     used, as before.
+
+    `def_line` is clang's *presumed* line — the coordinate a ``#line``/linemarker
+    directive in the source can rewrite away from physical line count. Comparing
+    it against a raw physical line count would silently anchor to the wrong
+    occurrence whenever such a directive is present, so each candidate's physical
+    line is first translated to the same presumed coordinate system before the
+    comparison (issue #145 follow-up: a directive after an inactive ``#if 0`` body
+    can make the active definition's presumed line collide with, or fall behind,
+    the inactive one's physical line).
     """
     candidates: list[tuple[int, str]] = []
     for match in re.finditer(rf"\b{re.escape(fn_name)}\s*\(", source_no_comments):
@@ -315,10 +363,17 @@ def _param_list_text(
         return None
     if def_line is None:
         return candidates[0][1]
+    breakpoints = _line_breakpoints(source_no_comments)
     # Sort key: candidates at or after `def_line` (key[0] == False) all sort before
     # any that are only before it, then nearest wins within each group — "at or
     # nearest after", falling back to nearest-before only if none qualify.
-    return min(candidates, key=lambda c: (c[0] < def_line, abs(c[0] - def_line)))[1]
+    return min(
+        candidates,
+        key=lambda c: (
+            _presumed_line(c[0], breakpoints) < def_line,
+            abs(_presumed_line(c[0], breakpoints) - def_line),
+        ),
+    )[1]
 
 
 @dataclass(frozen=True)

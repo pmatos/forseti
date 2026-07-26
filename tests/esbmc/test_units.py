@@ -291,6 +291,24 @@ def test_annotate_array_extents_preserves_def_line() -> None:
     assert out.def_line == 4
 
 
+# Issue #145 follow-up: a `#line` directive resets clang's *presumed* line counter
+# for everything after it, so an active definition's presumed line (`def_line`,
+# what clang reports) can land well before its physical line — here 1, not the
+# physical 5. Comparing `def_line` against a raw physical candidate line would
+# silently re-anchor to the inactive `#if 0` body, sitting at physical line 2.
+# Parametrized over both directive spellings clang honors: ISO C's `#line N` and
+# GNU's linemarker `# N` (no `line` keyword).
+@pytest.mark.parametrize("directive", ["#line 1", "# 1"])
+def test_annotate_array_extents_anchors_across_a_line_directive(directive: str) -> None:
+    source = (
+        f"#if 0\nvoid f(int p[20]) {{ }}\n#endif\n{directive}\n"
+        "void f(int *p) { *p = 1; }\n"
+    )
+    unit = Unit("f", (Param("p", "int *"),), def_line=1)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
 def test_blank_comment_preserves_line_numbers_across_a_multiline_comment() -> None:
     # `_param_list_text` compares byte-offset-derived line numbers in the
     # comment-stripped text against `Unit.def_line`, which clang reports against
@@ -422,6 +440,22 @@ def test_list_units_anchors_extent_to_ifdef_selected_definition(tmp_path: Path) 
         u for u in list_units(src, extra_flags=("-DWIDGET",)) if u.name == "f"
     )
     assert f_widget.params[0].array_extent == 20
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_anchors_extent_across_a_line_directive(tmp_path: Path) -> None:
+    # End-to-end (issue #145 follow-up): a `#line` directive makes clang report the
+    # active definition's presumed line (1) well before its physical line (5) —
+    # earlier, even, than the inactive `#if 0` body's physical line (2). Comparing
+    # `def_line` straight against physical candidate lines would pick the inactive
+    # body and copy its extent onto the active `int *p`.
+    src = tmp_path / "sig.c"
+    src.write_text(
+        "#if 0\nvoid f(int p[20]) { }\n#endif\n#line 1\nvoid f(int *p) { *p = 1; }\n"
+    )
+    f = next(u for u in list_units(src) if u.name == "f")
+    assert f.params[0].array_extent is None
+    assert f.params[0].array_extent_unresolved is False
 
 
 # The brittleness class from issue #131: every shape a regex over the source text
