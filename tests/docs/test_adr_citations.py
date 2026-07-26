@@ -14,6 +14,7 @@ record's title agrees with its filename.
 from __future__ import annotations
 
 import re
+import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -24,22 +25,6 @@ _CITATION = re.compile(r"ADR-(\d+)")
 _RECORD_NAME = re.compile(r"^(\d{4})-[a-z0-9-]+\.md$")
 _INDEX_LINK = re.compile(r"\[\d{4}\]\((\d{4}-[a-z0-9-]+\.md)\)")
 
-# VCS internals, tool caches, and the gitignored per-project store: machine
-# state, never a source of truth for a citation.
-_SKIPPED_DIRS = frozenset(
-    {
-        ".git",
-        ".forseti",
-        "__pycache__",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".venv",
-        "venv",
-        "htmlcov",
-        "node_modules",
-    }
-)
 # semantic-release regenerates CHANGELOG.md from commit subjects; a citation
 # there is frozen history no contributor can fix without rewriting it.
 _SKIPPED_FILES = frozenset({"CHANGELOG.md"})
@@ -50,19 +35,35 @@ def _normalize(number: str) -> str:
     return f"{int(number):04d}"
 
 
+def _tracked_files(directory: Path = REPO_ROOT) -> list[Path]:
+    """Paths git tracks under `directory`, relative to it.
+
+    Asking git rather than walking the working tree: a citation only counts if
+    it is *in* the repository. An `rglob` sweep also picked up build output and
+    tool state, so a stray `out/adr-scratch.txt` could fail the suite, and the
+    exclusion list had to be hand-maintained against .gitignore -- two copies
+    of one fact. Untracked files are nobody's source of truth yet, and CI only
+    ever has the tracked ones anyway.
+
+    Deliberately loud if git is absent: a sweep that quietly reads nothing
+    would report a green invariant it never checked.
+    """
+    completed = subprocess.run(
+        ["git", "-C", str(directory), "ls-files", "-z"],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    return [Path(name) for name in completed.stdout.split("\0") if name]
+
+
 def _sources() -> Iterator[tuple[Path, str]]:
-    """Every readable text file in the tree, as (repo-relative path, contents)."""
-    for path in sorted(REPO_ROOT.rglob("*")):
-        if not path.is_file() or path.name in _SKIPPED_FILES:
-            continue
-        relative = path.relative_to(REPO_ROOT)
-        if any(
-            part in _SKIPPED_DIRS or part.endswith(".egg-info")
-            for part in relative.parts
-        ):
+    """Every readable tracked text file, as (repo-relative path, contents)."""
+    for relative in sorted(_tracked_files()):
+        if relative.name in _SKIPPED_FILES:
             continue
         try:
-            yield relative, path.read_text(encoding="utf-8")
+            yield relative, (REPO_ROOT / relative).read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
             continue
 
@@ -108,6 +109,21 @@ def test_every_cited_adr_has_a_record() -> None:
         if number not in records
     }
     assert not dangling, f"ADR citations with no docs/adr/ record: {dangling}"
+
+
+def test_the_sweep_reads_tracked_files_only(tmp_path: Path) -> None:
+    """Ignored build output and untracked scratch files are not citation sites."""
+    subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
+    (tmp_path / ".gitignore").write_text("/out/\n", encoding="utf-8")
+    (tmp_path / "source.md").write_text("cites 0009\n", encoding="utf-8")
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "scratch.txt").write_text("cites 9999\n", encoding="utf-8")
+    (tmp_path / "untracked.md").write_text("cites 9998\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "add", ".gitignore", "source.md"], check=True
+    )
+
+    assert _tracked_files(tmp_path) == [Path(".gitignore"), Path("source.md")]
 
 
 def test_no_two_records_share_a_number() -> None:
