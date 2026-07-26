@@ -157,6 +157,16 @@ _NEEDS_CONTRACT_DETAIL = (
     "memory precondition/harness — not gated (see issue #122)"
 )
 
+# The verify snapshot's filename prefix (issue #150). `_included` rejects any
+# path whose basename starts with it — unconditionally, ahead of
+# `FORSETI_GATE_EXCLUDE`/`FORSETI_GATE_INCLUDE` — because a project can replace
+# (not extend) that env var, and a snapshot a killed hook could not clean up
+# must never be offered back to `verify_and_record` as a source in its own
+# right. `.` leads so `is_c_source`'s suffix check (`.c`, always true here —
+# see `_verifiable_source`) still lets it through the discovery scans as a
+# dotfile, which is exactly what the unconditional exclusion exists to catch.
+_VERIFY_SNAPSHOT_PREFIX = ".forseti-verify-"
+
 
 @dataclass(frozen=True)
 class UnitVerdict:
@@ -730,7 +740,16 @@ def _included(rel: str) -> bool:
 
     Exclude wins over include. When `FORSETI_GATE_EXCLUDE` is unset the built-in
     `_DEFAULT_EXCLUDE_GLOBS` apply; setting it replaces (not extends) them.
+
+    A verify snapshot's own name (`_VERIFY_SNAPSHOT_PREFIX`) is rejected first,
+    unconditionally — never subject to either glob. It has to be: `FORSETI_GATE_EXCLUDE`
+    *replaces* the defaults rather than extending them, so a project that sets one
+    would otherwise un-exclude a snapshot a killed hook left behind, and a
+    concurrent scan could then hand it back to `verify_and_record` as a source in
+    its own right.
     """
+    if os.path.basename(rel).startswith(_VERIFY_SNAPSHOT_PREFIX):
+        return False
     exclude = _globs(os.environ.get("FORSETI_GATE_EXCLUDE")) or _DEFAULT_EXCLUDE_GLOBS
     if _matches(rel, exclude):
         return False
@@ -1234,12 +1253,98 @@ def baseline_scanned(project_dir: str) -> int | None:
     return len(baseline)
 
 
+@contextlib.contextmanager
+def _verifiable_source(
+    file_path: str | os.PathLike[str], content: bytes, *, project_dir: str
+) -> Iterator[str]:
+    """Yield the path to verify `file_path`'s content against: an immutable sibling.
+
+    One boundary over from `_enumerable_source` (issue #150): the *verify* step
+    reads the real path today, guarded only by a re-hash after the loop
+    (`verify_and_record`) — which a transient A -> B -> A rewrite slips past,
+    because the bytes it verified and the bytes it finds afterward compare
+    equal. Writing `content` to a private snapshot and verifying THAT instead
+    means every verdict is computed against content hashing to the digest this
+    run stamped, full stop — there is no "afterward" for the verify itself to
+    race.
+
+    Staged as a **sibling of `file_path`, in its own real directory** — not a
+    mirrored copy elsewhere, which is what `_enumerable_source` uses for
+    enumeration. That choice is deliberate, not laziness: mirroring stops at the
+    project root (`_mirror_root`), so a source *at* the root with
+    `#include "../above.h"` misses the mirror and falls through to the `-I`
+    search with the spelled path — silently a different translation unit, not a
+    block (measured: `test_include_above_the_mirror_root_is_a_known_residual`).
+    Tolerable for an enumeration; not for the verify the whole gate rests on. A
+    same-directory snapshot has no mirror root to fall off: it *is* the
+    includer's own directory, real siblings included, so a quoted `#include`
+    resolves exactly as the in-place parse would — nothing to approximate.
+
+    The trade is the mirror's own residual for a narrower one: this snapshot
+    cannot occupy `file_path`'s own name (`tempfile.mkstemp` gives it a random
+    one), so a translation unit that `#include`s **itself by its own literal
+    name** reaches the live file during the verify, not the snapshot — the
+    self-alias class `_enumerable_source` closes by having the snapshot occupy
+    the source's exact spelled path. Pinned by
+    `test_self_include_by_own_name_is_a_known_residual`. Narrower because it
+    needs an unusual C construct (a `.c` including itself by name) rather than
+    an ordinary `#include "../common.h"` from a project-root source.
+
+    The name carries `_VERIFY_SNAPSHOT_PREFIX` so `_included` excludes it from
+    the gate's own discovery unconditionally — see there for why that has to be
+    unconditional. `git status` still lists it until the `finally` below runs
+    (or, if this process is killed first, until something else removes it) —
+    the cost of writing into the user's tree at all, and cheaper than the race
+    this exists to close.
+    """
+    spelled = os.path.join(project_dir, os.fspath(file_path))
+    src_dir = os.path.dirname(spelled) or "."
+    try:
+        fd, path = tempfile.mkstemp(
+            prefix=_VERIFY_SNAPSHOT_PREFIX, suffix=".c", dir=src_dir
+        )
+    except OSError as exc:
+        raise UnitsUnavailable(
+            f"could not stage a verify snapshot beside {file_path} (check free "
+            f"space and write access to {src_dir}): {exc}"
+        ) from exc
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise UnitsUnavailable(
+            f"could not stage a verify snapshot beside {file_path} (check free "
+            f"space and write access to {src_dir}): {exc}"
+        ) from exc
+    try:
+        yield path
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
 def verify_function(
-    file_path: str, function: str, *, project_dir: str, k: int = DEFAULT_K
+    file_path: str,
+    function: str,
+    *,
+    project_dir: str,
+    k: int = DEFAULT_K,
+    verify_path: str | None = None,
 ) -> UnitVerdict:
-    """Run ``forseti verify`` on one function and map its JSON payload to a verdict."""
+    """Run ``forseti verify`` on one function and map its JSON payload to a verdict.
+
+    `verify_path`, when given, is what actually gets handed to the CLI as the
+    source to parse — an immutable snapshot standing in for `file_path`
+    (`verify_and_record`'s `_verifiable_source`) so the verdict cannot describe a
+    transient rewrite. `file_path` still names the unit everywhere else: `rel`,
+    `uid`, and — rewritten back in below — every path in the CLI's own response.
+    Omitting it verifies `file_path` directly, unchanged from before.
+    """
     rel = unit_id(project_dir, file_path)
     uid = f"{rel}::{function}"
+    source = file_path if verify_path is None else verify_path
     try:
         # Same build flags the enumeration parsed with, so the verify sees the
         # same translation unit the unit list was taken from. Unparseable config
@@ -1252,7 +1357,7 @@ def verify_function(
     argv = [
         *resolve_forseti_cmd(),
         "verify",
-        file_path,
+        source,
         "--function",
         function,
         "--unwind",
@@ -1307,14 +1412,29 @@ def verify_function(
 
     verdict = str(payload.get("verdict", "error"))
     raw_argv = payload.get("argv")
+    counterexample = payload.get("counterexample")
+    detail = payload.get("reason") or payload.get("message")
+    if verify_path is not None:
+        # ESBMC embeds the source path it was given verbatim — in `argv` (just
+        # echoed back) and in each counterexample/diagnostic line ("file <path>
+        # line ...") — measured empirically against a live `esbmc`/`forseti
+        # verify`, not assumed. Substituting the snapshot back to the real path
+        # is what keeps the loop trace, and any counterexample the agent is
+        # asked to fix, pointing at a file that still exists on disk.
+        if isinstance(raw_argv, list):
+            raw_argv = [file_path if tok == verify_path else tok for tok in raw_argv]
+        if isinstance(counterexample, str):
+            counterexample = counterexample.replace(verify_path, file_path)
+        if isinstance(detail, str):
+            detail = detail.replace(verify_path, file_path)
     return UnitVerdict(
         uid,
         rel,
         function,
         verdict,
         int(payload.get("unwind", k)),
-        counterexample=payload.get("counterexample"),
-        detail=payload.get("reason") or payload.get("message"),
+        counterexample=counterexample,
+        detail=detail,
         argv=tuple(raw_argv) if isinstance(raw_argv, list) else None,
         duration_s=payload.get("duration_s"),
     )
@@ -1564,23 +1684,32 @@ def verify_and_record(
         that block must land.
 
         An unfinished-verify marker for `digest` is *spent one attempt*, never
-        deleted (PR #148 review). Deleting is what the ownership rule forbids: this
-        path can never own the marker — an error caller either returns before the
-        block that creates one or (the post-verify drift caller) has already
-        released its own claim, and `pending` holds a single claim per file — so the
-        marker it would drop always belongs to another run, whose pre-recorded `unknown`
-        units would then sit content-fresh (that run stamped `scanned` with these
-        same bytes) with nothing left to retry, the exact hole issue #140 closes.
-        Bumping keeps that retry claim alive while still making progress: leaving the
-        counter untouched would let a persistently-erroring file re-verify on every
-        scan forever — each error resets `stop_attempts` — instead of going quiet at
-        `MAX_PENDING_VERIFY_ATTEMPTS` and blocking its way to the loud residual. The
-        bump goes through `_pending_attempts`, so a corrupt counter normalizes to 1
-        rather than freezing, and stops at the cap so a marker no scan will retry
-        again cannot count up forever. `hash`/`pid` are left as the creating run
-        wrote them: this run owns nothing and will never clear the marker — and
-        because those two fields alone are `_pending_owner`'s identity, the charge
-        leaves the creating run still able to clear it.
+        deleted (PR #148 review). Deleting is not this call's decision to make,
+        whoever created the marker: this charge always means "verdicts for
+        `digest` could not be produced this round", so the retry claim has to
+        survive for a future scan regardless. Concretely, every caller that
+        reaches it either could not yet have created one (the read/enumeration
+        failures return before the block that creates it), is that very
+        block's own not-yet-released claim (the verify-snapshot staging
+        failure below, charged after this run stamped and pre-recorded but
+        before it ever reaches its own release), or has already released its
+        own claim earlier in the same run (the post-verify drift caller). In
+        every case `pending` holds a single claim per file, so bumping in
+        place — never deleting — is what keeps a killed or persistently-failing
+        run's pre-recorded `unknown` units retryable: deleting here would leave
+        them content-fresh (this run's own stamp still vouches for `digest`)
+        with nothing left to retry, the exact hole issue #140 closes. Bumping
+        keeps that retry claim alive while still making progress: leaving the
+        counter untouched would let a persistently-erroring file re-verify on
+        every scan forever — each error resets `stop_attempts` — instead of
+        going quiet at `MAX_PENDING_VERIFY_ATTEMPTS` and blocking its way to
+        the loud residual. The bump goes through `_pending_attempts`, so a
+        corrupt counter normalizes to 1 rather than freezing, and stops at the
+        cap so a marker no scan will retry again cannot count up forever.
+        `hash`/`pid` are left exactly as written: this call never clears the
+        marker either way, and because those two fields alone are
+        `_pending_owner`'s identity, the charge leaves whoever's claim it is
+        still able to clear it later.
 
         Only a marker recording exactly `digest` is charged: a concurrent run of
         *other* content is verifying bytes this error says nothing about.
@@ -1734,52 +1863,74 @@ def verify_and_record(
         )
 
     verdicts: list[UnitVerdict] = []
-    for d in defs:
-        if d.takes_pointer:
-            # Signature-based, a priori: skip the (meaningless) function-level
-            # verify — no ESBMC call — and report NEEDS_CONTRACT. Classifying by
-            # signature, never by matching "dereference failure" in a cex, keeps a
-            # genuine out-of-bounds bug (same string) from being suppressed.
-            verdicts.append(_needs_contract_verdict(rel, d.name, k))
-            continue
-        verdict = verify_function(file_path, d.name, project_dir=project_dir, k=k)
-        verdicts.append(verdict)
-        with gate_lock(project_dir):  # overwrite the pending entry
-            state = load_state(project_dir)
-            # Ownership-scoped, exactly like the stamp withdrawal below: a
-            # concurrent hook that has re-stamped `scanned` for this file owns
-            # its units too — it re-enumerated and pre-recorded them. This run's
-            # verdict describes content that hook has already superseded, so
-            # writing it could replace that run's fresh `violated` with a stale
-            # `verified`, after which the file hashes fresh and nothing blocks.
-            # Dropping it is safe in the other direction: the owner pre-records
-            # every unit as pending `unknown`, so an un-overwritten unit still
-            # blocks. (The stale verdict stays in the returned list — the
-            # PostToolUse message — but the Stop-gate reads state, not this.)
-            if state.get("scanned", {}).get(rel) == digest:
-                record(state, verdict)
-                save_state(project_dir, state)
+    try:
+        with _verifiable_source(file_path, raw, project_dir=project_dir) as verify_path:
+            for d in defs:
+                if d.takes_pointer:
+                    # Signature-based, a priori: skip the (meaningless)
+                    # function-level verify — no ESBMC call — and report
+                    # NEEDS_CONTRACT. Classifying by signature, never by
+                    # matching "dereference failure" in a cex, keeps a genuine
+                    # out-of-bounds bug (same string) from being suppressed.
+                    verdicts.append(_needs_contract_verdict(rel, d.name, k))
+                    continue
+                verdict = verify_function(
+                    file_path,
+                    d.name,
+                    project_dir=project_dir,
+                    k=k,
+                    verify_path=verify_path,
+                )
+                verdicts.append(verdict)
+                with gate_lock(project_dir):  # overwrite the pending entry
+                    state = load_state(project_dir)
+                    # Ownership-scoped, exactly like the stamp withdrawal below: a
+                    # concurrent hook that has re-stamped `scanned` for this file owns
+                    # its units too — it re-enumerated and pre-recorded them. This run's
+                    # verdict describes content that hook has already superseded, so
+                    # writing it could replace that run's fresh `violated` with a stale
+                    # `verified`, after which the file hashes fresh and nothing blocks.
+                    # Dropping it is safe in the other direction: the owner pre-records
+                    # every unit as pending `unknown`, so an un-overwritten unit still
+                    # blocks. (The stale verdict stays in the returned list — the
+                    # PostToolUse message — but the Stop-gate reads state, not this.)
+                    if state.get("scanned", {}).get(rel) == digest:
+                        record(state, verdict)
+                        save_state(project_dir, state)
+    except UnitsUnavailable as exc:
+        # Could not stage the verify snapshot (ENOSPC, an unwritable directory,
+        # a killed TMPDIR). The stamp and every function's pending `unknown`
+        # were already written above (`on_disk == digest`), so this is exactly
+        # the already-stamped case `unless_superseded` exists for: recording an
+        # unconditional `error` here would strand an unclearable `rel::?` on a
+        # file whose stamp nothing will ever re-check. Deferring quietly still
+        # leaves every unit blocking as pending `unknown`, and spends one retry
+        # attempt, so a killed or persistently-failing stage is retried up to
+        # `MAX_PENDING_VERIFY_ATTEMPTS` rather than forgotten.
+        return _blocking_error(str(exc)[:800], digest=digest, unless_superseded=True)
 
-    # The verifies read the *real* path, not the snapshot: a verdict has to
-    # describe the translation unit that actually ships, and the snapshot's
-    # mirrored neighbourhood reproduces in-place include resolution only up to
-    # its root — an include reaching above that fails to resolve, which is a
-    # tolerable blocking `error` for an enumeration and an intolerable one for
-    # the verify the whole gate rests on. Plus every counterexample and the
-    # trace's `argv` would name a temp file that no longer exists. So this
-    # boundary is guarded, not eliminated: re-hash once after the
-    # loop and fail closed on drift. Un-stamping is what makes the out-of-band
-    # scan re-gate the file, and the `error` blocks when there is no scan to fall
-    # back on (outside a git work tree); both clear on the next edit's reconcile.
+    # Issue #150: the verify above reads `verify_path` — an immutable snapshot of
+    # `raw`, never the live path — so every verdict just recorded is computed
+    # against content hashing to `digest`, full stop. A transient A -> B -> A
+    # during the verify can no longer taint it: the snapshot's bytes never move.
+    # (One narrow residual survives: a translation unit that `#include`s *itself
+    # by its own literal name* still reaches the live file for that nested read,
+    # since the snapshot cannot occupy that name — see `_verifiable_source` and
+    # `test_self_include_by_own_name_is_a_known_residual`.)
     #
-    # What this catches: a rewrite that lands and *stays* (A → B) during the
-    # verifies. What it does NOT catch — the acknowledged residual — is a
-    # transient A → B → A: a verdict computed against B stays attached to A's
-    # stamp, because the final bytes compare equal. Detecting that needs
-    # verification of immutable content, which costs more than it buys (above).
-    # So the invariant is precisely: if `scanned[rel]` is H, the units were
-    # enumerated from content hashing to H and the file hashed to H both then and
-    # after the loop — NOT that every verdict was computed against H.
+    # What the re-hash below is for now is different: keeping `scanned` fresh
+    # *promptly*, not protecting the verdict. A rewrite that lands and *stays*
+    # (A → B) after this run took its snapshot is nobody's fault, and the
+    # out-of-band scan would eventually re-gate B on its own (`stale_sources`
+    # compares live content-hash to `scanned` on every scan) — but there is no
+    # such scan outside a git work tree, and even inside one it only runs on the
+    # next hook. Withdrawing the stamp here — still ownership-scoped, still
+    # deferring to a concurrent run that has already re-stamped fresher content —
+    # makes that staleness visible immediately instead of silently passing until
+    # someone thinks to re-scan. So the invariant is precisely: if `scanned[rel]`
+    # is H, every verdict recorded alongside it was computed against content
+    # hashing to H (modulo the self-include residual above), and the file itself
+    # still hashed to H at least once, right after the verifies finished.
     withdrawn = False
     drifted = content_hash(file_path) != digest
     if drifted:
