@@ -540,6 +540,38 @@ def test_annotate_array_extents_ignores_a_line_directive_spliced_from_a_macro() 
     assert (out.array_extent, out.array_extent_unresolved) == (None, False)
 
 
+def test_line_breakpoints_joins_a_spliced_if_condition() -> None:
+    # PR #156 follow-up: `#if \` + newline + `0` is one logical `#if 0` to cpp
+    # (line splicing runs before the preprocessor ever evaluates a condition),
+    # but capturing only the first physical line's text would see just a
+    # trailing backslash and misclassify the branch as opaque/live, retaining
+    # the `#line` inside what is actually a dead branch.
+    source = "#if \\\n0\n#line 5\nx\n#endif\n"
+    assert _line_breakpoints(source) == []
+
+
+def test_line_breakpoints_joins_a_spliced_elif_condition() -> None:
+    # Mirror of the `#if` case: `#elif \` + newline + `0` is one logical
+    # `#elif 0` to cpp — still dead regardless of the opaque `#if X` before it
+    # — so a `#line` inside it must not count.
+    source = "#if X\n#elif \\\n0\n#line 5\nx\n#endif\n"
+    assert _line_breakpoints(source) == []
+
+
+def test_annotate_array_extents_ignores_a_line_directive_in_a_spliced_if_zero() -> None:
+    # End-to-end: without joining the spliced condition, `#if \` + newline +
+    # `0` reads as opaque/live, so the `#line 11` guarding the inactive
+    # array-shaped `f` stays a real breakpoint and can collide with the active
+    # definition's own presumed line.
+    source = (
+        "#if \\\n0\n#line 11\nvoid f(int p[20]) { }\n#endif\n"
+        "#line 11\nvoid f(int *p) { *p = 1; }\n"
+    )
+    unit = Unit("f", (Param("p", "int *"),), def_line=11)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
 def test_annotate_array_extents_breaks_a_genuine_presumed_tie_by_physical_line() -> (
     None
 ):

@@ -128,7 +128,12 @@ _LINE_DIRECTIVE_RE = re.compile(r"^[ \t]*#[ \t]*(?:line[ \t]+)?(\d+)\b", re.MULT
 # with `0`/`1` — `#if 0 || FEATURE` — is not misread as known either way: such
 # a branch genuinely might go either way, and disagreeing with cpp's own
 # evaluation would corrupt the presumed-line translation for the real code
-# after it, the same failure mode this whole exclusion exists to avoid.
+# after it, the same failure mode this whole exclusion exists to avoid. The
+# captured group also consumes an embedded backslash-continuation (PR #156
+# follow-up to issue #145: cpp splices a condition written as `#if \` +
+# newline + `0` into one logical `#if 0` before ever evaluating it, so
+# `_cond_events` strips any spliced newline out of the captured text — via
+# `_CONTINUATION_RE` — before comparing it to the literal `"0"`/`"1"`).
 #
 # `#ifdef`/`#ifndef` and any other `#if`/`#elif <expr>` stay opaque — their
 # condition needs macro state this scan does not have — so they are tracked
@@ -136,7 +141,7 @@ _LINE_DIRECTIVE_RE = re.compile(r"^[ \t]*#[ \t]*(?:line[ \t]+)?(\d+)\b", re.MULT
 # chain already decided it (matching `_param_list_text`'s own stance on such
 # bodies: it leaves picking the *right* one to `def_line`, not to evaluating
 # the condition).
-_IF_RE = re.compile(r"^[ \t]*#[ \t]*if[ \t]+([^\n]*)$", re.MULTILINE)
+_IF_RE = re.compile(r"^[ \t]*#[ \t]*if[ \t]+((?:\\\r?\n|[^\n])*)$", re.MULTILINE)
 _IFDEF_RE = re.compile(r"^[ \t]*#[ \t]*(?:ifdef|ifndef)\b", re.MULTILINE)
 
 # `#elif`'s condition is captured separately from `#if`'s: a literal `#elif 0`
@@ -146,8 +151,10 @@ _IFDEF_RE = re.compile(r"^[ \t]*#[ \t]*(?:ifdef|ifndef)\b", re.MULTILINE)
 # unconditional `#else` let a still-dead `#elif 0` branch's `#line` count). A
 # literal `#elif 1` is its mirror: it is live only if no earlier arm in the
 # chain was already known-taken — otherwise cpp never reaches it regardless of
-# its own condition being `1`.
-_ELIF_RE = re.compile(r"^[ \t]*#[ \t]*elif[ \t]+([^\n]*)$", re.MULTILINE)
+# its own condition being `1`. Like `_IF_RE`, the captured group consumes an
+# embedded backslash-continuation so a split condition still classifies
+# correctly.
+_ELIF_RE = re.compile(r"^[ \t]*#[ \t]*elif[ \t]+((?:\\\r?\n|[^\n])*)$", re.MULTILINE)
 
 # A bare `#else` has no condition of its own to read: it is taken whenever cpp
 # reaches it, which happens whenever nothing before it was. This scan can
@@ -416,12 +423,18 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
     `def_line`, not to evaluating the condition.
 
     A physical line that is itself the *continuation* of a backslash-
-    terminated previous line is never treated as a directive, however it
-    starts: cpp splices such a line onto the one above (translation phase 2)
-    before it ever looks for a leading ``#``, so a ``#line``/``#if``/...-
-    shaped token spliced in from, say, a multi-line ``#define``'s replacement
-    text is just macro-body text to cpp, not a directive this module should
-    react to (PR #156 follow-up to issue #145).
+    terminated previous line is never treated as a directive: cpp splices such
+    a line onto the one above (translation phase 2) before it ever looks for a
+    leading ``#``, so a ``#line``/``#if``/...-shaped token spliced in from,
+    say, a multi-line ``#define``'s replacement text is just macro-body text
+    to cpp, not a directive this module should react to (PR #156 follow-up to
+    issue #145). Splicing inside a comment is handled earlier, by
+    `_COMMENT_RE`/`_blank_comment`, before this function ever sees the text —
+    the exclusion here only concerns a whole *directive-shaped line* starting
+    on a continuation. A condition that is itself split across a splice (``#if
+    \\`` + newline + ``0``) is a separate case, handled by `_cond_events`
+    stripping the splice out of its captured condition text before comparing
+    it to the literal ``"0"``/``"1"``, not by this exclusion.
     """
     continuation_starts = {
         m.end() for m in _CONTINUATION_RE.finditer(source_no_comments)
@@ -442,7 +455,9 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
         return [
             (
                 m.start(),
-                kinds_by_literal.get(m.group(1).strip(), opaque_kind),
+                kinds_by_literal.get(
+                    _CONTINUATION_RE.sub("", m.group(1)).strip(), opaque_kind
+                ),
                 None,
             )
             for m in pattern.finditer(source_no_comments)
