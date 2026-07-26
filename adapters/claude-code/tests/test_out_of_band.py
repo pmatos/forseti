@@ -94,28 +94,84 @@ def test_included_defaults_and_overrides(monkeypatch: pytest.MonkeyPatch) -> Non
     assert not gate._included("generated/x.c")
 
 
-def test_included_rejects_enum_snapshot_names_unconditionally(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    snapshot_name = f"{gate._ENUM_SNAPSHOT_PREFIX}abc123.c"
-    assert gate._included(snapshot_name) is False
-    # Even when a project's own FORSETI_GATE_EXCLUDE would otherwise un-exclude
-    # it (it *replaces* the defaults, never extends them) and
-    # FORSETI_GATE_INCLUDE narrows scope to exactly this name.
-    monkeypatch.setenv("FORSETI_GATE_EXCLUDE", "nothing_matches_this")
-    monkeypatch.setenv("FORSETI_GATE_INCLUDE", snapshot_name)
-    assert gate._included(snapshot_name) is False
-
-
-def test_in_scope_c_abspath_rejects_an_enum_snapshot(tmp_path: Path) -> None:
+def test_in_scope_c_abspath_rejects_an_untracked_enum_snapshot(tmp_path: Path) -> None:
     # The shared funnel `discover_changed_c_sources`/`divergent_blob_sources`/
     # `baseline_blob_hashes` all go through: a leftover snapshot a killed hook
     # could not clean up must never come back as a source in its own right.
+    _git_init(tmp_path)
     rel = f"{gate._ENUM_SNAPSHOT_PREFIX}xyz.c"
     (tmp_path / rel).write_text("int f(void) { return 0; }\n")
     root = str(tmp_path)
     proj_real = os.path.realpath(str(tmp_path))
     assert gate._in_scope_c_abspath(str(tmp_path), root, proj_real, rel) is None
+
+
+def test_untracked_snapshot_exemption_survives_an_include_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The exemption for an untracked snapshot has to come before `_included`'s
+    # globs, or a project's own FORSETI_GATE_EXCLUDE (which *replaces* the
+    # defaults, never extends them) plus a narrowing FORSETI_GATE_INCLUDE could
+    # un-exclude it.
+    _git_init(tmp_path)
+    rel = f"{gate._ENUM_SNAPSHOT_PREFIX}xyz.c"
+    (tmp_path / rel).write_text("int f(void) { return 0; }\n")
+    monkeypatch.setenv("FORSETI_GATE_EXCLUDE", "nothing_matches_this")
+    monkeypatch.setenv("FORSETI_GATE_INCLUDE", rel)
+    root = str(tmp_path)
+    proj_real = os.path.realpath(str(tmp_path))
+    assert gate._in_scope_c_abspath(str(tmp_path), root, proj_real, rel) is None
+
+
+def test_in_scope_c_abspath_still_gates_a_tracked_file_sharing_the_prefix(
+    tmp_path: Path,
+) -> None:
+    # The residual the untracked-only exemption narrows: excluding by basename
+    # prefix alone also dropped a *tracked* file that happens to share it from
+    # every scan, so a Bash edit to it (invisible to the direct Write/Edit hook)
+    # could ship unverified. Only a provably untracked match is exempt now.
+    _git_init(tmp_path)
+    rel = f"{gate._ENUM_SNAPSHOT_PREFIX}core.c"
+    (tmp_path / rel).write_text("int f(void) { return 0; }\n")
+    _git_commit_all(tmp_path)
+    root = str(tmp_path)
+    proj_real = os.path.realpath(str(tmp_path))
+    assert gate._in_scope_c_abspath(str(tmp_path), root, proj_real, rel) == str(
+        tmp_path / rel
+    )
+
+
+def test_in_scope_c_abspath_gates_when_trackedness_cannot_be_determined(
+    tmp_path: Path,
+) -> None:
+    # `_git` reads as `None` for "git absent/timed out/not a work tree", not just
+    # for "untracked" — collapsing those would fail *open* in the one predicate
+    # whose job is to stop a silent bypass, so an unanswerable query must never
+    # exempt a file, only gate it like anything else.
+    rel = f"{gate._ENUM_SNAPSHOT_PREFIX}xyz.c"
+    (tmp_path / rel).write_text("int f(void) { return 0; }\n")
+    root = str(tmp_path)  # deliberately never `git init`ed
+    proj_real = os.path.realpath(str(tmp_path))
+    assert gate._in_scope_c_abspath(str(tmp_path), root, proj_real, rel) == str(
+        tmp_path / rel
+    )
+
+
+def test_discover_changed_c_sources_gates_a_bash_edit_to_a_tracked_snapshot_lookalike(
+    tmp_path: Path,
+) -> None:
+    # The reviewer's exact scenario end to end: a repo already tracks a
+    # legitimate source named like the snapshot prefix; an out-of-band (Bash)
+    # edit to it must still be discovered, not silently dropped by name alone.
+    _git_init(tmp_path)
+    rel = f"{gate._ENUM_SNAPSHOT_PREFIX}core.c"
+    (tmp_path / rel).write_text("int f(void) { return 0; }\n")
+    _git_commit_all(tmp_path)
+    (tmp_path / rel).write_text("int f(void) { return 1; }\n")  # the Bash edit
+
+    found = gate.discover_changed_c_sources(str(tmp_path))
+
+    assert found == [str(tmp_path / rel)]
 
 
 def test_parse_porcelain_z_handles_renames() -> None:

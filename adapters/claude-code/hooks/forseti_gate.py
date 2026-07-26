@@ -151,14 +151,14 @@ _NEEDS_CONTRACT_DETAIL = (
     "memory precondition/harness — not gated (see issue #122)"
 )
 
-# The enumeration snapshot's filename prefix (issue #151). `_included` rejects
-# any path whose basename starts with it — unconditionally, ahead of
-# `FORSETI_GATE_EXCLUDE`/`FORSETI_GATE_INCLUDE` — because a project can replace
-# (not extend) that env var, and a snapshot a killed hook could not clean up
-# must never be offered back to `verify_and_record` as a source in its own
-# right. `.` leads so `is_c_source`'s suffix check (`.c`, always true here —
-# see `_enumerable_source`) still lets it through the discovery scans as a
-# dotfile, which is exactly what the unconditional exclusion exists to catch.
+# The enumeration snapshot's filename prefix (issue #151). `_untracked_snapshot`
+# rejects a path whose basename starts with it *and* that git cannot show as
+# tracked — ahead of `FORSETI_GATE_EXCLUDE`/`FORSETI_GATE_INCLUDE` (a project can
+# replace, not extend, that env var), a snapshot a killed hook could not clean up
+# must never be offered back to `verify_and_record` as a source in its own right.
+# `.` leads so `is_c_source`'s suffix check (`.c`/`.C` — see `_enumerable_source`)
+# still lets it through the discovery scans as a dotfile, which is exactly what
+# that exclusion exists to catch.
 _ENUM_SNAPSHOT_PREFIX = ".forseti-units-"
 
 
@@ -403,11 +403,12 @@ def _enumerable_source(
     file beside the source is the only way left to make ESBMC resolve
     ``#include``s from the place the source actually lives.
 
-    The name carries `_ENUM_SNAPSHOT_PREFIX` so `_included` excludes it from the
-    gate's own discovery unconditionally — see there for why that has to be
-    unconditional. That guard only keeps the snapshot out of the *gate's own*
-    scans, though; nothing about it stops a concurrent `git add -A`, IDE, or
-    automation job from staging the file while it exists on disk.
+    The name carries `_ENUM_SNAPSHOT_PREFIX` so `_untracked_snapshot` excludes it
+    from the gate's own discovery for as long as it is untracked — see there for
+    why a *tracked* file sharing the prefix must not be exempted the same way.
+    That guard only keeps the snapshot out of the *gate's own* scans, though;
+    nothing about it stops a concurrent `git add -A`, IDE, or automation job from
+    staging the file while it exists on disk.
     `_index_ignore_snapshot` registers `_ENUM_SNAPSHOT_PREFIX*` in `src_dir`'s own
     `.git/info/exclude` *before* `mkstemp` runs (below), so there is no window
     where the snapshot sits in the tree unprotected — inside a git work tree,
@@ -438,7 +439,9 @@ def _enumerable_source(
     # scan. Mirrors how `_list_units` already converts `OSError` from the spawn.
     try:
         fd, path = tempfile.mkstemp(
-            prefix=_ENUM_SNAPSHOT_PREFIX, suffix=".c", dir=src_dir
+            prefix=_ENUM_SNAPSHOT_PREFIX,
+            suffix=Path(os.fspath(file_path)).suffix,
+            dir=src_dir,
         )
     except OSError as exc:
         raise UnitsUnavailable(
@@ -641,15 +644,11 @@ def _included(rel: str) -> bool:
     Exclude wins over include. When `FORSETI_GATE_EXCLUDE` is unset the built-in
     `_DEFAULT_EXCLUDE_GLOBS` apply; setting it replaces (not extends) them.
 
-    An enumeration snapshot's own name (`_ENUM_SNAPSHOT_PREFIX`) is rejected
-    first, unconditionally — never subject to either glob. It has to be:
-    `FORSETI_GATE_EXCLUDE` *replaces* the defaults rather than extending them, so
-    a project that sets one would otherwise un-exclude a snapshot a killed hook
-    left behind, and a concurrent scan could then hand it back to
-    `verify_and_record` as a source in its own right.
+    Purely name-based — it does not know about an enumeration snapshot's basename
+    prefix (`_ENUM_SNAPSHOT_PREFIX`). That exclusion lives one layer up, in
+    `_in_scope_c_abspath`, because it must not apply to a *tracked* file that
+    happens to share the prefix — see there for why.
     """
-    if os.path.basename(rel).startswith(_ENUM_SNAPSHOT_PREFIX):
-        return False
     exclude = _globs(os.environ.get("FORSETI_GATE_EXCLUDE")) or _DEFAULT_EXCLUDE_GLOBS
     if _matches(rel, exclude):
         return False
@@ -798,17 +797,52 @@ def git_committed_files_since(project_dir: str, baseline_head: str | None) -> li
     return [p for p in out.split("\0") if p]
 
 
+def _untracked_snapshot(root: str, rel: str) -> bool:
+    """True only when repo-root-relative `rel` is a *provably untracked* leftover
+    matching the enumeration snapshot's basename prefix (`_ENUM_SNAPSHOT_PREFIX`).
+
+    A snapshot `_enumerable_source` could not clean up (a kill) must never be
+    handed back to `verify_and_record` as a source in its own right — that is
+    this check's job. But a repository can also already *track* a legitimate
+    source whose name happens to share the prefix; excluding by name alone would
+    silently drop a real, changed file from every scan (a Bash edit to it would
+    ship unverified, since the direct Write/Edit hook never sees a Bash write).
+    So the exemption only fires when git can affirmatively say the path is not in
+    its index — never when the question can't be asked. A missing/unreachable git,
+    a timeout, or `root` not being a work tree all read `_git` as ``None``; treated
+    as "provably untracked" that would fail *open* (exempt, i.e. silently drop, a
+    file that might well be a real tracked source) in the one predicate whose job
+    this round is to stop exactly that silent bypass — so ``None`` never exempts.
+
+    ``:(literal)`` keeps `rel` from being read as a glob/pathspec-magic pattern —
+    a tracked file literally named ``.forseti-units-[a].c`` would otherwise be
+    matched as a character class instead of itself and could read as untracked.
+
+    The residual this leaves, deliberately: a *new*, not-yet-tracked legitimate
+    source that happens to share the prefix is still silently exempt until it is
+    `git add`ed. Narrowing further (e.g. also requiring `mkstemp`'s random-suffix
+    shape) is a second, overlapping guard for the same gap trackedness already
+    closes for the common case (a killed hook's snapshot is never staged, per
+    `_index_ignore_snapshot`) — not worth it for how exotic a deliberately
+    prefix-named untracked source is.
+    """
+    if not os.path.basename(rel).startswith(_ENUM_SNAPSHOT_PREFIX):
+        return False
+    listed = _git(root, "ls-files", "-z", "--", f":(literal){rel}")
+    return listed is not None and not listed.strip()
+
+
 def _in_scope_c_abspath(
     project_dir: str, root: str, proj_real: str, rel: str
 ) -> str | None:
     """Absolute path for repo-root-relative `rel` if it is an in-scope, included C
     source under `project_dir`, else ``None``.
 
-    Applies the C-suffix, project-subtree, and include/exclude-glob filters shared by
-    the worktree scan (`discover_changed_c_sources`) and the staged/committed-blob
-    scan (`divergent_blob_sources`). Deliberately does **not** check file existence —
-    a staged or committed blob can outlive its worktree file (a `git add`-then-`rm`),
-    and the blob scan must still gate it.
+    Applies the C-suffix, project-subtree, untracked-snapshot, and include/exclude-
+    glob filters shared by the worktree scan (`discover_changed_c_sources`) and the
+    staged/committed-blob scan (`divergent_blob_sources`). Deliberately does **not**
+    check file existence — a staged or committed blob can outlive its worktree file
+    (a `git add`-then-`rm`), and the blob scan must still gate it.
     """
     abspath = os.path.join(root, rel)
     if not is_c_source(abspath):
@@ -818,6 +852,8 @@ def _in_scope_c_abspath(
             return None  # changed outside this project subtree — out of scope
     except ValueError:
         return None  # different drive/root — cannot be under proj
+    if _untracked_snapshot(root, rel):
+        return None
     if not _included(os.path.relpath(abspath, project_dir)):
         return None
     return abspath

@@ -419,6 +419,61 @@ def test_snapshot_directory_stands_in_for_the_sources_own(
     assert not enumerated.exists()  # the snapshot is cleaned up
 
 
+def test_snapshot_preserves_the_source_extension_including_case(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # `is_c_source`/`extract_function_defs` lowercase the suffix to decide whether
+    # to enumerate at all, but clang itself does not: an uppercase `.C` source is
+    # C++, not C. A hard-coded `.c` snapshot would silently reinterpret it as C —
+    # e.g. dropping a function guarded by `#ifdef __cplusplus` that the real file
+    # has — so the snapshot's suffix has to match the source's own, case included.
+    dest = tmp_path / "argv.json"
+    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
+    )
+    src = tmp_path / "x.C"
+    src.write_text("int f(void) { return 0; }\n")
+
+    gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+    captured = json.loads(dest.read_text())
+    enumerated = Path(captured["argv"][1])
+    assert enumerated.suffix == ".C"
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_uppercase_c_source_snapshot_matches_in_place_enumeration(
+    tmp_path: Path,
+) -> None:
+    # Measured, not assumed: clang (via `forseti list-units`) parses a `.C`
+    # source as C++, so `__cplusplus` is defined there and undefined for a `.c`
+    # one. A hard-coded `.c` snapshot suffix would enumerate `only_in_cxx` out of
+    # existence — reporting an empty-looking unit list that then gets stamped as
+    # scanned, silently skipping a function the in-place (and later verify) parse
+    # both see.
+    src = tmp_path / "x.C"
+    src.write_text(
+        "int f(void) { return 0; }\n"
+        "#ifdef __cplusplus\n"
+        "int only_in_cxx(void) { return 1; }\n"
+        "#endif\n"
+    )
+
+    in_place = gate.extract_functions(str(src), project_dir=str(tmp_path))
+    snapshotted = [
+        d.name
+        for d in gate.extract_function_defs(
+            str(src), project_dir=str(tmp_path), content=src.read_bytes()
+        )
+    ]
+
+    assert in_place == ["f", "only_in_cxx"]
+    assert snapshotted == in_place
+
+
 def test_snapshot_does_not_disturb_angle_include_or_iquote_precedence(
     tmp_path: Path, monkeypatch
 ) -> None:

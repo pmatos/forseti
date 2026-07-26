@@ -201,17 +201,20 @@ turns a verdict into an error.
   `-I` instead would be wrong: `-I` also joins the *angle-bracket* search and
   lands after any `-iquote`, so `#include <config.h>` next to a generated
   `config.h` would pick the wrong one, flip an `#if`, and hide a unit from the
-  gate — same-directory staging needs no flag at all.) The snapshot's name is
-  excluded from the gate's own discovery unconditionally — never subject to
-  `FORSETI_GATE_INCLUDE`/`_EXCLUDE` — so one a killed hook could not clean up is
-  never itself offered back as a source. Inside a git work tree the snapshot's
-  name is also registered in `.git/info/exclude` before it is staged, so a
-  concurrent `git add -A`/`git status` never sees it either — only an explicit,
-  forced `git add -f <path>` can still index it. The trade for dropping the earlier
-  mirrored design (which had a project-root boundary a quoted include could
-  climb past, silently landing on a different translation unit) is a narrower
-  residual: a translation unit that `#include`s the source under any name that
-  resolves to its own inode — its literal filename, a same-directory symlink, or
+  gate — same-directory staging needs no flag at all.) A snapshot's name is
+  excluded from the gate's own discovery — never subject to
+  `FORSETI_GATE_INCLUDE`/`_EXCLUDE` — for as long as git can show it is
+  untracked, so one a killed hook could not clean up is never itself offered
+  back as a source; a *tracked* file that happens to share the snapshot's
+  basename prefix is still discovered and gated normally. Inside a git work
+  tree the snapshot's name is also registered in `.git/info/exclude` before it
+  is staged, so a concurrent `git add -A`/`git status` never sees it either —
+  only an explicit, forced `git add -f <path>` can still index it. The trade for
+  dropping the earlier mirrored design (which had a project-root boundary a
+  quoted include could climb past, silently landing on a different translation
+  unit) is a narrower residual: a translation unit that `#include`s the source
+  under any name that resolves to its own inode — its literal filename, a
+  same-directory symlink, or
   a hard link — still reaches the live file for that nested read, since a
   same-directory snapshot needs a random name to avoid colliding with a
   concurrent enumeration of the same file and so cannot occupy any of those
