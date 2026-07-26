@@ -120,6 +120,16 @@ MAX_PENDING_VERIFY_ATTEMPTS = 3
 # source reached through more than this could not have been `open`ed either.
 _MAX_SYMLINK_HOPS = 40
 
+# How many times `verify_and_record` re-reads a file whose mtime moved between
+# the two `fstat`s bracketing its read — see the comment at that read for why a
+# lone re-read-through-the-same-fd does not by itself guarantee `raw` and
+# `mtime_ns` describe the same instant. Bounded, not looped forever: a file
+# some other process keeps rewriting on every attempt fails closed as a
+# blocking `error` (or, if a concurrent run has already stamped fresher
+# content, defers quietly to it) instead of spinning here (review feedback on
+# PR #159, issue #150).
+_MTIME_STABLE_ATTEMPTS = 5
+
 C_SUFFIXES = {".c", ".h"}
 
 # Out-of-band discovery (issue #99): a C file written via the `Bash` tool
@@ -162,8 +172,9 @@ _NEEDS_CONTRACT_DETAIL = (
 # `FORSETI_GATE_EXCLUDE`/`FORSETI_GATE_INCLUDE` — because a project can replace
 # (not extend) that env var, and a snapshot a killed hook could not clean up
 # must never be offered back to `verify_and_record` as a source in its own
-# right. `.` leads so `is_c_source`'s suffix check (`.c`, always true here —
-# see `_verifiable_source`) still lets it through the discovery scans as a
+# right. `.` leads so `is_c_source`'s suffix check (always true here — the
+# snapshot's suffix always case-insensitively matches `file_path`'s own, see
+# `_verifiable_source`) still lets it through the discovery scans as a
 # dotfile, which is exactly what the unconditional exclusion exists to catch.
 _VERIFY_SNAPSHOT_PREFIX = ".forseti-verify-"
 
@@ -1256,12 +1267,18 @@ def baseline_scanned(project_dir: str) -> int | None:
 def _line_directive(path: str) -> bytes:
     r"""A `#line 1 "path"` directive, escaped as a single C string literal.
 
-    Backslashes and double quotes are the only characters that would otherwise
-    end the literal early or corrupt it (a Windows-style path, or the rare `"`
-    in a filename); everything else passes through unescaped, same as a C
-    string literal allows.
+    Backslashes, double quotes, and newlines are the characters that would
+    otherwise end the literal early or corrupt it (a Windows-style path, a
+    `"` in a filename, or a `\n`/`\r`, all of which are legal in a POSIX
+    path); everything else passes through unescaped, same as a C string
+    literal allows.
     """
-    escaped = path.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = (
+        path.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
     return f'#line 1 "{escaped}"\n'.encode()
 
 
@@ -1358,6 +1375,23 @@ def _verifiable_source(
     unrecognized `﻿int`) even though the same file compiles fine in place
     (review feedback on PR #159, issue #150).
 
+    The snapshot keeps `file_path`'s own suffix, case included, rather than a
+    fixed `.c`: `is_c_source`/`extract_function_defs` both lowercase before
+    comparing, so an uppercase `.C` reaches here too, and the two spellings are
+    not interchangeable to `esbmc`'s own frontend — the one `forseti verify`
+    actually runs, not just GCC's documented convention. Verified empirically:
+    the same bytes parse as C++ through a `.C` name (`class Foo { ... };`
+    parses; the identical `.c` name fails with "use of undeclared identifier")
+    and diverge at runtime too (`sizeof('a') == sizeof(int)` — true in C,
+    false in C++ — flips `esbmc`'s verdict on an otherwise identical file
+    depending only on which suffix it was run with). Forcing `.c` would verify
+    a `.C` file as C while the real translation unit — the one that ships —
+    is C++, letting a safety branch that depends on the difference diverge
+    from the recorded verdict. It would also part ways with
+    `_enumerable_source`, which already stages the enumeration snapshot under
+    the source's real basename, suffix and all (review feedback on PR #159,
+    issue #150).
+
     The name carries `_VERIFY_SNAPSHOT_PREFIX` so `_included` excludes it from
     the gate's own discovery unconditionally — see there for why that has to be
     unconditional. `git status` still lists it until the `finally` below runs
@@ -1375,7 +1409,9 @@ def _verifiable_source(
     )
     try:
         fd, path = tempfile.mkstemp(
-            prefix=_VERIFY_SNAPSHOT_PREFIX, suffix=".c", dir=src_dir
+            prefix=_VERIFY_SNAPSHOT_PREFIX,
+            suffix=Path(os.fspath(file_path)).suffix,
+            dir=src_dir,
         )
     except OSError as exc:
         raise UnitsUnavailable(
@@ -1802,14 +1838,18 @@ def verify_and_record(
         Only a marker recording exactly `digest` is charged: a concurrent run of
         *other* content is verifying bytes this error says nothing about.
 
-        Three callers pass no `digest` and so touch nothing. The read failure never
+        Four callers pass no `digest` and so touch nothing. The read failure never
         learned which bytes it was scanning, so it cannot name the claim to charge —
         and such a file also fails `content_hash`, so `stale_sources` skips it
-        entirely and no frozen counter can spin. The other two are the drift checks,
+        entirely and no frozen counter can spin. Two more are the drift checks,
         around the enumeration and around the verify loop, and they share a reason:
         each fires precisely *because* the file no longer hashes to `digest`, so
         charging that content's retry budget would spend a claim on bytes this run is
-        no longer speaking for. The counter is bumped by the next run that scans
+        no longer speaking for. The fourth is the mtime-pairing retry giving up
+        above `verify_and_record`'s own read: it fires *before* this run has created
+        a `pending` marker of its own, so any entry already under `rel` belongs to a
+        prior run, not this one's to charge — passing no `digest` just makes
+        `charge` inert either way. The counter is bumped by the next run that scans
         whatever the file now holds.
         """
         verdict = UnitVerdict(f"{rel}::?", rel, "?", "error", k, detail=detail)
@@ -1837,11 +1877,44 @@ def verify_and_record(
     try:
         # Read and stat through the same fd, not `Path.read_bytes()` followed by a
         # separate `os.stat`: `mtime_ns` below has to describe the exact bytes in
-        # `raw`, and a second, independent syscall against `file_path` could land
-        # on a rewrite that happened in between.
-        with open(file_path, "rb") as handle:
-            raw = handle.read()
-            mtime_ns = os.fstat(handle.fileno()).st_mtime_ns
+        # `raw`. Same fd is not enough by itself, though — `read()` and `fstat()`
+        # are still two separate syscalls, so an in-place rewrite by another
+        # process can land between them, or straddle the read itself, without
+        # `raw` reflecting the write that moved the mtime. A transient A -> B -> A
+        # can then leave `raw` holding A while `mtime_ns` reports B's timestamp —
+        # a mismatched pair the content-only checks further down (which compare
+        # bytes, never mtime) would never catch, so a `__TIMESTAMP__` branch could
+        # be verified against a moment `raw` was never at. Bracketing the read
+        # with an `fstat()` on each side and retrying unless they agree rules
+        # that out — and, unlike the `stat`-based verify guard the issue
+        # rejects for being coarse-filesystem-dependent, this bracket isn't:
+        # an mtime delta too small for the filesystem to represent is also too
+        # small for `__TIMESTAMP__` to show, since that macro reads the same
+        # clock. Content itself stays hash-guarded further down regardless
+        # (review feedback on PR #159, issue #150).
+        for _ in range(_MTIME_STABLE_ATTEMPTS):
+            with open(file_path, "rb") as handle:
+                before_ns = os.fstat(handle.fileno()).st_mtime_ns
+                raw = handle.read()
+                mtime_ns = os.fstat(handle.fileno()).st_mtime_ns
+            if mtime_ns == before_ns:
+                break
+        else:
+            # Unlike the `OSError` below, this file is perfectly readable — it
+            # will hash the same as any other content-fresh file — so a stamp
+            # already vouching for what is on disk now means some other run
+            # owns it, and this failure must defer quietly rather than strand
+            # an unclearable `rel::?` on a file `stale_sources` would
+            # otherwise read as fresh. No `digest` passed either: this fires
+            # before this run has created a `pending` marker of its own, so
+            # any entry already under `rel` belongs to a prior run, not this
+            # one's to charge — `charge` is inert either way with `digest`
+            # left `None` (see `_blocking_error`'s docstring).
+            return _blocking_error(
+                f"{file_path} kept changing while being read; could not pair "
+                "its bytes with a stable mtime",
+                unless_superseded=True,
+            )
     except OSError as exc:
         return _blocking_error(str(exc))
 

@@ -24,6 +24,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import forseti_gate as gate
 import pytest
@@ -1291,6 +1292,37 @@ def test_line_directive_escapes_quotes_and_backslashes() -> None:
     assert gate._line_directive('a"b\\c.c') == b'#line 1 "a\\"b\\\\c.c"\n'
 
 
+def test_line_directive_escapes_newlines_and_carriage_returns() -> None:
+    # A `#line` directive must occupy one logical line, so a literal `\n`/`\r`
+    # in `path` — legal in a POSIX filename, and not filtered by anything
+    # upstream (`is_c_source` only checks the suffix) — would otherwise end the
+    # string literal early and corrupt the directive. Review feedback on PR
+    # #159, issue #150.
+    assert gate._line_directive("a\nb\rc.c") == b'#line 1 "a\\nb\\rc.c"\n'
+
+
+def test_verifiable_source_preserves_uppercase_c_suffix(tmp_path: Path) -> None:
+    # `is_c_source`/`extract_function_defs` both lowercase the suffix before
+    # comparing, so an uppercase `.C` file reaches `_verifiable_source` too.
+    # Forcing a fixed `.c` snapshot would hand `esbmc`'s own frontend a
+    # different language signal than the real file's own name does — measured
+    # directly against a live `esbmc`, identical bytes named `.C` parse as C++
+    # (accepting `class Foo { ... };`) and diverge at runtime from the same
+    # bytes named `.c` (`sizeof('a') == sizeof(int)` is true in C, false in
+    # C++) — letting the verdict describe a translation unit the compiler
+    # would not actually build from the real file. Review feedback on PR #159,
+    # issue #150.
+    src = tmp_path / "x.C"
+    content = b"int f(void) { return 0; }\n"
+    src.write_bytes(content)
+    mtime_ns = os.stat(src).st_mtime_ns
+
+    with gate._verifiable_source(
+        str(src), content, project_dir=str(tmp_path), mtime_ns=mtime_ns
+    ) as vp:
+        assert vp.endswith(".C")
+
+
 def test_verifiable_source_preserves_mtime_for_timestamp_macro(tmp_path: Path) -> None:
     # `#line` fixes the *presumed name* `__FILE__`/`__BASE_FILE__` read, but
     # measured directly against clang, `__TIMESTAMP__` follows the snapshot's
@@ -1432,6 +1464,121 @@ def test_unstageable_verify_snapshot_takes_three_failures_to_exhaust_retries(
             bool(gate.stale_sources(str(tmp_path), state, [str(src)]))
             == still_retryable
         )
+
+
+def test_verify_and_record_retries_when_mtime_races_the_read(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # `read()` and `fstat()` are two separate syscalls even through the same fd,
+    # so a rewrite landing strictly between them (or straddling the read) can
+    # pair stable content with a foreign mtime — content-only drift checks
+    # elsewhere in `verify_and_record` never see this, since they compare
+    # bytes, never mtime. Bracketing the read with an `fstat()` on each side and
+    # retrying until they agree is the fix; this drives that path by making the
+    # first bracket disagree and the second stabilize, and checks the run still
+    # completes normally off the stabilized bracket. Review feedback on PR
+    # #159, issue #150.
+    src = tmp_path / "x.c"
+    original = "alpha\n"
+    src.write_text(original)
+    target_ino = os.stat(src).st_ino
+    real_fstat = os.fstat
+    calls = {"n": 0}
+
+    def flaky_fstat(fd: int) -> object:
+        real = real_fstat(fd)
+        if real.st_ino != target_ino:
+            return real
+        calls["n"] += 1
+        if calls["n"] <= 2:  # only the first bracket disagrees
+            return SimpleNamespace(st_mtime_ns=real.st_mtime_ns + calls["n"])
+        return real
+
+    monkeypatch.setattr(gate.os, "fstat", flaky_fstat)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _content_keyed_verify_forseti_cmd(tmp_path, original=original),
+    )
+
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert [v.verdict for v in verdicts] == ["verified"]
+    assert calls["n"] == 4  # one unstable bracket, then one stable bracket
+    after = gate.load_state(str(tmp_path))
+    assert after["scanned"]["x.c"] == hashlib.sha256(original.encode()).hexdigest()
+
+
+def test_verify_and_record_fails_closed_when_mtime_never_stabilizes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A file some other process keeps rewriting on every single attempt must
+    # not spin forever, and must not proceed with an unpaired (content, mtime)
+    # either: it fails closed as a blocking `error`, the same family as an
+    # unreadable file, bounded by `_MTIME_STABLE_ATTEMPTS`. Review feedback on
+    # PR #159, issue #150.
+    src = tmp_path / "x.c"
+    src.write_text("alpha\n")
+    target_ino = os.stat(src).st_ino
+    real_fstat = os.fstat
+    calls = {"n": 0}
+
+    def always_moving_fstat(fd: int) -> object:
+        real = real_fstat(fd)
+        if real.st_ino != target_ino:
+            return real
+        calls["n"] += 1
+        return SimpleNamespace(st_mtime_ns=real.st_mtime_ns + calls["n"])
+
+    monkeypatch.setattr(gate.os, "fstat", always_moving_fstat)
+    _seed_scanned(tmp_path)
+
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert [v.verdict for v in verdicts] == ["error"]
+    assert calls["n"] == 2 * gate._MTIME_STABLE_ATTEMPTS  # bounded, not infinite
+    after = gate.load_state(str(tmp_path))
+    assert "x.c" not in after["scanned"]  # never stamped as scanned
+
+
+def test_mtime_never_stabilizing_defers_to_a_concurrent_runs_stamp(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Unlike an unreadable file (which also fails `content_hash`, so
+    # `stale_sources` skips it entirely), a file whose mtime never stabilizes
+    # is perfectly readable — it hashes the same as any other content-fresh
+    # file. So if a concurrent run has already stamped `scanned` with exactly
+    # what's on disk now, that run owns the file: blocking anyway would strand
+    # an unclearable `x.c::?`, since the file would hash equal to the
+    # surviving stamp and `stale_sources` would read it as fresh forever.
+    src = tmp_path / "x.c"
+    content = "alpha\n"
+    src.write_text(content)
+    target_ino = os.stat(src).st_ino
+    real_fstat = os.fstat
+    calls = {"n": 0}
+
+    def always_moving_fstat(fd: int) -> object:
+        real = real_fstat(fd)
+        if real.st_ino != target_ino:
+            return real
+        calls["n"] += 1
+        return SimpleNamespace(st_mtime_ns=real.st_mtime_ns + calls["n"])
+
+    monkeypatch.setattr(gate.os, "fstat", always_moving_fstat)
+    state = gate.load_state(str(tmp_path))
+    state.setdefault("scanned", {})["x.c"] = hashlib.sha256(
+        content.encode()
+    ).hexdigest()
+    gate.save_state(str(tmp_path), state)
+
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert verdicts == []  # deferred quietly, not a stray `?`
+    assert calls["n"] == 2 * gate._MTIME_STABLE_ATTEMPTS  # still bounded
+    after = gate.load_state(str(tmp_path))
+    assert "x.c::?" not in after.get("units", {})
+    assert after["scanned"]["x.c"] == hashlib.sha256(content.encode()).hexdigest()
 
 
 def test_pointer_only_file_never_stages_a_verify_snapshot(
