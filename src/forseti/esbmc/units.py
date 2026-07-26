@@ -53,6 +53,17 @@ _COMMENT_RE = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
 # documented as *referenced*, not *called* — an over-approximation.
 _CALLEE_RE = re.compile(r"\bFunction 0x[0-9a-fA-F]+ '(\w+)'")
 
+# Nodes C allows *between* a `CallExpr` and the `DeclRefExpr` naming its callee:
+# clang's own `FunctionToPointerDecay` cast, and the parentheses/dereferences the
+# grammar permits — `(f)(x)` adds a `ParenExpr`, `(*f)(x)` a `UnaryOperator` and a
+# second cast. Each is transparent only as its parent's *first* child, which is
+# what separates a callee from an argument: `apply(f, q)` wraps `f` in the same
+# decay cast, at index 1.
+_CALLEE_WRAPPERS = frozenset({"ImplicitCastExpr", "ParenExpr", "UnaryOperator"})
+
+# The site name reported for an escape with no named enclosing declaration.
+_FILE_SCOPE = "<file scope>"
+
 # A named parameter's array declarator: the name followed by *all* its consecutive
 # `[...]` groups, captured together (whitespace between them included) so a
 # multi-dimensional `p[2][3]` — or a spaced `p[2] [3]` — is recognised as such
@@ -140,6 +151,10 @@ class Unit:
     compositional discharge (RFC-0003 S3) verifies every caller of a unit, so a
     spurious edge costs one extra verification while a missing one would let an
     undischarged obligation pass as discharged.
+
+    What it is *not* is a call graph closed under function pointers: a body that
+    calls through ``fp`` references the variable, not what it holds. That blind
+    spot is reported separately by `parse_address_escapes`, not papered over here.
     """
 
     name: str
@@ -306,6 +321,87 @@ def parse_external_callers(
         if symbol in unit.calls:
             names[unit.name] = None
     return tuple(names)
+
+
+@dataclass
+class _AstNode:
+    """One node of the walked AST, with its position among its parent's children."""
+
+    depth: int
+    kind: str
+    rest: str
+    index: int
+    children: int = 0
+
+
+def _is_call_callee(stack: list[_AstNode]) -> bool:
+    """Whether the node on top of `stack` is the callee of a direct call.
+
+    Climbs the first-child chain of `_CALLEE_WRAPPERS` above the reference and
+    asks whether it lands on a ``CallExpr``'s first child. Anything else — an
+    argument, an initialiser, an ``&f``, an AST shape we have not seen — is *not*
+    a direct call, which is the conservative reading: an unfamiliar shape costs a
+    withheld discharge, never a claimed one.
+    """
+    k = len(stack) - 1
+    while k > 0 and stack[k].index == 0 and stack[k - 1].kind in _CALLEE_WRAPPERS:
+        k -= 1
+    return k > 0 and stack[k].index == 0 and stack[k - 1].kind == "CallExpr"
+
+
+def _enclosing_name(stack: list[_AstNode]) -> str:
+    """What to call the site of the node on top of `stack`.
+
+    The nearest enclosing named declaration: the function a reference sits in,
+    or — at file scope — the object whose initialiser holds it (``static cb_t fp
+    = f``). Reporting only, so a shape with no named ancestor degrades to
+    `_FILE_SCOPE` rather than dropping the escape.
+    """
+    for node in reversed(stack[:-1]):
+        if node.kind in ("FunctionDecl", "VarDecl"):
+            name = _NAME_RE.search(node.rest)
+            return name.group(1) if name else _FILE_SCOPE
+    return _FILE_SCOPE
+
+
+def parse_address_escapes(ast_text: str, symbol: str) -> tuple[str, ...]:
+    """Sites where `symbol`'s **address** is taken rather than called, by name.
+
+    A function whose address is stored in a pointer can be invoked through it
+    from anywhere in the translation unit, and an indirect ``fp(...)`` names only
+    the *variable* — so no `Unit.calls` edge leads back to `symbol` and the caller
+    enumeration silently misses that path. This reports the escapes so
+    compositional discharge (RFC-0003 S3) can withhold its upgrade instead:
+    ``static cb_t fp = f;`` at file scope yields ``fp``, an ``fp = f`` inside a
+    body yields the enclosing function.
+
+    A *direct* call is not an escape, however it is written (`_is_call_callee`),
+    including the recursive call in ``symbol``'s own body — otherwise every
+    recursive unit would be permanently undischargeable.
+    """
+    sites: dict[str, None] = {}
+    stack: list[_AstNode] = []
+    for line in ast_text.splitlines():
+        node = _NODE_RE.match(line)
+        if not node:
+            continue
+        art, kind, rest = node.group(1), node.group(2), node.group(3)
+        depth = _depth(art)
+        while stack and stack[-1].depth >= depth:
+            stack.pop()
+        index = 0
+        if stack:
+            index = stack[-1].children
+            stack[-1].children += 1
+        stack.append(_AstNode(depth, kind, rest, index))
+        if kind != "DeclRefExpr":
+            continue
+        referenced = _CALLEE_RE.search(rest)
+        if referenced is None or referenced.group(1) != symbol:
+            continue
+        if not _is_call_callee(stack):
+            sites[_enclosing_name(stack)] = None
+    return tuple(sites)
 
 
 def mask_comments(source_text: str) -> str:
@@ -498,6 +594,24 @@ def list_external_callers(
     """
     ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
     return parse_external_callers(ast_text, source, symbol)
+
+
+def list_address_escapes(
+    source: Path,
+    symbol: str,
+    *,
+    esbmc_bin: str = "esbmc",
+    timeout_s: float = 30.0,
+    extra_flags: Sequence[str] = (),
+) -> tuple[str, ...]:
+    """Sites in `source`'s translation unit that take `symbol`'s address.
+
+    The other way the caller enumeration can be incomplete — see
+    `parse_address_escapes`. Raises `ListUnitsError` on the same conditions as
+    `list_units`.
+    """
+    ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
+    return parse_address_escapes(ast_text, symbol)
 
 
 def list_units(

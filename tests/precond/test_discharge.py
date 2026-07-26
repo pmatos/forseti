@@ -117,6 +117,7 @@ def _run(
     function: str = "sum_bytes",
     source_text: str = SOURCE,
     external: Callable[[Path, str], tuple[str, ...]] = lambda _s, _f: (),
+    escapes: Callable[[Path, str], tuple[str, ...]] = lambda _s, _f: (),
 ) -> DischargeResult:
     src = tmp / "frame.c"
     src.write_text(source_text)
@@ -129,6 +130,7 @@ def _run(
         raw_verify=_raw(caller_verdicts or {}),
         list_units_fn=lambda _s: list(units),
         external_callers_fn=external,
+        address_escapes_fn=escapes,
     )
 
 
@@ -280,6 +282,7 @@ def test_one_broken_caller_outranks_the_clean_ones(tmp_path: Path) -> None:
         raw_verify=raw,
         list_units_fn=lambda _s: [CALLEE, CALLER, second],
         external_callers_fn=lambda _s, _f: (),
+        address_escapes_fn=lambda _s, _f: (),
     )
     assert result.assessment is Assessment.VIOLATED
     assert "payload_checksum()" in result.detail
@@ -302,6 +305,26 @@ def test_an_outside_caller_counts_even_with_no_local_caller(tmp_path: Path) -> N
     assert result.assessment is Assessment.ASSUMED_VERIFIED
     assert [c.caller for c in result.callers] == ["header_client"]
     assert "no caller" not in result.label  # there *is* one; we just cannot check it
+
+
+def test_an_escaped_address_withholds_the_upgrade(tmp_path: Path) -> None:
+    # `static cb_t fp = sum_bytes;` plus an indirect `fp(...)` is a caller no
+    # name-based enumeration can reach: the indirect call names the *variable*.
+    # A clean sweep of the callers we can see says nothing about that path.
+    result = _run(tmp_path, escapes=lambda _s, _f: ("fp",))
+    assert result.assessment is Assessment.ASSUMED_VERIFIED
+    unresolved = [c for c in result.callers if c.caller == "fp"]
+    assert unresolved and unresolved[0].outcome is CallerOutcome.UNRESOLVED
+    assert "takes the address of sum_bytes()" in result.label
+    # the caller that *was* checked still reports what it established
+    assert any(c.outcome is CallerOutcome.DISCHARGED for c in result.callers)
+
+
+def test_an_escape_counts_even_with_no_local_caller(tmp_path: Path) -> None:
+    result = _run(tmp_path, units=(CALLEE,), escapes=lambda _s, _f: ("fp",))
+    assert result.assessment is Assessment.ASSUMED_VERIFIED
+    assert [c.caller for c in result.callers] == ["fp"]
+    assert "no caller" not in result.label  # one exists; it just cannot be named
 
 
 def test_a_failed_external_listing_is_an_error(tmp_path: Path) -> None:
@@ -379,6 +402,7 @@ def test_unreadable_source_is_an_error(tmp_path: Path) -> None:
         raw_verify=_raw({}),
         list_units_fn=lambda _s: [CALLEE, CALLER],
         external_callers_fn=lambda _s, _f: (),
+        address_escapes_fn=lambda _s, _f: (),
     )
     assert result.assessment is Assessment.ERROR
     assert "could not read" in result.detail

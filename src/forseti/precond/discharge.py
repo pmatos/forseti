@@ -43,6 +43,17 @@ but is not a unit `list_units` reports, so `parse_external_callers` counts them
 from the same clang dump — each leaves the verdict at ``ASSUMED_VERIFIED`` with a
 loud "discharge incomplete", never an upgrade.
 
+**A caller set is only as complete as the call graph.** Callers are found by name,
+so a body that calls ``fp(...)`` references the *variable* and no edge leads back
+to whatever ``fp`` holds: a ``static cb_t fp = f;`` plus one indirect call is a
+caller of ``f`` that no enumeration built from `Unit.calls` will ever list. So the
+upgrade is withheld whenever `parse_address_escapes` finds ``f``'s address taken
+rather than called (``UNRESOLVED``) — the caller set is not enumerable, and a
+sweep of the callers we *could* see says nothing about the ones we could not.
+That makes a function in a dispatch table permanently ``ASSUMED_VERIFIED``, which
+is the honest reading: it really can be invoked from anywhere in the TU with
+anything. Following an indirect call to its targets is L1/S4 work.
+
 **What a discharge is relative to.** Each caller's own parameters are materialised
 by *its* S2 assumption, so one run proves ``caller precondition => callee
 precondition`` at every call site: one link of the chain, not the whole chain.
@@ -86,6 +97,7 @@ from forseti.esbmc import (
     Unit,
     Verified,
     Violated,
+    list_address_escapes,
     list_external_callers,
     list_units,
 )
@@ -126,11 +138,17 @@ class CallerOutcome(Enum):
     UNDERDETERMINED = "underdetermined"  # L0 under-read the *caller*'s own extent
     UNREACHABLE = "unreachable"  # never reaches the call — discharges nothing
     UNCHECKED = "unchecked"  # not materialisable / inconclusive — not a discharge
+    UNRESOLVED = "unresolved"  # takes the callee's address — the caller set is open
 
 
 @dataclass(frozen=True)
 class CallerCheck:
-    """One caller's contribution to (or withholding of) the discharge."""
+    """One caller's contribution to (or withholding of) the discharge.
+
+    `caller` names whatever can reach the callee: a function of this translation
+    unit, or — for an ``UNRESOLVED`` escape written at file scope — the object
+    whose initialiser holds the callee's address.
+    """
 
     caller: str
     outcome: CallerOutcome
@@ -240,15 +258,16 @@ def discharge_precondition(
     raw_verify: VerifyPort | None = None,
     list_units_fn: Callable[[Path], list[Unit]] | None = None,
     external_callers_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
+    address_escapes_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
 ) -> DischargeResult:
     """Verify `source::function` against its precondition, then discharge it.
 
     Runs S2 first and *only ever upgrades* its verdict: anything other than
     ``ASSUMED_VERIFIED`` (a real violation, ``NEEDS_CONTRACT``, an error) passes
     through untouched, because there is no assumption to discharge. `raw_verify`,
-    `list_units_fn` and `external_callers_fn` inject the esbmc calls for tests;
-    production adds a ``-I`` for the source's own directory so the generated
-    copy's relative ``#include``\\ s still resolve.
+    `list_units_fn`, `external_callers_fn` and `address_escapes_fn` inject the
+    esbmc calls for tests; production adds a ``-I`` for the source's own directory
+    so the generated copy's relative ``#include``\\ s still resolve.
     """
     lister = _memoized(
         list_units_fn or (lambda src: list_units(src, esbmc_bin=esbmc_bin))
@@ -280,12 +299,16 @@ def discharge_precondition(
     external = external_callers_fn or (
         lambda src, sym: list_external_callers(src, sym, esbmc_bin=esbmc_bin)
     )
+    escapes = address_escapes_fn or (
+        lambda src, sym: list_address_escapes(src, sym, esbmc_bin=esbmc_bin)
+    )
     args = (
         source,
         function,
         unit_result,
         lister(source),
         external,
+        escapes,
         max_len,
         ladder_cap,
         raw,
@@ -302,6 +325,7 @@ def _discharge(
     unit_result: PreconditionResult,
     units: list[Unit],
     external_callers_fn: Callable[[Path, str], tuple[str, ...]],
+    address_escapes_fn: Callable[[Path, str], tuple[str, ...]],
     max_len: int,
     ladder_cap: int,
     raw: VerifyPort,
@@ -333,15 +357,18 @@ def _discharge(
         )
 
     callers = tuple(u for u in units if u.name != function and function in u.calls)
-    # Callers the *gate* cannot enumerate: a `static inline` in an included header
-    # is part of this translation unit and can call the callee, but `list_units`
-    # narrows to the file under test by design. Counting them is what keeps
-    # "every caller in this TU" from being a claim about a set we never saw.
+    # The two ways the caller set can be wider than what `units` shows. Counting
+    # both is what keeps "every caller in this TU" from being a claim about a set
+    # we never saw: a `static inline` in an included header is part of this
+    # translation unit but is not a unit `list_units` reports, and an address
+    # taken rather than called can be invoked from anywhere through the pointer
+    # that holds it, under a name no call-graph edge leads back from.
     try:
         foreign = external_callers_fn(source, function)
+        escaped = address_escapes_fn(source, function)
     except ListUnitsError as exc:
         return DischargeResult(function, Assessment.ERROR, str(exc), unit_result)
-    unlistable = tuple(
+    unenumerable = tuple(
         CallerCheck(
             name,
             CallerOutcome.UNCHECKED,
@@ -349,10 +376,19 @@ def _discharge(
             "or build a harness for it",
         )
         for name in foreign
+    ) + tuple(
+        CallerCheck(
+            site,
+            CallerOutcome.UNRESOLVED,
+            f"takes the address of {function}() rather than calling it, so an "
+            "indirect call the caller enumeration cannot follow may reach it from "
+            "anywhere in this translation unit",
+        )
+        for site in escaped
     )
     if not callers:
-        if unlistable:
-            return _aggregate(function, unit_result, unlistable)
+        if unenumerable:
+            return _aggregate(function, unit_result, unenumerable)
         return DischargeResult(
             function,
             Assessment.ASSUMED_VERIFIED,
@@ -374,7 +410,7 @@ def _discharge(
         for caller in callers
     )
     anchored = frozenset(u.name for u in callers if not plan_unit(u).pointer_params)
-    return _aggregate(function, unit_result, checks + unlistable, anchored)
+    return _aggregate(function, unit_result, checks + unenumerable, anchored)
 
 
 def _weakest_read_pointers(plan: UnitPlan) -> tuple[str, ...]:

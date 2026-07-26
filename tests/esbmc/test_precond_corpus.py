@@ -258,3 +258,42 @@ def test_a_caller_defined_in_a_header_withholds_the_upgrade(tmp_path: Path) -> N
     assert outcomes["frame_checksum"] is CallerOutcome.DISCHARGED
     assert outcomes["header_client"] is CallerOutcome.UNCHECKED
     assert "defined outside" in result.label
+
+
+_TU_WITH_INDIRECT_CALLER = """\
+#include <stddef.h>
+#include <stdint.h>
+
+uint32_t sum_bytes(const uint8_t *buf, size_t len) {
+    uint32_t acc = 0;
+    for (size_t i = 0; i < len; i++) acc += buf[i];
+    return acc;
+}
+
+typedef uint32_t (*summer_t)(const uint8_t *, size_t);
+static summer_t dispatch = sum_bytes;
+
+uint32_t frame_checksum(const uint8_t *frame, size_t len) {
+    return sum_bytes(frame, len);
+}
+
+uint32_t dispatch_checksum(const uint8_t *frame) {
+    return dispatch(frame, 64);
+}
+"""
+
+
+def test_an_escaped_address_withholds_the_upgrade(tmp_path: Path) -> None:
+    # `dispatch_checksum` calls `sum_bytes` through a file-scope function pointer
+    # and asks for 64 bytes of a pointer whose signature states one. Its body
+    # names only `dispatch`, so no `Unit.calls` edge leads back to `sum_bytes`
+    # and it is not among the callers checked — upgrading on the strength of the
+    # one direct caller that *is* would claim a sweep that never saw this path.
+    src = tmp_path / "tu.c"
+    src.write_text(_TU_WITH_INDIRECT_CALLER)
+    result = discharge_precondition(src, function="sum_bytes", max_len=MAX_LEN)
+    assert result.assessment is Assessment.ASSUMED_VERIFIED, result.label
+    outcomes = {c.caller: c.outcome for c in result.callers}
+    assert outcomes["frame_checksum"] is CallerOutcome.DISCHARGED
+    assert outcomes["dispatch"] is CallerOutcome.UNRESOLVED
+    assert "takes the address of sum_bytes()" in result.label

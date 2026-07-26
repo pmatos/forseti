@@ -248,6 +248,20 @@ while such a definition exists would be a claim about a set that was never fully
 caller that withholds the upgrade. Enumerating and harnessing header‑defined units is L1/S4
 territory; until then the honest answer is that the discharge is incomplete and *why*.
 
+**And a caller set is only as complete as the call graph.** Callers are found by *name*, so a body
+that calls `fp(...)` references the variable and no edge leads back to what it holds: a
+`static cb_t fp = sum_bytes;` plus one indirect call is a caller that no enumeration built from
+`Unit.calls` will ever list, and a clean sweep of the callers we *can* see would say nothing about
+it. So `parse_address_escapes` walks the same dump for references to the callee that are not a
+direct call's callee — a file‑scope initialiser, an `&f`, an `fp = f`, a callback argument — telling
+them apart by AST *position* (a callee is the first child of its `CallExpr`, however it is
+parenthesised or dereferenced; an argument is not), and each becomes an `UNRESOLVED` entry that
+withholds the upgrade. An unfamiliar shape counts as an escape, so the failure direction is a
+withheld discharge and never a claimed one. The consequence, stated plainly: a function in a
+dispatch table is permanently `ASSUMED_VERIFIED` here — which is the honest reading, since it really
+can be invoked from anywhere in the TU with anything. Resolving an indirect call to its targets is
+L1/S4 work.
+
 **OQ1 answered — verify a generated copy.** Injecting into a copy works and keeps the promise S2
 made: `forseti discharge --emit-only` prints exactly what the checker sees, and the acceptance suite
 asserts the user's file is byte‑identical afterwards. Source annotations were never a live option

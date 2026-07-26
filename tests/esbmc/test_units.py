@@ -19,6 +19,7 @@ from forseti.esbmc.units import (
     find_definition_brace,
     list_units,
     mask_comments,
+    parse_address_escapes,
     parse_definitions,
     parse_external_callers,
     parse_units,
@@ -562,3 +563,116 @@ def test_parse_external_callers_never_reports_the_symbol_itself() -> None:
     # reporting it would make every recursive callee permanently undischargeable
     # for a reason that is not a caller at all.
     assert parse_external_callers(_RECURSIVE_AST, _TARGET, "leaf") == ()
+
+
+# Every way a C source can name `leaf` without calling it, in the shapes esbmc
+# 8.3.0 prints them (captured from a probe, abbreviated): a file-scope
+# initialiser, an `&leaf`, an `fp = leaf` inside a body, and a callback argument
+# — against the shapes that *are* a direct call: `leaf(...)`, `(leaf)(...)`,
+# `(*leaf)(...)`, and a recursive self-call. `indirect` calls through `fp` and so
+# names only the variable, which is the whole reason the escapes must be found.
+_FUNCTION_POINTER_AST = """\
+TranslationUnitDecl 0x5000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0x5001 </tmp/foo.c:1:1, col:38> col:6 used leaf 'void (int *, int)'
+| |-ParmVarDecl 0x5002 <col:11, col:16> col:16 used p 'int *'
+| `-CompoundStmt 0x5003 <col:26, col:38>
+|   `-CallExpr 0x5004 <col:28, col:37> 'void'
+|     |-ImplicitCastExpr 0x5005 <col:28> 'void (*)(i)' <FunctionToPointerDecay>
+|     | `-DeclRefExpr 0x5006 <col:28> 'void (i)' Function 0x5001 'leaf' 'void (i)'
+|     `-DeclRefExpr 0x5007 <col:33> 'int *' lvalue ParmVar 0x5002 'p' 'int *'
+|-VarDecl 0x5010 <line:4:1, col:18> col:13 used fp 'cb_t':'void (*)(i)' static cinit
+| `-ImplicitCastExpr 0x5011 <col:18> 'void (*)(i)' <FunctionToPointerDecay>
+|   `-DeclRefExpr 0x5012 <col:18> 'void (i)' Function 0x5001 'leaf' 'void (i)'
+|-VarDecl 0x5020 <line:5:1, col:22> col:13 alias 'cb_t':'void (*)(i)' static cinit
+| `-UnaryOperator 0x5021 <col:21, col:22> 'void (*)(i)' prefix '&' cannot overflow
+|   `-DeclRefExpr 0x5022 <col:22> 'void (i)' Function 0x5001 'leaf' 'void (i)'
+|-FunctionDecl 0x5030 <line:7:1, col:42> col:6 direct 'void (int *, int)'
+| |-ParmVarDecl 0x5031 <col:13, col:18> col:18 used q 'int *'
+| `-CompoundStmt 0x5032 <col:28, col:42>
+|   `-CallExpr 0x5033 <col:30, col:39> 'void'
+|     |-ImplicitCastExpr 0x5034 <col:30> 'void (*)(i)' <FunctionToPointerDecay>
+|     | `-DeclRefExpr 0x5035 <col:30> 'void (i)' Function 0x5001 'leaf' 'void (i)'
+|     `-DeclRefExpr 0x5036 <col:35> 'int *' lvalue ParmVar 0x5031 'q' 'int *'
+|-FunctionDecl 0x5040 <line:8:1, col:43> col:6 paren 'void (int *, int)'
+| `-CompoundStmt 0x5041 <col:27, col:43>
+|   `-CallExpr 0x5042 <col:29, col:40> 'void'
+|     `-ImplicitCastExpr 0x5043 <col:29, col:34> 'void (*)(i)' <FunctionToPointerDecay>
+|       `-ParenExpr 0x5044 <col:29, col:34> 'void (i)'
+|         `-DeclRefExpr 0x5045 <col:30> 'void (i)' Function 0x5001 'leaf' 'void (i)'
+|-FunctionDecl 0x5050 <line:9:1, col:44> col:6 deref 'void (int *, int)'
+| `-CompoundStmt 0x5051 <col:27, col:44>
+|   `-CallExpr 0x5052 <col:29, col:41> 'void'
+|     `-ImplicitCastExpr 0x5053 <col:29, col:35> 'void (*)(i)' <FunctionToPointerDecay>
+|       `-ParenExpr 0x5054 <col:29, col:35> 'void (i)'
+|         `-UnaryOperator 0x5055 <col:30, col:31> 'void (i)' prefix '*' cannot overflow
+|           `-ImplicitCastExpr 0x5056 <col:31> 'void (*)(i)' <FunctionToPointerDecay>
+|             `-DeclRefExpr 0x5057 <col:31> 'void (i)' Function 0x5001 'leaf' 'void (i)'
+|-FunctionDecl 0x5060 <line:10:1, col:42> col:6 indirect 'void (int *, int)'
+| |-ParmVarDecl 0x5061 <col:15, col:20> col:20 used q 'int *'
+| `-CompoundStmt 0x5062 <col:30, col:42>
+|   `-CallExpr 0x5063 <col:32, col:39> 'void'
+|     |-ImplicitCastExpr 0x5064 <col:32> 'cb_t':'void (*)(i)' <LValueToRValue>
+|     | `-DeclRefExpr 0x5065 <col:32> 'cb_t':'void (*)(i)' lvalue Var 0x5010 'fp' 'cb_t'
+|     `-DeclRefExpr 0x5066 <col:35> 'int *' lvalue ParmVar 0x5061 'q' 'int *'
+|-FunctionDecl 0x5070 <line:11:1, col:31> col:6 taker 'void (void)'
+| `-CompoundStmt 0x5071 <col:18, col:31>
+|   `-BinaryOperator 0x5072 <col:20, col:25> 'cb_t':'void (*)(i)' '='
+|     |-DeclRefExpr 0x5073 <col:20> 'cb_t':'void (*)(i)' lvalue Var 0x5010 'fp' 'cb_t'
+|     `-ImplicitCastExpr 0x5074 <col:25> 'void (*)(i)' <FunctionToPointerDecay>
+|       `-DeclRefExpr 0x5075 <col:25> 'void (i)' Function 0x5001 'leaf' 'void (i)'
+|-FunctionDecl 0x5080 <line:12:1, col:39> col:6 used apply 'void (cb_t, int *)'
+| |-ParmVarDecl 0x5081 <col:12, col:17> col:17 used c 'cb_t':'void (*)(i)'
+| `-CompoundStmt 0x5082 <col:28, col:39>
+`-FunctionDecl 0x5090 <line:13:1, col:39> col:6 passer 'void (int *)'
+  |-ParmVarDecl 0x5091 <col:13, col:18> col:18 used q 'int *'
+  `-CompoundStmt 0x5092 <col:21, col:39>
+    `-CallExpr 0x5093 <col:23, col:36> 'void'
+      |-ImplicitCastExpr 0x5094 <col:23> 'void (*)(c)' <FunctionToPointerDecay>
+      | `-DeclRefExpr 0x5095 <col:23> 'void (c)' Function 0x5080 'apply' 'void (c)'
+      |-ImplicitCastExpr 0x5096 <col:29> 'void (*)(i)' <FunctionToPointerDecay>
+      | `-DeclRefExpr 0x5097 <col:29> 'void (i)' Function 0x5001 'leaf' 'void (i)'
+      `-DeclRefExpr 0x5098 <col:35> 'int *' lvalue ParmVar 0x5091 'q' 'int *'
+"""
+
+
+def test_parse_address_escapes_reports_every_site_that_takes_the_address() -> None:
+    # `fp`/`alias` are file-scope objects holding it, `taker` stores it, `passer`
+    # hands it to a callback parameter. Each is a path to `leaf` that no name in
+    # `Unit.calls` leads back from.
+    assert parse_address_escapes(_FUNCTION_POINTER_AST, "leaf") == (
+        "fp",
+        "alias",
+        "taker",
+        "passer",
+    )
+
+
+def test_parse_address_escapes_ignores_every_way_of_writing_a_direct_call() -> None:
+    # `leaf(...)`, `(leaf)(...)` and `(*leaf)(...)` all reach the callee through
+    # the same decay cast an *argument* does; only the child position tells them
+    # apart. Treating one as an escape would make ordinary code undischargeable.
+    escapes = parse_address_escapes(_FUNCTION_POINTER_AST, "leaf")
+    assert not {"direct", "paren", "deref"} & set(escapes)
+    # ... including the recursive self-call in `leaf`'s own body.
+    assert "leaf" not in escapes
+
+
+def test_an_indirect_call_leaves_no_trace_in_unit_calls() -> None:
+    # Why the escapes have to be reported separately: `indirect` calls `leaf`
+    # through `fp`, and its body names only the variable.
+    units = {u.name: u for u in parse_units(_FUNCTION_POINTER_AST, _TARGET)}
+    assert "leaf" not in units["indirect"].calls
+    assert units["direct"].calls == ("leaf",)
+
+
+_ORPHAN_REFERENCE_AST = """\
+TranslationUnitDecl 0x6000 <<invalid sloc>> <invalid sloc>
+`-DeclRefExpr 0x6001 <col:18> 'void (i)' Function 0x6002 'leaf' 'void (i)'
+"""
+
+
+def test_parse_address_escapes_keeps_a_reference_it_cannot_name() -> None:
+    # A reference under no named declaration is still a reference; naming it
+    # `<file scope>` keeps the escape (and the withheld discharge) rather than
+    # dropping the one thing that says the caller set is open.
+    assert parse_address_escapes(_ORPHAN_REFERENCE_AST, "leaf") == ("<file scope>",)
