@@ -385,6 +385,43 @@ def test_renderability_reason_flags_constant_index_mixed_with_a_size_bound() -> 
     assert reason is not None and "constrains both a buffer" in reason
 
 
+_TWO_BUF_SIG = UnitSignature(
+    "pick",
+    "int",
+    (
+        BufferParam("int", "a", "n", const=True),
+        ScalarParam("unsigned", "n"),
+        BufferParam("int", "b", "m", const=True),
+        ScalarParam("unsigned", "m"),
+    ),
+)
+
+
+def test_index_use_of_another_buffers_length_allowed() -> None:
+    # Multi-buffer: every buffer's length ident is stripped from every buffer's
+    # subscript, so indexing `a` by `b`'s length `m` is still an index use.
+    spec = SemanticSpec("result == a[m - 1]", ("n >= 1", "m >= 1", "a[m - 1] >= 0"))
+    assert renderability_reason(_TWO_BUF_SIG, spec) is None
+
+
+def test_index_use_of_another_buffers_length_mixed_with_bound_rejected() -> None:
+    reason = renderability_reason(
+        _TWO_BUF_SIG, SemanticSpec("result == a[m - 1]", ("a[m - 1] >= 0 && m >= 1",))
+    )
+    assert reason is not None and "constrains both a buffer" in reason
+
+
+def test_nested_buffer_index_collapses_to_an_index_use() -> None:
+    # `a[b[0]]` needs the fixpoint strip: the inner `b[0]` goes first, then the
+    # outer `a[b]`. Nothing is left outside a subscript, so it is renderable.
+    spec = SemanticSpec("result >= 0", ("a[b[0]] >= 0",))
+    assert renderability_reason(_TWO_BUF_SIG, spec) is None
+    reason = renderability_reason(
+        _TWO_BUF_SIG, SemanticSpec("result >= 0", ("a[b[0]] >= 0 && n >= 1",))
+    )
+    assert reason is not None and "constrains both a buffer" in reason
+
+
 def test_static_gate_and_renderer_agree_on_index_use() -> None:
     # Parity in the accepting direction: what the static authority now admits, the
     # renderer emits -- the same single-authority invariant, read the other way.

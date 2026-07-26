@@ -477,21 +477,20 @@ def _strip_buffer_subscripts(expr: str, buffer_names: Collection[str]) -> str:
 
     Isolates the *index* uses of a buffer from the rest of the clause, so a caller
     can ask what a clause says about an identifier **outside** any subscript.
-    Iterated to a fixpoint so a nested index (``a[b[0]]``) collapses inside-out;
-    each pass strictly shortens the text, and an unbalanced ``[`` simply stops
-    matching, so it always terminates. Longest name first: with `a` and `ab` both
-    buffers, the alternation must not let `a` claim the head of ``ab[0]``.
+    One pattern per name rather than one alternation, so a name that prefixes
+    another (`a` and `ab`) needs no ordering argument. Iterated to a fixpoint so a
+    nested index (``a[b[0]]``) collapses inside-out: each substitution strictly
+    shortens the text and an unbalanced ``[`` simply stops matching, so the loop
+    always terminates -- with no buffers it settles after one no-op pass.
     """
-    if not buffer_names:
-        return expr
-    alternation = "|".join(
-        re.escape(name) for name in sorted(buffer_names, key=lambda n: (-len(n), n))
-    )
-    pattern = re.compile(rf"\b({alternation})\s*\[[^\[\]]*\]")
+    strippers = [
+        re.compile(rf"\b({re.escape(name)})\s*\[[^\[\]]*\]") for name in buffer_names
+    ]
     previous = ""
     while previous != expr:
         previous = expr
-        expr = pattern.sub(r"\1", expr)
+        for pattern in strippers:
+            expr = pattern.sub(r"\1", expr)
     return expr
 
 
