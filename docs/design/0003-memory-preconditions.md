@@ -237,8 +237,21 @@ call site — one link of the chain, not the whole chain. Proving `frame_checksu
 correctly says nothing about a third function calling `frame_checksum` badly; closing that needs
 `forseti discharge --function frame_checksum` in turn. The label carries the caveat verbatim, and
 drops it exactly when the chain is **anchored**: a caller whose own precondition is *empty* (no
-pointer parameters) has a harness that allocates real objects, leaving nothing assumed on its side,
-so a TU whose every caller is anchored is discharged outright.
+pointer parameters) has a harness that allocates real objects, leaving nothing assumed *about its
+parameters*, so a TU whose every caller is anchored is discharged outright for that dimension.
+
+**A check is one invocation, not every one a real program could make.** Every caller — anchored or
+not — is verified from exactly one call in a harness `main`, with the translation unit's own
+file-scope and `static` variables left at whatever value their own initialisers give them; S2
+materialises *parameters* only, never ambient state. A caller whose forwarded argument depends on
+mutable static/global state a real program could have changed by an earlier call — a `static bool
+seen;` flag picking a smaller buffer the second time a public `g(void)` runs — is therefore checked
+for that one entry, not for every entry a real program could make, whether or not `g` counts as
+anchored. The claim states that scope directly (`for one invocation of each caller from this
+translation unit's initial state`) rather than leaving it implicit, so dropping the "relative"
+caveat is never read as a closure over every possible invocation. Modelling repeated invocations
+and the ambient state they can carry between them is L1/S4 territory, same as resolving an indirect
+call to its targets below.
 
 **A caller the gate cannot enumerate is counted, not ignored.** `list_units` narrows to the file
 under test by design, so a `static inline` defined in an included header is part of the translation

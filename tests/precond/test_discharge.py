@@ -362,6 +362,27 @@ def test_a_precondition_free_caller_anchors_the_chain(tmp_path: Path) -> None:
     assert "relative to" not in result.label
 
 
+def test_discharge_states_its_invocation_scope(tmp_path: Path) -> None:
+    # Every caller check is one call from the TU's own initial static state
+    # (`render_sidecar` never varies file-scope/`static` state), whether or not
+    # the caller anchors the chain — a caller whose forwarded argument depends
+    # on ambient state a real program could have changed between calls is not
+    # re-checked after that state changes. `detail`, not just `label`, must
+    # carry the scope: it is what `--json` hands a consumer on its own.
+    entry = Unit("run", (), ("sum_bytes",))
+    anchored_result = _run(tmp_path, units=(CALLEE, entry))
+    assert (
+        "for one invocation of each caller from this translation unit's "
+        "initial state" in anchored_result.detail
+    )
+
+    relative_result = _run(tmp_path)
+    assert (
+        "for one invocation of each caller from this translation unit's "
+        "initial state" in relative_result.detail
+    )
+
+
 RECURSIVE_CALLEE = Unit(
     CALLEE.name, CALLEE.params, ("sum_bytes",), internal_linkage=True
 )

@@ -86,8 +86,21 @@ by *its* S2 assumption, so one run proves ``caller precondition => callee
 precondition`` at every call site: one link of the chain, not the whole chain.
 Closing a deeper chain means discharging each link in turn. The exception is an
 **anchored** caller — one whose own precondition is empty (no pointer parameters),
-whose harness therefore allocates real objects and leaves nothing assumed. The
-label states the caveat and drops it only when every caller is anchored.
+whose harness therefore allocates real objects and leaves nothing assumed *about
+its parameters*. The label states the caveat and drops it only when every caller
+is anchored.
+
+**What a single caller check does and does not cover.** Every caller — anchored
+or not — is verified from exactly one call in a harness ``main``, with the
+translation unit's own file-scope and ``static`` variables left at whatever
+value their own initialisers give them; RFC-0003 S2 materialises *parameters*
+only, never ambient state. A caller whose forwarded argument depends on mutable
+static/global state a real program could have changed by a later call — the
+classic "pick a smaller buffer once a flag has been flipped" — is therefore
+checked for that one entry, not for every entry a real program could make.
+Dropping the "relative" caveat says the parameter dimension is closed; it says
+nothing about ambient state, which is why the claim below states its own scope
+instead of leaving it implicit (RFC-0003 S4).
 
 **And it fails closed in the *other* direction too.** The mirror-image hazard is
 moving RFC-0003's phantom VIOLATED from the callee to the call site: a caller
@@ -683,12 +696,17 @@ def _aggregate(
 
     `anchored` names the callers whose *own* memory precondition is empty (no
     pointer parameters), so their harness allocates real objects and nothing is
-    left assumed on their side. When every discharging caller is anchored the
-    chain is closed outright; otherwise the discharge is **relative** to those
-    callers' own still-assumed preconditions, and says so — a caller `g` verified
-    to call `f` correctly under `g`'s precondition tells you nothing about a
-    third function calling `g` badly, and claiming otherwise would over-state
-    exactly the way this stage exists to stop.
+    left assumed about their parameters. When every discharging caller is
+    anchored the chain closes outright for that dimension; otherwise the
+    discharge is **relative** to those callers' own still-assumed preconditions,
+    and says so — a caller `g` verified to call `f` correctly under `g`'s
+    precondition tells you nothing about a third function calling `g` badly, and
+    claiming otherwise would over-state exactly the way this stage exists to
+    stop. Either way, the claim is scoped to one invocation of each caller from
+    this translation unit's own initial state: a caller whose forwarded argument
+    depends on mutable static/global state it can change between real calls is
+    not re-checked after that state changes, so the claim says so instead of
+    reading as a closure over every invocation a real program could make.
     """
     broken = tuple(c for c in checks if c.outcome is CallerOutcome.OBLIGATION_VIOLATED)
     if broken:
@@ -733,13 +751,19 @@ def _aggregate(
     # The bound belongs *inside* the claim, not appended by the label: `detail` is
     # what `--json` hands a consumer on its own, and an unqualified "every caller
     # satisfies it" would read as a statement for all inputs rather than one up to
-    # k (CLAUDE.md's vocabulary discipline).
+    # k (CLAUDE.md's vocabulary discipline). The invocation scope is the same
+    # kind of thing and belongs inside for the same reason: it is true of *every*
+    # discharge, anchored or relative, since `render_sidecar` calls each caller
+    # once with the TU's static/global state left at its own initial value — a
+    # caller whose forwarded argument depends on mutable ambient state it can
+    # change between real calls is not re-checked after that state changes.
     return DischargeResult(
         function,
         Assessment.DISCHARGED_VERIFIED,
         f"every caller of {function}() in this translation unit is verified to "
         f"satisfy its memory precondition up to k={unit_result.settled_k}, "
-        f"len<={unit_result.max_len}{relative}",
+        f"len<={unit_result.max_len}, for one invocation of each caller from "
+        f"this translation unit's initial state{relative}",
         unit_result,
         checks,
     )
