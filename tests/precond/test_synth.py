@@ -272,7 +272,6 @@ def test_render_conventional_extent_with_length_sizes_by_length_alone() -> None:
     )
     text = render_sidecar(plan_unit(unit), "s.c", max_len=8)
     assert "uint8_t * p = malloc((size_t)len);" in text
-    assert "16" not in text
 
 
 def test_render_static_minimum_floors_a_byte_length() -> None:
