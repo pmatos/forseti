@@ -471,6 +471,42 @@ def test_line_breakpoints_excludes_a_directive_inside_a_dead_if1_else_body() -> 
     assert _line_breakpoints(source) == [(2, 5)]
 
 
+def test_line_breakpoints_ignores_a_line_directive_spliced_from_a_macro() -> None:
+    # PR #156 follow-up: a physical line that only *looks* like `#line 1`
+    # because it is spliced onto the previous line's backslash continuation
+    # (here, a multi-line `#define`'s replacement text) is not a directive to
+    # cpp at all — line splicing (translation phase 2) merges it into the
+    # `#define` before cpp ever looks for a leading `#`.
+    source = "#define UNUSED tokens \\\n#line 1\nx\n"
+    assert _line_breakpoints(source) == []
+
+
+def test_line_breakpoints_ignores_a_conditional_directive_spliced_from_a_macro() -> (
+    None
+):
+    # The splicing hazard applies to every directive regex, not just
+    # `#line` itself: an unfiltered, spliced-in `#if 0` would open a
+    # permanently-dead frame (no matching `#endif` exists in the real source
+    # to close it) and silently drop every later breakpoint in the file.
+    source = "#define X \\\n#if 0\n#line 5\nx\n"
+    assert _line_breakpoints(source) == [(3, 5)]
+
+
+def test_annotate_array_extents_ignores_a_line_directive_spliced_from_a_macro() -> None:
+    # End-to-end: the inactive array-shaped `f` sits behind a real `#if 0`,
+    # and the active pointer `f` follows a `#define`/`#line`-lookalike pair.
+    # Without splicing awareness, the phantom `#line 1` would make the active
+    # definition's translated presumed line collide with (or fall closer to)
+    # the inactive one's, than the definition clang actually reports (6).
+    source = (
+        "#if 0\nvoid f(int p[20]) { }\n#endif\n"
+        "#define UNUSED tokens \\\n#line 1\nvoid f(int *p) { *p = 1; }\n"
+    )
+    unit = Unit("f", (Param("p", "int *"),), def_line=6)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
 def test_annotate_array_extents_breaks_a_genuine_presumed_tie_by_physical_line() -> (
     None
 ):

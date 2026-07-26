@@ -153,6 +153,18 @@ _ELIF_RE = re.compile(r"^[ \t]*#[ \t]*elif[ \t]+([^\n]*)$", re.MULTILINE)
 _ELSE_RE = re.compile(r"^[ \t]*#[ \t]*else\b", re.MULTILINE)
 _ENDIF_RE = re.compile(r"^[ \t]*#[ \t]*endif\b", re.MULTILINE)
 
+# A backslash immediately before a newline splices the following physical line
+# onto this one (translation phase 2) — cpp decides whether a logical line is
+# a directive *after* splicing, so a physical line that only looks like a
+# directive because it follows a `\`-continued line (e.g. a multi-line
+# `#define`'s replacement text spilling a `#line`-shaped token onto its own
+# line) is not a directive at all and must not feed any of the `^`-anchored
+# regexes above (PR #156 follow-up to issue #145). `\r?` tolerates a CRLF
+# source even though `list_units` itself reads via `Path.read_text()`
+# (universal newlines), since `annotate_array_extents` is also callable
+# directly on arbitrary text.
+_CONTINUATION_RE = re.compile(r"\\\r?\n")
+
 
 @dataclass(frozen=True)
 class Param:
@@ -395,7 +407,18 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
     known-taken — and is assumed live absent that proof, exactly as
     `_param_list_text` itself leaves picking the right ``#ifdef`` branch to
     `def_line`, not to evaluating the condition.
+
+    A physical line that is itself the *continuation* of a backslash-
+    terminated previous line is never treated as a directive, however it
+    starts: cpp splices such a line onto the one above (translation phase 2)
+    before it ever looks for a leading ``#``, so a ``#line``/``#if``/...-
+    shaped token spliced in from, say, a multi-line ``#define``'s replacement
+    text is just macro-body text to cpp, not a directive this module should
+    react to (PR #156 follow-up to issue #145).
     """
+    continuation_starts = {
+        m.end() for m in _CONTINUATION_RE.finditer(source_no_comments)
+    }
 
     def _events(
         pattern: re.Pattern[str], kind: str, *, keep_match: bool = False
@@ -403,6 +426,7 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
         return [
             (m.start(), kind, m if keep_match else None)
             for m in pattern.finditer(source_no_comments)
+            if m.start() not in continuation_starts
         ]
 
     def _cond_events(
@@ -415,6 +439,7 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
                 None,
             )
             for m in pattern.finditer(source_no_comments)
+            if m.start() not in continuation_starts
         ]
 
     events = sorted(
