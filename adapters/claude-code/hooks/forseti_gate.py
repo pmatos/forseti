@@ -16,7 +16,6 @@ this gate.
 from __future__ import annotations
 
 import contextlib
-import errno
 import fcntl
 import fnmatch
 import hashlib
@@ -115,11 +114,6 @@ MAX_STOP_ATTEMPTS = 3
 # via MAX_STOP_ATTEMPTS.
 MAX_PENDING_VERIFY_ATTEMPTS = 3
 
-# Symlinked directory components the snapshot's mirror plan will follow before it
-# calls the chain a loop — Linux's own `MAXSYMLINKS` for one path resolution. A
-# source reached through more than this could not have been `open`ed either.
-_MAX_SYMLINK_HOPS = 40
-
 C_SUFFIXES = {".c", ".h"}
 
 # Out-of-band discovery (issue #99): a C file written via the `Bash` tool
@@ -156,6 +150,16 @@ _NEEDS_CONTRACT_DETAIL = (
     "pointer/array parameter(s); function-level safety is unreliable without a "
     "memory precondition/harness — not gated (see issue #122)"
 )
+
+# The enumeration snapshot's filename prefix (issue #151). `_included` rejects
+# any path whose basename starts with it — unconditionally, ahead of
+# `FORSETI_GATE_EXCLUDE`/`FORSETI_GATE_INCLUDE` — because a project can replace
+# (not extend) that env var, and a snapshot a killed hook could not clean up
+# must never be offered back to `verify_and_record` as a source in its own
+# right. `.` leads so `is_c_source`'s suffix check (`.c`, always true here —
+# see `_enumerable_source`) still lets it through the discovery scans as a
+# dotfile, which is exactly what the unconditional exclusion exists to catch.
+_ENUM_SNAPSHOT_PREFIX = ".forseti-units-"
 
 
 @dataclass(frozen=True)
@@ -246,12 +250,17 @@ def _kernel_dir(path: str) -> str:
     resolves ``link`` before it climbs, landing on the parent of the link's
     *target*. Since the gate reads and verifies through that same kernel walk, a
     snapshot staged at the collapsed path would stand in for a different file's
-    neighbourhood — or a different file altogether.
+    neighbourhood — or a different file altogether. `tempfile.mkstemp` cannot be
+    trusted to do this on its own: it normalizes its `dir` argument with
+    `os.path.abspath` before opening anything, so handing it a raw
+    ``proj/link/..`` reproduces exactly the lexical mistake this function exists
+    to avoid (measured, not assumed — see `_enumerable_source`).
 
     Only ``..`` forces a resolution. A symlinked component *not* followed by one
-    stays spelled, so `_mirror_plan` still sees it and reproduces it as a symlink
-    — which is what keeps the two ways of resolving a ``..`` inside an ``#include``
-    agreeing (see there). Paths without ``..`` come back untouched.
+    stays spelled and is returned unresolved: staging directly at that spelled
+    path is itself a real filesystem write, and the kernel resolves it exactly
+    as it would resolve the real file's own `open()` — nothing left for this
+    function to do. Paths without ``..`` come back untouched.
     """
     cur = os.sep if os.path.isabs(path) else os.getcwd()
     for part in path.split(os.sep):
@@ -266,308 +275,122 @@ def _kernel_dir(path: str) -> str:
     return cur
 
 
-def _contains(root: str, path: str) -> bool:
-    """Is `path` `root` itself or lexically below it?"""
-    prefix = root if root.endswith(os.sep) else root + os.sep
-    return path == root or path.startswith(prefix)
-
-
-def _mirror_root(src_dir: str, project_dir: str) -> str:
-    """The highest ancestor of `src_dir` whose entries the snapshot mirrors.
-
-    `project_dir` when it contains `src_dir` — the gate's whole universe is the
-    project, and mirroring stops there rather than walking to ``/``, which would
-    mean a `scandir` of `$HOME` (thousands of entries, and an unreadable one turns
-    into a blocking `error`) for every edit. Otherwise the source's own directory:
-    a file outside the project has no ancestry the gate can claim.
-
-    Containment is tried against the project dir as spelled *and* as resolved,
-    because the two spellings do not have to agree: with `proj -> /data/proj`, a
-    hook may be handed `<cwd>/proj/src/x.c` while out-of-band discovery builds its
-    paths on the git root, which `git rev-parse` reports resolved. Lexically, one
-    of those is not under the other — and calling a file physically inside the
-    project "outside" costs it its whole ancestry, so an ordinary
-    ``#include "../common.h"`` stops resolving and enumeration blocks (or, with an
-    `-I` to fall through to, quietly reads a different header). Whichever test
-    matches returns a prefix of `src_dir`, so the source keeps its own spelling.
-    """
-    root = os.path.abspath(project_dir)
-    if _contains(root, src_dir):
-        return root
-    real_root = os.path.realpath(project_dir)
-    return real_root if _contains(real_root, src_dir) else src_dir
-
-
-def _staged(tmp: str, path: str) -> str:
-    """`path`'s place inside the snapshot tree: the same depth, rooted at `tmp`."""
-    return os.path.join(tmp, os.path.relpath(path, os.sep))
-
-
-def _file_id(path: str) -> tuple[int, int] | None:
-    """``(st_dev, st_ino)`` for `path`, links followed; ``None`` if it cannot stat."""
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    return st.st_dev, st.st_ino
-
-
-def _mirror_entries(
-    real_dir: str,
-    into: str,
-    *,
-    source_id: tuple[int, int] | None = None,
-    snapshot: str | None = None,
-) -> None:
-    """Symlink every entry of `real_dir` into `into` that is not already there.
-
-    Whatever the caller has already put in `into` is the mirrored tree itself —
-    a level of the chain down to the snapshot, a reproduced symlink component, or
-    the snapshot file — and must never be overwritten by a link back to the real
-    entry of the same name. `lexists`, so a *dangling* link already staged counts
-    too. A directory is linked whole, so ``#include "sub/h.h"`` resolves through
-    it.
-
-    An entry that is **another name for the source** — a sibling
-    ``alias.c -> x.c``, or a hard link — is linked to `snapshot` instead. Left
-    pointing at the real file it would be a door back out of the immutable copy:
-    a translation unit that includes itself under that name reads whatever is on
-    disk *now*, and its ``#define``s then decide which units the snapshot
-    enumerates (issue #141's own race, one include deep). Compared by
-    ``(st_dev, st_ino)`` so a hard link counts, and an entry that cannot be
-    stat'd is still linked to the real path — one extra `stat` per entry beside
-    the `lexists` already spent.
-    """
-    with os.scandir(real_dir) as entries:
-        for entry in entries:
-            dest = os.path.join(into, entry.name)
-            if os.path.lexists(dest):
-                continue
-            checkable = snapshot is not None and source_id is not None
-            if checkable and _file_id(entry.path) == source_id:
-                os.symlink(str(snapshot), dest)  # another name for the source
-            else:
-                os.symlink(entry.path, dest)
-
-
-def _mirror_plan(
-    src_dir: str, project_dir: str
-) -> tuple[list[str], list[tuple[str, str]]]:
-    """How to reproduce `src_dir`'s ancestry: real directories, symlink components.
-
-    Returns the directories to recreate as *real* directories (each mirroring its
-    own entries) and the ``(spelled link, its target)`` pairs to recreate as
-    *symlinks*, so that both ways of resolving a ``..`` agree with the in-place
-    parse:
-
-    * **The kernel walks it.** ``..`` from a directory reached through a symlink
-      is the parent of the link's *target*, not of the link — clang concatenates
-      the including file's directory with the spelled path and hands the result
-      to ``open``, so this is the resolution that actually happens (measured, not
-      assumed). Reproducing a symlinked component as a real directory would make
-      ``..`` climb the spelled chain instead, silently selecting a different
-      header — which flips ``#if`` branches, so enumeration reports units the
-      verify never sees, prunes the rest, and stamps the file.
-    * **The caller normalizes it lexically.** The spelled chain is reproduced
-      *as spelled*, so ``foo/../bar`` collapsed before the open lands on the
-      mirror of the same directory it lands on in place.
-
-    The walk stops at the first symlinked component, hops to its target, and
-    resumes from that target's own `_mirror_root` — so a link into the project
-    keeps the full ancestry, and a link out of it mirrors the target directory
-    (entries yes, parent no) exactly as a source outside the project does.
-    """
-    real_dirs: list[str] = []
-    links: list[tuple[str, str]] = []
-    hops = 0
-    base = _mirror_root(src_dir, project_dir)
-    steps = [] if src_dir == base else os.path.relpath(src_dir, base).split(os.sep)
-    while True:
-        if base not in real_dirs:
-            real_dirs.append(base)
-        cur, hop = base, None
-        for i, step in enumerate(steps):
-            nxt = os.path.join(cur, step)
-            if os.path.islink(nxt):
-                hop = (nxt, steps[i + 1 :])
-                break
-            cur = nxt
-            if cur not in real_dirs:
-                real_dirs.append(cur)
-        if hop is None:
-            return real_dirs, links
-        link, rest = hop
-        # A cyclic component would loop here forever, and `os.path.realpath` will
-        # not say so: it gives up and hands back a path that is *not* resolved —
-        # `a -> a` unchanged, `a -> a/x` one component longer every time. The
-        # second shape is why this is a **budget**, not a seen-set: with the target
-        # growing, no (link, rest) state ever recurs, so a repeat-detector spins.
-        #
-        # The budget is the kernel's own: `MAXSYMLINKS` traversals for one path
-        # resolution. Anything past it could not have been `open`ed either — this
-        # walk only runs for a source already read — so blocking is the honest
-        # answer, and it leaves room for the legitimate repeat this must not
-        # reject (`self -> .` walked as `self/self/x.c` visits one component
-        # twice, and the kernel counts that the same way).
-        hops += 1
-        if hops > _MAX_SYMLINK_HOPS:
-            raise OSError(errno.ELOOP, "symlinked directory component loops", link)
-        target = os.path.realpath(link)
-        # Deduped: the same component can legitimately be reached twice (the
-        # `self -> .` walk again), and staging one plan entry twice would raise
-        # `FileExistsError` at `os.symlink` — a blocking `error` by another route.
-        if (link, target) not in links:
-            links.append((link, target))
-        # Against the *resolved* project dir: `target` is fully resolved, so that
-        # is the apples-to-apples comparison, and a link that lands back inside a
-        # project which is itself reached through a symlink keeps its full
-        # ancestry rather than being treated as foreign.
-        base = _mirror_root(target, os.path.realpath(project_dir))
-        below = [] if target == base else os.path.relpath(target, base).split(os.sep)
-        # `target` is fully resolved, so nothing in `below` can be a symlink; only
-        # the not-yet-walked `rest` can hop again.
-        steps = below + rest
-
-
 @contextlib.contextmanager
 def _enumerable_source(
     file_path: str | os.PathLike[str], content: bytes | None, *, project_dir: str
 ) -> Iterator[str]:
-    """Yield the path to enumerate for `file_path` — itself, or an immutable copy.
+    """Yield the path to enumerate for `file_path` — itself, or an immutable sibling.
 
     With `content` ``None`` the file is enumerated where it lies. Given `content`,
-    those exact bytes are written to a snapshot in a private temp directory and
-    *that* is what gets parsed — so the enumeration is of the caller's bytes by
-    construction, not of whatever the file happens to hold when the CLI re-reads
-    it (issue #141). Write the bytes; never `shutil.copy` or re-read `file_path`,
-    or the race walks straight back in.
+    those exact bytes are written to a snapshot and *that* is what gets parsed —
+    so the enumeration is of the caller's bytes by construction, not of whatever
+    the file happens to hold when the CLI re-reads it (issue #141). Write the
+    bytes; never `shutil.copy` or re-read `file_path`, or the race walks straight
+    back in.
 
-    The temp tree is then made to **stand in for the source's own
-    neighbourhood**, because clang resolves a quoted ``#include`` against the
-    directory of the file it is reading — so the snapshot has to *be* in an
-    equivalent directory, including for headers reached through it, which clang
-    opens by their linked path and whose own quoted includes therefore resolve
-    the same way. Two things make it equivalent:
+    Staged as a **sibling of `file_path`, in its own real directory** — not a
+    tree mirrored elsewhere, which is what this replaced (issue #151). clang
+    resolves a quoted ``#include`` against the directory of the file it is
+    reading, and a same-directory snapshot *is* that directory: every real
+    sibling, and everything a ``..`` chain can reach, resolves exactly as the
+    in-place parse would — nothing to reproduce, and no boundary to fall off.
+    The mirrored design this replaces had to stop somewhere short of the
+    filesystem root (walking to it would mean a `scandir` of ``$HOME`` on every
+    edit) and so left a residual: a quoted include climbing above that boundary
+    missed the mirror and fell through to the ``-I`` search with the *spelled*
+    path, silently landing on a different translation unit. Nothing needs
+    mirroring now, so that boundary — and every helper that built and walked the
+    synthetic tree it required — is gone with it. The old
+    ``test_include_above_the_mirror_root_is_a_known_residual`` pinned the miss;
+    ``test_include_above_the_project_root_is_no_longer_a_residual`` is its
+    replacement, since there is no boundary left to climb past.
 
-    * **Siblings.** Every other entry of the source's directory is symlinked
-      beside the snapshot, so ``#include "sibling.h"`` resolves to the real one —
-      except a sibling that *is* the source under another name, which leads back
-      to the snapshot (`_mirror_entries`).
+    The trade is a narrower residual in its place: this snapshot cannot occupy
+    `file_path`'s own name (`tempfile.mkstemp` gives it a random one, so two
+    concurrent enumerations of the same file cannot collide with each other
+    either), so a translation unit that ``#include``s the source under any name
+    that resolves to its own inode — its literal filename, a same-directory
+    symlink, or a hard link — still reaches the live file for that nested read,
+    not the frozen snapshot. Pinned by
+    ``test_a_source_alias_leads_back_into_the_live_file_is_a_known_residual``
+    and, one level deeper and unaffected by this change either way (a nested
+    alias below a subdirectory was never protected here),
+    ``test_a_nested_source_alias_is_a_known_residual``.
 
-    Immutability is the *top-level* file's, and two ways of naming the source
-    still reach the live one: an **absolute** include (clang opens the spelled
-    path, which no mirrored neighbourhood can stand in for) and an alias *below*
-    a mirrored directory (``sub/alias.c -> ../x.c``, since a directory is linked
-    whole). A translation unit that includes itself that way, during a transient
-    A -> B -> A, can enumerate B — the same residual the verify loop already
-    carries, and the same fix: enumeration of content the parser cannot reach
-    around, which means a Core CLI taking content on stdin with an explicit
-    include root, not a deeper mirror. Mirroring subdirectories entry-by-entry
-    instead would `scandir` and `stat` the source's whole subtree on every edit.
-    Pinned by ``test_a_nested_source_alias_is_a_known_residual``.
-    * **Ancestry.** The chain from `_mirror_root` down to the source's directory
-      is reproduced level by level, each mirroring its own entries bar the names
-      the chain itself already occupies, so ``#include "../common.h"`` — the
-      ordinary shape for a ``src/foo.c`` — resolves too. A real directory where
-      the source has a real directory and a *symlink* where it has a symlink
-      (`_mirror_plan`): ``..`` is then the same directory the in-place parse
-      reaches whether the caller normalizes ``foo/../bar`` lexically or lets the
-      kernel walk it.
+    The source's own path is derived **as spelled** — joined onto `project_dir`
+    (the subprocess's cwd) but never `resolve()`d — and the snapshot is staged
+    beside it. clang searches the directory of the path it was *given*, so for a
+    symlinked source file resolving would mirror the link target's directory
+    instead: a header beside the link would go missing, and a same-named header
+    beside the target would be silently preferred.
 
-    The tree also reproduces the source's **absolute depth** (``/a/b/x.c`` stages
-    at ``<tmp>/a/b/x.c``), with the levels above the mirror root real but empty.
-    A ``..`` chain that climbs past the root then lands on an empty private
-    directory instead of on ``/tmp``, where a same-named file — anyone's, the
-    directory is world-writable — would silently be included.
+    One part of it is not spelled: a ``..`` in the given path is resolved the
+    way the kernel walks it (`_kernel_dir`), never left to
+    `tempfile.mkstemp`'s own lexical `os.path.abspath` normalization — see there
+    for why the difference is real, not academic. The kernel is what picked the
+    file whose bytes were hashed and what will pick it again for the verify, so
+    collapsing ``proj/link/../x.c`` lexically to ``proj/x.c`` would stage the
+    snapshot beside the *project's* headers instead of the link target's — a
+    different translation unit, which is the failure this staging exists to
+    prevent. A symlinked component not followed by a ``..`` stays spelled, since
+    staging directly at that spelled path is itself a real filesystem write and
+    the kernel resolves it correctly without any help from this function.
 
-    Above the mirror root, resolution is **not** reproduced, and the miss is not
-    the end of it: clang falls through to the ``-I`` search with the *spelled*
-    path, so ``#include "../above.h"`` from a file at the project root ends at
-    whatever ``<-I dir>/../above.h`` finds — a blocking `error` when there is no
-    such flag, and otherwise a header the in-place parse need not have picked.
-    ``-I.`` is the spelling that reproduces it (the CLI runs with
-    ``cwd=project_dir``). Unchanged from the siblings-only staging this replaces;
-    what the padding removes is the far worse variant where the miss landed in
-    ``/tmp`` itself. Pinned by
-    ``test_include_above_the_mirror_root_is_a_known_residual``.
+    An explicit include root piped to ``forseti list-units`` on stdin — no
+    staging at all — looks like a cleaner fix than either design and was
+    considered (issue #151). It is not buildable against ESBMC 8.3.0: there is
+    no stdin convention (``esbmc - --parse-tree-only`` fails with "failed to
+    figure out type of file -", measured, not assumed) and no flag that
+    separates a quoted include's search base from the file's own location
+    (``-iquote`` is rejected; only ``-I``/``--idirafter`` are exposed). A real
+    file beside the source is the only way left to make ESBMC resolve
+    ``#include``s from the place the source actually lives.
 
-    An ``-I <source dir>`` looks like a cheaper substitute for all this and is not
-    one: ``-I`` also joins the **angle-bracket** search, and it appends *after*
-    any ``-iquote`` from `FORSETI_BUILD_FLAGS` instead of taking the source
-    directory's first-place precedence. Either one silently selects a different
-    header than the in-place parse would — ``#include <config.h>`` next to a
-    generated ``config.h`` is the standard shape — which flips ``#if`` branches,
-    so enumeration reports units the verify never sees, prunes the rest, and
-    stamps the file. (ESBMC 8.3.0 offers no quoted-only include flag: it rejects
-    clang's ``-iquote``, exposing only ``-I``/``--idirafter``.) Mirroring needs no
-    flag at all and leaves every search path exactly as it was.
-
-    The source's own path is derived **as spelled** — absolutized against
-    `project_dir` (the subprocess's cwd) but never `resolve()`d — and the
-    snapshot is staged there. clang searches the directory of the path it was
-    *given*, so for a symlinked source file resolving would mirror the link
-    target's directory instead: a header beside the link would go missing, and a
-    same-named header beside the target would be silently preferred.
-
-    One part of it is not spelled: a ``..`` in the given path is resolved the way
-    the kernel walks it (`_kernel_dir`). The kernel is what picked the file whose
-    bytes were hashed and what will pick it again for the verify, so collapsing
-    ``proj/link/../x.c`` lexically to ``proj/x.c`` would surround content read
-    from the link target's parent with the *project's* headers — a different
-    translation unit, which is the failure this staging exists to prevent.
-    Symlinked directory components not followed by a ``..`` stay spelled and are
-    reproduced as symlinks; see `_mirror_plan`.
+    The name carries `_ENUM_SNAPSHOT_PREFIX` so `_included` excludes it from the
+    gate's own discovery unconditionally — see there for why that has to be
+    unconditional. `git status` lists it until the `finally` below runs (or,
+    if this process is killed first, until something else removes it) — the
+    cost of staging beside the source at all, the same one `_verifiable_source`
+    pays at the verify boundary (issue #150).
     """
     if content is None:
         yield str(file_path)
         return
     spelled = os.path.join(project_dir, os.fspath(file_path))
-    src_dir, name = _kernel_dir(os.path.dirname(spelled)), os.path.basename(spelled)
-    target = os.path.join(src_dir, name)
-    # Every `OSError` the staging can raise — an unwritable/missing `TMPDIR`,
-    # `ENOSPC`, `EDQUOT`, an unreadable directory anywhere on the mirrored chain,
-    # a failed cleanup — has to land as `UnitsUnavailable`, the one exception
-    # `verify_and_record` turns into a blocking `error`. Left bare it escapes to
-    # the hook, which installs no handler: the process dies with a traceback and
-    # exit 1 (not the blocking exit 2) before any verdict or `scanned` stamp is
-    # written, so the edit passes with the file unverified. Outside a git work
-    # tree nothing backstops that — the same reason the post-verify drift check
-    # blocks rather than deferring to the out-of-band scan. Mirrors how
-    # `_list_units` already converts `OSError` from the spawn.
+    src_dir = _kernel_dir(os.path.dirname(spelled))
+    # Every `OSError` the staging can raise — an unwritable directory, `ENOSPC`,
+    # `EDQUOT`, a failed cleanup — has to land as `UnitsUnavailable`, the one
+    # exception `verify_and_record` turns into a blocking `error`. Left bare it
+    # escapes to the hook, which installs no handler: the process dies with a
+    # traceback and exit 1 (not the blocking exit 2) before any verdict or
+    # `scanned` stamp is written, so the edit passes with the file unverified.
+    # Outside a git work tree nothing backstops that — the same reason the
+    # post-verify drift check blocks rather than deferring to the out-of-band
+    # scan. Mirrors how `_list_units` already converts `OSError` from the spawn.
     try:
-        with tempfile.TemporaryDirectory(prefix="forseti-units-") as tmp:
-            real_dirs, links = _mirror_plan(src_dir, project_dir)
-            # Order is load-bearing. The whole skeleton — every level of the
-            # chain, every reproduced symlink component, and the snapshot itself
-            # — has to exist before any level mirrors its entries, because
-            # `_mirror_entries` yields to whatever is already staged. Mirror the
-            # source's directory first and its own name would become a link back
-            # to the real file, which `write_bytes` would then follow and
-            # *truncate the user's source*.
-            for real in real_dirs:
-                os.makedirs(_staged(tmp, real), exist_ok=True)
-            for link, link_target in links:
-                os.symlink(_staged(tmp, link_target), _staged(tmp, link))
-            snapshot = Path(_staged(tmp, target))
-            snapshot.write_bytes(content)
-            # Taken before the mirroring, off the real file: any entry that turns
-            # out to be this same inode is another name for the source and must
-            # lead to the snapshot, not back out to the live file.
-            source_id = _file_id(target)
-            for real in real_dirs:
-                _mirror_entries(
-                    real,
-                    _staged(tmp, real),
-                    source_id=source_id,
-                    snapshot=str(snapshot),
-                )
-            yield str(snapshot)
+        fd, path = tempfile.mkstemp(
+            prefix=_ENUM_SNAPSHOT_PREFIX, suffix=".c", dir=src_dir
+        )
     except OSError as exc:
         raise UnitsUnavailable(
-            f"could not stage a snapshot of {name} for enumeration (check "
-            f"TMPDIR, free space, and read access to {src_dir} and the "
-            f"directories `_mirror_plan` reproduces for it): {exc}"
+            f"could not stage a snapshot of {file_path} for enumeration (check "
+            f"free space and write access to {src_dir}): {exc}"
         ) from exc
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise UnitsUnavailable(
+            f"could not stage a snapshot of {file_path} for enumeration (check "
+            f"free space and write access to {src_dir}): {exc}"
+        ) from exc
+    try:
+        yield path
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
 
 
 def extract_function_defs(
@@ -626,7 +449,7 @@ def _list_units(source: str, *, project_dir: str) -> list[FuncDef]:
     # `error` on every edited file rather than a listing. Only the build flags go
     # here: `SAFETY_FLAGS` is for the verify, and a property flag on a
     # `--parse-tree-only` run is at best inert. Nothing is added for a snapshot —
-    # `_enumerable_source` mirrors the source's directory precisely so the search
+    # `_enumerable_source` stages it beside the source itself, so the search
     # paths stay identical to the in-place parse.
     build_flags = _build_flags()
     if build_flags:
@@ -730,7 +553,16 @@ def _included(rel: str) -> bool:
 
     Exclude wins over include. When `FORSETI_GATE_EXCLUDE` is unset the built-in
     `_DEFAULT_EXCLUDE_GLOBS` apply; setting it replaces (not extends) them.
+
+    An enumeration snapshot's own name (`_ENUM_SNAPSHOT_PREFIX`) is rejected
+    first, unconditionally — never subject to either glob. It has to be:
+    `FORSETI_GATE_EXCLUDE` *replaces* the defaults rather than extending them, so
+    a project that sets one would otherwise un-exclude a snapshot a killed hook
+    left behind, and a concurrent scan could then hand it back to
+    `verify_and_record` as a source in its own right.
     """
+    if os.path.basename(rel).startswith(_ENUM_SNAPSHOT_PREFIX):
+        return False
     exclude = _globs(os.environ.get("FORSETI_GATE_EXCLUDE")) or _DEFAULT_EXCLUDE_GLOBS
     if _matches(rel, exclude):
         return False
@@ -1760,14 +1592,14 @@ def verify_and_record(
                 record(state, verdict)
                 save_state(project_dir, state)
 
-    # The verifies read the *real* path, not the snapshot: a verdict has to
-    # describe the translation unit that actually ships, and the snapshot's
-    # mirrored neighbourhood reproduces in-place include resolution only up to
-    # its root — an include reaching above that fails to resolve, which is a
-    # tolerable blocking `error` for an enumeration and an intolerable one for
-    # the verify the whole gate rests on. Plus every counterexample and the
-    # trace's `argv` would name a temp file that no longer exists. So this
-    # boundary is guarded, not eliminated: re-hash once after the
+    # The verifies read the *real* path, not the snapshot `extract_function_defs`
+    # enumerated against: a verdict has to describe the translation unit that
+    # actually ships, and verifying the enumeration snapshot instead is not a
+    # drop-in substitute — it would need to stay alive for the whole (much
+    # longer) verify call rather than the brief parse-tree-only enumeration, and
+    # every counterexample and the trace's `argv` would name a temp file that no
+    # longer exists once it is cleaned up (issue #150). So this boundary is
+    # guarded, not eliminated: re-hash once after the
     # loop and fail closed on drift. Un-stamping is what makes the out-of-band
     # scan re-gate the file, and the `error` blocks when there is no scan to fall
     # back on (outside a git work tree); both clear on the next edit's reconcile.

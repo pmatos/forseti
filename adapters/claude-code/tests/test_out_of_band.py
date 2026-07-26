@@ -94,6 +94,30 @@ def test_included_defaults_and_overrides(monkeypatch: pytest.MonkeyPatch) -> Non
     assert not gate._included("generated/x.c")
 
 
+def test_included_rejects_enum_snapshot_names_unconditionally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot_name = f"{gate._ENUM_SNAPSHOT_PREFIX}abc123.c"
+    assert gate._included(snapshot_name) is False
+    # Even when a project's own FORSETI_GATE_EXCLUDE would otherwise un-exclude
+    # it (it *replaces* the defaults, never extends them) and
+    # FORSETI_GATE_INCLUDE narrows scope to exactly this name.
+    monkeypatch.setenv("FORSETI_GATE_EXCLUDE", "nothing_matches_this")
+    monkeypatch.setenv("FORSETI_GATE_INCLUDE", snapshot_name)
+    assert gate._included(snapshot_name) is False
+
+
+def test_in_scope_c_abspath_rejects_an_enum_snapshot(tmp_path: Path) -> None:
+    # The shared funnel `discover_changed_c_sources`/`divergent_blob_sources`/
+    # `baseline_blob_hashes` all go through: a leftover snapshot a killed hook
+    # could not clean up must never come back as a source in its own right.
+    rel = f"{gate._ENUM_SNAPSHOT_PREFIX}xyz.c"
+    (tmp_path / rel).write_text("int f(void) { return 0; }\n")
+    root = str(tmp_path)
+    proj_real = os.path.realpath(str(tmp_path))
+    assert gate._in_scope_c_abspath(str(tmp_path), root, proj_real, rel) is None
+
+
 def test_parse_porcelain_z_handles_renames() -> None:
     # rename record: "R  new\0old"; the old-path token must be skipped
     out = "R  new.c\x00old.c\x00 M mod.c\x00?? fresh.c\x00A  added.c\x00"
