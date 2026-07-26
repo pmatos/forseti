@@ -602,3 +602,43 @@ def test_discharge_preserves_file_identity_in_the_generated_copy(
     result = discharge_precondition(src, function="sum_bytes", max_len=MAX_LEN)
     assert result.assessment is Assessment.DISCHARGED_VERIFIED, result.label
     assert result.callers[0].outcome is CallerOutcome.DISCHARGED
+
+
+_ELEM_COUNT_LEAF = """\
+#include <stddef.h>
+#include <stdint.h>
+
+static uint32_t sum_elems(const uint32_t *p, size_t count) {
+    uint32_t acc = 0;
+    for (size_t i = 0; i < count; i++) acc += p[i];
+    return acc;
+}
+
+uint32_t frame_checksum(const uint32_t *frame, size_t count) {
+    return sum_elems(frame, count);
+}
+
+uint32_t overflow_checksum(const uint32_t *frame, size_t count) {
+    return sum_elems(frame, count + ((size_t)1 << 62));
+}
+"""
+
+
+def test_an_overflowing_element_count_does_not_discharge(tmp_path: Path) -> None:
+    # `overflow_checksum` states its own extent for `frame` (a `count` it never
+    # forwards unmodified) so it is not the mirror-image "bare pointer" caller
+    # this stage already withholds without blame — it forwards 2**62 elements of
+    # a 4-byte type instead, exactly 2**64, wrapping `count * sizeof(*p)` to
+    # zero. Without the multiplication guard, the obligation's `size` would be
+    # zero and `r_ok` would accept whatever small object this caller's own
+    # sidecar allocates, wrongly discharging a caller that never supplied the
+    # span the precondition describes — with the guard, it is caught and named
+    # as a real violation instead.
+    src = tmp_path / "elem_count.c"
+    src.write_text(_ELEM_COUNT_LEAF)
+    result = discharge_precondition(src, function="sum_elems", max_len=MAX_LEN)
+    assert result.assessment is Assessment.VIOLATED, result.label
+    outcomes = {c.caller: c.outcome for c in result.callers}
+    assert outcomes["frame_checksum"] is CallerOutcome.DISCHARGED
+    assert outcomes["overflow_checksum"] is CallerOutcome.OBLIGATION_VIOLATED
+    assert "overflow_checksum()" in result.detail

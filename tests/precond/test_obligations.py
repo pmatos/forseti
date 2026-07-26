@@ -72,6 +72,26 @@ def test_fixed_array_obligation_uses_the_extent() -> None:
     assert "(size_t)20 * sizeof(*out)" in expr
 
 
+def test_element_count_obligation_guards_its_own_multiplication() -> None:
+    # `_pointer_alloc` multiplies a caller-controlled count by `sizeof(*p)` for
+    # this role alone — a count near `SIZE_MAX / sizeof(*p)` would otherwise wrap
+    # the product to a small `size` before the offset/wraparound guards ever see
+    # it, letting `r_ok` accept an undersized object.
+    unit = Unit("fill", (Param("p", "int *"), Param("count", "size_t")))
+    expr = obligation_expr(plan_unit(unit).pointer_params[0])
+    assert "((size_t)count) <= (__SIZE_TYPE__)-1 / sizeof(*p)" in expr
+    # placed first, so a short-circuit never lets the wrapped product decide it
+    assert expr.index("(__SIZE_TYPE__)-1") < expr.index("__ESBMC_POINTER_OFFSET")
+
+
+def test_byte_length_and_fixed_array_obligations_add_no_count_guard() -> None:
+    # Neither multiplicand is caller-controlled: `PTR_BYTE_LEN` never multiplies
+    # at all, and `FIXED_ARRAY`'s extent comes from the signature itself.
+    assert "(__SIZE_TYPE__)-1" not in obligation_expr(_plan().pointer_params[0])
+    unit = Unit("digest", (Param("out", "unsigned char *", array_extent=20),))
+    assert "(__SIZE_TYPE__)-1" not in obligation_expr(plan_unit(unit).pointer_params[0])
+
+
 def test_injection_adds_one_labelled_assert_per_pointer() -> None:
     injected = inject_obligations(SOURCE, _plan())
     assert f'"{OBLIGATION_LABEL_PREFIX}sum_bytes:buf"' in injected

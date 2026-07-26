@@ -325,6 +325,24 @@ def _at_least(size: str, floor: str) -> str:
     return f"({size} > {floor} ? {size} : {floor})"
 
 
+def _element_count(plan: ParamPlan) -> str | None:
+    """The count `_pointer_alloc` multiplies by `sizeof(*p)`, or ``None``.
+
+    ``None`` for every role but `PTR_ELEM_COUNT` — the only one where this
+    multiplicand is caller-controlled rather than fixed at compile time
+    (`FIXED_ARRAY`'s ``extent`` comes from the signature itself) or already
+    byte-sized with no multiplication at all (`PTR_BYTE_LEN`). Exposed so
+    `obligation_expr` can guard the *same* value `_pointer_alloc` multiplies,
+    rather than re-deriving an expression that could silently drift from it.
+    """
+    if plan.role is not ParamRole.PTR_ELEM_COUNT:
+        return None
+    count = f"(size_t){plan.length_var}"
+    if plan.static_min_extent is not None:
+        count = _at_least(count, f"(size_t){plan.static_min_extent}")
+    return count
+
+
 def _pointer_alloc(plan: ParamPlan) -> str:
     """The `malloc(...)` size expression for a pointer/array plan.
 
@@ -344,9 +362,8 @@ def _pointer_alloc(plan: ParamPlan) -> str:
         floor = f"(size_t){plan.static_min_extent} * sizeof(*{plan.var})"
         return _at_least(nbytes, floor)
     if plan.role is ParamRole.PTR_ELEM_COUNT:
-        count = f"(size_t){plan.length_var}"
-        if plan.static_min_extent is not None:
-            count = _at_least(count, f"(size_t){plan.static_min_extent}")
+        count = _element_count(plan)
+        assert count is not None  # role is PTR_ELEM_COUNT, so `_element_count` gave one
         return f"{count} * sizeof(*{plan.var})"
     if plan.role is ParamRole.FIXED_ARRAY:
         return f"(size_t){plan.extent} * sizeof(*{plan.var})"
@@ -437,18 +454,32 @@ def obligation_expr(plan: ParamPlan) -> str:
     object's end (``r_ok(malloc(1) + 2, 4)`` passes), so the direct form would
     silently discharge exactly the caller bug that matters — a run-off interior
     pointer. Asking instead for ``offset + n`` bytes *from offset zero*, where
-    ``r_ok`` is exact, restores the intended meaning. The two guards in front are
-    equally load-bearing: a negative offset is not a rebasable pointer, and
+    ``r_ok`` is exact, restores the intended meaning. The three guards in front
+    are equally load-bearing: a negative offset is not a rebasable pointer,
     ``offset + n`` wrapping around ``size_t`` (a caller's underflowed length,
     the classic ``len - HEADER`` bug) would otherwise ask for a *tiny* span and
-    pass.
+    pass, and — for `PTR_ELEM_COUNT`, whose `_pointer_alloc` multiplies a
+    caller-controlled count by ``sizeof(*p)`` — that multiplication itself can
+    wrap first: a caller passing a count near ``SIZE_MAX / sizeof(*p)`` shrinks
+    ``n`` before either the offset or the addition is ever checked, so the count
+    is bounded against overflowing *its own* multiplication before `_pointer_alloc`
+    is trusted at all.
     """
     ptr = f"(const void *){plan.var}"
     offset = f"__ESBMC_POINTER_OFFSET({ptr})"
     size = f"(__SIZE_TYPE__)({_pointer_alloc(plan)})"
     span = f"((__SIZE_TYPE__){offset} + {size})"
     base = f"(void *)((const char *){plan.var} - {offset})"
-    return f"({offset} >= 0 && {span} >= {size} && __ESBMC_r_ok({base}, {span}))"
+    count = _element_count(plan)
+    count_guard = (
+        ""
+        if count is None
+        else f"({count}) <= (__SIZE_TYPE__)-1 / sizeof(*{plan.var}) && "
+    )
+    return (
+        f"({count_guard}{offset} >= 0 && {span} >= {size} && "
+        f"__ESBMC_r_ok({base}, {span}))"
+    )
 
 
 def _obligation_targets(plan: UnitPlan) -> tuple[ParamPlan, ...]:
