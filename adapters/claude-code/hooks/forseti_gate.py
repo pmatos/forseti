@@ -1265,9 +1265,16 @@ def _line_directive(path: str) -> bytes:
     return f'#line 1 "{escaped}"\n'.encode()
 
 
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+
 @contextlib.contextmanager
 def _verifiable_source(
-    file_path: str | os.PathLike[str], content: bytes, *, project_dir: str
+    file_path: str | os.PathLike[str],
+    content: bytes,
+    *,
+    project_dir: str,
+    mtime_ns: int,
 ) -> Iterator[str]:
     """Yield the path to verify `file_path`'s content against: an immutable sibling.
 
@@ -1329,6 +1336,28 @@ def _verifiable_source(
     unit — which is exactly why this directive is safe here and would not be
     there.
 
+    `__TIMESTAMP__` (a GCC/clang extension expanding to the source's last
+    modification time, `ctime`-formatted) is the same class of problem one
+    layer down from `__FILE__`, and — unlike `__FILE__` — the `#line` directive
+    does *nothing* for it: measured directly against clang, `__TIMESTAMP__`
+    follows the snapshot's own physical mtime regardless of what the directive
+    presumes the name to be. Left alone, a freshly-`mkstemp`'d snapshot always
+    reads "now", diverging from `file_path`'s real mtime on every verify.
+    `mtime_ns` is required, not optional, and is applied to the snapshot with
+    `os.utime` right after writing it, so `__TIMESTAMP__` expands to the same
+    value in place or through the snapshot — a caller cannot silently opt back
+    into the "now" mtime by omitting it (review feedback on PR #159, issue
+    #150).
+
+    A leading UTF-8 BOM is written at byte zero, ahead of the directive,
+    instead of being pushed into the middle of the file: clang only recognizes
+    a BOM there, and one sitting in front of the directive is read as part of
+    the directive's own first token, corrupting it. Verified empirically:
+    without this, a valid BOM-prefixed `.c` fails to compile through the
+    snapshot with the BOM fused onto whatever follows (e.g. `int` becomes an
+    unrecognized `﻿int`) even though the same file compiles fine in place
+    (review feedback on PR #159, issue #150).
+
     The name carries `_VERIFY_SNAPSHOT_PREFIX` so `_included` excludes it from
     the gate's own discovery unconditionally — see there for why that has to be
     unconditional. `git status` still lists it until the `finally` below runs
@@ -1339,6 +1368,11 @@ def _verifiable_source(
     spelled = os.path.join(project_dir, os.fspath(file_path))
     src_dir = os.path.dirname(spelled) or "."
     directive = _line_directive(os.fspath(file_path))
+    bom, body = (
+        (content[: len(_UTF8_BOM)], content[len(_UTF8_BOM) :])
+        if content.startswith(_UTF8_BOM)
+        else (b"", content)
+    )
     try:
         fd, path = tempfile.mkstemp(
             prefix=_VERIFY_SNAPSHOT_PREFIX, suffix=".c", dir=src_dir
@@ -1350,8 +1384,10 @@ def _verifiable_source(
         ) from exc
     try:
         with os.fdopen(fd, "wb") as handle:
+            handle.write(bom)
             handle.write(directive)
-            handle.write(content)
+            handle.write(body)
+        os.utime(path, ns=(mtime_ns, mtime_ns))
     except OSError as exc:
         with contextlib.suppress(OSError):
             os.unlink(path)
@@ -1689,7 +1725,11 @@ def verify_and_record(
     rel = unit_id(project_dir, file_path)
 
     def _blocking_error(
-        detail: str, *, digest: str | None = None, unless_superseded: bool = False
+        detail: str,
+        *,
+        digest: str | None = None,
+        unless_superseded: bool = False,
+        charge: bool = True,
     ) -> list[UnitVerdict]:
         """Record a blocking `error` verdict for the whole file and return it.
 
@@ -1728,28 +1768,35 @@ def verify_and_record(
         deleted (PR #148 review). Deleting is not this call's decision to make,
         whoever created the marker: this charge always means "verdicts for
         `digest` could not be produced this round", so the retry claim has to
-        survive for a future scan regardless. Concretely, every caller that
-        reaches it either could not yet have created one (the read/enumeration
-        failures return before the block that creates it), is that very
-        block's own not-yet-released claim (the verify-snapshot staging
-        failure below, charged after this run stamped and pre-recorded but
-        before it ever reaches its own release), or has already released its
-        own claim earlier in the same run (the post-verify drift caller). In
-        every case `pending` holds a single claim per file, so bumping in
-        place — never deleting — is what keeps a killed or persistently-failing
-        run's pre-recorded `unknown` units retryable: deleting here would leave
-        them content-fresh (this run's own stamp still vouches for `digest`)
-        with nothing left to retry, the exact hole issue #140 closes. Bumping
-        keeps that retry claim alive while still making progress: leaving the
-        counter untouched would let a persistently-erroring file re-verify on
-        every scan forever — each error resets `stop_attempts` — instead of
-        going quiet at `MAX_PENDING_VERIFY_ATTEMPTS` and blocking its way to
-        the loud residual. The bump goes through `_pending_attempts`, so a
-        corrupt counter normalizes to 1 rather than freezing, and stops at the
-        cap so a marker no scan will retry again cannot count up forever.
-        `hash`/`pid` are left exactly as written: this call never clears the
-        marker either way, and because those two fields alone are
-        `_pending_owner`'s identity, the charge leaves whoever's claim it is
+        survive for a future scan regardless. `charge` exists because owning the
+        marker changes what "this round" means: the enumeration failure above is
+        the only caller that leaves `charge` at its default `True` — it fires
+        before this run could have created a marker of its own, so any entry it
+        finds under `rel` for `digest` belongs to a *prior* run (a kill, or an
+        earlier persistent failure), and bumping it is this run's one and only
+        contribution to that budget. The verify-snapshot staging failure below
+        passes `charge=False` instead: by the time it fires, this run already
+        owns the marker under `rel` — created earlier in this same call, with
+        its `attempts` set to count this very attempt (the reconcile block's
+        "counting the start") — so charging again here would spend the attempt
+        this run is *currently making* a second time, exhausting
+        `MAX_PENDING_VERIFY_ATTEMPTS` in two real failures instead of three
+        (review feedback on PR #159, issue #150). In every case `pending` holds
+        a single claim per file, so bumping in place — never deleting — is what
+        keeps a killed or persistently-failing run's pre-recorded `unknown`
+        units retryable: deleting here would leave them content-fresh (this
+        run's own stamp still vouches for `digest`) with nothing left to retry,
+        the exact hole issue #140 closes. Bumping keeps that retry claim alive
+        while still making progress: leaving the counter untouched would let a
+        persistently-erroring file re-verify on every scan forever — each error
+        resets `stop_attempts` — instead of going quiet at
+        `MAX_PENDING_VERIFY_ATTEMPTS` and blocking its way to the loud residual.
+        The bump goes through `_pending_attempts`, so a corrupt counter
+        normalizes to 1 rather than freezing, and stops at the cap so a marker
+        no scan will retry again cannot count up forever. `hash`/`pid` are left
+        exactly as written: this call never clears the marker either way, and
+        because those two fields alone are `_pending_owner`'s identity, the
+        charge (or the deliberate lack of one) leaves whoever's claim it is
         still able to clear it later.
 
         Only a marker recording exactly `digest` is charged: a concurrent run of
@@ -1780,7 +1827,7 @@ def verify_and_record(
             if not superseded:
                 record(state, verdict)
                 state["stop_attempts"] = 0
-            if attempts is not None:
+            if charge and attempts is not None:
                 pending[rel]["attempts"] = min(
                     attempts + 1, MAX_PENDING_VERIFY_ATTEMPTS
                 )
@@ -1788,7 +1835,13 @@ def verify_and_record(
         return [] if superseded else [verdict]
 
     try:
-        raw = Path(file_path).read_bytes()
+        # Read and stat through the same fd, not `Path.read_bytes()` followed by a
+        # separate `os.stat`: `mtime_ns` below has to describe the exact bytes in
+        # `raw`, and a second, independent syscall against `file_path` could land
+        # on a rewrite that happened in between.
+        with open(file_path, "rb") as handle:
+            raw = handle.read()
+            mtime_ns = os.fstat(handle.fileno()).st_mtime_ns
     except OSError as exc:
         return _blocking_error(str(exc))
 
@@ -1912,7 +1965,7 @@ def verify_and_record(
     # of space) still lets a pointer-only edit through non-blocking, instead of
     # gating and retrying for a snapshot nothing downstream would have used.
     verify_ctx: contextlib.AbstractContextManager[str] = (
-        _verifiable_source(file_path, raw, project_dir=project_dir)
+        _verifiable_source(file_path, raw, project_dir=project_dir, mtime_ns=mtime_ns)
         if any(not d.takes_pointer for d in defs)
         else contextlib.nullcontext(file_path)
     )
@@ -1957,10 +2010,16 @@ def verify_and_record(
         # the already-stamped case `unless_superseded` exists for: recording an
         # unconditional `error` here would strand an unclearable `rel::?` on a
         # file whose stamp nothing will ever re-check. Deferring quietly still
-        # leaves every unit blocking as pending `unknown`, and spends one retry
-        # attempt, so a killed or persistently-failing stage is retried up to
-        # `MAX_PENDING_VERIFY_ATTEMPTS` rather than forgotten.
-        return _blocking_error(str(exc)[:800], digest=digest, unless_superseded=True)
+        # leaves every unit blocking as pending `unknown` — retried up to
+        # `MAX_PENDING_VERIFY_ATTEMPTS` rather than forgotten. `charge=False`:
+        # the marker this run owns was already bumped to count this very
+        # attempt when it was created above ("counting the start"), so
+        # charging again here would spend it twice — one staging failure would
+        # cost two of the three attempts (review feedback on PR #159, issue
+        # #150).
+        return _blocking_error(
+            str(exc)[:800], digest=digest, unless_superseded=True, charge=False
+        )
 
     # Issue #150: the verify above reads `verify_path` — an immutable snapshot of
     # `raw`, never the live path — so every verdict just recorded is computed

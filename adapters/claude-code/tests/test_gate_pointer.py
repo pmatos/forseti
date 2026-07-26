@@ -22,6 +22,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 import forseti_gate as gate
@@ -1276,8 +1277,11 @@ def test_verifiable_source_prepends_line_directive(tmp_path: Path) -> None:
     src.parent.mkdir()
     content = b"int f(void) { return 0; }\n"
     src.write_bytes(content)
+    mtime_ns = os.stat(src).st_mtime_ns
 
-    with gate._verifiable_source(str(src), content, project_dir=str(tmp_path)) as vp:
+    with gate._verifiable_source(
+        str(src), content, project_dir=str(tmp_path), mtime_ns=mtime_ns
+    ) as vp:
         written = Path(vp).read_bytes()
 
     assert written == f'#line 1 "{src}"\n'.encode() + content
@@ -1285,6 +1289,59 @@ def test_verifiable_source_prepends_line_directive(tmp_path: Path) -> None:
 
 def test_line_directive_escapes_quotes_and_backslashes() -> None:
     assert gate._line_directive('a"b\\c.c') == b'#line 1 "a\\"b\\\\c.c"\n'
+
+
+def test_verifiable_source_preserves_mtime_for_timestamp_macro(tmp_path: Path) -> None:
+    # `#line` fixes the *presumed name* `__FILE__`/`__BASE_FILE__` read, but
+    # measured directly against clang, `__TIMESTAMP__` follows the snapshot's
+    # own physical mtime regardless — a fresh `mkstemp` always reads "now"
+    # unless corrected. `mtime_ns` threads the original's mtime through so the
+    # snapshot's matches it exactly. Review feedback on PR #159, issue #150.
+    src = tmp_path / "x.c"
+    content = b"int f(void) { return 0; }\n"
+    src.write_bytes(content)
+    old_ns = 1_577_836_800_000_000_000  # 2020-01-01T00:00:00Z, well before "now"
+    os.utime(src, ns=(old_ns, old_ns))
+
+    with gate._verifiable_source(
+        str(src), content, project_dir=str(tmp_path), mtime_ns=old_ns
+    ) as vp:
+        assert os.stat(vp).st_mtime_ns == old_ns
+
+
+def test_verifiable_source_keeps_leading_bom_at_byte_zero(tmp_path: Path) -> None:
+    # Writing the directive first would push a leading UTF-8 BOM into the
+    # middle of the file, fusing it onto the first real token. Verified
+    # empirically against clang: `int` becomes an unrecognized `﻿int` and
+    # the file fails to parse. The BOM must stay at byte zero, ahead of the
+    # directive. Review feedback on PR #159, issue #150.
+    src = tmp_path / "x.c"
+    body = b"int f(void) { return 0; }\n"
+    content = gate._UTF8_BOM + body
+    src.write_bytes(content)
+    mtime_ns = os.stat(src).st_mtime_ns
+
+    with gate._verifiable_source(
+        str(src), content, project_dir=str(tmp_path), mtime_ns=mtime_ns
+    ) as vp:
+        written = Path(vp).read_bytes()
+
+    assert written == gate._UTF8_BOM + f'#line 1 "{src}"\n'.encode() + body
+
+
+def test_verifiable_source_without_bom_is_unaffected(tmp_path: Path) -> None:
+    src = tmp_path / "x.c"
+    content = b"int f(void) { return 0; }\n"
+    src.write_bytes(content)
+    mtime_ns = os.stat(src).st_mtime_ns
+
+    with gate._verifiable_source(
+        str(src), content, project_dir=str(tmp_path), mtime_ns=mtime_ns
+    ) as vp:
+        written = Path(vp).read_bytes()
+
+    assert not written.startswith(gate._UTF8_BOM)
+    assert written == f'#line 1 "{src}"\n'.encode() + content
 
 
 def _unstageable_verify_snapshot(monkeypatch, message: str = "No space left") -> None:
@@ -1307,7 +1364,12 @@ def test_unstageable_verify_snapshot_raises_units_unavailable(
     src.write_text("int f(void) { return 0; }\n")
     with (
         pytest.raises(gate.UnitsUnavailable, match="snapshot"),
-        gate._verifiable_source(str(src), b"...", project_dir=str(tmp_path)),
+        gate._verifiable_source(
+            str(src),
+            b"...",
+            project_dir=str(tmp_path),
+            mtime_ns=os.stat(src).st_mtime_ns,
+        ),
     ):
         pass
 
@@ -1321,9 +1383,12 @@ def test_unstageable_verify_snapshot_defers_quietly_and_charges_a_retry(
     # exists for. Recording an unconditional `error` on top would strand an
     # unclearable `x.c::?` on a file whose stamp nothing will ever re-check.
     # It defers quietly instead: the pending `unknown` unit stays blocking, and
-    # the file's unfinished-verify marker is charged one attempt so a
-    # persistently-failing stage is retried up to MAX_PENDING_VERIFY_ATTEMPTS
-    # rather than forgotten.
+    # the file's unfinished-verify marker is charged exactly *one* attempt —
+    # the marker already counted this attempt the moment it was created, a few
+    # lines above the snapshot staging that then failed, so `_blocking_error`
+    # must not add a second charge on top of it. (An earlier version of this
+    # test pinned that double-charge bug as `attempts == 2`; review feedback
+    # on PR #159, issue #150.)
     src = tmp_path / "x.c"
     src.write_text("f\n")
     digest = hashlib.sha256(src.read_bytes()).hexdigest()
@@ -1338,8 +1403,35 @@ def test_unstageable_verify_snapshot_defers_quietly_and_charges_a_retry(
     after = gate.load_state(str(tmp_path))
     assert after["scanned"]["x.c"] == digest  # never withdrawn
     assert after["units"]["x.c::f"]["verdict"] == "unknown"  # still blocking
-    assert after["pending"]["x.c"]["attempts"] == 2  # one attempt charged
+    assert after["pending"]["x.c"]["attempts"] == 1  # exactly one attempt charged
     assert gate.blocking_units(after)
+    assert gate.stale_sources(str(tmp_path), after, [str(src)]) == [str(src)]
+
+
+def test_unstageable_verify_snapshot_takes_three_failures_to_exhaust_retries(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # MAX_PENDING_VERIFY_ATTEMPTS == 3, so it must take three *separate*
+    # staging failures — not two — before the file drops out of
+    # `stale_sources`'s retry set. The double-charge bug spent 2 of the 3
+    # attempts on a single failure, so the boundary landed one failure early;
+    # this pins the corrected count (review feedback on PR #159, issue #150).
+    src = tmp_path / "x.c"
+    src.write_text("f\n")
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+    _unstageable_verify_snapshot(monkeypatch)
+
+    for expected_attempts in (1, 2, 3):
+        gate.verify_and_record(str(src), project_dir=str(tmp_path))
+        state = gate.load_state(str(tmp_path))
+        assert state["pending"]["x.c"]["attempts"] == expected_attempts
+        still_retryable = expected_attempts < gate.MAX_PENDING_VERIFY_ATTEMPTS
+        assert (
+            bool(gate.stale_sources(str(tmp_path), state, [str(src)]))
+            == still_retryable
+        )
 
 
 def test_pointer_only_file_never_stages_a_verify_snapshot(
@@ -1456,6 +1548,54 @@ def test_verify_snapshot_preserves_file_and_base_file_macro_identity(
 
     assert len(verdicts) == 1
     assert verdicts[0].verdict == "verified"
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_verify_snapshot_preserves_timestamp_macro(tmp_path: Path) -> None:
+    # `__TIMESTAMP__` (a GCC/clang extension, `ctime`-formatted) is a second
+    # identity leak the `#line` directive above does nothing for: measured
+    # directly against clang, it follows the snapshot's own *physical* mtime,
+    # not the presumed name — so without correcting it, a branch on it
+    # diverges the instant `mkstemp` gives the snapshot a "now" mtime.
+    # Review feedback on PR #159, issue #150.
+    src = tmp_path / "timestamped.c"
+    old = 1_577_836_800  # 2020-01-01T00:00:00Z, well before "now"
+    stamp = time.ctime(old)
+    src.write_text(
+        "#include <string.h>\n"
+        "int check_timestamp(void) {\n"
+        f'    if (strcmp(__TIMESTAMP__, "{stamp}") == 0) {{\n'
+        "        return 0;\n"
+        "    }\n"
+        "    int *p = 0;\n"
+        "    return *p;\n"
+        "}\n"
+    )
+    os.utime(src, (old, old))  # after the write above, which bumps mtime itself
+
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert len(verdicts) == 1
+    assert verdicts[0].verdict == "verified"
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_verify_snapshot_of_bom_prefixed_source_still_verifies(tmp_path: Path) -> None:
+    # A BOM-prefixed `.c` compiles fine in place; through the snapshot, writing
+    # the `#line` directive ahead of a BOM that isn't at byte zero fuses the
+    # BOM onto the directive's own first token, so the translation unit fails
+    # to parse — a genuine bug would come back `error` (an unparseable
+    # snapshot) instead of `violated` (the real verdict). Review feedback on
+    # PR #159, issue #150.
+    src = tmp_path / "bom.c"
+    src.write_bytes(
+        gate._UTF8_BOM + b"int f(void) {\n    int *p = 0;\n    return *p;\n}\n"
+    )
+
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert len(verdicts) == 1
+    assert verdicts[0].verdict == "violated"
 
 
 def test_verify_snapshot_is_removed_after_verify_and_record(
@@ -2014,7 +2154,9 @@ def test_self_include_by_own_name_is_a_known_residual(tmp_path: Path) -> None:
     # up by name in the compiled translation unit, unaffected by that filter.
     src.write_bytes(original.replace(b"#define PICK 1", b"#define PICK 0"))
 
-    with gate._verifiable_source(str(src), original, project_dir=str(tmp_path)) as vp:
+    with gate._verifiable_source(
+        str(src), original, project_dir=str(tmp_path), mtime_ns=os.stat(src).st_mtime_ns
+    ) as vp:
         live = gate.verify_function(
             str(src), "from_the_live_file", project_dir=str(tmp_path), verify_path=vp
         )
