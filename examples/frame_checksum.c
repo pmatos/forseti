@@ -11,6 +11,10 @@
  *
  *   `forseti discharge examples/frame_checksum.c --function sum_bytes`
  *
+ * That the translation unit is enough is the leaf's `static` doing the work: with
+ * external linkage another `.c` could call `sum_bytes` with anything, and the
+ * discharge would report the obligation *exported* instead of closed.
+ *
  * The two callers are the interesting pair. `frame_checksum` forwards the whole
  * buffer unchanged; `payload_checksum` hands on an **interior pointer** with an
  * adjusted length, which is valid only because of its own short-frame guard. The
