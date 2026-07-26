@@ -12,9 +12,11 @@ from pathlib import Path
 import pytest
 
 from forseti.esbmc.units import (
+    _COMMENT_RE,
     ListUnitsError,
     Param,
     Unit,
+    _blank_comment,
     annotate_array_extents,
     list_units,
     parse_units,
@@ -80,6 +82,15 @@ def test_parse_units_param_types_are_canonical() -> None:
     assert reg.params == (Param("cb", "void (*)(void)"),)
     hash_ = next(u for u in parse_units(_AST, _TARGET) if u.name == "hash")
     assert [p.type for p in hash_.params] == ["const uint8_t *", "unsigned long"]
+
+
+def test_parse_units_captures_definition_line() -> None:
+    # `def_line` anchors `annotate_array_extents`'s declarator search (issue #145);
+    # each of these is read off the FunctionDecl's own AST location in `_AST`.
+    units = {u.name: u for u in parse_units(_AST, _TARGET)}
+    assert units["scal"].def_line == 3  # <line:3:1, col:29>
+    assert units["hash"].def_line == 4  # <line:4:1, col:77>
+    assert units["reg"].def_line == 6  # <line:6:1, col:27>
 
 
 def test_parse_units_empty_on_declarations_only() -> None:
@@ -236,6 +247,92 @@ def test_annotate_array_extents_unknown_function_unchanged() -> None:
     assert annotate_array_extents([unit], "void other(int x){}")[0] == unit
 
 
+# Issue #145: textual order alone cannot tell an inactive `#if 0`/`#ifdef` body
+# apart from the definition clang actually compiled — the first one is not
+# necessarily the right one, and (for a literal extent) the wrong one is the more
+# dangerous direction: an over-sized object can mask a real out-of-bounds.
+_IF0_LITERAL_SOURCE = (
+    "#if 0\nvoid f(int p[20]) { }\n#endif\nvoid f(int *p) { *p = 1; }\n"
+)
+_IF0_MACRO_SOURCE = "#if 0\nvoid f(int p[N]) { }\n#endif\nvoid f(int *p) { *p = 1; }\n"
+
+
+def test_annotate_array_extents_anchors_past_inactive_if0_body() -> None:
+    # `def_line=4` is what `parse_units` would report for the active `f` (clang
+    # never sees the `#if 0` body at all) — anchoring to it must skip the inactive
+    # literal-extent body, not read `p` as a fixed array of 20.
+    unit = Unit("f", (Param("p", "int *"),), def_line=4)
+    out = annotate_array_extents([unit], _IF0_LITERAL_SOURCE)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
+def test_annotate_array_extents_without_def_line_uses_first_textual_match() -> None:
+    # Documents the pre-#145 hazard the anchor fixes: absent a `def_line` hint,
+    # the first definition-shaped occurrence wins even when it is the inactive
+    # `#if 0` body — misreading a plain `int *p` as a fixed array of 20.
+    unit = Unit("f", (Param("p", "int *"),))
+    out = annotate_array_extents([unit], _IF0_LITERAL_SOURCE)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (20, False)
+
+
+def test_annotate_array_extents_anchors_past_inactive_macro_extent() -> None:
+    # Same anchor, with the inactive body's extent stated as a macro instead of a
+    # literal — the #137 unresolved-extent signal must not leak from it either.
+    unit = Unit("f", (Param("p", "int *"),), def_line=4)
+    out = annotate_array_extents([unit], _IF0_MACRO_SOURCE)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
+def test_annotate_array_extents_preserves_def_line() -> None:
+    # The returned Unit keeps its def_line, so a second annotation pass (or an
+    # equality check against a hand-built Unit) is not silently reset to None.
+    unit = Unit("f", (Param("p", "int *"),), def_line=4)
+    out = annotate_array_extents([unit], _IF0_LITERAL_SOURCE)[0]
+    assert out.def_line == 4
+
+
+def test_blank_comment_preserves_line_numbers_across_a_multiline_comment() -> None:
+    # `_param_list_text` compares byte-offset-derived line numbers in the
+    # comment-stripped text against `Unit.def_line`, which clang reports against
+    # the *original* source. A multi-line block comment collapsed to a single
+    # space (as a naive `re.sub(_COMMENT_RE, " ", ...)` would) shifts every line
+    # after it, breaking that comparison — `_blank_comment` must instead keep the
+    # comment's newlines so line numbers stay aligned with the original source.
+    source = "int a;\n/* line one\nline two\nline three */\nint b;\n"
+    stripped = _COMMENT_RE.sub(_blank_comment, source)
+    assert stripped.count("\n") == source.count("\n")
+    b_line_original = next(
+        i for i, line in enumerate(source.splitlines(), 1) if "int b;" in line
+    )
+    b_line_stripped = next(
+        i for i, line in enumerate(stripped.splitlines(), 1) if "int b;" in line
+    )
+    assert b_line_stripped == b_line_original == 5
+
+
+def test_annotate_array_extents_anchors_correctly_across_a_multiline_comment() -> None:
+    # A realistic case combining both mechanisms: a multi-line doc comment sits
+    # between the inactive `#if 0` body and the active definition, so a correct
+    # anchor depends on `_blank_comment` keeping the active definition's line
+    # number aligned with the `def_line` clang reports against the real source.
+    source = (
+        "#if 0\n"
+        "void f(int p[20]) { }\n"
+        "#endif\n"
+        "/* Documents f.\n"
+        " * See also: nothing.\n"
+        " */\n"
+        "void f(int *p) { *p = 1; }\n"
+    )
+    def_line = next(
+        i for i, line in enumerate(source.splitlines(), 1) if "int *p" in line
+    )
+    assert def_line == 7
+    unit = Unit("f", (Param("p", "int *"),), def_line=def_line)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
 _HAVE_ESBMC = shutil.which("esbmc") is not None
 
 
@@ -289,6 +386,42 @@ def test_list_units_marks_macro_extent_unresolved(tmp_path: Path) -> None:
         "tag": (16, False),
         "raw": (None, False),
     }
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_anchors_extent_to_active_if0_definition(tmp_path: Path) -> None:
+    # End-to-end (issue #145): an inactive `#if 0` body must not donate its array
+    # extent to the definition clang actually compiled. The over-sized hazard this
+    # closes is the dangerous direction — it can mask a real out-of-bounds by
+    # backing a plain `int *p` with a too-large object (VIOLATED -> VERIFIED).
+    src = tmp_path / "sig.c"
+    src.write_text("#if 0\nvoid f(int p[20]) { }\n#endif\nvoid f(int *p) { *p = 1; }\n")
+    f = next(u for u in list_units(src) if u.name == "f")
+    assert f.params[0].array_extent is None
+    assert f.params[0].array_extent_unresolved is False
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_anchors_extent_to_ifdef_selected_definition(tmp_path: Path) -> None:
+    # Same anchor, for the other conditional-compilation shape the issue calls
+    # out: an `#ifdef`-selected alternative definition. Whichever branch clang
+    # actually compiles is the one the extent must come from.
+    src = tmp_path / "sig.c"
+    src.write_text(
+        "#ifdef WIDGET\n"
+        "void f(int p[20]) { (void)p; }\n"
+        "#else\n"
+        "void f(int *p) { *p = 1; }\n"
+        "#endif\n"
+    )
+    f_default = next(u for u in list_units(src) if u.name == "f")
+    assert f_default.params[0].array_extent is None
+    assert f_default.params[0].array_extent_unresolved is False
+
+    f_widget = next(
+        u for u in list_units(src, extra_flags=("-DWIDGET",)) if u.name == "f"
+    )
+    assert f_widget.params[0].array_extent == 20
 
 
 # The brittleness class from issue #131: every shape a regex over the source text

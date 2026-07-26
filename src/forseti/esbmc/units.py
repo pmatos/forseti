@@ -126,10 +126,18 @@ class Param:
 
 @dataclass(frozen=True)
 class Unit:
-    """A function *definition* found in the source: its name and parameters."""
+    """A function *definition* found in the source: its name and parameters.
+
+    `def_line` is the 1-based line of the definition clang actually compiled, as
+    reported by its own AST location — set by `parse_units`, ``None`` for a
+    hand-built `Unit` (tests). `annotate_array_extents` anchors its declarator
+    search to this line so a `#if 0`/`#ifdef`-excluded alternative body with the
+    same name cannot donate its array shape to the active definition (issue #145).
+    """
 
     name: str
     params: tuple[Param, ...]
+    def_line: int | None = None
 
     @property
     def takes_pointer(self) -> bool:
@@ -156,6 +164,24 @@ def _loc_file(rest: str, current: str) -> str:
     if head in ("line", "col"):
         return current
     return head
+
+
+def _loc_line(rest: str, current: int) -> int:
+    """The 1-based source line a node line refers to.
+
+    Mirrors `_loc_file`: a bare ``col:N`` inherits `current` (same line as the
+    enclosing location); ``line:N:...`` or a full ``PATH:N:...`` gives the new line.
+    """
+    match = _LOC_RE.search(rest)
+    if not match:
+        return current
+    parts = match.group(1).split(":")
+    if parts[0] == "col" or len(parts) < 2:
+        return current
+    try:
+        return int(parts[-2])
+    except ValueError:
+        return current
 
 
 def _depth(art: str) -> int:
@@ -188,11 +214,13 @@ def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
     units: list[Unit] = []
     seen: set[str] = set()
     current_file = ""
+    current_line = 0
 
     # State for the FunctionDecl currently being assembled.
     fn_name: str | None = None
     fn_depth = -1
     fn_in_target = False
+    fn_def_line: int | None = None
     params: list[Param] = []
     is_definition = False
 
@@ -200,7 +228,7 @@ def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
         nonlocal fn_name
         if fn_name and fn_in_target and is_definition and fn_name not in seen:
             seen.add(fn_name)
-            units.append(Unit(fn_name, tuple(params)))
+            units.append(Unit(fn_name, tuple(params), fn_def_line))
         fn_name = None
 
     for line in ast_text.splitlines():
@@ -210,6 +238,7 @@ def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
         art, kind, rest = node.group(1), node.group(2), node.group(3)
         depth = _depth(art)
         current_file = _loc_file(rest, current_file)
+        current_line = _loc_line(rest, current_line)
 
         # A node at or above the open FunctionDecl's depth ends its subtree.
         if fn_name is not None and depth <= fn_depth:
@@ -223,6 +252,7 @@ def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
             fn_in_target = bool(current_file) and (
                 os.path.normpath(current_file) == source_norm
             )
+            fn_def_line = current_line
             params = []
             is_definition = False
         elif fn_name is not None and depth > fn_depth:
@@ -242,16 +272,28 @@ def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
     return units
 
 
-def _param_list_text(source_no_comments: str, fn_name: str) -> str | None:
+def _param_list_text(
+    source_no_comments: str, fn_name: str, def_line: int | None = None
+) -> str | None:
     """The parameter-list text of `fn_name`'s *definition*, or ``None``.
 
-    Scans for ``fn_name (`` and balances parentheses to the matching ``)``; the
-    occurrence whose ``)`` is followed (past whitespace) by ``{`` is the
-    definition — so a prototype (``);``) or a call site (``) ;``, ``))``) is
-    skipped. Deliberately narrow: clang already told us the canonical types and
-    which parameters are pointers, so this only has to isolate the declarator
-    text to harvest an array extent from — never to classify a type.
+    Scans for ``fn_name (`` and balances parentheses to the matching ``)``; an
+    occurrence whose ``)`` is followed (past whitespace) by ``{`` is *definition-
+    shaped* — so a prototype (``);``) or a call site (``) ;``, ``))``) is skipped.
+    Deliberately narrow: clang already told us the canonical types and which
+    parameters are pointers, so this only has to isolate the declarator text to
+    harvest an array extent from — never to classify a type.
+
+    Textual order alone cannot tell two definition-shaped occurrences of the same
+    name apart — e.g. an inactive ``#if 0`` body ahead of the one clang actually
+    compiled (issue #145). When `def_line` is given (the compiled definition's
+    line, from `Unit.def_line`), the occurrence at or nearest *after* that line is
+    preferred over one before it — `def_line` points at the declaration's opening
+    line, which the ``fn_name (`` text can follow by a line or two (a return type
+    on its own line). Without `def_line` the first definition-shaped occurrence is
+    used, as before.
     """
+    candidates: list[tuple[int, str]] = []
     for match in re.finditer(rf"\b{re.escape(fn_name)}\s*\(", source_no_comments):
         depth = 0
         j = match.end() - 1  # index of the '('
@@ -270,8 +312,16 @@ def _param_list_text(source_no_comments: str, fn_name: str) -> str | None:
         while k < len(source_no_comments) and source_no_comments[k].isspace():
             k += 1
         if k < len(source_no_comments) and source_no_comments[k] == "{":
-            return source_no_comments[match.end() : j]
-    return None
+            line = source_no_comments.count("\n", 0, match.start()) + 1
+            candidates.append((line, source_no_comments[match.end() : j]))
+    if not candidates:
+        return None
+    if def_line is None:
+        return candidates[0][1]
+    # Sort key: candidates at or after `def_line` (key[0] == False) all sort before
+    # any that are only before it, then nearest wins within each group — "at or
+    # nearest after", falling back to nearest-before only if none qualify.
+    return min(candidates, key=lambda c: (c[0] < def_line, abs(c[0] - def_line)))[1]
 
 
 @dataclass(frozen=True)
@@ -330,6 +380,19 @@ def _annotated_param(param: Param, param_list: str) -> Param:
     )
 
 
+def _blank_comment(match: re.Match[str]) -> str:
+    """A comment's replacement text: its newlines, so line numbers stay aligned.
+
+    A single-line comment (`//...` or a same-line `/*...*/`) becomes one space,
+    same as before. A multi-line block comment becomes that many bare newlines
+    instead — dropping its inline text (fine; a comment holds no declarator) while
+    keeping every following line's number identical to `source_text`'s, which
+    `_param_list_text` relies on to match a `Unit.def_line` from clang.
+    """
+    newlines = match.group(0).count("\n")
+    return "\n" * newlines if newlines else " "
+
+
 def annotate_array_extents(units: list[Unit], source_text: str) -> list[Unit]:
     """Attach each pointer parameter's written fixed-array extent, from `source_text`.
 
@@ -341,18 +404,22 @@ def annotate_array_extents(units: list[Unit], source_text: str) -> list[Unit]:
     separate from the AST walk (and independently tested) because the extent
     comes from the *source declarator*, not the clang type — which has adjusted
     ``T p[N]`` to ``T *`` and discarded ``N``.
+
+    The declarator search is anchored to `Unit.def_line` (`_param_list_text`), so
+    a same-named definition excluded by `#if 0`/`#ifdef` cannot donate its extent
+    to the one clang actually compiled (issue #145).
     """
-    stripped = _COMMENT_RE.sub(" ", source_text)
+    stripped = _COMMENT_RE.sub(_blank_comment, source_text)
     annotated: list[Unit] = []
     for unit in units:
-        param_list = _param_list_text(stripped, unit.name)
+        param_list = _param_list_text(stripped, unit.name, unit.def_line)
         if param_list is None:
             annotated.append(unit)
             continue
         params = tuple(
             _annotated_param(p, param_list) if p.is_pointer else p for p in unit.params
         )
-        annotated.append(Unit(unit.name, params))
+        annotated.append(Unit(unit.name, params, unit.def_line))
     return annotated
 
 
