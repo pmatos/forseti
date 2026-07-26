@@ -19,7 +19,7 @@ emission is deferred (ADR-0009 D2).
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 
 from .cexpr import derefs_or_subscripts, identifiers, references
@@ -309,10 +309,12 @@ def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | 
       result on uninitialized storage, masking a unit that never writes it; domains
       constrain inputs only.
     * a **precondition mixing a buffer and its length** -- a single clause naming
-      both a buffer and a buffer-length identifier (``n >= 1 && a[0] >= 0``) has no
-      correct emission point: the length bound must precede the ``int a[n]`` VLA and
-      the buffer-content predicate must follow it, so it is rejected rather than
-      mis-ordered (the renderer's `_split_assumptions` reuses this very predicate).
+      both a buffer and a buffer-length identifier *outside a subscript index*
+      (``n >= 1 && a[0] >= 0``) has no correct emission point: the length bound must
+      precede the ``int a[n]`` VLA and the buffer-content predicate must follow it,
+      so it is rejected rather than mis-ordered. A length named only as an index
+      (``a[n - 1] >= 0``) is a buffer-content predicate like any other and is
+      accepted (the renderer's `_split_assumptions` reuses this very predicate).
 
     Best-effort and conservative on the emission rules: it may over-reject an exotic
     postcondition, but a rejected *renderable* property is safe whereas emitting
@@ -470,19 +472,55 @@ def _is_scalar_backed(buf: BufferParam) -> bool:
     return buf.out and buf.length.strip() == "1"
 
 
+def _strip_buffer_subscripts(expr: str, buffer_names: Collection[str]) -> str:
+    """`expr` with every ``buf[...]`` subscript reduced to the bare buffer name.
+
+    Isolates the *index* uses of a buffer from the rest of the clause, so a caller
+    can ask what a clause says about an identifier **outside** any subscript.
+    Iterated to a fixpoint so a nested index (``a[b[0]]``) collapses inside-out;
+    each pass strictly shortens the text, and an unbalanced ``[`` simply stops
+    matching, so it always terminates. Longest name first: with `a` and `ab` both
+    buffers, the alternation must not let `a` claim the head of ``ab[0]``.
+    """
+    if not buffer_names:
+        return expr
+    alternation = "|".join(
+        re.escape(name) for name in sorted(buffer_names, key=lambda n: (-len(n), n))
+    )
+    pattern = re.compile(rf"\b({alternation})\s*\[[^\[\]]*\]")
+    previous = ""
+    while previous != expr:
+        previous = expr
+        expr = pattern.sub(r"\1", expr)
+    return expr
+
+
 def _mixed_buffer_length_reason(
     preconditions: Sequence[str], buffers: Sequence[BufferParam]
 ) -> str | None:
     """Why a precondition cannot be ordered around its VLA, or None if all can.
 
-    A single clause that constrains *both* a buffer and a buffer-length identifier
+    A single clause that constrains *both* a buffer and the buffer's *size*
     (e.g. ``n >= 1 && n <= 2 && a[0] >= 0``) has no correct emission point: the
     length bound must precede the ``int a[n]`` VLA declaration, the buffer-content
     predicate must follow the nondet fill, and splitting arbitrary C on ``&&`` is
-    unsound under ``||`` precedence. Source-free -- it needs only the
-    signature-derived buffers and the spec's preconditions -- so it is a
-    `(signature, spec)` guard `renderability_reason` owns and `_split_assumptions`
-    reuses: one rule, two callers, one message.
+    unsound under ``||`` precedence.
+
+    Naming the length identifier is *not* itself a size constraint: in
+    ``a[n - 1] >= 0`` the `n` is an index into an already-declared buffer, so the
+    whole clause emits after the VLA and fill. Only a length identifier appearing
+    **outside** a buffer subscript forces pre-VLA ordering, so the check strips
+    ``a[...]`` (`_strip_buffer_subscripts`) before looking for one -- an index-use
+    is renderable, an index-use combined with a genuine bound
+    (``a[n - 1] >= 0 && n >= 1``) is still not.
+
+    This decides *emission ordering* only, never index bounds: whether ``n - 1``
+    is in range for ``a[n]`` is ESBMC's to catch in the emitted harness, exactly as
+    it already is for the long-accepted constant-index ``a[5] >= 0``.
+
+    Source-free -- it needs only the signature-derived buffers and the spec's
+    preconditions -- so it is a `(signature, spec)` guard `renderability_reason`
+    owns and `_split_assumptions` reuses: one rule, two callers, one message.
     """
     buffer_names = {buf.name for buf in buffers}
     length_idents = {ident for buf in buffers for ident in identifiers(buf.length)}
@@ -490,11 +528,13 @@ def _mixed_buffer_length_reason(
         stripped = raw.strip()
         if not stripped or not any(references(stripped, n) for n in buffer_names):
             continue
-        if any(references(stripped, ident) for ident in length_idents):
+        outside_indices = _strip_buffer_subscripts(stripped, buffer_names)
+        if any(references(outside_indices, ident) for ident in length_idents):
             return (
                 f"precondition {stripped!r} constrains both a buffer and a "
-                "buffer-length identifier; split it into separate domain entries "
-                "so the length bound can precede the VLA it sizes"
+                "buffer-length identifier outside a subscript index; split it into "
+                "separate domain entries so the length bound can precede the VLA it "
+                "sizes"
             )
     return None
 
@@ -504,14 +544,15 @@ def _split_assumptions(
 ) -> tuple[list[str], list[str]]:
     """Partition preconditions by whether they reference a buffer parameter.
 
-    A precondition over buffer *contents* (e.g. ``a[0] >= 0``) can only be
-    emitted once the buffer is declared and nondet-filled, so it goes *after*
-    `_render_buffer`; a length/scalar-only precondition (e.g. ``len <= 4``) must
-    stay *before* the VLA declaration it sizes. Blank entries are dropped.
+    A precondition over buffer *contents* (e.g. ``a[0] >= 0``, ``a[n - 1] >= 0``)
+    can only be emitted once the buffer is declared and nondet-filled, so it goes
+    *after* `_render_buffer` -- including when its index names the length, which by
+    then is a bound scalar. A length/scalar-only precondition (e.g. ``len <= 4``)
+    must stay *before* the VLA declaration it sizes. Blank entries are dropped.
     Returns ``(pre_buffer, post_buffer)``.
 
-    A single clause constraining *both* a buffer and a buffer-length identifier
-    cannot be placed correctly; `_mixed_buffer_length_reason` -- the same guard
+    A single clause constraining *both* a buffer and the buffer's size cannot be
+    placed correctly; `_mixed_buffer_length_reason` -- the same guard
     `renderability_reason` consults statically -- names why, raised here as
     `HarnessError`. The caller supplies the length bound and the buffer predicate
     as separate `domain` entries instead. (In practice `render_semantic_harness`

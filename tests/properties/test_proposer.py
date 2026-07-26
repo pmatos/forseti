@@ -331,6 +331,47 @@ def test_mixed_buffer_length_domain_rejected_in_flow() -> None:
     assert "constrains both a buffer" in result.rejected[0].reason
 
 
+def test_last_element_buffer_domain_accepted() -> None:
+    # The bug this closes (#123): `a[n - 1] >= 0` names `n` only as an index, so it
+    # renders after the VLA and must not be discarded at propose time just because
+    # the clause mentions the length identifier.
+    spec = CandidateSpec(
+        expression="result == a[n - 1]", domain=("n >= 1", "a[n - 1] >= 0")
+    )
+    assert validate_candidate(spec, buf_sig()) is None
+
+
+def test_last_element_buffer_domain_accepted_in_flow() -> None:
+    # End-to-end: the proposer persists the candidate rather than rejecting it.
+    result = propose_properties(
+        ProposalRequest(
+            "u::first",
+            "int first(const int *a, unsigned n) { return a[0]; }",
+            signature=buf_sig(),
+        ),
+        client=FakeLLMClient(
+            reply(
+                {
+                    "expression": "result == a[n - 1]",
+                    "domain": ["n >= 1", "a[n - 1] >= 0"],
+                }
+            )
+        ),
+    )
+    assert not result.rejected
+    assert len(result.accepted) == 1
+
+
+def test_index_use_mixed_with_size_bound_still_rejected() -> None:
+    # The narrowing is precise, not a blanket loosening: an index use combined with
+    # a genuine size bound in one clause still cannot be ordered around the VLA.
+    spec = CandidateSpec(
+        expression="result == a[n - 1]", domain=("a[n - 1] >= 0 && n >= 1",)
+    )
+    reason = validate_candidate(spec, buf_sig())
+    assert reason is not None and "constrains both a buffer" in reason
+
+
 @pytest.mark.parametrize(
     "expr",
     [
