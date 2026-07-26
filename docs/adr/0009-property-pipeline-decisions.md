@@ -12,8 +12,8 @@ Epic #3 (W2 — property generation) was decomposed into #62 → #66 on 2026-07-
 gated that decomposition, each one deciding what a sub-issue could even be scoped to: where
 proposed properties live, whether reachability properties are checked in W2, who makes the LLM
 call, and what a checked property produces. They were taken together as one batch of *velocity*
-choices for P2, and the code cites them as **ADR-0009 D1–D4** — 22 citations across
-`properties/`, `orchestrator/` and `core/propose.py`.
+choices for P2, and the code cites them as **ADR-0009 D1–D4** — 22 citations: 21 in `src/`
+(`properties/`, `orchestrator/`, `core/propose.py`) and one in `tests/properties/test_model.py`.
 
 ## Decision
 
@@ -83,9 +83,9 @@ they populate. Note the vocabulary: `held` is the property-level analogue of `VE
 
 ## Revisit
 
-These were taken as provisional at the **P2 grading-cost checkpoint** (`docs/roadmap.md`, P2):
-D1's backend, D3's hardcoded `claude -p`, and D4's verdict-only scope are all expected to be
-re-examined once grading cost is measured. D2 is unparked by prioritising reachability
+These were taken as provisional, to be re-examined at the **P2 grading-cost checkpoint**
+(`docs/roadmap.md`, P2): D1's backend, D3's hardcoded `claude -p`, and D4's verdict-only scope
+are all expected to be revisited once grading cost is measured. D2 is unparked by prioritising reachability
 properties (#63).
 
 ADRs are immutable once Accepted: any of these changing means a **new superseding ADR**, not an
