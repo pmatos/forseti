@@ -1569,6 +1569,37 @@ def test_a_source_alias_leads_back_into_the_snapshot(
 
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_a_resolved_path_under_a_symlinked_project_keeps_its_ancestry(
+    tmp_path: Path,
+) -> None:
+    # The project dir and the source path need not be spelled the same way: with
+    # `link -> real`, a hook may be handed `<link>/sub/x.c` while out-of-band
+    # discovery builds its paths on the git root, which `git rev-parse` reports
+    # *resolved*. A lexical containment test calls the second one external, and a
+    # file "outside" the project gets no ancestry mirrored — so an ordinary
+    # `#include "../common.h"` stops resolving, which is a blocking `error` on a
+    # file that parses fine in place.
+    real = tmp_path / "real"
+    (real / "sub").mkdir(parents=True)
+    (real / "common.h").write_text("#define COMMON 1\n")
+    src = real / "sub" / "x.c"
+    src.write_text('#include "../common.h"\nint f(int x) { return x + COMMON; }\n')
+    (tmp_path / "link").symlink_to(real)
+    spelled_project = str(tmp_path / "link")  # ...but the source path is resolved
+
+    in_place = gate.extract_functions(str(src), project_dir=spelled_project)
+    snapshotted = [
+        d.name
+        for d in gate.extract_function_defs(
+            str(src), project_dir=spelled_project, content=src.read_bytes()
+        )
+    ]
+
+    assert in_place == ["f"]
+    assert snapshotted == in_place
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
 def test_a_component_walked_twice_is_not_a_loop(tmp_path: Path) -> None:
     # `self -> .` is a real idiom, and `self/self/x.c` is a perfectly ordinary path
     # the kernel resolves in two hops. The loop guard keyed on the spelled link

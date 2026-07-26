@@ -266,18 +266,36 @@ def _kernel_dir(path: str) -> str:
     return cur
 
 
+def _contains(root: str, path: str) -> bool:
+    """Is `path` `root` itself or lexically below it?"""
+    prefix = root if root.endswith(os.sep) else root + os.sep
+    return path == root or path.startswith(prefix)
+
+
 def _mirror_root(src_dir: str, project_dir: str) -> str:
     """The highest ancestor of `src_dir` whose entries the snapshot mirrors.
 
-    `project_dir` when it lexically contains `src_dir` — the gate's whole universe
-    is the project, and mirroring stops there rather than walking to ``/``, which
-    would mean a `scandir` of `$HOME` (thousands of entries, and an unreadable one
-    turns into a blocking `error`) for every edit. Otherwise the source's own
-    directory: a file outside the project has no ancestry the gate can claim.
+    `project_dir` when it contains `src_dir` — the gate's whole universe is the
+    project, and mirroring stops there rather than walking to ``/``, which would
+    mean a `scandir` of `$HOME` (thousands of entries, and an unreadable one turns
+    into a blocking `error`) for every edit. Otherwise the source's own directory:
+    a file outside the project has no ancestry the gate can claim.
+
+    Containment is tried against the project dir as spelled *and* as resolved,
+    because the two spellings do not have to agree: with `proj -> /data/proj`, a
+    hook may be handed `<cwd>/proj/src/x.c` while out-of-band discovery builds its
+    paths on the git root, which `git rev-parse` reports resolved. Lexically, one
+    of those is not under the other — and calling a file physically inside the
+    project "outside" costs it its whole ancestry, so an ordinary
+    ``#include "../common.h"`` stops resolving and enumeration blocks (or, with an
+    `-I` to fall through to, quietly reads a different header). Whichever test
+    matches returns a prefix of `src_dir`, so the source keeps its own spelling.
     """
     root = os.path.abspath(project_dir)
-    prefix = root if root.endswith(os.sep) else root + os.sep
-    return root if src_dir == root or src_dir.startswith(prefix) else src_dir
+    if _contains(root, src_dir):
+        return root
+    real_root = os.path.realpath(project_dir)
+    return real_root if _contains(real_root, src_dir) else src_dir
 
 
 def _staged(tmp: str, path: str) -> str:
