@@ -1962,10 +1962,55 @@ def verify_and_record(
     # has superseded ours, and the reconcile below would then prune and pre-record
     # against content nobody has on disk.
     marker: dict[str, object] = {}  # only ever read on the path that fills it
+    mtime_unstable = False
     with gate_lock(project_dir):
         state = load_state(project_dir)
-        on_disk = content_hash(file_path)
-        if on_disk == digest:
+        # Re-pair content and mtime right here under the lock, not by reusing the
+        # far-earlier top-of-function read: `extract_function_defs` above shells out
+        # to `forseti list-units`, real wall-clock time in which a touch/rewrite-
+        # with-identical-bytes can move the file's mtime without moving `on_disk`
+        # off `digest` — invisible to a content-only check, so the earlier
+        # `mtime_ns` could describe a moment already behind the one this run is
+        # about to stamp as fresh. Bracketed exactly like the top-of-function read
+        # (`fstat` on each side, retried until they agree), so a stable
+        # `fresh_mtime_ns` is trustworthy paired with whatever `on_disk` reads as.
+        # This has to happen *inside* the same lock that stamps `scanned` — same
+        # reason the plain content re-check already did (see the comment above this
+        # block): reading it first and checking after acquiring the lock would let a
+        # concurrent run's rewrite-and-stamp land in between, so a stale `on_disk`
+        # here would go on to reclaim an entry a concurrent run had already made
+        # correct (review feedback on PR #159, issue #150).
+        on_disk: str | None = None
+        fresh_mtime_ns = mtime_ns
+        for _ in range(_MTIME_STABLE_ATTEMPTS):
+            try:
+                with open(file_path, "rb") as handle:
+                    before_ns = os.fstat(handle.fileno()).st_mtime_ns
+                    on_disk = hashlib.sha256(handle.read()).hexdigest()
+                    fresh_mtime_ns = os.fstat(handle.fileno()).st_mtime_ns
+            except OSError:
+                on_disk = None
+                break
+            if fresh_mtime_ns == before_ns:
+                break
+        else:
+            # Readable on every attempt, just never stable — distinct from
+            # "unreadable" and from "content changed" (both handled below via
+            # `on_disk`), so this gets the top bracket's own message and
+            # treatment instead of being folded into "someone else's content is
+            # on disk". Deferred until the lock releases: `_blocking_error`
+            # takes the same lock itself.
+            mtime_unstable = True
+
+        if not mtime_unstable and on_disk == digest:
+            # `on_disk == digest` means this re-read's bytes are the same bytes
+            # `raw` holds (both hash to `digest`), so `fresh_mtime_ns` — paired
+            # with THIS read, under this same lock — describes those bytes at
+            # least as well as (and more recently than) the `mtime_ns` captured
+            # before `extract_function_defs` ran. Staging still uses `raw` itself
+            # (identical content, already what was enumerated) with this
+            # refreshed timestamp.
+            mtime_ns = fresh_mtime_ns
             # Reconcile + record every current function BEFORE the slow verifies:
             # drop functions the file no longer defines, reset the Stop-gate's
             # patience, and pre-record each — a pointer/array-taking unit as its
@@ -2008,6 +2053,13 @@ def verify_and_record(
                         ),
                     )
             save_state(project_dir, state)
+
+    if mtime_unstable:
+        return _blocking_error(
+            f"{file_path} kept changing while being read; could not pair "
+            "its bytes with a stable mtime",
+            unless_superseded=True,
+        )
 
     if on_disk != digest:
         # Someone else's content is on disk. If a stamp already vouches for

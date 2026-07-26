@@ -1475,9 +1475,11 @@ def test_verify_and_record_retries_when_mtime_races_the_read(
     # elsewhere in `verify_and_record` never see this, since they compare
     # bytes, never mtime. Bracketing the read with an `fstat()` on each side and
     # retrying until they agree is the fix; this drives that path by making the
-    # first bracket disagree and the second stabilize, and checks the run still
-    # completes normally off the stabilized bracket. Review feedback on PR
-    # #159, issue #150.
+    # first bracket (the top-of-function read) disagree once before stabilizing.
+    # The second bracket (the pre-verify re-pair under `gate_lock`, closing the
+    # narrower window `extract_function_defs`'s subprocess call leaves open)
+    # then reads real, already-stable `fstat` values on its very first
+    # iteration. Review feedback on PR #159, issue #150.
     src = tmp_path / "x.c"
     original = "alpha\n"
     src.write_text(original)
@@ -1504,7 +1506,9 @@ def test_verify_and_record_retries_when_mtime_races_the_read(
     verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
 
     assert [v.verdict for v in verdicts] == ["verified"]
-    assert calls["n"] == 4  # one unstable bracket, then one stable bracket
+    # 4 calls to stabilize the first bracket (one retry) + 2 for the second
+    # bracket's single, already-stable iteration.
+    assert calls["n"] == 6
     after = gate.load_state(str(tmp_path))
     assert after["scanned"]["x.c"] == hashlib.sha256(original.encode()).hexdigest()
 
@@ -1579,6 +1583,49 @@ def test_mtime_never_stabilizing_defers_to_a_concurrent_runs_stamp(
     after = gate.load_state(str(tmp_path))
     assert "x.c::?" not in after.get("units", {})
     assert after["scanned"]["x.c"] == hashlib.sha256(content.encode()).hexdigest()
+
+
+def test_verify_and_record_stages_the_mtime_seen_at_verify_time_not_before_enumeration(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The reviewer's exact scenario: the source is touched with identical bytes
+    # *after* the top-of-function bracket pairs `raw`/`mtime_ns` but *during* the
+    # `extract_function_defs` subprocess call — a window a content-only check can
+    # never see. `after_read` runs inside that subprocess, right after it reads
+    # the source, so it lands precisely there. The snapshot must be staged with
+    # the mtime observed at verify time, not the one captured before enumeration
+    # started. Review feedback on PR #159, issue #150.
+    src = tmp_path / "x.c"
+    src.write_text("f\n")
+    touched_ns = os.stat(src).st_mtime_ns + 5_000_000_000  # unambiguously distinct
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            after_read=(
+                f"import os; os.utime({str(src)!r}, ns=({touched_ns}, {touched_ns}))"
+            ),
+            verdict="verified",
+        ),
+    )
+    captured: dict[str, int] = {}
+    real_verifiable_source = gate._verifiable_source
+
+    @contextlib.contextmanager
+    def capturing_verifiable_source(file_path, content, *, project_dir, mtime_ns):
+        captured["mtime_ns"] = mtime_ns
+        with real_verifiable_source(
+            file_path, content, project_dir=project_dir, mtime_ns=mtime_ns
+        ) as path:
+            yield path
+
+    monkeypatch.setattr(gate, "_verifiable_source", capturing_verifiable_source)
+
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert [v.verdict for v in verdicts] == ["verified"]
+    assert captured["mtime_ns"] == touched_ns
 
 
 def test_pointer_only_file_never_stages_a_verify_snapshot(
