@@ -407,6 +407,24 @@ def test_annotate_array_extents_ignores_a_line_directive_inside_a_dead_elif0_bod
     assert (out.array_extent, out.array_extent_unresolved) == (None, False)
 
 
+def test_annotate_array_extents_ignores_a_line_directive_inside_a_dead_if1_body() -> (
+    None
+):
+    # PR #156 follow-up: the inactive array-shaped definition sits behind an
+    # `#else` paired with a literal `#if 1` — cpp always takes the `#if 1` arm,
+    # so the `#else`'s own `#line 11` never reaches the compiler either. Before
+    # this fix, `#if 1` was read as opaque and its `#else` was always assumed
+    # live, so this `#line 11` collided with the active definition's and the
+    # physical-line tiebreak picked the (physically later) inactive candidate.
+    source = (
+        "#if 1\n#line 11\nvoid f(int *p) { return; }\n"
+        "#else\n#line 11\nvoid f(int p[20]) { return; }\n#endif\n"
+    )
+    unit = Unit("f", (Param("p", "int *"),), def_line=11)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
 def test_line_breakpoints_excludes_a_directive_inside_a_dead_if0_body() -> None:
     source = "#if 0\n#line 5\nx\n#endif\n#line 9\ny\n"
     assert _line_breakpoints(source) == [(5, 9)]
@@ -442,6 +460,15 @@ def test_line_breakpoints_elif_zero_stays_dead() -> None:
     # unconditional `#else` that follows is guaranteed live.
     source = "#if 0\n#line 5\nx\n#elif 0\n#line 9\ny\n#else\n#line 11\nz\n#endif\n"
     assert _line_breakpoints(source) == [(8, 11)]
+
+
+def test_line_breakpoints_excludes_a_directive_inside_a_dead_if1_else_body() -> None:
+    # PR #156 follow-up: `#if 1` is a literal-true condition, so cpp always
+    # takes it and never reaches the paired `#else` — a `#line` there must not
+    # count, even though an `#else` is unconditionally live after an *opaque*
+    # `#if` (contrast `test_line_breakpoints_else_reactivates_a_dead_if0_branch`).
+    source = "#if 1\n#line 5\nx\n#else\n#line 9\ny\n#endif\n"
+    assert _line_breakpoints(source) == [(2, 5)]
 
 
 def test_annotate_array_extents_breaks_a_genuine_presumed_tie_by_physical_line() -> (

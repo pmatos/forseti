@@ -109,21 +109,26 @@ _STATIC_MIN_RE = re.compile(r"\bstatic\b")
 # "line" word) never do.
 _LINE_DIRECTIVE_RE = re.compile(r"^[ \t]*#[ \t]*(?:line[ \t]+)?(\d+)\b", re.MULTILINE)
 
-# A literal `#if 0`/`#elif 0` (the complete condition is the digit `0`, nothing
-# else) is the one conditional this scan can resolve without a preprocessor: cpp
-# never takes that branch, so a `#line` inside it never reaches the compiler
-# either. The condition is captured (rather than prefix-matched) so a longer
-# expression that merely *starts* with `0` — `#if 0 || FEATURE` — is not
-# misread as known-false too (PR #156 follow-up to issue #145): such a branch
-# genuinely might be taken, and excluding a `#line` that cpp does process would
-# corrupt the presumed-line translation for the real code after it, the same
-# failure mode this whole exclusion exists to avoid.
+# A literal `#if 0`/`#elif 0` or `#if 1`/`#elif 1` (the complete condition is
+# exactly the digit `0` or `1`, nothing else) are the only conditionals this
+# scan can resolve without a preprocessor: cpp always skips the former and
+# always takes the latter, so a `#line` inside the skipped arm never reaches
+# the compiler — and once a literal-`1` arm has been taken, neither does one
+# inside any later `#elif`/`#else` in the same chain (PR #156 follow-up to
+# issue #145: `#if 1` was previously read as opaque, so its `#else` was always
+# assumed live even though cpp never takes it). The condition is captured
+# (rather than prefix-matched) so a longer expression that merely *starts*
+# with `0`/`1` — `#if 0 || FEATURE` — is not misread as known either way: such
+# a branch genuinely might go either way, and disagreeing with cpp's own
+# evaluation would corrupt the presumed-line translation for the real code
+# after it, the same failure mode this whole exclusion exists to avoid.
 #
-# `#ifdef`/`#ifndef` and any other `#if`/`#elif <expr>` are opaque — their
+# `#ifdef`/`#ifndef` and any other `#if`/`#elif <expr>` stay opaque — their
 # condition needs macro state this scan does not have — so they are tracked
-# only to balance nesting, not to judge liveness (matching `_param_list_text`'s
-# own stance on such bodies: it leaves picking the *right* one to `def_line`,
-# not to evaluating the condition).
+# only to balance nesting and to know whether an *earlier* arm in their own
+# chain already decided it (matching `_param_list_text`'s own stance on such
+# bodies: it leaves picking the *right* one to `def_line`, not to evaluating
+# the condition).
 _IF_RE = re.compile(r"^[ \t]*#[ \t]*if[ \t]+([^\n]*)$", re.MULTILINE)
 _IFDEF_RE = re.compile(r"^[ \t]*#[ \t]*(?:ifdef|ifndef)\b", re.MULTILINE)
 
@@ -131,15 +136,20 @@ _IFDEF_RE = re.compile(r"^[ \t]*#[ \t]*(?:ifdef|ifndef)\b", re.MULTILINE)
 # does not reactivate a dead branch the way `#else` does — its own condition is
 # still false, so the branch it introduces stays dead regardless of what came
 # before it (PR #156 follow-up to issue #145: treating every `#elif` as an
-# unconditional `#else` let a still-dead `#elif 0` branch's `#line` count).
+# unconditional `#else` let a still-dead `#elif 0` branch's `#line` count). A
+# literal `#elif 1` is its mirror: it is live only if no earlier arm in the
+# chain was already known-taken — otherwise cpp never reaches it regardless of
+# its own condition being `1`.
 _ELIF_RE = re.compile(r"^[ \t]*#[ \t]*elif[ \t]+([^\n]*)$", re.MULTILINE)
 
 # A bare `#else` has no condition of its own to read: it is taken whenever cpp
-# reaches it, which happens whenever nothing before it was — a fact this scan
-# can prove only when every earlier branch in the chain was a literal `0`, and
-# must otherwise assume (the same "assumed live" bias as an opaque `#if`).
-# Either way the branch it opens is not known-dead, so it always clears the
-# current frame's dead flag.
+# reaches it, which happens whenever nothing before it was. This scan can
+# prove that to be false — the else is dead — only once an earlier arm in the
+# same chain was a literal `1`; absent that proof it must assume the else
+# might be live (the same "assumed live" bias as an opaque `#if`), exactly as
+# it must assume a still-unproven earlier arm might not be taken at all (PR
+# #156 follow-up to issue #145: previously `#else` was unconditionally marked
+# live even after a known-taken `#if 1`).
 _ELSE_RE = re.compile(r"^[ \t]*#[ \t]*else\b", re.MULTILINE)
 _ENDIF_RE = re.compile(r"^[ \t]*#[ \t]*endif\b", re.MULTILINE)
 
@@ -372,14 +382,19 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
     never processes it, so such a directive never resets clang's own counter
     either — including it would let a duplicate ``#line`` guarding an inactive
     body collide with the one guarding the active definition (PR #156
-    follow-up to issue #145). Nesting is tracked (an ``#if``/``#ifdef``/
-    ``#ifndef`` inside a dead branch stays dead regardless of its own
-    condition), but any branch whose own condition is not the complete literal
-    ``0`` is opaque — its condition needs macro state this textual scan does
-    not have, or (for ``#else``) needs knowing whether an earlier opaque branch
-    was taken — and is assumed live, exactly as `_param_list_text` itself
-    leaves picking the right ``#ifdef`` branch to `def_line`, not to
-    evaluating the condition.
+    follow-up to issue #145). A directive inside a literal ``#if 1``/``#elif
+    1`` branch's *sibling* ``#elif``/``#else`` arms is excluded for the mirror
+    reason: cpp never reaches them once the literal-``1`` arm was taken, so a
+    ``#line`` there never resets the counter either (PR #156 follow-up to
+    issue #145: previously such a sibling was always assumed live). Nesting is
+    tracked (an ``#if``/``#ifdef``/``#ifndef`` inside a dead branch stays dead
+    regardless of its own condition), but any branch whose own condition is
+    not the complete literal ``0`` or ``1`` is opaque — its condition needs
+    macro state this textual scan does not have, or (for ``#elif``/``#else``)
+    needs knowing whether an earlier arm in its own chain was already
+    known-taken — and is assumed live absent that proof, exactly as
+    `_param_list_text` itself leaves picking the right ``#ifdef`` branch to
+    `def_line`, not to evaluating the condition.
     """
 
     def _events(
@@ -391,45 +406,60 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
         ]
 
     def _cond_events(
-        pattern: re.Pattern[str], zero_kind: str, opaque_kind: str
+        pattern: re.Pattern[str], kinds_by_literal: dict[str, str], opaque_kind: str
     ) -> list[tuple[int, str, None]]:
         return [
             (
                 m.start(),
-                zero_kind if m.group(1).strip() == "0" else opaque_kind,
+                kinds_by_literal.get(m.group(1).strip(), opaque_kind),
                 None,
             )
             for m in pattern.finditer(source_no_comments)
         ]
 
     events = sorted(
-        _cond_events(_IF_RE, "if0", "ifop")
+        _cond_events(_IF_RE, {"0": "if0", "1": "if1"}, "ifop")
         + _events(_IFDEF_RE, "ifop")
-        + _cond_events(_ELIF_RE, "elif0", "elifop")
+        + _cond_events(_ELIF_RE, {"0": "elif0", "1": "elif1"}, "elifop")
         + _events(_ELSE_RE, "else")
         + _events(_ENDIF_RE, "endif")
         + _events(_LINE_DIRECTIVE_RE, "line", keep_match=True),
         key=lambda event: event[0],
     )
-    dead_stack: list[bool] = []  # one entry per open conditional; True = dead branch
+    # One `(dead, decided)` pair per open conditional. `dead` is whether the
+    # *current* arm is known-dead; `decided` is whether some earlier arm in
+    # this same chain was already known-taken (a literal `1`) — once true, cpp
+    # can never reach any later `#elif`/`#else` in the chain, however live
+    # that arm looks in isolation (PR #156 follow-up to issue #145).
+    stack: list[tuple[bool, bool]] = []
     breakpoints: list[tuple[int, int]] = []
     for pos, kind, match in events:
         if kind == "if0":
-            dead_stack.append(True)
+            stack.append((True, False))
+        elif kind == "if1":
+            stack.append((False, True))
         elif kind == "ifop":
-            dead_stack.append(False)
+            stack.append((False, False))
         elif kind == "elif0":
             # Own condition is false, independent of every earlier branch's
             # state — this specific branch is never taken.
-            if dead_stack:
-                dead_stack[-1] = True
+            if stack:
+                _, decided = stack[-1]
+                stack[-1] = (True, decided)
+        elif kind == "elif1":
+            if stack:
+                _, decided = stack[-1]
+                # Dead if an earlier arm already won the chain; otherwise this
+                # literal `1` is the winner from here on.
+                stack[-1] = (decided, True)
         elif kind in ("elifop", "else"):
-            if dead_stack:
-                dead_stack[-1] = False
+            if stack:
+                _, decided = stack[-1]
+                stack[-1] = (decided, decided)
         elif kind == "endif":
-            if dead_stack:
-                dead_stack.pop()
-        elif match is not None and not any(dead_stack):
+            if stack:
+                stack.pop()
+        elif match is not None and not any(dead for dead, _ in stack):
             physical = source_no_comments.count("\n", 0, pos) + 1
             breakpoints.append((physical, int(match.group(1))))
     return breakpoints
