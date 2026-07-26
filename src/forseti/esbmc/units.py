@@ -39,9 +39,19 @@ _LOC_RE = re.compile(r"<([^,>]+)")
 
 # One location token: `<built-in>:line:col`, `PATH:line:col`/`line:line:col`, or a
 # same-line abbreviation `col:col`. `<built-in>` is spelled out (rather than
-# `[^\s,<>]+`) because it contains its own literal `<`/`>`, which would otherwise
+# `[^,<>]+?`) because it contains its own literal `<`/`>`, which would otherwise
 # be mistaken for the enclosing range's brackets.
-_LOC_TOKEN_RE = r"<built-in>:\d+:\d+|[^\s,<>]+:\d+:\d+|col:\d+"
+#
+# `PATH` is matched lazily up to its `:line:col` suffix rather than as a
+# whitespace-free run: clang echoes the input path verbatim, spaces included
+# (`</tmp/path space/test.c:4:1, col:17>`), so excluding `\s` from the path
+# class would leave a spaced path unmatched entirely — `_loc_line` would then
+# silently keep its caller's line instead of this node's own (PR #156 follow-up
+# to issue #145). The lazy `+?` still stops at the first `:digit:digit` it
+# finds, so it does not overrun into a following `,`/`>`-delimited token — and
+# `col:\d+` is tried *before* it, so a same-line abbreviation is never at risk
+# of being swallowed as a (nonexistent) path prefix of some later token.
+_LOC_TOKEN_RE = r"<built-in>:\d+:\d+|col:\d+|[^,<>]+?:\d+:\d+"
 
 # A node's full location: `<start[, end]> point`. `point` is a `Decl`'s own
 # identifier location, distinct from `start` — the range's beginning — whenever
@@ -99,17 +109,39 @@ _STATIC_MIN_RE = re.compile(r"\bstatic\b")
 # "line" word) never do.
 _LINE_DIRECTIVE_RE = re.compile(r"^[ \t]*#[ \t]*(?:line[ \t]+)?(\d+)\b", re.MULTILINE)
 
-# `#if 0` (the literal, always-false form) is the one conditional this scan can
-# resolve without a preprocessor: cpp never processes anything up to its `#else`/
-# `#endif`, so a `#line` inside it never reaches the compiler either. `#ifdef`,
-# `#ifndef`, and any other `#if <expr>` are opaque — their condition needs macro
-# state this scan does not have — so they are tracked only to balance nesting, not
-# to judge liveness (matching `_param_list_text`'s own stance on such bodies: it
-# leaves picking the *right* one to `def_line`, not to evaluating the condition).
-_IF_ZERO_RE = re.compile(r"^[ \t]*#[ \t]*if\s+0\b", re.MULTILINE)
-_IF_OPAQUE_RE = re.compile(r"^[ \t]*#[ \t]*(?:ifdef|ifndef|if\s+(?!0\b))", re.MULTILINE)
-_COND_ELSE_RE = re.compile(r"^[ \t]*#[ \t]*(?:elif|else)\b", re.MULTILINE)
-_COND_ENDIF_RE = re.compile(r"^[ \t]*#[ \t]*endif\b", re.MULTILINE)
+# A literal `#if 0`/`#elif 0` (the complete condition is the digit `0`, nothing
+# else) is the one conditional this scan can resolve without a preprocessor: cpp
+# never takes that branch, so a `#line` inside it never reaches the compiler
+# either. The condition is captured (rather than prefix-matched) so a longer
+# expression that merely *starts* with `0` — `#if 0 || FEATURE` — is not
+# misread as known-false too (PR #156 follow-up to issue #145): such a branch
+# genuinely might be taken, and excluding a `#line` that cpp does process would
+# corrupt the presumed-line translation for the real code after it, the same
+# failure mode this whole exclusion exists to avoid.
+#
+# `#ifdef`/`#ifndef` and any other `#if`/`#elif <expr>` are opaque — their
+# condition needs macro state this scan does not have — so they are tracked
+# only to balance nesting, not to judge liveness (matching `_param_list_text`'s
+# own stance on such bodies: it leaves picking the *right* one to `def_line`,
+# not to evaluating the condition).
+_IF_RE = re.compile(r"^[ \t]*#[ \t]*if[ \t]+([^\n]*)$", re.MULTILINE)
+_IFDEF_RE = re.compile(r"^[ \t]*#[ \t]*(?:ifdef|ifndef)\b", re.MULTILINE)
+
+# `#elif`'s condition is captured separately from `#if`'s: a literal `#elif 0`
+# does not reactivate a dead branch the way `#else` does — its own condition is
+# still false, so the branch it introduces stays dead regardless of what came
+# before it (PR #156 follow-up to issue #145: treating every `#elif` as an
+# unconditional `#else` let a still-dead `#elif 0` branch's `#line` count).
+_ELIF_RE = re.compile(r"^[ \t]*#[ \t]*elif[ \t]+([^\n]*)$", re.MULTILINE)
+
+# A bare `#else` has no condition of its own to read: it is taken whenever cpp
+# reaches it, which happens whenever nothing before it was — a fact this scan
+# can prove only when every earlier branch in the chain was a literal `0`, and
+# must otherwise assume (the same "assumed live" bias as an opaque `#if`).
+# Either way the branch it opens is not known-dead, so it always clears the
+# current frame's dead flag.
+_ELSE_RE = re.compile(r"^[ \t]*#[ \t]*else\b", re.MULTILINE)
+_ENDIF_RE = re.compile(r"^[ \t]*#[ \t]*endif\b", re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -336,16 +368,18 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
     physical line after it reads one higher — until the next directive — mirroring
     how ``#line N`` (or GNU's ``# N "file"``) resets clang's own line counter.
 
-    A directive inside a literal ``#if 0`` block is excluded: cpp never processes
-    anything up to its ``#else``/``#endif``, so such a directive never resets
-    clang's own counter either — including it would let a duplicate ``#line``
-    guarding an inactive body collide with the one guarding the active definition
-    (PR #156 follow-up to issue #145). Nesting is tracked (an ``#if``/``#ifdef``/
-    ``#ifndef`` inside a dead ``#if 0`` stays dead regardless of its own
-    condition), but any conditional *other* than a literal ``#if 0`` is opaque —
-    its condition needs macro state this textual scan does not have — and is
-    assumed live, exactly as `_param_list_text` itself leaves picking the right
-    ``#ifdef`` branch to `def_line`, not to evaluating the condition.
+    A directive inside a literal ``#if 0``/``#elif 0`` branch is excluded: cpp
+    never processes it, so such a directive never resets clang's own counter
+    either — including it would let a duplicate ``#line`` guarding an inactive
+    body collide with the one guarding the active definition (PR #156
+    follow-up to issue #145). Nesting is tracked (an ``#if``/``#ifdef``/
+    ``#ifndef`` inside a dead branch stays dead regardless of its own
+    condition), but any branch whose own condition is not the complete literal
+    ``0`` is opaque — its condition needs macro state this textual scan does
+    not have, or (for ``#else``) needs knowing whether an earlier opaque branch
+    was taken — and is assumed live, exactly as `_param_list_text` itself
+    leaves picking the right ``#ifdef`` branch to `def_line`, not to
+    evaluating the condition.
     """
 
     def _events(
@@ -356,31 +390,45 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
             for m in pattern.finditer(source_no_comments)
         ]
 
+    def _cond_events(
+        pattern: re.Pattern[str], zero_kind: str, opaque_kind: str
+    ) -> list[tuple[int, str, None]]:
+        return [
+            (
+                m.start(),
+                zero_kind if m.group(1).strip() == "0" else opaque_kind,
+                None,
+            )
+            for m in pattern.finditer(source_no_comments)
+        ]
+
     events = sorted(
-        _events(_IF_ZERO_RE, "if0")
-        + _events(_IF_OPAQUE_RE, "ifop")
-        + _events(_COND_ELSE_RE, "else")
-        + _events(_COND_ENDIF_RE, "endif")
+        _cond_events(_IF_RE, "if0", "ifop")
+        + _events(_IFDEF_RE, "ifop")
+        + _cond_events(_ELIF_RE, "elif0", "elifop")
+        + _events(_ELSE_RE, "else")
+        + _events(_ENDIF_RE, "endif")
         + _events(_LINE_DIRECTIVE_RE, "line", keep_match=True),
         key=lambda event: event[0],
     )
     dead_stack: list[bool] = []  # one entry per open conditional; True = dead branch
-    zero_stack: list[bool] = []  # parallel: was this frame opened by a literal `#if 0`
     breakpoints: list[tuple[int, int]] = []
     for pos, kind, match in events:
         if kind == "if0":
             dead_stack.append(True)
-            zero_stack.append(True)
         elif kind == "ifop":
             dead_stack.append(False)
-            zero_stack.append(False)
-        elif kind == "else":
-            if dead_stack and zero_stack[-1]:
+        elif kind == "elif0":
+            # Own condition is false, independent of every earlier branch's
+            # state — this specific branch is never taken.
+            if dead_stack:
+                dead_stack[-1] = True
+        elif kind in ("elifop", "else"):
+            if dead_stack:
                 dead_stack[-1] = False
         elif kind == "endif":
             if dead_stack:
                 dead_stack.pop()
-                zero_stack.pop()
         elif match is not None and not any(dead_stack):
             physical = source_no_comments.count("\n", 0, pos) + 1
             breakpoints.append((physical, int(match.group(1))))
@@ -432,13 +480,13 @@ def _param_list_text(
     the inactive one's physical line).
 
     Two candidates can still translate to the *same* presumed line even after
-    `_line_breakpoints` excludes a ``#line`` sitting inside a literal ``#if 0`` —
-    e.g. two directives outside any conditional at all, each immediately ahead of
-    a definition-shaped occurrence. `min`'s stability would otherwise silently
-    keep whichever candidate is textually first. As a last resort, ties are
-    broken by physical line, preferring the later occurrence — consistent with
-    this anchor's own default assumption (issue #145): an inactive alternative
-    more often sits *before* the active one than after.
+    `_line_breakpoints` excludes a ``#line`` sitting inside a literal ``#if 0``/
+    ``#elif 0`` branch — e.g. two directives outside any conditional at all, each
+    immediately ahead of a definition-shaped occurrence. `min`'s stability would
+    otherwise silently keep whichever candidate is textually first. As a last
+    resort, ties are broken by physical line, preferring the later occurrence —
+    consistent with this anchor's own default assumption (issue #145): an
+    inactive alternative more often sits *before* the active one than after.
 
     A duplicate directive inside an *opaque* conditional (``#ifdef``) is not this
     case: this textual scan cannot tell which branch cpp took, so nothing here —

@@ -118,6 +118,28 @@ def test_parse_units_macro_return_type_uses_identifier_line_not_range_start() ->
     assert unit.def_line == 5
 
 
+# PR #156 follow-up: clang echoes the input path verbatim, spaces included, when
+# the source lives in a directory whose name has one. This is a real `esbmc
+# --parse-tree-only` dump (captured against `/tmp/path space/test.c`), trimmed to
+# the one FunctionDecl.
+_WHITESPACE_PATH_AST = """\
+TranslationUnitDecl 0x1000 <<invalid sloc>> <invalid sloc>
+`-FunctionDecl 0x117363d0 </tmp/path space/test.c:1:1, col:26> col:6 f 'void (int *)'
+  |-ParmVarDecl 0x11736308 <col:8, col:13> col:13 used p 'int *'
+  `-CompoundStmt 0x11736510 <col:16, col:26>
+"""
+
+
+def test_parse_units_path_with_whitespace() -> None:
+    # A token pattern that requires a whitespace-free path leaves this location
+    # chain unmatched entirely, so `def_line` would silently retain whatever line
+    # preceded it instead of this node's own — and, with an earlier inactive
+    # same-named definition, that stale anchor can select the wrong one's array
+    # extent (PR #156 follow-up to issue #145).
+    unit = next(iter(parse_units(_WHITESPACE_PATH_AST, "/tmp/path space/test.c")))
+    assert unit.def_line == 1
+
+
 def test_parse_units_empty_on_declarations_only() -> None:
     header = (
         "TranslationUnitDecl 0x1 <<invalid sloc>>\n"
@@ -369,6 +391,22 @@ def test_annotate_array_extents_ignores_a_dead_if0_line_directive_mirrored() -> 
     assert (out.array_extent, out.array_extent_unresolved) == (None, False)
 
 
+def test_annotate_array_extents_ignores_a_line_directive_inside_a_dead_elif0_body() -> (
+    None
+):
+    # PR #156 follow-up: the inactive array-shaped definition sits behind an
+    # `#elif 0`, not the `#if 0` itself. Treating every `#elif` as an
+    # unconditional `#else` would reactivate this still-dead branch and let its
+    # `#line 11` collide with the one guarding the active definition above.
+    source = (
+        "#line 11\nvoid f(int *p) { *p = 1; }\n"
+        "#if 0\n#elif 0\n#line 11\nvoid f(int p[20]) { }\n#endif\n"
+    )
+    unit = Unit("f", (Param("p", "int *"),), def_line=11)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
 def test_line_breakpoints_excludes_a_directive_inside_a_dead_if0_body() -> None:
     source = "#if 0\n#line 5\nx\n#endif\n#line 9\ny\n"
     assert _line_breakpoints(source) == [(5, 9)]
@@ -387,6 +425,23 @@ def test_line_breakpoints_ignores_an_unbalanced_endif() -> None:
     # arbitrary real-world source, not a validated preprocessor input.
     source = "#endif\n#line 5\nx\n"
     assert _line_breakpoints(source) == [(2, 5)]
+
+
+def test_line_breakpoints_does_not_treat_a_prefix_zero_as_known_false() -> None:
+    # PR #156 follow-up: `#if 0 || FEATURE` merely *starts* with `0` — its full
+    # condition is not the literal zero, so cpp might genuinely take this branch
+    # and its `#line` must still count, not be silently dropped.
+    source = "#if 0 || FEATURE\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(2, 5), (5, 9)]
+
+
+def test_line_breakpoints_elif_zero_stays_dead() -> None:
+    # PR #156 follow-up: treating every `#elif` as an unconditional `#else`
+    # would reactivate this still-dead `#elif 0` branch (its own condition is
+    # false too) and let its `#line` collide with a real one elsewhere. Only the
+    # unconditional `#else` that follows is guaranteed live.
+    source = "#if 0\n#line 5\nx\n#elif 0\n#line 9\ny\n#else\n#line 11\nz\n#endif\n"
+    assert _line_breakpoints(source) == [(8, 11)]
 
 
 def test_annotate_array_extents_breaks_a_genuine_presumed_tie_by_physical_line() -> (
@@ -589,6 +644,25 @@ def test_list_units_ignores_a_line_directive_inside_a_dead_if0_body(
         "#if 0\n#line 11\nvoid f(int p[20]) { }\n#endif\n"
         "#line 11\nvoid f(int *p) { *p = 1; }\n"
     )
+    f = next(u for u in list_units(src) if u.name == "f")
+    assert f.params[0].array_extent is None
+    assert f.params[0].array_extent_unresolved is False
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_anchors_extent_with_whitespace_in_the_path(
+    tmp_path: Path,
+) -> None:
+    # End-to-end (PR #156 follow-up): clang echoes the input path verbatim,
+    # spaces included, when the source lives in a directory whose name has one.
+    # A token pattern that requires a whitespace-free path would leave `def_line`
+    # unset, letting the inactive `#if 0` body's array extent donate to the
+    # active `int *p` — the exact over-sized-object hazard issue #145 exists to
+    # close.
+    src_dir = tmp_path / "path space"
+    src_dir.mkdir()
+    src = src_dir / "sig.c"
+    src.write_text("#if 0\nvoid f(int p[20]) { }\n#endif\nvoid f(int *p) { *p = 1; }\n")
     f = next(u for u in list_units(src) if u.name == "f")
     assert f.params[0].array_extent is None
     assert f.params[0].array_extent_unresolved is False
