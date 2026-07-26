@@ -405,6 +405,46 @@ def test_an_alias_opens_the_caller_set(tmp_path: Path) -> None:
     assert "another name for sum_bytes()" in result.label
 
 
+_ALIAS_TO_LABELLED_LEAF = """\
+#include <stddef.h>
+#include <stdint.h>
+
+static uint32_t sum_bytes(const uint8_t *buf, size_t len) __asm__("sum_impl");
+
+static uint32_t sum_bytes(const uint8_t *buf, size_t len) {
+    uint32_t acc = 0;
+    for (size_t i = 0; i < len; i++) acc += buf[i];
+    return acc;
+}
+
+static uint32_t sum_alias(const uint8_t *buf, size_t len)
+    __attribute__((alias("sum_impl")));
+
+uint32_t frame_checksum(const uint8_t *frame, size_t len) {
+    return sum_bytes(frame, len);
+}
+
+uint32_t via_alias(const uint8_t frame[4]) { return sum_alias(frame, 64); }
+"""
+
+
+def test_an_alias_to_a_labelled_leaf_opens_the_caller_set(tmp_path: Path) -> None:
+    # `sum_alias`'s alias attribute names `sum_bytes`'s *linker* symbol
+    # ("sum_impl"), not its C name — a shape the alias/label fixes up to now left
+    # uncovered, since the alias branch compared only against the bare C name.
+    # Without the fix, `via_alias`'s 64-byte read of a 4-byte object is invisible
+    # to the caller set and `frame_checksum` alone would carry `sum_bytes` to
+    # DISCHARGED_VERIFIED.
+    src = tmp_path / "alias_to_labelled.c"
+    src.write_text(_ALIAS_TO_LABELLED_LEAF)
+    result = discharge_precondition(src, function="sum_bytes", max_len=MAX_LEN)
+    assert result.assessment is Assessment.ASSUMED_VERIFIED, result.label
+    outcomes = {c.caller: c.outcome for c in result.callers}
+    assert outcomes["frame_checksum"] is CallerOutcome.DISCHARGED
+    assert outcomes["sum_alias"] is CallerOutcome.UNRESOLVED
+    assert "another name for sum_bytes()" in result.label
+
+
 _CLEANUP_HANDLER = """\
 #include <stddef.h>
 #include <stdint.h>

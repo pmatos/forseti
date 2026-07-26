@@ -477,6 +477,14 @@ def parse_symbol_aliases(ast_text: str, symbol: str) -> tuple[str, ...]:
     and equally ``void fa(int *) __asm__("f")`` next to a plain ``f``, where only
     one side carries a label at all.
 
+    The two mechanisms also combine: ``alias("impl.sym")`` names a *linker*
+    symbol, so when `symbol` itself carries ``__asm__("impl.sym")`` the alias
+    that actually links to it names that label, not `symbol`'s bare C name —
+    matching only the literal name would miss it. `AliasAttr` targets are
+    therefore compared against the same effective-symbol set (`symbol`'s own
+    label, or `symbol` itself when it has none) the label loop below computes,
+    not against `symbol` alone.
+
     What this does *not* cover is a function named by an attribute rather than
     aliased by one — a ``cleanup`` handler, say. That is `parse_address_escapes`'
     job: clang prints those as an ordinary ``Function 0x… 'name'`` reference, and
@@ -484,16 +492,23 @@ def parse_symbol_aliases(ast_text: str, symbol: str) -> tuple[str, ...]:
     """
     aliases: dict[str, None] = {}
     labels: dict[str, set[str]] = {}
+    alias_targets: dict[str, set[str]] = {}
     for stack, kind, rest, _file in _walk(ast_text):
         if kind == "FunctionDecl":
             labels.setdefault(_declared_name(rest), set())
-        elif kind == "AliasAttr" and symbol in _TARGET_NAME_RE.findall(rest):
-            aliases[_enclosing_name(stack)] = None
+        elif kind == "AliasAttr":
+            alias_targets.setdefault(_enclosing_name(stack), set()).update(
+                _TARGET_NAME_RE.findall(rest)
+            )
         elif kind == "AsmLabelAttr":
             labels.setdefault(_enclosing_name(stack), set()).update(
                 _TARGET_NAME_RE.findall(rest)
             )
     target = labels.get(symbol) or {symbol}
+    effective_target = target | {symbol}
+    for name, targets in alias_targets.items():
+        if targets & effective_target:
+            aliases[name] = None
     for name, own in labels.items():
         if name != symbol and (own or {name}) & target:
             aliases[name] = None

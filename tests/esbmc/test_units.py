@@ -778,6 +778,30 @@ def test_parse_symbol_aliases_ignores_an_alias_to_another_symbol() -> None:
     assert parse_symbol_aliases(_ALIAS_AST, "client") == ()
 
 
+# The two mechanisms combine: `fa`'s alias attribute names `leaf`'s *linker*
+# symbol ("impl.sym") — the assembly label `leaf` is relabelled to — not its bare
+# C name. Comparing an `AliasAttr` target against `symbol` alone (rather than
+# `symbol`'s effective symbol set, the same one the label loop below computes)
+# would miss this alias entirely.
+_ALIAS_TO_LABELLED_TARGET_AST = """\
+TranslationUnitDecl 0xd000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0xd001 </tmp/foo.c:1:1, col:42> col:13 used leaf 'void (int *)' static
+| |-ParmVarDecl 0xd002 <col:15, col:20> col:20 used p 'int *'
+| |-CompoundStmt 0xd003 <col:30, col:42>
+| `-AsmLabelAttr 0xd004 <col:39> "impl.sym" IsLiteralLabel
+`-FunctionDecl 0xd010 <line:2:1, col:57> col:13 used fa 'void (int *)' static
+  |-ParmVarDecl 0xd011 <col:15, col:20> col:20 p 'int *'
+  `-AliasAttr 0xd012 <col:46, col:55> "impl.sym"
+"""
+
+
+def test_an_alias_names_a_labelled_targets_linker_symbol() -> None:
+    assert parse_symbol_aliases(_ALIAS_TO_LABELLED_TARGET_AST, "leaf") == ("fa",)
+    # the direction that matters for discharge: asking for callers of `fa` itself
+    # (which names no one) still finds nothing, exactly as a plain alias would
+    assert parse_symbol_aliases(_ALIAS_TO_LABELLED_TARGET_AST, "fa") == ()
+
+
 # Two more attribute-borne paths esbmc 8.3.0 prints: a `cleanup` handler, which
 # clang renders as an ordinary `Function 0x… 'name'` reference on the variable
 # (so it is a *reference outside a call*, not an alias), and a shared `__asm__`
