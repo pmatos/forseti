@@ -37,8 +37,19 @@ it gives up is *modularity* (the callee's body is still explored), not soundness
 
 **Aggregation fails closed.** ``DISCHARGED_VERIFIED`` requires that every caller
 was actually checked *and* every check passed. A caller L0 cannot materialise, an
-inconclusive ladder, an unreachable call site — each leaves the verdict at
-``ASSUMED_VERIFIED`` with a loud "discharge incomplete", never an upgrade.
+inconclusive ladder, an unreachable call site, or a caller the gate cannot even
+enumerate — a ``static inline`` in an included header is in this translation unit
+but is not a unit `list_units` reports, so `parse_external_callers` counts them
+from the same clang dump — each leaves the verdict at ``ASSUMED_VERIFIED`` with a
+loud "discharge incomplete", never an upgrade.
+
+**What a discharge is relative to.** Each caller's own parameters are materialised
+by *its* S2 assumption, so one run proves ``caller precondition => callee
+precondition`` at every call site: one link of the chain, not the whole chain.
+Closing a deeper chain means discharging each link in turn. The exception is an
+**anchored** caller — one whose own precondition is empty (no pointer parameters),
+whose harness therefore allocates real objects and leaves nothing assumed. The
+label states the caveat and drops it only when every caller is anchored.
 
 **And it fails closed in the *other* direction too.** The mirror-image hazard is
 moving RFC-0003's phantom VIOLATED from the callee to the call site: a caller
@@ -69,7 +80,15 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from forseti.esbmc import EsbmcResult, Unit, Verified, Violated, list_units
+from forseti.esbmc import (
+    EsbmcResult,
+    ListUnitsError,
+    Unit,
+    Verified,
+    Violated,
+    list_external_callers,
+    list_units,
+)
 from forseti.orchestrator.ladder import verify_ladder
 from forseti.orchestrator.ports import VerifyPort
 
@@ -220,15 +239,16 @@ def discharge_precondition(
     work_dir: Path | None = None,
     raw_verify: VerifyPort | None = None,
     list_units_fn: Callable[[Path], list[Unit]] | None = None,
+    external_callers_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
 ) -> DischargeResult:
     """Verify `source::function` against its precondition, then discharge it.
 
     Runs S2 first and *only ever upgrades* its verdict: anything other than
     ``ASSUMED_VERIFIED`` (a real violation, ``NEEDS_CONTRACT``, an error) passes
-    through untouched, because there is no assumption to discharge. `raw_verify`
-    and `list_units_fn` inject the esbmc calls for tests; production adds a ``-I``
-    for the source's own directory so the generated copy's relative
-    ``#include``\\ s still resolve.
+    through untouched, because there is no assumption to discharge. `raw_verify`,
+    `list_units_fn` and `external_callers_fn` inject the esbmc calls for tests;
+    production adds a ``-I`` for the source's own directory so the generated
+    copy's relative ``#include``\\ s still resolve.
     """
     lister = _memoized(
         list_units_fn or (lambda src: list_units(src, esbmc_bin=esbmc_bin))
@@ -257,7 +277,19 @@ def discharge_precondition(
         esbmc_bin=esbmc_bin,
         extra_flags=(f"-I{source.resolve().parent}",),
     )
-    args = (source, function, unit_result, lister(source), max_len, ladder_cap, raw)
+    external = external_callers_fn or (
+        lambda src, sym: list_external_callers(src, sym, esbmc_bin=esbmc_bin)
+    )
+    args = (
+        source,
+        function,
+        unit_result,
+        lister(source),
+        external,
+        max_len,
+        ladder_cap,
+        raw,
+    )
     if work_dir is not None:
         return _discharge(*args, work_dir)
     with tempfile.TemporaryDirectory(prefix="forseti-discharge-") as tmp:
@@ -269,6 +301,7 @@ def _discharge(
     function: str,
     unit_result: PreconditionResult,
     units: list[Unit],
+    external_callers_fn: Callable[[Path, str], tuple[str, ...]],
     max_len: int,
     ladder_cap: int,
     raw: VerifyPort,
@@ -300,7 +333,26 @@ def _discharge(
         )
 
     callers = tuple(u for u in units if u.name != function and function in u.calls)
+    # Callers the *gate* cannot enumerate: a `static inline` in an included header
+    # is part of this translation unit and can call the callee, but `list_units`
+    # narrows to the file under test by design. Counting them is what keeps
+    # "every caller in this TU" from being a claim about a set we never saw.
+    try:
+        foreign = external_callers_fn(source, function)
+    except ListUnitsError as exc:
+        return DischargeResult(function, Assessment.ERROR, str(exc), unit_result)
+    unlistable = tuple(
+        CallerCheck(
+            name,
+            CallerOutcome.UNCHECKED,
+            f"defined outside {source}, so the gate cannot enumerate it as a unit "
+            "or build a harness for it",
+        )
+        for name in foreign
+    )
     if not callers:
+        if unlistable:
+            return _aggregate(function, unit_result, unlistable)
         return DischargeResult(
             function,
             Assessment.ASSUMED_VERIFIED,
@@ -321,7 +373,8 @@ def _discharge(
         )
         for caller in callers
     )
-    return _aggregate(function, unit_result, checks)
+    anchored = frozenset(u.name for u in callers if not plan_unit(u).pointer_params)
+    return _aggregate(function, unit_result, checks + unlistable, anchored)
 
 
 def _weakest_read_pointers(plan: UnitPlan) -> tuple[str, ...]:
@@ -443,9 +496,22 @@ def _check_caller(
 
 
 def _aggregate(
-    function: str, unit_result: PreconditionResult, checks: tuple[CallerCheck, ...]
+    function: str,
+    unit_result: PreconditionResult,
+    checks: tuple[CallerCheck, ...],
+    anchored: frozenset[str] = frozenset(),
 ) -> DischargeResult:
-    """Fold the per-caller checks into one verdict — upgrading only on a clean sweep."""
+    """Fold the per-caller checks into one verdict — upgrading only on a clean sweep.
+
+    `anchored` names the callers whose *own* memory precondition is empty (no
+    pointer parameters), so their harness allocates real objects and nothing is
+    left assumed on their side. When every discharging caller is anchored the
+    chain is closed outright; otherwise the discharge is **relative** to those
+    callers' own still-assumed preconditions, and says so — a caller `g` proven
+    to call `f` correctly under `g`'s precondition tells you nothing about a
+    third function calling `g` badly, and claiming otherwise would over-state
+    exactly the way this stage exists to stop.
+    """
     broken = tuple(c for c in checks if c.outcome is CallerOutcome.OBLIGATION_VIOLATED)
     if broken:
         names = ", ".join(f"{c.caller}()" for c in broken)
@@ -467,11 +533,18 @@ def _aggregate(
             unit_result,
             checks,
         )
+    anchors = tuple(c.caller for c in checks if c.caller in anchored)
+    relative = (
+        ""
+        if len(anchors) == len(checks)
+        else " — relative to each caller's own synthesised precondition, which "
+        "stays assumed until that caller is itself discharged"
+    )
     return DischargeResult(
         function,
         Assessment.DISCHARGED_VERIFIED,
         f"every caller of {function}() in this translation unit is proven to "
-        "satisfy its memory precondition",
+        f"satisfy its memory precondition{relative}",
         unit_result,
         checks,
     )

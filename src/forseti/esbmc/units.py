@@ -185,38 +185,35 @@ def _error_line(text: str) -> str:
     return ""
 
 
-def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
-    """Function definitions in `source` from an ``esbmc --parse-tree-only`` dump.
+def parse_definitions(ast_text: str) -> list[tuple[str, Unit]]:
+    """Every function *definition* in an ``esbmc --parse-tree-only`` dump.
 
-    Walks the textual AST tracking the current file; for each ``FunctionDecl`` in
-    `source` it collects the immediate ``ParmVarDecl`` children (with their
-    canonical types), every function the subtree *references* (`Unit.calls`), and
-    keeps the unit only if the subtree contains a ``CompoundStmt`` — i.e. it is a
-    *definition*, not a prototype (so a header of declarations yields nothing,
-    matching what the gate can verify). Deduped by name, first definition wins.
+    Walks the textual AST tracking the current file and pairs each definition with
+    the file it came from — the whole *translation unit*, headers included, not
+    just the file that was passed to esbmc. For each ``FunctionDecl`` it collects
+    the immediate ``ParmVarDecl`` children (with their canonical types) and every
+    function the subtree references (`Unit.calls`), keeping it only if the subtree
+    contains a ``CompoundStmt`` — i.e. it is a definition, not a prototype.
+
+    Neither filtered nor deduped: `parse_units` narrows this to the file under
+    test (what the gate can verify), while `parse_external_callers` needs exactly
+    the part `parse_units` drops.
     """
-    # Attribute a function to `source` by a normalized full-path match against
-    # clang's location (clang echoes the input path verbatim), so a definition
-    # from a same-basename `#include`d file in another directory is not misread
-    # as belonging to `source`.
-    source_norm = os.path.normpath(str(source))
-    units: list[Unit] = []
-    seen: set[str] = set()
+    found: list[tuple[str, Unit]] = []
     current_file = ""
 
     # State for the FunctionDecl currently being assembled.
     fn_name: str | None = None
     fn_depth = -1
-    fn_in_target = False
+    fn_file = ""
     params: list[Param] = []
     calls: dict[str, None] = {}  # an ordered set of referenced function names
     is_definition = False
 
     def flush() -> None:
         nonlocal fn_name
-        if fn_name and fn_in_target and is_definition and fn_name not in seen:
-            seen.add(fn_name)
-            units.append(Unit(fn_name, tuple(params), tuple(calls)))
+        if fn_name and is_definition:
+            found.append((fn_file, Unit(fn_name, tuple(params), tuple(calls))))
         fn_name = None
 
     for line in ast_text.splitlines():
@@ -236,9 +233,7 @@ def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
             name_match = _NAME_RE.search(rest)
             fn_name = name_match.group(1) if name_match else None
             fn_depth = depth
-            fn_in_target = bool(current_file) and (
-                os.path.normpath(current_file) == source_norm
-            )
+            fn_file = current_file
             params = []
             calls = {}
             is_definition = False
@@ -260,7 +255,57 @@ def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
                     calls[callee.group(1)] = None
 
     flush()
+    return found
+
+
+def _is_target(file: str, source_norm: str) -> bool:
+    """Whether a definition's clang location names `source`.
+
+    A normalized *full-path* match (clang echoes the input path verbatim), so a
+    definition from a same-basename ``#include``\\ d file in another directory is
+    not misread as belonging to `source`. An empty location is never the target.
+    """
+    return bool(file) and os.path.normpath(file) == source_norm
+
+
+def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
+    """Function definitions in `source` from an ``esbmc --parse-tree-only`` dump.
+
+    `parse_definitions` narrowed to the file under test — a header of
+    declarations yields nothing, matching what the gate can verify. Deduped by
+    name, first definition wins.
+    """
+    source_norm = os.path.normpath(str(source))
+    units: list[Unit] = []
+    seen: set[str] = set()
+    for file, unit in parse_definitions(ast_text):
+        if not _is_target(file, source_norm) or unit.name in seen:
+            continue
+        seen.add(unit.name)
+        units.append(unit)
     return units
+
+
+def parse_external_callers(
+    ast_text: str, source: str | Path, symbol: str
+) -> tuple[str, ...]:
+    """Definitions **outside** `source` that reference `symbol`, by name.
+
+    The blind spot `parse_units` has by construction: a ``static inline`` in an
+    included header is part of the same translation unit and can call `symbol`,
+    but it is not a unit the gate enumerates. Compositional discharge (RFC-0003
+    S3) has to know they exist — it cannot claim every caller in the TU was
+    checked while some were never even listed — so it counts them and withholds
+    the upgrade rather than quietly ignoring them.
+    """
+    source_norm = os.path.normpath(str(source))
+    names: dict[str, None] = {}
+    for file, unit in parse_definitions(ast_text):
+        if _is_target(file, source_norm) or unit.name == symbol:
+            continue
+        if symbol in unit.calls:
+            names[unit.name] = None
+    return tuple(names)
 
 
 def mask_comments(source_text: str) -> str:
@@ -409,6 +454,52 @@ def annotate_array_extents(units: list[Unit], source_text: str) -> list[Unit]:
     return annotated
 
 
+def _parse_tree(
+    source: Path, esbmc_bin: str, timeout_s: float, extra_flags: Sequence[str]
+) -> str:
+    """The clang AST dump for `source`, or raise `ListUnitsError`.
+
+    Raises when esbmc cannot be invoked (missing/unrunnable binary) **or** when
+    the parse run fails (missing source, bad include path, C parse error — esbmc
+    exits nonzero), so a failed parse is never indistinguishable from a file that
+    happens to define nothing. ESBMC prints the dump to stderr; both streams are
+    combined so the parser is robust to which one a given build uses.
+    """
+    argv = (esbmc_bin, str(source), "--parse-tree-only", *extra_flags)
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ListUnitsError(
+            f"esbmc --parse-tree-only failed: {esbmc_bin}: {exc}"
+        ) from exc
+    if proc.returncode != 0:
+        detail = (
+            _error_line(proc.stderr)
+            or _error_line(proc.stdout)
+            or f"exit {proc.returncode}"
+        )
+        raise ListUnitsError(f"esbmc --parse-tree-only failed ({esbmc_bin}): {detail}")
+    return proc.stdout + "\n" + proc.stderr
+
+
+def list_external_callers(
+    source: Path,
+    symbol: str,
+    *,
+    esbmc_bin: str = "esbmc",
+    timeout_s: float = 30.0,
+    extra_flags: Sequence[str] = (),
+) -> tuple[str, ...]:
+    """Names of definitions *outside* `source` that reference `symbol`.
+
+    The complement of `list_units` over the same translation unit — see
+    `parse_external_callers` for why compositional discharge needs it. Raises
+    `ListUnitsError` on the same conditions as `list_units`.
+    """
+    ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
+    return parse_external_callers(ast_text, source, symbol)
+
+
 def list_units(
     source: Path,
     *,
@@ -425,23 +516,7 @@ def list_units(
     failed parse as an empty file, which would be indistinguishable from a valid
     one and could let the gate silently skip a unit.
     """
-    argv = (esbmc_bin, str(source), "--parse-tree-only", *extra_flags)
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ListUnitsError(
-            f"esbmc --parse-tree-only failed: {esbmc_bin}: {exc}"
-        ) from exc
-    if proc.returncode != 0:
-        detail = (
-            _error_line(proc.stderr)
-            or _error_line(proc.stdout)
-            or f"exit {proc.returncode}"
-        )
-        raise ListUnitsError(f"esbmc --parse-tree-only failed ({esbmc_bin}): {detail}")
-    # ESBMC prints the AST dump to stderr; combine both streams so the parser is
-    # robust to which stream a given build uses.
-    units = parse_units(proc.stdout + "\n" + proc.stderr, source)
+    units = parse_units(_parse_tree(source, esbmc_bin, timeout_s, extra_flags), source)
     # Enrich with fixed-array extents read from the source declarators (the clang
     # type has adjusted `T p[N]` to `T *`). Best-effort: a successful parse means
     # esbmc read the file, so a read failure here is unexpected — degrade to the

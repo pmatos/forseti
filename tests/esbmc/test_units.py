@@ -19,6 +19,8 @@ from forseti.esbmc.units import (
     find_definition_brace,
     list_units,
     mask_comments,
+    parse_definitions,
+    parse_external_callers,
     parse_units,
 )
 
@@ -494,3 +496,69 @@ def test_find_definition_brace_skips_prototypes_and_call_sites() -> None:
 
 def test_find_definition_brace_absent_without_a_definition() -> None:
     assert find_definition_brace("void f(int *p);\n", "f") is None
+
+
+_HEADER_CALLER_AST = """\
+TranslationUnitDecl 0x3000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0x3001 </tmp/foo.c:1:1, col:40> col:6 leaf 'void (int *)'
+| |-ParmVarDecl 0x3002 <col:12, col:18> col:18 used p 'int *'
+| `-CompoundStmt 0x3003 <col:24, col:40>
+|-FunctionDecl 0x3010 </tmp/helper.h:2:1, col:60> col:20 header_client 'void (int *)'
+| |-ParmVarDecl 0x3011 <col:12, col:18> col:18 used q 'int *'
+| `-CompoundStmt 0x3012 <col:24, col:60>
+|   `-DeclRefExpr 0x3013 <col:26> 'void (int *)' Function 0x3001 'leaf' 'void (i)'
+|-FunctionDecl 0x3020 </tmp/helper.h:9:1, col:30> col:20 header_proto 'void (int *)'
+| `-DeclRefExpr 0x3021 <col:26> 'void (int *)' Function 0x3001 'leaf' 'void (i)'
+|-FunctionDecl 0x3025 </tmp/helper.h:14:1, col:30> col:20 header_other 'int ()'
+| `-CompoundStmt 0x3026 <col:24, col:30>
+`-FunctionDecl 0x3030 </tmp/foo.c:12:1, col:60> col:6 local_client 'void (int *)'
+  |-ParmVarDecl 0x3031 <col:12, col:18> col:18 used q 'int *'
+  `-CompoundStmt 0x3032 <col:24, col:60>
+    `-DeclRefExpr 0x3033 <col:26> 'void (int *)' Function 0x3001 'leaf' 'void (i)'
+"""
+
+
+def test_parse_definitions_keeps_every_file() -> None:
+    files = {name for name, _ in parse_definitions(_HEADER_CALLER_AST)}
+    assert files == {"/tmp/foo.c", "/tmp/helper.h"}
+
+
+def test_parse_external_callers_finds_header_definitions() -> None:
+    # The blind spot `parse_units` has by construction: a definition in an
+    # included header is in the same TU but is not a unit the gate enumerates.
+    assert "header_client" not in {
+        u.name for u in parse_units(_HEADER_CALLER_AST, _TARGET)
+    }
+    assert parse_external_callers(_HEADER_CALLER_AST, _TARGET, "leaf") == (
+        "header_client",
+    )
+
+
+def test_parse_external_callers_ignores_prototypes_and_local_callers() -> None:
+    external = parse_external_callers(_HEADER_CALLER_AST, _TARGET, "leaf")
+    assert "header_proto" not in external  # no CompoundStmt → not a definition
+    assert "local_client" not in external  # in the target file → an enumerable unit
+    assert "header_other" not in external  # a header definition that never calls it
+
+
+def test_parse_external_callers_is_relative_to_the_given_source() -> None:
+    # Same dump, different file under test: what counts as "outside" flips.
+    assert parse_external_callers(_HEADER_CALLER_AST, "/tmp/helper.h", "leaf") == (
+        "local_client",
+    )
+
+
+_RECURSIVE_AST = """\
+TranslationUnitDecl 0x4000 <<invalid sloc>> <invalid sloc>
+`-FunctionDecl 0x4001 </tmp/helper.h:1:1, col:40> col:6 leaf 'void (int)'
+  |-ParmVarDecl 0x4002 <col:12, col:18> col:18 used n 'int'
+  `-CompoundStmt 0x4003 <col:24, col:40>
+    `-DeclRefExpr 0x4004 <col:26> 'void (int)' Function 0x4001 'leaf' 'void (i)'
+"""
+
+
+def test_parse_external_callers_never_reports_the_symbol_itself() -> None:
+    # A recursive definition outside the file under test references its own name;
+    # reporting it would make every recursive callee permanently undischargeable
+    # for a reason that is not a caller at all.
+    assert parse_external_callers(_RECURSIVE_AST, _TARGET, "leaf") == ()

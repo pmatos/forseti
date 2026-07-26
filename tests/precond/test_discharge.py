@@ -20,6 +20,7 @@ import pytest
 
 from forseti.esbmc import (
     EsbmcResult,
+    ListUnitsError,
     RunMeta,
     Unit,
     Unknown,
@@ -115,6 +116,7 @@ def _run(
     units: tuple[Unit, ...] = (CALLEE, CALLER),
     function: str = "sum_bytes",
     source_text: str = SOURCE,
+    external: Callable[[Path, str], tuple[str, ...]] = lambda _s, _f: (),
 ) -> DischargeResult:
     src = tmp / "frame.c"
     src.write_text(source_text)
@@ -126,6 +128,7 @@ def _run(
         work_dir=tmp,
         raw_verify=_raw(caller_verdicts or {}),
         list_units_fn=lambda _s: list(units),
+        external_callers_fn=external,
     )
 
 
@@ -276,10 +279,57 @@ def test_one_broken_caller_outranks_the_clean_ones(tmp_path: Path) -> None:
         work_dir=tmp_path,
         raw_verify=raw,
         list_units_fn=lambda _s: [CALLEE, CALLER, second],
+        external_callers_fn=lambda _s, _f: (),
     )
     assert result.assessment is Assessment.VIOLATED
     assert "payload_checksum()" in result.detail
     assert "frame_checksum()" not in result.detail
+
+
+def test_a_caller_outside_the_file_withholds_the_upgrade(tmp_path: Path) -> None:
+    # A `static inline` in an included header is a caller in this translation
+    # unit that `list_units` cannot enumerate by design. Claiming "every caller"
+    # while some were never listed would be a claim about a set we never saw.
+    result = _run(tmp_path, external=lambda _s, _f: ("header_client",))
+    assert result.assessment is Assessment.ASSUMED_VERIFIED
+    unchecked = [c for c in result.callers if c.caller == "header_client"]
+    assert unchecked and unchecked[0].outcome is CallerOutcome.UNCHECKED
+    assert "defined outside" in result.label
+
+
+def test_an_outside_caller_counts_even_with_no_local_caller(tmp_path: Path) -> None:
+    result = _run(tmp_path, units=(CALLEE,), external=lambda _s, _f: ("header_client",))
+    assert result.assessment is Assessment.ASSUMED_VERIFIED
+    assert [c.caller for c in result.callers] == ["header_client"]
+    assert "no caller" not in result.label  # there *is* one; we just cannot check it
+
+
+def test_a_failed_external_listing_is_an_error(tmp_path: Path) -> None:
+    def boom(_source: Path, _symbol: str) -> tuple[str, ...]:
+        raise ListUnitsError("esbmc --parse-tree-only failed: gone")
+
+    result = _run(tmp_path, external=boom)
+    assert result.assessment is Assessment.ERROR
+    assert "gone" in result.detail
+
+
+def test_discharge_states_what_it_is_relative_to(tmp_path: Path) -> None:
+    # `frame_checksum` has its own (still assumed) precondition, so proving it
+    # calls `sum_bytes` correctly says nothing about a third function calling
+    # `frame_checksum` badly. The label must not hide that.
+    result = _run(tmp_path)
+    assert result.assessment is Assessment.DISCHARGED_VERIFIED
+    assert "relative to each caller's own synthesised precondition" in result.label
+
+
+def test_a_precondition_free_caller_anchors_the_chain(tmp_path: Path) -> None:
+    # A caller with no pointer parameters has an empty precondition of its own,
+    # so its harness allocates real objects and nothing stays assumed on its
+    # side — the chain closes outright and the caveat is dropped.
+    entry = Unit("run", (), ("sum_bytes",))
+    result = _run(tmp_path, units=(CALLEE, entry))
+    assert result.assessment is Assessment.DISCHARGED_VERIFIED
+    assert "relative to" not in result.label
 
 
 def test_no_caller_in_the_translation_unit_stays_assumed(tmp_path: Path) -> None:
@@ -328,6 +378,7 @@ def test_unreadable_source_is_an_error(tmp_path: Path) -> None:
         work_dir=tmp_path,
         raw_verify=_raw({}),
         list_units_fn=lambda _s: [CALLEE, CALLER],
+        external_callers_fn=lambda _s, _f: (),
     )
     assert result.assessment is Assessment.ERROR
     assert "could not read" in result.detail

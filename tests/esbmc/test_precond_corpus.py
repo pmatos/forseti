@@ -217,3 +217,44 @@ def test_an_underdetermined_caller_is_not_a_phantom_violation(tmp_path: Path) ->
     assert result.assessment is Assessment.ASSUMED_VERIFIED, result.label
     assert result.callers[0].outcome is CallerOutcome.UNDERDETERMINED
     assert "hash_block" in result.label
+
+
+_HEADER_CALLER = """\
+static inline uint32_t header_client(const uint8_t *p) {
+    return sum_bytes(p, 64);
+}
+"""
+
+_TU_WITH_HEADER_CALLER = """\
+#include <stddef.h>
+#include <stdint.h>
+
+uint32_t sum_bytes(const uint8_t *buf, size_t len) {
+    uint32_t acc = 0;
+    for (size_t i = 0; i < len; i++) acc += buf[i];
+    return acc;
+}
+
+#include "helper.h"
+
+uint32_t frame_checksum(const uint8_t *frame, size_t len) {
+    return sum_bytes(frame, len);
+}
+"""
+
+
+def test_a_caller_defined_in_a_header_withholds_the_upgrade(tmp_path: Path) -> None:
+    # `list_units` narrows to the file under test by design, so a `static inline`
+    # caller in an included header is part of the translation unit but is not an
+    # enumerable unit. Upgrading here would claim "every caller in this TU" about
+    # a set that was never fully seen — so it is counted and the upgrade withheld,
+    # even though the one caller we *can* check discharges cleanly.
+    (tmp_path / "helper.h").write_text(_HEADER_CALLER)
+    src = tmp_path / "tu.c"
+    src.write_text(_TU_WITH_HEADER_CALLER)
+    result = discharge_precondition(src, function="sum_bytes", max_len=MAX_LEN)
+    assert result.assessment is Assessment.ASSUMED_VERIFIED, result.label
+    outcomes = {c.caller: c.outcome for c in result.callers}
+    assert outcomes["frame_checksum"] is CallerOutcome.DISCHARGED
+    assert outcomes["header_client"] is CallerOutcome.UNCHECKED
+    assert "defined outside" in result.label

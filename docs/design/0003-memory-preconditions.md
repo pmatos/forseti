@@ -231,6 +231,23 @@ but the process status stays the callee's `ASSUMED_VERIFIED` 0 — that caller i
 verification unit and its own gate run is what should redden. Only a silent pass is forbidden, which
 is why every withheld discharge is spelled out in the label.
 
+**A discharge is *relative*, and says so.** Each caller's own parameters are materialised by *its*
+S2 assumption, so what one command proves is `caller precondition ⟹ callee precondition` at every
+call site — one link of the chain, not the whole chain. Proving `frame_checksum` calls `sum_bytes`
+correctly says nothing about a third function calling `frame_checksum` badly; closing that needs
+`forseti discharge --function frame_checksum` in turn. The label carries the caveat verbatim, and
+drops it exactly when the chain is **anchored**: a caller whose own precondition is *empty* (no
+pointer parameters) has a harness that allocates real objects, leaving nothing assumed on its side,
+so a TU whose every caller is anchored is discharged outright.
+
+**A caller the gate cannot enumerate is counted, not ignored.** `list_units` narrows to the file
+under test by design, so a `static inline` defined in an included header is part of the translation
+unit yet is not a unit the gate can plan or build a harness for. Claiming "every caller in this TU"
+while such a definition exists would be a claim about a set that was never fully seen, so
+`parse_external_callers` finds them from the same clang dump and each one becomes an `UNCHECKED`
+caller that withholds the upgrade. Enumerating and harnessing header‑defined units is L1/S4
+territory; until then the honest answer is that the discharge is incomplete and *why*.
+
 **OQ1 answered — verify a generated copy.** Injecting into a copy works and keeps the promise S2
 made: `forseti discharge --emit-only` prints exactly what the checker sees, and the acceptance suite
 asserts the user's file is byte‑identical afterwards. Source annotations were never a live option
