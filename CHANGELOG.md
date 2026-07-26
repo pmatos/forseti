@@ -1,3 +1,10 @@
+## [1.6.5](https://github.com/pmatos/forseti/compare/v1.6.4...v1.6.5) (2026-07-26)
+
+
+### Bug Fixes
+
+* **precond:** pair a conventional T p[N] extent with an accompanying length ([#158](https://github.com/pmatos/forseti/issues/158)) ([18eed0d](https://github.com/pmatos/forseti/commit/18eed0d9bdbbd87a27c4e9316e42c111a45c9d65))
+
 ## [1.6.4](https://github.com/pmatos/forseti/compare/v1.6.3...v1.6.4) (2026-07-26)
 
 
