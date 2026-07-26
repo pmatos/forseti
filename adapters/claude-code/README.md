@@ -239,13 +239,15 @@ turns a verdict into an error.
   real file does — so the snapshot's first line is a `#line 1 "<real path>"`
   directive, fixing the presumed name back to the original without touching
   where its bytes sit; verified against a live `esbmc` run. The snapshot's name
-  is excluded from the gate's own discovery unconditionally — never subject to
-  `FORSETI_GATE_INCLUDE`/`_EXCLUDE` — so one a killed hook could not clean up
-  is never itself offered back as a source to verify. Staging it at all is
-  skipped when every definition in the file takes a pointer/array parameter
-  (`NEEDS_CONTRACT`, no ESBMC call ever reached): a directory that could not
-  host a snapshot must not gate an edit that would never have needed one.
-  Every path the CLI's own response names — the trace's
+  is excluded from the gate's own discovery — never subject to
+  `FORSETI_GATE_INCLUDE`/`_EXCLUDE` — for as long as git can show it is
+  untracked, so one a killed hook could not clean up is never itself offered
+  back as a source to verify; a *tracked* file that happens to share the
+  snapshot's basename prefix is still discovered and gated normally. Staging it
+  at all is skipped when every definition in the file takes a pointer/array
+  parameter (`NEEDS_CONTRACT`, no ESBMC call ever reached): a directory that
+  could not host a snapshot must not gate an edit that would never have needed
+  one. Every path the CLI's own response names — the trace's
   `argv` and any counterexample — is rewritten from the snapshot back to the
   real file before it is recorded, so the loop trace and any fix Claude is asked
   to make still point at a file that exists on disk. The file is still

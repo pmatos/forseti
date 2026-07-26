@@ -167,15 +167,15 @@ _NEEDS_CONTRACT_DETAIL = (
     "memory precondition/harness — not gated (see issue #122)"
 )
 
-# The verify snapshot's filename prefix (issue #150). `_included` rejects any
-# path whose basename starts with it — unconditionally, ahead of
-# `FORSETI_GATE_EXCLUDE`/`FORSETI_GATE_INCLUDE` — because a project can replace
-# (not extend) that env var, and a snapshot a killed hook could not clean up
-# must never be offered back to `verify_and_record` as a source in its own
-# right. `.` leads so `is_c_source`'s suffix check (always true here — the
-# snapshot's suffix always case-insensitively matches `file_path`'s own, see
-# `_verifiable_source`) still lets it through the discovery scans as a
-# dotfile, which is exactly what the unconditional exclusion exists to catch.
+# The verify snapshot's filename prefix (issue #150). `_untracked_verify_snapshot`
+# rejects a path whose basename starts with it *and* that git cannot show as
+# tracked — ahead of `FORSETI_GATE_EXCLUDE`/`FORSETI_GATE_INCLUDE` (a project can
+# replace, not extend, that env var), a snapshot a killed hook could not clean up
+# must never be offered back to `verify_and_record` as a source in its own right.
+# `.` leads so `is_c_source`'s suffix check (always true here — the snapshot's
+# suffix always case-insensitively matches `file_path`'s own, see
+# `_verifiable_source`) still lets it through the discovery scans as a dotfile,
+# which is exactly what that exclusion exists to catch.
 _VERIFY_SNAPSHOT_PREFIX = ".forseti-verify-"
 
 
@@ -752,15 +752,11 @@ def _included(rel: str) -> bool:
     Exclude wins over include. When `FORSETI_GATE_EXCLUDE` is unset the built-in
     `_DEFAULT_EXCLUDE_GLOBS` apply; setting it replaces (not extends) them.
 
-    A verify snapshot's own name (`_VERIFY_SNAPSHOT_PREFIX`) is rejected first,
-    unconditionally — never subject to either glob. It has to be: `FORSETI_GATE_EXCLUDE`
-    *replaces* the defaults rather than extending them, so a project that sets one
-    would otherwise un-exclude a snapshot a killed hook left behind, and a
-    concurrent scan could then hand it back to `verify_and_record` as a source in
-    its own right.
+    Purely name-based — it does not know about the verify snapshot's basename
+    prefix (`_VERIFY_SNAPSHOT_PREFIX`). That exclusion lives one layer up, in
+    `_in_scope_c_abspath`, because it must not apply to a *tracked* file that
+    happens to share the prefix — see there for why.
     """
-    if os.path.basename(rel).startswith(_VERIFY_SNAPSHOT_PREFIX):
-        return False
     exclude = _globs(os.environ.get("FORSETI_GATE_EXCLUDE")) or _DEFAULT_EXCLUDE_GLOBS
     if _matches(rel, exclude):
         return False
@@ -909,17 +905,52 @@ def git_committed_files_since(project_dir: str, baseline_head: str | None) -> li
     return [p for p in out.split("\0") if p]
 
 
+def _untracked_verify_snapshot(root: str, rel: str) -> bool:
+    """True only when repo-root-relative `rel` is a *provably untracked* leftover
+    matching the verify snapshot's basename prefix (`_VERIFY_SNAPSHOT_PREFIX`).
+
+    A snapshot `_verifiable_source` could not clean up (a kill) must never be
+    handed back to `verify_and_record` as a source in its own right — that is
+    this check's job. But a repository can also already *track* a legitimate
+    source whose name happens to share the prefix; excluding by name alone would
+    silently drop a real, changed file from every scan (a Bash edit to it would
+    ship unverified, since the direct Write/Edit hook never sees a Bash write —
+    review feedback on PR #159, issue #150). So the exemption only fires when git
+    can affirmatively say the path is not in its index — never when the question
+    can't be asked. A missing/unreachable git, a timeout, or `root` not being a
+    work tree all read `_git` as ``None``; treating that as "provably untracked"
+    would fail *open* (exempt, i.e. silently drop, a file that might well be a
+    real tracked source) in the one predicate whose job this round is to stop
+    exactly that silent bypass — so ``None`` never exempts.
+
+    ``:(literal)`` keeps `rel` from being read as a glob/pathspec-magic pattern —
+    a tracked file literally named ``.forseti-verify-[a].c`` would otherwise be
+    matched as a character class instead of itself and could read as untracked.
+
+    The residual this leaves, deliberately: a *new*, not-yet-tracked legitimate
+    source that happens to share the prefix is still silently exempt until it is
+    `git add`ed. Narrowing further (e.g. also requiring `mkstemp`'s random-suffix
+    shape) is a second, overlapping guard for the same gap trackedness already
+    closes for the common case — not worth it for how exotic a deliberately
+    prefix-named untracked source is.
+    """
+    if not os.path.basename(rel).startswith(_VERIFY_SNAPSHOT_PREFIX):
+        return False
+    listed = _git(root, "ls-files", "-z", "--", f":(literal){rel}")
+    return listed is not None and not listed.strip()
+
+
 def _in_scope_c_abspath(
     project_dir: str, root: str, proj_real: str, rel: str
 ) -> str | None:
     """Absolute path for repo-root-relative `rel` if it is an in-scope, included C
     source under `project_dir`, else ``None``.
 
-    Applies the C-suffix, project-subtree, and include/exclude-glob filters shared by
-    the worktree scan (`discover_changed_c_sources`) and the staged/committed-blob
-    scan (`divergent_blob_sources`). Deliberately does **not** check file existence —
-    a staged or committed blob can outlive its worktree file (a `git add`-then-`rm`),
-    and the blob scan must still gate it.
+    Applies the C-suffix, project-subtree, untracked-snapshot, and include/exclude-
+    glob filters shared by the worktree scan (`discover_changed_c_sources`) and the
+    staged/committed-blob scan (`divergent_blob_sources`). Deliberately does **not**
+    check file existence — a staged or committed blob can outlive its worktree file
+    (a `git add`-then-`rm`), and the blob scan must still gate it.
     """
     abspath = os.path.join(root, rel)
     if not is_c_source(abspath):
@@ -929,6 +960,8 @@ def _in_scope_c_abspath(
             return None  # changed outside this project subtree — out of scope
     except ValueError:
         return None  # different drive/root — cannot be under proj
+    if _untracked_verify_snapshot(root, rel):
+        return None
     if not _included(os.path.relpath(abspath, project_dir)):
         return None
     return abspath
@@ -1392,9 +1425,10 @@ def _verifiable_source(
     the source's real basename, suffix and all (review feedback on PR #159,
     issue #150).
 
-    The name carries `_VERIFY_SNAPSHOT_PREFIX` so `_included` excludes it from
-    the gate's own discovery unconditionally — see there for why that has to be
-    unconditional. `git status` still lists it until the `finally` below runs
+    The name carries `_VERIFY_SNAPSHOT_PREFIX` so `_untracked_verify_snapshot`
+    excludes it from the gate's own discovery for as long as it is untracked —
+    see there for why a *tracked* file sharing the prefix must not be exempted
+    the same way. `git status` still lists it until the `finally` below runs
     (or, if this process is killed first, until something else removes it) —
     the cost of writing into the user's tree at all, and cheaper than the race
     this exists to close.
