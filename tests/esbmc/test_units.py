@@ -471,6 +471,39 @@ def test_line_breakpoints_excludes_a_directive_inside_a_dead_if1_else_body() -> 
     assert _line_breakpoints(source) == [(2, 5)]
 
 
+def test_line_breakpoints_elif_one_is_live_when_no_earlier_arm_won() -> None:
+    # PR #156 follow-up: a literal `#elif 1` is live exactly when nothing
+    # earlier in the chain was already known-taken — the opaque `#if FOO`
+    # hasn't proven anything either way, so this arm is (optimistically)
+    # assumed live, the same bias as an opaque `#if`/`#elif` on its own.
+    source = "#if FOO\n#elif 1\n#line 5\nx\n#endif\n"
+    assert _line_breakpoints(source) == [(3, 5)]
+
+
+def test_line_breakpoints_elif_one_is_dead_after_an_earlier_if_one() -> None:
+    # Mirror: once a literal `#if 1` has already won the chain, a later
+    # `#elif 1` can never be reached, however true its own condition reads.
+    source = "#if 1\n#elif 1\n#line 5\nx\n#endif\n"
+    assert _line_breakpoints(source) == []
+
+
+def test_line_breakpoints_ignores_an_unbalanced_elif_zero() -> None:
+    # A stray `#elif 0` with no matching `#if` must not raise, mirroring
+    # `test_line_breakpoints_ignores_an_unbalanced_endif` for `#endif`.
+    source = "#elif 0\n#line 5\nx\n"
+    assert _line_breakpoints(source) == [(2, 5)]
+
+
+def test_line_breakpoints_ignores_an_unbalanced_elif_one() -> None:
+    source = "#elif 1\n#line 5\nx\n"
+    assert _line_breakpoints(source) == [(2, 5)]
+
+
+def test_line_breakpoints_ignores_an_unbalanced_else() -> None:
+    source = "#else\n#line 5\nx\n"
+    assert _line_breakpoints(source) == [(2, 5)]
+
+
 def test_line_breakpoints_ignores_a_line_directive_spliced_from_a_macro() -> None:
     # PR #156 follow-up: a physical line that only *looks* like `#line 1`
     # because it is spliced onto the previous line's backslash continuation
