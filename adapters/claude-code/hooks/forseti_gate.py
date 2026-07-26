@@ -458,6 +458,17 @@ def _enumerable_source(
             f"could not stage a snapshot of {file_path} for enumeration (check "
             f"free space and write access to {src_dir}): {exc}"
         ) from exc
+    except BaseException:
+        # A KeyboardInterrupt/SystemExit (or any other non-OSError) during the
+        # write must not leak the snapshot `mkstemp` already created — the
+        # `except OSError` above only ever covered write failures reported as
+        # an OSError, and the yield's own `except BaseException` below wraps
+        # only the yield, not this write. Same best-effort cleanup, and a bare
+        # re-raise so an interrupt isn't relabeled as a blocking
+        # `UnitsUnavailable`.
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
     try:
         yield path
     except BaseException:

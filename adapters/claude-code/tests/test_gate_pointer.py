@@ -756,6 +756,48 @@ def test_snapshot_cleanup_failure_does_not_mask_a_pending_enumeration_failure(
         gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
 
 
+def test_snapshot_is_removed_when_the_write_is_interrupted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A KeyboardInterrupt (or any other non-OSError) raised while writing the
+    # snapshot's content used to escape both the write's `except OSError` and
+    # the yield's `except BaseException` (which wraps only the yield, not the
+    # write step above it) — leaking the file `mkstemp` already created on
+    # disk indefinitely.
+    class _InterruptingHandle:
+        def __enter__(self) -> _InterruptingHandle:
+            return self
+
+        def __exit__(self, *exc_info: object) -> None:
+            return None
+
+        def write(self, data: bytes) -> int:
+            raise KeyboardInterrupt
+
+    def _fdopen(fd: int, mode: str) -> _InterruptingHandle:
+        os.close(fd)
+        return _InterruptingHandle()
+
+    monkeypatch.setattr(gate.os, "fdopen", _fdopen)
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    with (
+        pytest.raises(KeyboardInterrupt),
+        gate._enumerable_source(
+            str(src), b"int f(void) { return 0; }\n", project_dir=str(tmp_path)
+        ),
+    ):
+        pass
+
+    leftover = [
+        p.name
+        for p in tmp_path.iterdir()
+        if p.name.startswith(gate._ENUM_SNAPSHOT_PREFIX)
+    ]
+    assert leftover == []
+
+
 def test_exclude_is_registered_against_the_source_repo_not_the_project_root(
     tmp_path: Path, monkeypatch
 ) -> None:
