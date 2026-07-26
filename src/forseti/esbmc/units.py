@@ -69,7 +69,14 @@ _TYPE_RE = re.compile(r"'([^']*)'")
 
 # Line (`// ...`) and block (`/* ... */`) comments, stripped before harvesting an
 # array extent so a `[N]` inside a comment can never be misread as a declarator.
-_COMMENT_RE = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
+# A `//` comment absorbs a trailing backslash-newline as part of itself: cpp
+# splices lines (translation phase 2) before it ever recognizes a comment
+# (phase 3), so `// text \` continued onto a `#line`/`#if`-looking next line is,
+# to cpp, one comment spanning both physical lines — not a directive (PR #156
+# follow-up to issue #145: `_line_breakpoints`' own continuation exclusion runs
+# on this already-blanked text, so a backslash swallowed by an *unspliced* `//`
+# match here would already be gone by the time that exclusion could see it).
+_COMMENT_RE = re.compile(r"//(?:\\\r?\n|[^\n])*|/\*.*?\*/", re.DOTALL)
 
 # A named parameter's array declarator: the name followed by *all* its consecutive
 # `[...]` groups, captured together (whitespace between them included) so a
@@ -649,10 +656,12 @@ def _blank_comment(match: re.Match[str]) -> str:
     """A comment's replacement text: its newlines, so line numbers stay aligned.
 
     A single-line comment (`//...` or a same-line `/*...*/`) becomes one space,
-    same as before. A multi-line block comment becomes that many bare newlines
-    instead — dropping its inline text (fine; a comment holds no declarator) while
-    keeping every following line's number identical to `source_text`'s, which
-    `_param_list_text` relies on to match a `Unit.def_line` from clang.
+    same as before. A multi-line comment — a block comment, or a `//` comment
+    that absorbed a backslash-continuation (PR #156 follow-up to issue #145) —
+    becomes that many bare newlines instead — dropping its inline text (fine; a
+    comment holds no declarator) while keeping every following line's number
+    identical to `source_text`'s, which `_param_list_text` relies on to match a
+    `Unit.def_line` from clang.
     """
     newlines = match.group(0).count("\n")
     return "\n" * newlines if newlines else " "

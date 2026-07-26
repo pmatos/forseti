@@ -598,6 +598,41 @@ def test_annotate_array_extents_anchors_correctly_across_a_multiline_comment() -
     assert (out.array_extent, out.array_extent_unresolved) == (None, False)
 
 
+def test_blank_comment_absorbs_a_backslash_continued_line_comment() -> None:
+    # PR #156 follow-up: cpp splices a `\`-terminated line onto the next before
+    # it ever recognizes a `//` comment (translation phase 2 runs before phase
+    # 3), so a directive-looking line right after such a splice is part of the
+    # comment, not a directive. `_COMMENT_RE` must absorb the continuation so
+    # the directive-looking text is blanked away with it, not left exposed.
+    source = "int a;\n// comment \\\n#line 1\nint b;\n"
+    stripped = _COMMENT_RE.sub(_blank_comment, source)
+    assert stripped.count("\n") == source.count("\n")
+    assert "#line" not in stripped
+    b_line_original = next(
+        i for i, line in enumerate(source.splitlines(), 1) if "int b;" in line
+    )
+    b_line_stripped = next(
+        i for i, line in enumerate(stripped.splitlines(), 1) if "int b;" in line
+    )
+    assert b_line_stripped == b_line_original == 4
+
+
+def test_annotate_array_extents_ignores_a_line_directive_spliced_from_a_comment() -> (
+    None
+):
+    # End-to-end: the earlier continuation fix (1dc377c) only scanned the
+    # already-blanked text, where a backslash inside a `//` comment was already
+    # erased along with the comment — invisible to that continuation check. The
+    # phantom `#line 1` must instead never survive comment-blanking at all.
+    source = (
+        "#if 0\nvoid f(int p[20]) { }\n#endif\n"
+        "// c \\\n#line 1\nvoid f(int *p) { *p = 1; }\n"
+    )
+    unit = Unit("f", (Param("p", "int *"),), def_line=6)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
 _HAVE_ESBMC = shutil.which("esbmc") is not None
 
 
