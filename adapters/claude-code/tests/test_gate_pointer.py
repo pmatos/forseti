@@ -15,7 +15,11 @@ broken launcher elsewhere is shadowed)::
 
 from __future__ import annotations
 
+import contextlib
+import errno
+import hashlib
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -49,13 +53,86 @@ def _fake_forseti_cmd(
 
 
 def _argv_capturing_forseti_cmd(tmp_path: Path, dest: Path) -> list[str]:
-    """A fake CLI that records its argv to `dest` and reports no units."""
+    """A fake CLI recording its argv and the source's *neighbourhood* to `dest`.
+
+    `siblings` maps each entry beside the file it was handed to that entry's
+    real path — which is how a test checks that a snapshot's temp directory
+    stands in for the source's own directory (`_enumerable_source` mirrors it
+    with symlinks, so quoted `#include`s resolve exactly as they would in place).
+    `ancestors` is the same walking upwards *lexically*, one record per level
+    from the source's directory to ``/``: what a `..` in an `#include` would find
+    if the caller normalized the path itself. `kernel_ancestors` is the walk the
+    kernel actually performs — it resolves each component first, so a symlinked
+    one sends the chain somewhere the lexical walk never goes. `islink`/`real`
+    say which of the two a given level belongs to. A level that cannot be listed
+    records ``None`` rather than aborting the capture.
+    """
     script = tmp_path / "argv_forseti.py"
     script.write_text(
-        "import json, sys\n"
-        f"open({str(dest)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
+        "import json, os, sys\n"
+        "def ents(p):\n"
+        "    try:\n"
+        "        return {e: os.path.realpath(os.path.join(p, e))"
+        " for e in os.listdir(p)}\n"
+        "    except OSError:\n"
+        "        return None\n"
+        "src = sys.argv[2]\n"
+        "d = os.path.dirname(src)\n"
+        "sib = ents(d)\n"
+        "anc = []\n"
+        "while d and d != os.sep:\n"
+        "    anc.append({'path': d, 'islink': os.path.islink(d),"
+        " 'real': os.path.realpath(d), 'entries': ents(d)})\n"
+        "    d = os.path.dirname(d)\n"
+        "k = os.path.realpath(os.path.dirname(src))\n"
+        "ker = []\n"
+        "while k and k != os.sep:\n"
+        "    ker.append({'path': k, 'entries': ents(k)})\n"
+        "    k = os.path.dirname(k)\n"
+        f"open({str(dest)!r}, 'w').write("
+        "json.dumps({'argv': sys.argv[1:], 'siblings': sib, 'ancestors': anc,"
+        " 'kernel_ancestors': ker}))\n"
         "sys.stdout.write('{\"units\": []}')\n"
     )
+    return [sys.executable, str(script)]
+
+
+def _echoing_forseti_cmd(
+    tmp_path: Path,
+    *,
+    before_read: str = "",
+    after_read: str = "",
+    during_verify: str = "",
+    verdict: str = "violated",
+) -> list[str]:
+    """A fake CLI: `list-units` reports one unit per word of the file it was HANDED.
+
+    Echoing the *content back as unit names* is what lets a test assert which
+    bytes were actually enumerated — a canned payload cannot. `before_read` and
+    `after_read` are Python statements run around that read, straddling it: this
+    is the seam for rewriting the original source *while* the CLI is "parsing"
+    it, which is the only ordering that reproduces the issue #141 interleaving (a
+    rewrite that both starts and finishes before the read is not a race at all).
+    `during_verify` is the same seam for the `verify` call. `verify` answers
+    `verdict` (`violated` by default, so every enumerated unit ends up blocking).
+    """
+    script = tmp_path / "echo_forseti.py"
+    body = [
+        "import json, sys",
+        "if sys.argv[1] == 'list-units':",
+        "    src = sys.argv[2]",
+        *(f"    {line}" for line in before_read.splitlines()),
+        "    names = open(src).read().split()",
+        *(f"    {line}" for line in after_read.splitlines()),
+        "    print(json.dumps({'source': src, 'units': ["
+        "{'function': n, 'takes_pointer': False} for n in names]}))",
+        "else:",
+        *(f"    {line}" for line in during_verify.splitlines()),
+        "    fn = sys.argv[sys.argv.index('--function') + 1]",
+        f"    print(json.dumps({{'verdict': {verdict!r}, 'unwind': 1, "
+        "'counterexample': 'cex ' + fn}))",
+    ]
+    script.write_text("\n".join(body) + "\n")
     return [sys.executable, str(script)]
 
 
@@ -126,7 +203,7 @@ def test_list_units_timeout_reaches_the_cli_unrounded(
     src = tmp_path / "x.c"
     src.write_text("int f(void) { return 0; }\n")
     assert gate.extract_function_defs(str(src), project_dir=str(tmp_path)) == []
-    argv = json.loads(dest.read_text())
+    argv = json.loads(dest.read_text())["argv"]
     assert argv[argv.index("--timeout") + 1] == expected
 
 
@@ -298,31 +375,417 @@ def test_extract_function_defs_empty_units_is_a_clean_pass(
     )
 
 
-def test_rewrite_during_enumeration_does_not_prune_or_stamp(
+def test_enumeration_parses_the_given_content_not_a_re_read(
     tmp_path: Path, monkeypatch
 ) -> None:
-    # The A -> B -> A interleaving: `list-units` re-reads the file, so a concurrent
-    # `> f.c` rewrite can have it enumerate the zero-byte instant (a *successful*
-    # empty list) before the original bytes are restored. Left unchecked that
-    # prunes every unit the file has — dropping an already-recorded blocking
-    # verdict — and stamps `scanned` with the restored content's digest, so the
-    # Stop-gate and the out-of-band scan both see a handled file. Note a byte
-    # comparison alone cannot catch this: the content is identical afterwards.
+    # `content=` is the fix for issue #141: those exact bytes are what gets
+    # parsed, so no re-read of the path can substitute different ones. Here the
+    # on-disk bytes and the passed bytes disagree — the passed bytes must win,
+    # and the original must be left alone.
     src = tmp_path / "x.c"
-    original = "int f(int a) { return a; }\n"
-    src.write_text(original)
+    src.write_text("ondisk\n")
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+    defs = gate.extract_function_defs(
+        str(src), project_dir=str(tmp_path), content=b"snapshot\n"
+    )
+    assert [d.name for d in defs] == ["snapshot"]
+    assert src.read_text() == "ondisk\n"
 
+
+def test_snapshot_directory_stands_in_for_the_sources_own(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # clang resolves a quoted `#include "sibling.h"` against the directory of the
+    # file it is reading, so the snapshot has to sit in an equivalent directory:
+    # every entry beside the source is mirrored into the temp dir. Crucially this
+    # needs NO `-I` — see the next test for why a flag is not a substitute.
+    dest = tmp_path / "argv.json"
+    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
+    )
+    sub = tmp_path / "sub"
+    (sub / "nested").mkdir(parents=True)
+    (sub / "helper.h").write_text("#define HELP 1\n")
+    (sub / "nested" / "deep.h").write_text("#define DEEP 2\n")
+    src = sub / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+    captured = json.loads(dest.read_text())
+    enumerated = Path(captured["argv"][1])
+    assert enumerated != src and enumerated.name == "x.c"  # a recognisable name
+    # The sibling header and the subdirectory both resolve to the real ones...
+    assert captured["siblings"]["helper.h"] == str((sub / "helper.h").resolve())
+    assert captured["siblings"]["nested"] == str((sub / "nested").resolve())
+    # ...and the source's own name is the snapshot, not a link back to the file.
+    assert captured["siblings"]["x.c"] != str(src.resolve())
+    assert "--" not in captured["argv"]  # no include flag invented
+    assert not enumerated.exists()  # the temp mirror is cleaned up
+
+
+def test_snapshot_does_not_disturb_angle_include_or_iquote_precedence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Why the directory is mirrored rather than named with `-I`: `-I` also joins
+    # the *angle-bracket* search, and lands after any `-iquote` from
+    # FORSETI_BUILD_FLAGS instead of taking the source directory's first-place
+    # precedence. With `#include <config.h>` next to a generated `config.h` —
+    # the standard shape — either one selects a different header than the
+    # in-place parse, flipping `#if` branches so enumeration reports units the
+    # verify never sees. The build flags must reach esbmc untouched and alone.
+    dest = tmp_path / "argv.json"
+    monkeypatch.setenv("FORSETI_BUILD_FLAGS", "-Igenerated -iquote quoted -DWIDGET")
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+    argv = json.loads(dest.read_text())["argv"]
+    assert argv[argv.index("--") + 1 :] == [
+        "-Igenerated",
+        "-iquote",
+        "quoted",
+        "-DWIDGET",
+    ]
+
+
+def test_snapshot_mirrors_the_lexical_directory_not_the_symlink_target(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # clang searches the directory of the path it was *given*, so for a symlinked
+    # source that is the link's directory, not the target's. Mirroring the
+    # resolved one would drop a header beside the link and silently prefer a
+    # same-named header beside the target — enumerating units the in-place parse
+    # never sees.
+    dest = tmp_path / "argv.json"
+    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
+    )
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "x.c").write_text("int f(void) { return 0; }\n")
+    (real / "config.h").write_text("#define WHICH 2\n")  # must NOT be mirrored
+    link_dir = tmp_path / "linked"
+    link_dir.mkdir()
+    (link_dir / "config.h").write_text("#define WHICH 1\n")  # this one must be
+    (link_dir / "x.c").symlink_to(real / "x.c")
+
+    gate.extract_function_defs(
+        str(link_dir / "x.c"), project_dir=str(tmp_path), content=b"f\n"
+    )
+
+    siblings = json.loads(dest.read_text())["siblings"]
+    assert siblings["config.h"] == str((link_dir / "config.h").resolve())
+
+
+def test_snapshot_mirrors_the_dir_resolved_against_project_dir(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The CLI subprocess runs with cwd=project_dir, so a relative `file_path` is
+    # relative to *that*, not to the hook process's cwd. A bare `os.path.abspath`
+    # would mirror whatever directory the hook happened to start in.
+    dest = tmp_path / "argv.json"
+    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
+    )
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "x.c").write_text("int f(void) { return 0; }\n")
+    (sub / "helper.h").write_text("#define HELP 1\n")
+
+    gate.extract_function_defs("sub/x.c", project_dir=str(tmp_path), content=b"f\n")
+
+    siblings = json.loads(dest.read_text())["siblings"]
+    assert siblings["helper.h"] == str((sub / "helper.h").resolve())
+
+
+def test_snapshot_mirrors_the_ancestry_up_to_the_project_dir(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # `#include "../common.h"` — the ordinary shape for a `src/foo.c` — resolves
+    # against the *parent* of the source's directory. Mirroring only the siblings
+    # left it unresolvable, so `list-units` failed on a translation unit that
+    # parses perfectly in place and the gate recorded a blocking `error`. The
+    # chain from the project dir down is mirrored too: each level carries its own
+    # entries, minus the one the chain continues through.
+    dest = tmp_path / "argv.json"
+    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
+    )
+    proj = tmp_path / "proj"
+    (proj / "src").mkdir(parents=True)
+    (proj / "common.h").write_text("#define COMMON 1\n")
+    (proj / "include").mkdir()
+    src = proj / "src" / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    gate.extract_function_defs(str(src), project_dir=str(proj), content=b"f\n")
+
+    captured = json.loads(dest.read_text())
+    staged = Path(captured["argv"][1])
+    src_level, proj_level = captured["ancestors"][0], captured["ancestors"][1]
+    assert proj_level["entries"]["common.h"] == str((proj / "common.h").resolve())
+    assert proj_level["entries"]["include"] == str((proj / "include").resolve())
+    # `src` on the chain is the mirror the snapshot sits in, NOT a link back to
+    # the real directory — a link there would put the real `x.c` beside it.
+    assert proj_level["entries"]["src"] == str(staged.parent.resolve())
+    # Every step is a real directory, so `..` walks the mirror whether the caller
+    # normalizes `foo/../bar` lexically or leaves it to the kernel.
+    assert not src_level["islink"] and not proj_level["islink"]
+
+
+def test_snapshot_reproduces_a_symlinked_directory_component(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A `..` climbing past a *symlinked* component does not climb the spelled
+    # chain: the kernel resolves the component first, so `link/src/../..` lands
+    # beside the link's target. clang hands the concatenated path straight to
+    # `open`, so that is the resolution the in-place parse gets. Reproducing the
+    # component as a real directory would send the climb up the spelled chain
+    # instead and silently select a different header — a different translation
+    # unit, which enumeration then prunes and stamps against.
+    dest = tmp_path / "argv.json"
+    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
+    )
+    proj = tmp_path / "proj"
+    pkg = proj / "vendor" / "pkg"
+    (pkg / "src").mkdir(parents=True)
+    (pkg / "common.h").write_text("#define COMMON 1\n")
+    (proj / "vendor" / "selector.h").write_text("#define WHICH 1\n")  # the real pick
+    (proj / "selector.h").write_text("#define WHICH 2\n")  # the spelled-chain decoy
+    (proj / "link").symlink_to(pkg)
+    src = proj / "link" / "src" / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    gate.extract_function_defs(str(src), project_dir=str(proj), content=b"f\n")
+
+    captured = json.loads(dest.read_text())
+    src_level, link_level, proj_level = captured["ancestors"][:3]
+    kernel = captured["kernel_ancestors"]
+    # The component is a link in the mirror too, so the kernel walk leaves the
+    # spelled chain exactly where it does in place...
+    assert link_level["islink"]
+    assert os.path.dirname(src_level["real"]) == link_level["real"]
+    assert os.path.dirname(link_level["real"]) != proj_level["real"]
+    # ...landing on the target's own parent, where `../../selector.h` finds the
+    # header the in-place parse finds — not the project's decoy.
+    assert kernel[2]["entries"]["selector.h"] == str(
+        (proj / "vendor" / "selector.h").resolve()
+    )
+    # The target's entries are mirrored, so a one-level `#include "../common.h"`
+    # keeps resolving (it already did — mirroring scandirs through the link).
+    assert kernel[1]["entries"]["common.h"] == str((pkg / "common.h").resolve())
+    # And the spelled chain survives as spelled, for a caller that normalizes
+    # `foo/../bar` itself: lexically two levels up is still the project dir.
+    assert proj_level["entries"]["selector.h"] == str((proj / "selector.h").resolve())
+
+
+def test_snapshot_reproduces_the_sources_absolute_depth(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # An `#include` that climbs past the mirror root has to land somewhere
+    # private and empty. Staging at the temp root itself would make `../x.h`
+    # resolve into `/tmp` — world-writable, so anyone's same-named header would
+    # be included and the gate would enumerate a *different* translation unit.
+    # That is worse than the blocking `error` an unresolved include produces, so
+    # the source's absolute path is reproduced under the temp root and the levels
+    # above the mirror root are left empty.
+    dest = tmp_path / "argv.json"
+    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
+    )
+    proj = tmp_path / "proj"
+    (proj / "src").mkdir(parents=True)
+    src = proj / "src" / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    gate.extract_function_defs(str(src), project_dir=str(proj), content=b"f\n")
+
+    captured = json.loads(dest.read_text())
+    staged = captured["argv"][1]
+    assert staged.endswith(str(src)) and staged != str(src)  # padded, not flattened
+    above_root = captured["ancestors"][2]  # one level above the mirrored project
+    assert list(above_root["entries"]) == ["proj"]  # nothing real to climb into
+
+
+def test_snapshot_ancestry_stops_at_the_mirror_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A source outside the project has no ancestry the gate can claim, and
+    # walking to `/` would mean a `scandir` of `$HOME` on every edit (thousands
+    # of entries, and an unreadable one becomes a blocking `error`). Mirroring
+    # stops at the source's own directory: siblings yes, parent's entries no.
+    dest = tmp_path / "argv.json"
+    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
+    )
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "helper.h").write_text("#define HELP 1\n")
+    src = outside / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    gate.extract_function_defs(str(src), project_dir=str(proj), content=b"f\n")
+
+    captured = json.loads(dest.read_text())
+    assert captured["siblings"]["helper.h"] == str((outside / "helper.h").resolve())
+    assert list(captured["ancestors"][1]["entries"]) == ["outside"]  # not mirrored
+
+
+def test_in_place_enumeration_uses_no_snapshot(tmp_path: Path, monkeypatch) -> None:
+    # Without `content=` nothing is staged — the file is parsed where it lies,
+    # exactly as before.
+    dest = tmp_path / "argv.json"
+    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    gate.extract_function_defs(str(src), project_dir=str(tmp_path))
+    argv = json.loads(dest.read_text())["argv"]
+    assert argv[1] == str(src)
+    assert "--" not in argv
+
+
+def _unstageable_snapshot(monkeypatch, message: str = "No space left") -> None:
+    """Make staging the snapshot fail with a bare `OSError`: ENOSPC, bad TMPDIR, ..."""
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise OSError(message)
+
+    monkeypatch.setattr(gate.tempfile, "TemporaryDirectory", _boom)
+
+
+def test_unstageable_snapshot_raises_units_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # An unwritable/missing TMPDIR, ENOSPC or EDQUOT must surface as the one
+    # exception the gate knows how to block on. A bare OSError escapes to the
+    # hook, which installs no handler — the process would die with a traceback
+    # and exit 1 rather than the blocking exit 2.
+    _unstageable_snapshot(monkeypatch)
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    with pytest.raises(gate.UnitsUnavailable, match="snapshot"):
+        gate.extract_function_defs(
+            str(src), project_dir=str(tmp_path), content=b"int f(void){return 0;}\n"
+        )
+
+
+def test_unstageable_snapshot_blocks_and_does_not_stamp(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # End to end, the fail-closed half: a file whose snapshot could not be staged
+    # is never enumerated, so it must record a blocking `error` and must NOT be
+    # stamped `scanned` — a stamp would let the out-of-band scan dedup the edit
+    # as already handled, and outside a git work tree there is no scan at all.
+    _unstageable_snapshot(monkeypatch)
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    _seed_scanned(tmp_path)
+
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert [v.verdict for v in verdicts] == ["error"]
+    after = gate.load_state(str(tmp_path))
+    assert "x.c" not in after["scanned"]
+    assert after["scanned"]["sentinel.c"] == "deadbeef"
+    assert gate.blocking_units(after)
+
+
+def test_transient_rewrite_during_enumeration_is_enumerated_faithfully(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The A -> B -> A interleaving: a concurrent `> f.c` rewrite passes through a
+    # zero-byte instant, which enumerates as a *successful* empty list. Re-reading
+    # the path would prune every unit the file has — dropping an already-recorded
+    # blocking verdict — and then stamp `scanned` with the restored content's
+    # digest, leaving the Stop-gate and the out-of-band scan both satisfied.
+    # Enumerating a snapshot of the hashed bytes makes that impossible, and makes
+    # it so deterministically: the old metadata guard only noticed the rewrite
+    # when the filesystem's timestamp granularity was fine enough to resolve it.
+    src = tmp_path / "x.c"
+    original = "alpha beta\n"
+    src.write_text(original)
+    _seed_scanned(tmp_path)
+
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            before_read=f"open({str(src)!r}, 'w').write('')",  # truncated...
+            after_read=f"open({str(src)!r}, 'w').write({original!r})",  # ...restored
+        ),
+    )
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert sorted(v.function for v in verdicts) == ["alpha", "beta"]
+    after = gate.load_state(str(tmp_path))
+    assert sorted(after["units"]) == ["x.c::alpha", "x.c::beta"]
+    assert len(gate.blocking_units(after)) == 2
+    # Stamped with the digest of the content that was actually enumerated.
+    assert after["scanned"]["x.c"] == hashlib.sha256(original.encode()).hexdigest()
+
+
+def test_persistent_rewrite_during_enumeration_does_not_prune_or_stamp(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A rewrite that lands and *stays* is a different failure: we enumerated A but
+    # the file now holds B, so recording A's units against B would be a lie. The
+    # post-enumeration content re-hash fails closed on it — by content, so it
+    # holds on a coarse-timestamp filesystem, and without depending on the
+    # out-of-band scan to re-gate B later (which it cannot do outside a git tree).
+    src = tmp_path / "x.c"
+    src.write_text("alpha\n")
     state = gate.load_state(str(tmp_path))
-    gate.record(state, gate.UnitVerdict("x.c::f", "x.c", "f", "violated", 4))
+    gate.record(state, gate.UnitVerdict("x.c::alpha", "x.c", "alpha", "violated", 4))
     gate.save_state(str(tmp_path), state)
     _seed_scanned(tmp_path)
 
-    def _enumerate_a_rewritten_file(file_path, *, project_dir):
-        src.write_text("")  # the transient truncation the rewrite passes through
-        src.write_text(original)  # ...restored, so the bytes compare equal again
-        return []
-
-    monkeypatch.setattr(gate, "extract_function_defs", _enumerate_a_rewritten_file)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            before_read=f"open({str(src)!r}, 'w').write('beta\\n')",  # and left there
+        ),
+    )
     verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
 
     assert [v.verdict for v in verdicts] == ["error"]
@@ -331,6 +794,433 @@ def test_rewrite_during_enumeration_does_not_prune_or_stamp(
     assert after["scanned"]["sentinel.c"] == "deadbeef"
     assert gate.blocking_units(after)  # the pre-existing violation survived
     assert any(u.get("verdict") == "violated" for u in after["units"].values())
+
+
+def test_stamp_is_not_reclaimed_from_a_run_that_already_finished(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Taking the stamp is a claim to be authoritative, so the content check has to
+    # happen under the same lock that writes it. Checked before the lock, this run
+    # (version A) could pass, pause, and resume after a concurrent run (version B)
+    # had verified and stamped B — then reclaim the entry with A's digest, prune
+    # and overwrite B's verdicts against content nobody has on disk, and finally
+    # withdraw the stamp on the post-verify re-hash, leaving a blocking `x.c::?`
+    # despite B having succeeded. Here the fake CLI stands in for that concurrent
+    # run, landing entirely within this run's `list-units`.
+    src = tmp_path / "x.c"
+    src.write_text("alpha\n")
+    _seed_scanned(tmp_path)
+    state_file = tmp_path / ".forseti" / "gate_state.json"
+    beta_digest = hashlib.sha256(b"beta\n").hexdigest()
+
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            after_read=(
+                f"open({str(src)!r}, 'w').write('beta\\n')\n"
+                "import json, pathlib\n"
+                f"_p = pathlib.Path({str(state_file)!r})\n"
+                "_st = json.loads(_p.read_text())\n"
+                f"_st['scanned']['x.c'] = {beta_digest!r}\n"
+                "_st['units']['x.c::beta'] = {'unit_id': 'x.c::beta', "
+                "'file': 'x.c', 'function': 'beta', 'verdict': 'violated', "
+                "'k': 1}\n"
+                "_p.write_text(json.dumps(_st))"
+            ),
+        ),
+    )
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert verdicts == []  # deferred to the run that owns the file
+    after = gate.load_state(str(tmp_path))
+    assert after["scanned"]["x.c"] == beta_digest  # never reclaimed for A
+    assert after["units"]["x.c::beta"]["verdict"] == "violated"  # B's verdict stands
+    assert "x.c::alpha" not in after["units"]  # ...and A's units were not recorded
+    # No stranded, unclearable block: the file hashes equal to the surviving
+    # stamp, so nothing would ever re-run the reconcile that prunes a `?`.
+    assert "x.c::?" not in after["units"]
+    assert gate.blocking_units(after)  # B's violation still gates the Stop hook
+
+
+def test_stamp_is_not_reclaimed_after_losing_the_lock_race(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The sharper half of the same race: the window that matters is between this
+    # run's content check and its stamp, and waiting for the gate lock is what
+    # opens it. Patching the lock so another run's work is already done when this
+    # one gets in models exactly that — B rewrote the source, stamped its digest
+    # and recorded its verdict while A queued. Checked before the lock, A would
+    # then reclaim the entry with a digest matching nothing on disk, prune B's
+    # units, and end by withdrawing the stamp and blocking on a file B had
+    # legitimately verified.
+    src = tmp_path / "x.c"
+    src.write_text("alpha\n")
+    _seed_scanned(tmp_path)
+    beta_digest = hashlib.sha256(b"beta\n").hexdigest()
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+    real_lock, landed = gate.gate_lock, []
+
+    @contextlib.contextmanager
+    def lock_a_concurrent_run_got_first(project_dir: str):
+        with real_lock(project_dir):
+            if not landed:
+                landed.append(True)
+                src.write_text("beta\n")
+                state = gate.load_state(project_dir)
+                state["scanned"]["x.c"] = beta_digest
+                gate.record(
+                    state,
+                    gate.UnitVerdict("x.c::beta", "x.c", "beta", "violated", 1),
+                )
+                gate.save_state(project_dir, state)
+            yield
+
+    monkeypatch.setattr(gate, "gate_lock", lock_a_concurrent_run_got_first)
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert verdicts == []
+    after = gate.load_state(str(tmp_path))
+    assert after["scanned"]["x.c"] == beta_digest  # B's stamp, not reclaimed
+    assert after["units"]["x.c::beta"]["verdict"] == "violated"  # nor B's units
+    assert "x.c::alpha" not in after["units"]  # A's stale reconcile never ran
+    assert "x.c::?" not in after["units"]  # and B was not blocked on afterwards
+
+
+def test_enumerate_drift_block_defers_to_a_stamp_taken_after_the_check(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The enumerate-side drift check reads `scanned` under the stamp lock and then
+    # releases it, so a concurrent run can stamp what is on disk before the block
+    # is published — and that `x.c::?` is then unclearable for the usual reason.
+    # Deciding the deferral where the check ran cannot close it; it has to be
+    # re-decided under the lock that records the verdict. The rewrite lands during
+    # enumeration (nothing vouches for it yet), the other run's stamp on the lock
+    # acquisition the block itself takes.
+    src = tmp_path / "x.c"
+    src.write_text("alpha\n")
+    _seed_scanned(tmp_path)
+    beta_digest = hashlib.sha256(b"beta\n").hexdigest()
+
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path, after_read=f"open({str(src)!r}, 'w').write('beta\\n')"
+        ),
+    )
+    real_lock, locks = gate.gate_lock, []
+
+    @contextlib.contextmanager
+    def lock_a_concurrent_run_stamped_in(project_dir: str):
+        with real_lock(project_dir):
+            locks.append(1)
+            if len(locks) == 2:  # the one `_blocking_error` takes
+                state = gate.load_state(project_dir)
+                state["scanned"]["x.c"] = beta_digest
+                gate.record(
+                    state,
+                    gate.UnitVerdict("x.c::beta", "x.c", "beta", "violated", 1),
+                )
+                gate.save_state(project_dir, state)
+            yield
+
+    monkeypatch.setattr(gate, "gate_lock", lock_a_concurrent_run_stamped_in)
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert len(locks) == 2  # the stamp check, then the block — the window between
+    assert verdicts == []  # deferred to the run that owns the file
+    after = gate.load_state(str(tmp_path))
+    assert "x.c::?" not in after["units"]  # no stranded, unclearable block
+    assert after["scanned"]["x.c"] == beta_digest
+    assert gate.blocking_units(after)  # the other run's violation still gates
+    assert gate.stale_sources(str(tmp_path), after, [str(src)]) == []
+
+
+def test_persistent_rewrite_during_verify_withdraws_the_stamp_and_blocks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The verifies read the *real* path — a verdict must describe the translation
+    # unit that ships — so a rewrite landing there can attach a `verified` verdict
+    # to bytes the gate never stamped. Re-hashing once after the loop fails closed
+    # on a rewrite that lands and *stays*: the up-front stamp is withdrawn, so the
+    # out-of-band scan re-gates the file, and a blocking `error` covers the case
+    # where there is no such scan (outside a git work tree). A transient
+    # A -> B -> A during a verify is the acknowledged residual (see below) — the
+    # final bytes compare equal, so nothing here can see it.
+    src = tmp_path / "x.c"
+    src.write_text("alpha\n")
+    _seed_scanned(tmp_path)
+
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            verdict="verified",  # a clean verdict — for content no longer on disk
+            during_verify=f"open({str(src)!r}, 'w').write('beta\\n')",
+        ),
+    )
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert [v.verdict for v in verdicts] == ["error"]
+    after = gate.load_state(str(tmp_path))
+    assert "x.c" not in after["scanned"]  # the up-front stamp was withdrawn
+    assert after["scanned"]["sentinel.c"] == "deadbeef"
+    assert gate.blocking_units(after)  # not left passing on a stale `verified`
+    # The unfinished-verify marker (#140) is released too. A claim means "a run
+    # started verifying these bytes and never finished", which is what makes the
+    # next scan retry; this run *did* finish — it concluded the verdicts cannot
+    # be trusted and said so with a blocking `error`. Only a kill should leave a
+    # claim behind.
+    assert "x.c" not in after["pending"]
+
+
+def test_rewrite_during_verify_releases_the_claim_when_deferring(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The other drift exit: a concurrent run owns the stamp, so this run neither
+    # withdraws nor blocks. It has still finished, so its own claim must be
+    # released — while `_pending_owner` keeps it from touching the *other* run's.
+    src = tmp_path / "x.c"
+    src.write_text("alpha\n")
+    _seed_scanned(tmp_path)
+    state_file = tmp_path / ".forseti" / "gate_state.json"
+    beta_digest = hashlib.sha256(b"beta\n").hexdigest()
+
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            verdict="verified",
+            during_verify=(
+                f"open({str(src)!r}, 'w').write('beta\\n')\n"
+                "import json, pathlib\n"
+                f"_p = pathlib.Path({str(state_file)!r})\n"
+                "_st = json.loads(_p.read_text())\n"
+                f"_st['scanned']['x.c'] = {beta_digest!r}\n"
+                # The concurrent run's own claim, which this run must not clear.
+                f"_st['pending']['x.c'] = {{'hash': {beta_digest!r}, "
+                "'attempts': 1, 'pid': 999999}\n"
+                "_p.write_text(json.dumps(_st))"
+            ),
+        ),
+    )
+    gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    after = gate.load_state(str(tmp_path))
+    assert after["scanned"]["x.c"] == beta_digest  # the other run's stamp survives
+    assert after["pending"]["x.c"] == {  # ...and so does its claim, untouched
+        "hash": beta_digest,
+        "attempts": 1,
+        "pid": 999999,
+    }
+
+
+def test_transient_rewrite_during_verify_is_a_known_residual(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Characterization, not an endorsement. A transient A -> B -> A *during a
+    # verify* leaves B's verdict attached to A's stamp: the post-loop re-hash can
+    # only compare final bytes, and they are equal. Closing it would mean
+    # verifying immutable content, which changes *what* is verified — the
+    # snapshot reproduces include resolution only up to its mirror root, so an
+    # include reaching above that would turn a verifiable file into a blocking
+    # `error` — and would put a since-deleted temp path in every counterexample
+    # and in the trace's
+    # `argv`. Pinned here so the limit is explicit in the suite, and so a future
+    # fix flips this test rather than quietly widening the guarantee.
+    src = tmp_path / "x.c"
+    original = "alpha\n"
+    src.write_text(original)
+
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            verdict="verified",
+            during_verify=(
+                f"open({str(src)!r}, 'w').write('beta\\n')\n"  # what got verified
+                f"open({str(src)!r}, 'w').write({original!r})"  # ...then restored
+            ),
+        ),
+    )
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert [v.verdict for v in verdicts] == ["verified"]
+    after = gate.load_state(str(tmp_path))
+    assert after["scanned"]["x.c"] == hashlib.sha256(original.encode()).hexdigest()
+    assert gate.blocking_units(after) == []  # the residual: A passes on B's verdict
+
+
+def test_rewrite_during_verify_defers_to_a_concurrent_runs_stamp(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Withdrawing the stamp must be ownership-scoped, and so must the block.
+    # Concurrent hooks share gate_state.json, so a run that has since re-stamped
+    # its own digest owns the entry — popping it would re-gate content that run
+    # legitimately verified, and blocking anyway would strand a `x.c::?` error
+    # nothing can clear: the file now hashes equal to the surviving stamp, so the
+    # out-of-band scan reads it as fresh and never re-runs the reconcile that
+    # prunes `?`.
+    #
+    # The *per-function* write has to be scoped the same way, and that is the
+    # sharper half: this run verified A and says `verified`; the other run
+    # verified the B now on disk and says `violated`. Writing ours last would
+    # replace a live violation with a stale pass on a file that hashes fresh —
+    # nothing would block. Here the fake CLI stands in for that concurrent hook,
+    # rewriting the source and recording both its stamp and its verdict.
+    src = tmp_path / "x.c"
+    src.write_text("alpha\n")
+    _seed_scanned(tmp_path)
+    state_file = tmp_path / ".forseti" / "gate_state.json"
+    beta_digest = hashlib.sha256(b"beta\n").hexdigest()
+
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            verdict="verified",  # ...for content the other run has superseded
+            during_verify=(
+                f"open({str(src)!r}, 'w').write('beta\\n')\n"
+                "import json, pathlib\n"
+                f"_p = pathlib.Path({str(state_file)!r})\n"
+                "_st = json.loads(_p.read_text())\n"
+                f"_st['scanned']['x.c'] = {beta_digest!r}\n"
+                "_st['units']['x.c::alpha'] = {'unit_id': 'x.c::alpha', "
+                "'file': 'x.c', 'function': 'alpha', 'verdict': 'violated', "
+                "'k': 1}\n"
+                "_p.write_text(json.dumps(_st))"
+            ),
+        ),
+    )
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    # No blocking `?` verdict — and no stale `verified` either. The returned list
+    # is what the PostToolUse hook reports and acts on, so handing back a verdict
+    # for content the other run has replaced would report a pass for bytes this
+    # run never saw (or, the other way round, feed Claude a counterexample for
+    # code no longer on disk).
+    assert verdicts == []
+    after = gate.load_state(str(tmp_path))
+    assert after["scanned"]["x.c"] == beta_digest  # the other run's stamp survives
+    assert "x.c::?" not in after["units"]  # ...and no stranded, unclearable block
+    # ...and the stale `verified` never displaced the live violation.
+    assert after["units"]["x.c::alpha"]["verdict"] == "violated"
+    assert gate.blocking_units(after)
+
+
+def test_drift_block_defers_to_a_stamp_taken_after_the_withdrawal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The sibling above catches the concurrent run *before* the withdrawal; this
+    # one catches it after. Withdrawing releases the lock, so a hook for the newer
+    # content can stamp it and verify it through before the block is published.
+    # Published unconditionally, that `x.c::?` can never be cleared: the file
+    # hashes equal to the surviving stamp and no claim is left pending, so
+    # `stale_sources` never re-offers the file, the reconcile that prunes `?`
+    # never runs, and the Stop-gate blocks its way to a residual on a file the
+    # other run legitimately verified. The lock is the seam — the concurrent run's
+    # work lands on the first acquisition taken after this run gave up its stamp.
+    src = tmp_path / "x.c"
+    src.write_text("alpha\n")
+    _seed_scanned(tmp_path)
+    beta_digest = hashlib.sha256(b"beta\n").hexdigest()
+
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            verdict="verified",  # a clean verdict — for content no longer on disk
+            during_verify=f"open({str(src)!r}, 'w').write('beta\\n')",
+        ),
+    )
+    real_lock, landed = gate.gate_lock, []
+
+    @contextlib.contextmanager
+    def lock_a_concurrent_run_finished_in(project_dir: str):
+        with real_lock(project_dir):
+            state = gate.load_state(project_dir)
+            gave_up_the_stamp = "x.c" not in state["scanned"]
+            if not landed and gave_up_the_stamp and "x.c::alpha" in state["units"]:
+                landed.append(True)
+                state["scanned"]["x.c"] = beta_digest
+                gate.record(
+                    state,
+                    gate.UnitVerdict("x.c::beta", "x.c", "beta", "violated", 1),
+                )
+                gate.save_state(project_dir, state)
+            yield
+
+    monkeypatch.setattr(gate, "gate_lock", lock_a_concurrent_run_finished_in)
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert landed  # the interleaving under test really happened
+    assert verdicts == []  # deferred to the run that owns the file
+    after = gate.load_state(str(tmp_path))
+    assert "x.c::?" not in after["units"]  # no stranded, unclearable block
+    assert after["scanned"]["x.c"] == beta_digest  # the other run's stamp survives
+    assert after["units"]["x.c::beta"]["verdict"] == "violated"  # ...and its verdict
+    assert gate.blocking_units(after)  # which is what gates the Stop hook now
+    # Why an unconditional block would have stuck: nothing marks the file for a
+    # re-scan, so no later run would reach the reconcile that prunes the `?`.
+    assert gate.stale_sources(str(tmp_path), after, [str(src)]) == []
+
+
+def test_drift_block_still_lands_when_no_stamp_vouches_for_the_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The other half of that test: "a stamp exists" is not the condition — "a stamp
+    # equal to what is on disk" is. Here a concurrent run stamps a third content
+    # that never reaches disk, so nothing vouches for the bytes sitting there. The
+    # block must land, and it is clearable precisely because the file reads stale.
+    src = tmp_path / "x.c"
+    src.write_text("alpha\n")
+    _seed_scanned(tmp_path)
+    gamma_digest = hashlib.sha256(b"gamma\n").hexdigest()
+
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            verdict="verified",
+            during_verify=f"open({str(src)!r}, 'w').write('beta\\n')",
+        ),
+    )
+    real_lock, landed = gate.gate_lock, []
+
+    @contextlib.contextmanager
+    def lock_a_concurrent_run_stamped_other_content_in(project_dir: str):
+        with real_lock(project_dir):
+            state = gate.load_state(project_dir)
+            gave_up_the_stamp = "x.c" not in state["scanned"]
+            if not landed and gave_up_the_stamp and "x.c::alpha" in state["units"]:
+                landed.append(True)
+                state["scanned"]["x.c"] = gamma_digest
+                gate.save_state(project_dir, state)
+            yield
+
+    monkeypatch.setattr(
+        gate, "gate_lock", lock_a_concurrent_run_stamped_other_content_in
+    )
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert landed
+    assert [v.verdict for v in verdicts] == ["error"]  # not suppressed
+    after = gate.load_state(str(tmp_path))
+    assert after["units"]["x.c::?"]["verdict"] == "error"
+    assert gate.blocking_units(after)
+    # ...and it can be cleared: the file hashes to neither stamp, so the next scan
+    # re-offers it and the reconcile drops the `?`.
+    assert gate.stale_sources(str(tmp_path), after, [str(src)]) == [str(src)]
 
 
 def test_units_absent_payload_records_blocking_error(
@@ -499,6 +1389,361 @@ def test_pointer_param_detection(
 
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+@pytest.mark.parametrize("depth, spelled", [(1, "../common.h"), (2, "../../common.h")])
+def test_relative_include_resolves_through_the_snapshot(
+    tmp_path: Path, depth: int, spelled: str
+) -> None:
+    # The fake CLIs never resolve an `#include`, so only the real frontend can
+    # show the behaviour: a parent-relative include enumerates through the
+    # snapshot exactly as it does in place. Mirroring siblings alone, this raised
+    # `UnitsUnavailable` — a blocking `error` on a file that parses fine on disk.
+    (tmp_path / "common.h").write_text("#define COMMON 1\n")
+    src_dir = tmp_path.joinpath(*[f"d{i}" for i in range(depth)])
+    src_dir.mkdir(parents=True)
+    src = src_dir / "x.c"
+    src.write_text(f'#include "{spelled}"\nint f(int x) {{ return x + COMMON; }}\n')
+
+    in_place = gate.extract_function_defs(str(src), project_dir=str(tmp_path))
+    snapshotted = gate.extract_function_defs(
+        str(src), project_dir=str(tmp_path), content=src.read_bytes()
+    )
+
+    assert [d.name for d in in_place] == ["f"]
+    assert [d.name for d in snapshotted] == ["f"]
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_include_above_the_mirror_root_is_a_known_residual(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Characterization, not an endorsement. Mirroring stops at the project dir,
+    # so `#include "../common.h"` from a file *at* the root misses in the mirror
+    # — and clang then falls through to the `-I` search with the spelled path,
+    # which here resolves `sub/../common.h` to the project's own header instead
+    # of the one above it. Different `VARIANT`, so the `#if` hides a function the
+    # in-place parse enumerates: a wrong translation unit, not a block. Pinned so
+    # a future fix flips this test rather than quietly widening the guarantee.
+    # It is not a regression — the siblings-only staging did exactly this; what
+    # the padded depth removes is the worse variant where the miss landed in
+    # `/tmp` itself, where any user's `common.h` would have won.
+    (tmp_path / "common.h").write_text("#define VARIANT 2\n")  # the in-place pick
+    proj = tmp_path / "proj"
+    (proj / "sub").mkdir(parents=True)
+    (proj / "common.h").write_text("#define VARIANT 1\n")  # what the `-I` finds
+    src = proj / "x.c"
+    src.write_text(
+        '#include "../common.h"\n'
+        "int f(int x) { return x; }\n"
+        "#if VARIANT == 2\n"
+        "int only_above(int x) { return x; }\n"
+        "#endif\n"
+    )
+    monkeypatch.setenv("FORSETI_BUILD_FLAGS", "-Isub")
+
+    in_place = gate.extract_function_defs("x.c", project_dir=str(proj))
+    snapshotted = gate.extract_function_defs(
+        "x.c", project_dir=str(proj), content=src.read_bytes()
+    )
+
+    assert sorted(d.name for d in in_place) == ["f", "only_above"]
+    assert sorted(d.name for d in snapshotted) == ["f"]  # the residual
+
+
+def _symlinked_component_tree(proj: Path, pkg: Path) -> Path:
+    """A source under a symlinked directory, with two candidate `selector.h`.
+
+    ``proj/link -> pkg``; the source sits at ``link/src/x.c`` and climbs two
+    levels. The kernel resolves `link` first, so in place it reaches the header
+    beside `pkg`; the spelled chain would reach the one beside `proj`. The two
+    select different `#if` branches, so the unit lists differ.
+    """
+    (pkg / "src").mkdir(parents=True)
+    (pkg.parent / "selector.h").write_text("#define PICK_TARGET 1\n")
+    (proj / "selector.h").write_text("#define PICK_SPELLED 1\n")
+    (pkg / "common.h").write_text("#define ONE 1\n")
+    (proj / "link").symlink_to(pkg)
+    src = pkg / "src" / "x.c"
+    src.write_text(
+        '#include "../../selector.h"\n'
+        '#include "../common.h"\n'
+        "#ifdef PICK_TARGET\n"
+        "int target_won(int x) { return x + ONE; }\n"
+        "#endif\n"
+        "#ifdef PICK_SPELLED\n"
+        "int spelled_won(int x) { return x; }\n"
+        "#endif\n"
+    )
+    return src
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_symlinked_component_enumerates_like_the_in_place_parse(tmp_path: Path) -> None:
+    # End to end against the real frontend: `..` past a symlinked component is
+    # resolved by the kernel, so the in-place parse reads the header beside the
+    # link's *target*. Mirroring the component as a real directory read the one
+    # beside the link instead — a different translation unit, enumerated as
+    # authoritative and then pruned and stamped against.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    src = _symlinked_component_tree(proj, proj / "vendor" / "pkg")
+
+    in_place = gate.extract_functions("link/src/x.c", project_dir=str(proj))
+    snapshotted = [
+        d.name
+        for d in gate.extract_function_defs(
+            "link/src/x.c", project_dir=str(proj), content=src.read_bytes()
+        )
+    ]
+
+    assert in_place == ["target_won"]
+    assert snapshotted == in_place
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_symlink_out_of_the_project_blocks_rather_than_switching_headers(
+    tmp_path: Path,
+) -> None:
+    # Characterization. When the link leaves the project the mirror can claim no
+    # ancestry above its target — the same rule that stops the walk at the
+    # project dir, and for the same reason (a `scandir` of `$HOME` on every
+    # edit). So a climb past the target lands on empty padding and the parse
+    # fails: a blocking `error`, which is the honest answer for a translation
+    # unit the gate cannot reproduce. What it must never be again is the silent
+    # one — enumerating `spelled_won`, a unit the in-place parse does not have.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    src = _symlinked_component_tree(proj, tmp_path / "external" / "pkg")
+
+    assert gate.extract_functions("link/src/x.c", project_dir=str(proj)) == [
+        "target_won"
+    ]
+    with pytest.raises(gate.UnitsUnavailable):
+        gate.extract_function_defs(
+            "link/src/x.c", project_dir=str(proj), content=src.read_bytes()
+        )
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+@pytest.mark.parametrize("alias", ["symlink", "hardlink"])
+def test_a_source_alias_leads_back_into_the_snapshot(
+    tmp_path: Path, alias: str
+) -> None:
+    # A sibling that is the source under *another name* is a door out of the
+    # immutable copy. Linked to the real file, a translation unit that includes
+    # itself through that name reads whatever is on disk now — and its `#define`s
+    # then decide which units the *snapshot* enumerates. That is issue #141's own
+    # race one include deep: units enumerated from a transient B, pruned and
+    # stamped against the restored A. Both names for one inode must lead to the
+    # snapshot.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    src = proj / "x.c"
+    src.write_text(
+        "#ifdef SELF\n"
+        "#define PICK 1\n"
+        "#else\n"
+        "#define SELF\n"
+        '#include "alias.c"\n'
+        "#if PICK\n"
+        "int from_the_snapshot(int x) { return x; }\n"
+        "#else\n"
+        "int from_the_live_file(int x) { return x; }\n"
+        "#endif\n"
+        "#endif\n"
+    )
+    snapshotted = src.read_bytes()
+    if alias == "symlink":
+        (proj / "alias.c").symlink_to("x.c")
+    else:
+        os.link(src, proj / "alias.c")
+    src.write_bytes(snapshotted.replace(b"#define PICK 1", b"#define PICK 0"))
+
+    names = [
+        d.name
+        for d in gate.extract_function_defs(
+            "x.c", project_dir=str(proj), content=snapshotted
+        )
+    ]
+
+    assert names == ["from_the_snapshot"]
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_a_resolved_path_under_a_symlinked_project_keeps_its_ancestry(
+    tmp_path: Path,
+) -> None:
+    # The project dir and the source path need not be spelled the same way: with
+    # `link -> real`, a hook may be handed `<link>/sub/x.c` while out-of-band
+    # discovery builds its paths on the git root, which `git rev-parse` reports
+    # *resolved*. A lexical containment test calls the second one external, and a
+    # file "outside" the project gets no ancestry mirrored — so an ordinary
+    # `#include "../common.h"` stops resolving, which is a blocking `error` on a
+    # file that parses fine in place.
+    real = tmp_path / "real"
+    (real / "sub").mkdir(parents=True)
+    (real / "common.h").write_text("#define COMMON 1\n")
+    src = real / "sub" / "x.c"
+    src.write_text('#include "../common.h"\nint f(int x) { return x + COMMON; }\n')
+    (tmp_path / "link").symlink_to(real)
+    spelled_project = str(tmp_path / "link")  # ...but the source path is resolved
+
+    in_place = gate.extract_functions(str(src), project_dir=spelled_project)
+    snapshotted = [
+        d.name
+        for d in gate.extract_function_defs(
+            str(src), project_dir=spelled_project, content=src.read_bytes()
+        )
+    ]
+
+    assert in_place == ["f"]
+    assert snapshotted == in_place
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_a_component_walked_twice_is_not_a_loop(tmp_path: Path) -> None:
+    # `self -> .` is a real idiom, and `self/self/x.c` is a perfectly ordinary path
+    # the kernel resolves in two hops. The loop guard keyed on the spelled link
+    # alone called that a cycle and turned an innocuous layout into a blocking
+    # `error` on every edit. Keyed on the walk *state*, the second visit has a
+    # shorter `rest` and is allowed — and the plan is deduped, since staging the
+    # same component twice would raise `FileExistsError` and block by another
+    # route.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "self").symlink_to(".")
+    (proj / "common.h").write_text("#define COMMON 1\n")
+    (proj / "x.c").write_text(
+        '#include "common.h"\nint f(int x) { return x + COMMON; }\n'
+    )
+    given = "self/self/x.c"
+
+    in_place = gate.extract_functions(given, project_dir=str(proj))
+    snapshotted = [
+        d.name
+        for d in gate.extract_function_defs(
+            given, project_dir=str(proj), content=(proj / "x.c").read_bytes()
+        )
+    ]
+
+    assert in_place == ["f"]
+    assert snapshotted == in_place
+
+
+@pytest.mark.parametrize(
+    ("name", "points_to"),
+    [
+        ("mutual", "b"),  # a -> b, b -> a: `realpath` hands the link back unchanged
+        ("expanding", "a/x"),  # a -> a/x: ...and here, one component LONGER each time
+    ],
+)
+def test_a_symlink_cycle_blocks_instead_of_spinning(
+    tmp_path: Path, name: str, points_to: str
+) -> None:
+    # The guard the fix above must not remove — and the reason it is a budget and
+    # not a seen-set. `realpath` never reports ELOOP; it gives up and returns
+    # something unresolved. For `a -> a/x` that something *grows*, so no (link,
+    # rest) state ever recurs and a repeat-detector would spin forever inside a
+    # hook. The kernel's own `MAXSYMLINKS` bounds it: past that, the source could
+    # not have been read either, so blocking is the honest answer.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "a").symlink_to(proj / points_to)
+    if name == "mutual":
+        (proj / "b").symlink_to(proj / "a")
+
+    with pytest.raises(OSError) as excinfo:
+        gate._mirror_plan(str(proj / "a"), str(proj))
+    assert excinfo.value.errno == errno.ELOOP
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_a_nested_source_alias_is_a_known_residual(tmp_path: Path) -> None:
+    # Characterization, not an endorsement, and the boundary of the guarantee the
+    # test above establishes. A directory is mirrored by linking it *whole*, so an
+    # alias one level down (`sub/alias.c -> ../x.c`) is never compared with the
+    # source and leads back to the live file — as does an absolute include of the
+    # source, which no mirrored neighbourhood can intercept at all. Immutability is
+    # the top-level file's; a self-include reaching around it lands back in the
+    # A -> B -> A residual the verify loop already carries.
+    #
+    # Closing it by mirroring subdirectories entry-by-entry would `scandir` and
+    # `stat` the source's whole subtree on every edit — disproportionate to a
+    # translation unit that includes itself through a nested alias. The real fix
+    # is the one the verify loop needs too: enumeration of content the parser
+    # cannot reach around (Core CLI, content on stdin, explicit include root).
+    proj = tmp_path / "proj"
+    (proj / "sub").mkdir(parents=True)
+    src = proj / "x.c"
+    src.write_text(
+        "#ifdef SELF\n"
+        "#define PICK 1\n"
+        "#else\n"
+        "#define SELF\n"
+        '#include "sub/alias.c"\n'
+        "#if PICK\n"
+        "int from_the_snapshot(int x) { return x; }\n"
+        "#else\n"
+        "int from_the_live_file(int x) { return x; }\n"
+        "#endif\n"
+        "#endif\n"
+    )
+    snapshotted = src.read_bytes()
+    (proj / "sub" / "alias.c").symlink_to("../x.c")
+    src.write_bytes(snapshotted.replace(b"#define PICK 1", b"#define PICK 0"))
+
+    names = [
+        d.name
+        for d in gate.extract_function_defs(
+            "x.c", project_dir=str(proj), content=snapshotted
+        )
+    ]
+
+    assert names == ["from_the_live_file"]  # the residual: not the snapshot's branch
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_dotdot_in_the_given_path_stages_where_the_kernel_lands(
+    tmp_path: Path,
+) -> None:
+    # The same divergence one level earlier: not a `..` inside an `#include`, but
+    # one in the path the hook was handed. `abspath` collapses `proj/link/../x.c`
+    # to `proj/x.c` lexically, while the read and the verify both go through the
+    # kernel, which resolves `link` first and lands on `vendor/x.c`. Staged at the
+    # collapsed path, the snapshot would wrap the *other* file's bytes in the
+    # project's headers — a different `#if` branch, so enumeration reports a unit
+    # the verify never sees, prunes the rest, and stamps the file.
+    proj = tmp_path / "proj"
+    vendor = tmp_path / "vendor"
+    (vendor / "pkg").mkdir(parents=True)
+    proj.mkdir()
+    (proj / "link").symlink_to(vendor / "pkg")
+    (vendor / "selector.h").write_text("#define PICK_TARGET 1\n")
+    (proj / "selector.h").write_text("#define PICK_SPELLED 1\n")
+    src = vendor / "x.c"
+    src.write_text(
+        '#include "selector.h"\n'
+        "#ifdef PICK_TARGET\n"
+        "int target_won(int x) { return x; }\n"
+        "#endif\n"
+        "#ifdef PICK_SPELLED\n"
+        "int spelled_won(int x) { return x; }\n"
+        "#endif\n"
+    )
+    given = "link/../x.c"
+
+    in_place = gate.extract_functions(given, project_dir=str(proj))
+    snapshotted = [
+        d.name
+        for d in gate.extract_function_defs(
+            given, project_dir=str(proj), content=src.read_bytes()
+        )
+    ]
+
+    assert in_place == ["target_won"]  # what the kernel — and so the verify — sees
+    assert snapshotted == in_place
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
 def test_function_like_macro_not_enumerated(tmp_path: Path) -> None:
     # A function-like macro is not a definition — the authoritative parse ignores
     # it, where the regex could false-match its `NAME(args)` shape.
@@ -588,7 +1833,7 @@ def test_build_flags_reach_the_list_units_parse(tmp_path: Path, monkeypatch) -> 
     src = tmp_path / "x.c"
     src.write_text("int f(void) { return 0; }\n")
     assert gate.extract_function_defs(str(src), project_dir=str(tmp_path)) == []
-    argv = json.loads(dest.read_text())
+    argv = json.loads(dest.read_text())["argv"]
     assert argv[argv.index("--") + 1 :] == ["-Iinclude", "-DNDEBUG"]
 
 
@@ -606,7 +1851,7 @@ def test_build_flags_are_shell_split_not_split_on_spaces(
     src = tmp_path / "x.c"
     src.write_text("int f(void) { return 0; }\n")
     gate.extract_function_defs(str(src), project_dir=str(tmp_path))
-    argv = json.loads(dest.read_text())
+    argv = json.loads(dest.read_text())["argv"]
     assert argv[argv.index("--") + 1 :] == ["-I/opt/my sdk/include", "-DX=1"]
 
 
@@ -620,7 +1865,7 @@ def test_no_build_flags_adds_no_separator(tmp_path: Path, monkeypatch) -> None:
     src = tmp_path / "x.c"
     src.write_text("int f(void) { return 0; }\n")
     gate.extract_function_defs(str(src), project_dir=str(tmp_path))
-    assert "--" not in json.loads(dest.read_text())
+    assert "--" not in json.loads(dest.read_text())["argv"]
 
 
 def test_build_flags_reach_the_verify_too(tmp_path: Path, monkeypatch) -> None:
@@ -648,7 +1893,7 @@ def test_safety_flags_do_not_leak_into_the_parse(tmp_path: Path, monkeypatch) ->
     src = tmp_path / "x.c"
     src.write_text("int f(void) { return 0; }\n")
     gate.extract_function_defs(str(src), project_dir=str(tmp_path))
-    argv = json.loads(dest.read_text())
+    argv = json.loads(dest.read_text())["argv"]
     for flag in gate.SAFETY_FLAGS:
         assert flag not in argv
 
@@ -666,7 +1911,7 @@ def test_build_flags_are_read_per_call_not_at_import(
     src.write_text("int f(void) { return 0; }\n")
     monkeypatch.setenv("FORSETI_BUILD_FLAGS", "-DLATE")
     gate.extract_function_defs(str(src), project_dir=str(tmp_path))
-    assert "-DLATE" in json.loads(dest.read_text())
+    assert "-DLATE" in json.loads(dest.read_text())["argv"]
 
 
 def test_malformed_build_flags_block_instead_of_crashing(
@@ -706,3 +1951,44 @@ def test_wellformed_build_flags_still_parse(tmp_path: Path, monkeypatch) -> None
     # The guard must not swallow valid config: balanced quoting still splits.
     monkeypatch.setenv("FORSETI_BUILD_FLAGS", "'-I/opt/my sdk' -DX")
     assert gate._build_flags() == ("-I/opt/my sdk", "-DX")
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_snapshot_enumeration_matches_the_in_place_parse(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # End to end against the real frontend, on the shape an include flag gets
+    # wrong: `#include <config.h>` with a same-named header sitting beside the
+    # source and the real one reached through FORSETI_BUILD_FLAGS. The two
+    # `config.h` select different `#if` branches, so a snapshot that disturbed
+    # the search order would enumerate a different unit list than the in-place
+    # parse — and the gate would prune and stamp on the strength of it.
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    (generated / "config.h").write_text("#define WIDGET 1\n")
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    (src_dir / "config.h").write_text("#define WIDGET 0\n")  # the decoy sibling
+    (src_dir / "helper.h").write_text("#define HELP 1\n")  # a genuine quoted sibling
+    body = (
+        '#include <config.h>\n#include "helper.h"\n'
+        "int scal(int a) { return a + HELP; }\n"
+        "#if WIDGET\n"
+        "int only_with_widget(int x) { return x; }\n"
+        "#endif\n"
+    )
+    src = src_dir / "x.c"
+    src.write_text(body)
+    monkeypatch.setenv("FORSETI_BUILD_FLAGS", f"-I{generated}")
+
+    in_place = gate.extract_functions(str(src), project_dir=str(tmp_path))
+    snapshot = [
+        d.name
+        for d in gate.extract_function_defs(
+            str(src), project_dir=str(tmp_path), content=body.encode()
+        )
+    ]
+
+    # The generated header wins in both, so the guarded unit is present in both.
+    assert in_place == ["scal", "only_with_widget"]
+    assert snapshot == in_place

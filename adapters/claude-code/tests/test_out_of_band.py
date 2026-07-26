@@ -289,7 +289,9 @@ def _enumerate_one_unit(monkeypatch: pytest.MonkeyPatch, name: str = "f") -> Non
     monkeypatch.setattr(
         gate,
         "extract_function_defs",
-        lambda file_path, *, project_dir: [gate.FuncDef(name, takes_pointer=False)],
+        lambda file_path, *, project_dir, content=None: [
+            gate.FuncDef(name, takes_pointer=False)
+        ],
     )
 
 
@@ -374,9 +376,14 @@ def test_blocking_error_on_a_retry_spends_an_attempt(
 ) -> None:
     # Every error path returns BEFORE the block that bumps the retry counter, so a
     # marker left behind by a previous kill would make a persistently-erroring file
-    # re-verify forever with the counter frozen (each error resets stop_attempts).
-    # The error charges the marker one attempt instead — the killed run's units stay
-    # retryable, and the retries still run out.
+    # re-verify forever with the counter frozen. The error charges the marker one
+    # attempt instead — the killed run's units stay retryable, and the retries still
+    # run out.
+    #
+    # The charge happens even though the verdict is *not* recorded here: the killed
+    # run stamped these bytes, so a `?` would be unclearable the moment that run's
+    # successor finishes, while the retry budget still has to shrink. What keeps the
+    # turn blocked is that run's own pending `unknown`.
     src = tmp_path / "broken.c"
     src.write_text("int f(void){return 0;}\n")
     _enumerate_one_unit(monkeypatch)
@@ -384,16 +391,17 @@ def test_blocking_error_on_a_retry_spends_an_attempt(
     with pytest.raises(_Killed):
         gate.verify_and_record(str(src), project_dir=str(tmp_path))
 
-    def _unavailable(file_path, *, project_dir):
+    def _unavailable(file_path, *, project_dir, content=None):
         raise gate.UnitsUnavailable("forseti CLI could not be launched")
 
     monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
     verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
 
-    assert [v.verdict for v in verdicts] == ["error"]
+    assert verdicts == []
     state = gate.load_state(str(tmp_path))
+    assert "broken.c::?" not in state["units"]
     assert state["pending"]["broken.c"]["attempts"] == 2  # charged, not frozen
-    assert gate.blocking_units(state)  # the error itself keeps the turn blocked
+    assert gate.blocking_units(state)  # the killed run's unit keeps the turn blocked
     # The kill's pending `unknown` unit is still retryable — the point of the marker.
     assert gate.stale_sources(str(tmp_path), state, [str(src)]) == [str(src)]
 
@@ -579,7 +587,7 @@ def test_cleanup_survives_a_concurrent_error_charging_its_marker(
     def _verify_while_a_concurrent_scan_errors(
         fp, fn, *, project_dir, k=gate.DEFAULT_K
     ):
-        def _unavailable(file_path, *, project_dir):
+        def _unavailable(file_path, *, project_dir, content=None):
             raise gate.UnitsUnavailable("forseti CLI could not be launched")
 
         monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
@@ -600,28 +608,35 @@ def test_blocking_error_charge_stops_at_the_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The charge spends a retry budget, it does not keep a tally: once the budget is
-    # gone the marker is one no scan will offer again, so further errors must leave
-    # the counter at the cap rather than counting it up forever (PR #148 review).
+    # gone, a further error must leave the counter at the cap rather than counting
+    # it up forever (PR #148 review).
+    #
+    # Reaching that charge takes a spent marker on a file that is still *offered* —
+    # a capped marker alone retires the file, and then nothing is published at all
+    # (see the deferral tests). Here the stamp its killed run left has since been
+    # withdrawn by another run's drift check, so the file reads stale for the other
+    # reason while the marker for these bytes is already spent.
     src = tmp_path / "spent.c"
     digest = _concurrent_run_starts(tmp_path, src, "int f(void){return 0;}\n")
     with gate.gate_lock(str(tmp_path)):
         state = gate.load_state(str(tmp_path))
         state["pending"]["spent.c"]["attempts"] = gate.MAX_PENDING_VERIFY_ATTEMPTS
+        del state["scanned"]["spent.c"]
         gate.save_state(str(tmp_path), state)
 
-    def _unavailable(file_path, *, project_dir):
+    def _unavailable(file_path, *, project_dir, content=None):
         raise gate.UnitsUnavailable("forseti CLI could not be launched")
 
     monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
-    gate.verify_and_record(str(src), project_dir=str(tmp_path))
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
 
+    assert [v.verdict for v in verdicts] == ["error"]  # published, so it did charge
     state = gate.load_state(str(tmp_path))
     assert state["pending"]["spent.c"] == {
         "hash": digest,
-        "attempts": gate.MAX_PENDING_VERIFY_ATTEMPTS,
+        "attempts": gate.MAX_PENDING_VERIFY_ATTEMPTS,  # clamped, not MAX + 1
         "pid": os.getpid() + 1,
     }
-    assert gate.stale_sources(str(tmp_path), state, [str(src)]) == []  # still retired
 
 
 def test_blocking_error_preserves_a_newer_runs_pending_marker(
@@ -631,11 +646,18 @@ def test_blocking_error_preserves_a_newer_runs_pending_marker(
     # the bytes THIS run read. `raw` is read before the units are enumerated, so a
     # newer run's marker — a claim on content this error says nothing about — must
     # come through the error unchanged, counter included.
+    #
+    # It comes through untouched here in the strongest way — nothing is written at
+    # all. The newer run's stamp vouches for what is on disk, so this error is
+    # deferred, and the claim it would otherwise charge records *other* bytes than
+    # the ones this run read.
     src = tmp_path / "err.c"
     src.write_text("int f(void){return 0;}\n")
     newer: dict[str, str] = {}
 
-    def _newer_run_starts_then_enumeration_fails(file_path, *, project_dir):
+    def _newer_run_starts_then_enumeration_fails(
+        file_path, *, project_dir, content=None
+    ):
         newer["digest"] = _concurrent_run_starts(
             tmp_path, src, "int f(void){return 1;}\n"
         )
@@ -646,13 +668,115 @@ def test_blocking_error_preserves_a_newer_runs_pending_marker(
     )
     verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
 
-    assert [v.verdict for v in verdicts] == ["error"]  # this scan still blocks
+    assert verdicts == []  # deferred to the run that owns what is on disk
     state = gate.load_state(str(tmp_path))
+    assert "err.c::?" not in state["units"]
     assert state["pending"]["err.c"] == {
         "hash": newer["digest"],
         "attempts": 1,
         "pid": os.getpid() + 1,
     }
+    assert gate.stale_sources(str(tmp_path), state, [str(src)]) == [str(src)]
+
+
+def _newer_run_finishes(project_dir: Path, path: Path, content: str) -> str:
+    """The same second run, but one that *completed*: stamped, verified, no claim."""
+    path.write_text(content)
+    rel = gate.unit_id(str(project_dir), str(path))
+    digest = gate.content_hash(str(path))
+    assert digest is not None
+    with gate.gate_lock(str(project_dir)):
+        state = gate.load_state(str(project_dir))
+        state["scanned"][rel] = digest
+        gate.record(
+            state,
+            gate.UnitVerdict(f"{rel}::f", rel, "f", "verified", gate.DEFAULT_K),
+        )
+        gate.save_state(str(project_dir), state)
+    return digest
+
+
+def test_enumeration_failure_defers_to_a_run_that_already_finished(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The unclearable shape, one caller over from the drift error. This run reads
+    # A, a concurrent run replaces it with B and verifies B through, and then this
+    # run's enumeration of A fails. Published, `err.c::?` would never be cleared:
+    # B's stamp matches disk and B left no claim, so `stale_sources` never re-offers
+    # the file and the reconcile that prunes `?` never runs — the Stop gate would
+    # block to the cap on a file B legitimately verified.
+    src = tmp_path / "err.c"
+    src.write_text("int f(void){return 0;}\n")
+    newer: dict[str, str] = {}
+
+    def _newer_run_finishes_then_enumeration_fails(
+        file_path, *, project_dir, content=None
+    ):
+        newer["digest"] = _newer_run_finishes(tmp_path, src, "int f(void){return 1;}\n")
+        raise gate.UnitsUnavailable("forseti CLI could not be launched")
+
+    monkeypatch.setattr(
+        gate, "extract_function_defs", _newer_run_finishes_then_enumeration_fails
+    )
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert verdicts == []  # deferred to the run that owns what is on disk
+    state = gate.load_state(str(tmp_path))
+    assert "err.c::?" not in state["units"]
+    assert state["scanned"]["err.c"] == newer["digest"]  # B's stamp, untouched
+    assert gate.blocking_units(state) == []  # B verified it; nothing left to block
+    # Why publishing would have stuck: nothing marks the file for a re-scan.
+    assert gate.stale_sources(str(tmp_path), state, [str(src)]) == []
+
+
+def test_enumeration_failure_defers_on_content_already_gated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A no-op edit of content that is already stamped, with `esbmc` since gone from
+    # `PATH` (or a `TemporaryDirectory` that would not clean up). The stamp equals
+    # both what is on disk and the bytes this error is about — which is the
+    # tempting case for keeping the block, and the wrong one: those very bytes were
+    # enumerated by the run that stamped them and its verdicts still describe them,
+    # so this adds nothing and its `?` would be unclearable on top of a verified
+    # file. The tooling failure surfaces on the next edit that *changes* the file,
+    # where no stamp matches — see below.
+    src = tmp_path / "err.c"
+    src.write_text("int f(void){return 0;}\n")
+    _newer_run_finishes(tmp_path, src, "int f(void){return 0;}\n")
+
+    def _unavailable(file_path, *, project_dir, content=None):
+        raise gate.UnitsUnavailable("esbmc not found on PATH")
+
+    monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert verdicts == []
+    state = gate.load_state(str(tmp_path))
+    assert "err.c::?" not in state["units"]
+    assert state["units"]["err.c::f"]["verdict"] == "verified"  # what still stands
+
+
+def test_enumeration_failure_blocks_when_the_stamp_is_for_other_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The discrimination that keeps the deferral honest: a stamp exists, but for
+    # content that is no longer on disk, so nobody has gated what is there now.
+    # This must block — and it is clearable, because the file reads stale.
+    src = tmp_path / "err.c"
+    src.write_text("int f(void){return 0;}\n")
+    _newer_run_finishes(tmp_path, src, "int f(void){return 0;}\n")
+    src.write_text("int f(void){return 1;}\n")  # edited past the stamp
+
+    def _unavailable(file_path, *, project_dir, content=None):
+        raise gate.UnitsUnavailable("esbmc not found on PATH")
+
+    monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert [v.verdict for v in verdicts] == ["error"]
+    state = gate.load_state(str(tmp_path))
+    assert state["units"]["err.c::?"]["verdict"] == "error"
+    assert gate.blocking_units(state)
     assert gate.stale_sources(str(tmp_path), state, [str(src)]) == [str(src)]
 
 
@@ -668,18 +792,18 @@ def test_blocking_error_preserves_a_concurrent_same_content_marker(
     src = tmp_path / "shared.c"
     digest = _concurrent_run_starts(tmp_path, src, "int f(void){return 0;}\n")
 
-    def _unavailable(file_path, *, project_dir):
+    def _unavailable(file_path, *, project_dir, content=None):
         raise gate.UnitsUnavailable("forseti CLI could not be launched")
 
     monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
     verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
 
-    assert [v.verdict for v in verdicts] == ["error"]
+    assert verdicts == []  # the killed run stamped these bytes; it owns the file
     state = gate.load_state(str(tmp_path))
     assert state["pending"]["shared.c"] == {
         "hash": digest,
-        "attempts": 2,  # charged...
-        "pid": os.getpid() + 1,  # ...but still the creating run's marker
+        "attempts": 2,  # charged anyway — the budget shrinks even when quiet...
+        "pid": os.getpid() + 1,  # ...and it is still the creating run's marker
     }
     assert state["units"]["shared.c::f"]["verdict"] == "unknown"  # still pending
     assert state["scanned"]["shared.c"] == digest  # content-fresh by hash...
@@ -704,7 +828,7 @@ def test_errored_retries_are_capped_then_residual(
 
     scans: list[str] = []
 
-    def _unavailable(file_path, *, project_dir):
+    def _unavailable(file_path, *, project_dir, content=None):
         scans.append(str(file_path))
         raise gate.UnitsUnavailable("forseti CLI could not be launched")
 
@@ -727,9 +851,11 @@ def test_recovered_enumeration_clears_the_error_and_the_marker(
 ) -> None:
     # The other direction: `forseti`/esbmc was briefly unavailable. Charging the
     # marker keeps the file a retry candidate, so the scan that finds the CLI again
-    # re-verifies it — and the whole-file `error` unit is reconciled away by the
-    # up-front prune (`?` is not a function the file defines), so a transient
-    # failure cannot leave the turn blocked forever.
+    # re-verifies it — and a transient failure cannot leave the turn blocked
+    # forever. Two things make that true: the failing scan records no `?` at all
+    # while the killed run's stamp still vouches for these bytes, and any `?` that
+    # *was* recorded (a scan of content nothing vouches for) is reconciled away by
+    # the up-front prune, since `?` is not a function the file defines.
     _git_init(tmp_path)
     src = tmp_path / "flaky.c"
     src.write_text("int f(void){return 0;}\n")
@@ -738,12 +864,15 @@ def test_recovered_enumeration_clears_the_error_and_the_marker(
     with contextlib.suppress(_Killed):
         _run(post_bash.main, tmp_path, monkeypatch)
 
-    def _unavailable(file_path, *, project_dir):
+    def _unavailable(file_path, *, project_dir, content=None):
         raise gate.UnitsUnavailable("forseti CLI could not be launched")
 
     monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
     _run(post_bash.main, tmp_path, monkeypatch)
-    assert gate.load_state(str(tmp_path))["units"]["flaky.c::?"]["verdict"] == "error"
+    blocked = gate.load_state(str(tmp_path))
+    assert "flaky.c::?" not in blocked["units"]  # nothing stranded to clear
+    assert gate.blocking_units(blocked)  # ...and the turn is blocked regardless
+    assert blocked["pending"]["flaky.c"]["attempts"] == 2  # the budget still shrank
 
     _enumerate_one_unit(monkeypatch)  # the CLI is back
     monkeypatch.setattr(gate, "verify_function", _verified_verdict("flaky.c"))

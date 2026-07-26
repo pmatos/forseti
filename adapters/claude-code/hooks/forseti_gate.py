@@ -16,6 +16,7 @@ this gate.
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import fnmatch
 import hashlib
@@ -26,6 +27,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
@@ -112,6 +114,11 @@ MAX_STOP_ATTEMPTS = 3
 # file's still-pending `unknown` units keep blocking and reach the loud residual
 # via MAX_STOP_ATTEMPTS.
 MAX_PENDING_VERIFY_ATTEMPTS = 3
+
+# Symlinked directory components the snapshot's mirror plan will follow before it
+# calls the chain a loop — Linux's own `MAXSYMLINKS` for one path resolution. A
+# source reached through more than this could not have been `open`ed either.
+_MAX_SYMLINK_HOPS = 40
 
 C_SUFFIXES = {".c", ".h"}
 
@@ -232,8 +239,342 @@ def _func_def(unit: object) -> FuncDef:
     return FuncDef(name, takes_pointer)
 
 
+def _kernel_dir(path: str) -> str:
+    """`path` with each ``..`` resolved the way the kernel walks it, nothing else.
+
+    `os.path.abspath` collapses ``a/link/..`` to ``a`` lexically, but the kernel
+    resolves ``link`` before it climbs, landing on the parent of the link's
+    *target*. Since the gate reads and verifies through that same kernel walk, a
+    snapshot staged at the collapsed path would stand in for a different file's
+    neighbourhood — or a different file altogether.
+
+    Only ``..`` forces a resolution. A symlinked component *not* followed by one
+    stays spelled, so `_mirror_plan` still sees it and reproduces it as a symlink
+    — which is what keeps the two ways of resolving a ``..`` inside an ``#include``
+    agreeing (see there). Paths without ``..`` come back untouched.
+    """
+    cur = os.sep if os.path.isabs(path) else os.getcwd()
+    for part in path.split(os.sep):
+        if not part or part == os.curdir:
+            continue
+        if part == os.pardir:
+            # `dirname` of the *resolved* path: ``/`` is its own parent, which is
+            # also what a climb past the root does in place.
+            cur = os.path.dirname(os.path.realpath(cur))
+        else:
+            cur = os.path.join(cur, part)
+    return cur
+
+
+def _contains(root: str, path: str) -> bool:
+    """Is `path` `root` itself or lexically below it?"""
+    prefix = root if root.endswith(os.sep) else root + os.sep
+    return path == root or path.startswith(prefix)
+
+
+def _mirror_root(src_dir: str, project_dir: str) -> str:
+    """The highest ancestor of `src_dir` whose entries the snapshot mirrors.
+
+    `project_dir` when it contains `src_dir` — the gate's whole universe is the
+    project, and mirroring stops there rather than walking to ``/``, which would
+    mean a `scandir` of `$HOME` (thousands of entries, and an unreadable one turns
+    into a blocking `error`) for every edit. Otherwise the source's own directory:
+    a file outside the project has no ancestry the gate can claim.
+
+    Containment is tried against the project dir as spelled *and* as resolved,
+    because the two spellings do not have to agree: with `proj -> /data/proj`, a
+    hook may be handed `<cwd>/proj/src/x.c` while out-of-band discovery builds its
+    paths on the git root, which `git rev-parse` reports resolved. Lexically, one
+    of those is not under the other — and calling a file physically inside the
+    project "outside" costs it its whole ancestry, so an ordinary
+    ``#include "../common.h"`` stops resolving and enumeration blocks (or, with an
+    `-I` to fall through to, quietly reads a different header). Whichever test
+    matches returns a prefix of `src_dir`, so the source keeps its own spelling.
+    """
+    root = os.path.abspath(project_dir)
+    if _contains(root, src_dir):
+        return root
+    real_root = os.path.realpath(project_dir)
+    return real_root if _contains(real_root, src_dir) else src_dir
+
+
+def _staged(tmp: str, path: str) -> str:
+    """`path`'s place inside the snapshot tree: the same depth, rooted at `tmp`."""
+    return os.path.join(tmp, os.path.relpath(path, os.sep))
+
+
+def _file_id(path: str) -> tuple[int, int] | None:
+    """``(st_dev, st_ino)`` for `path`, links followed; ``None`` if it cannot stat."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
+
+
+def _mirror_entries(
+    real_dir: str,
+    into: str,
+    *,
+    source_id: tuple[int, int] | None = None,
+    snapshot: str | None = None,
+) -> None:
+    """Symlink every entry of `real_dir` into `into` that is not already there.
+
+    Whatever the caller has already put in `into` is the mirrored tree itself —
+    a level of the chain down to the snapshot, a reproduced symlink component, or
+    the snapshot file — and must never be overwritten by a link back to the real
+    entry of the same name. `lexists`, so a *dangling* link already staged counts
+    too. A directory is linked whole, so ``#include "sub/h.h"`` resolves through
+    it.
+
+    An entry that is **another name for the source** — a sibling
+    ``alias.c -> x.c``, or a hard link — is linked to `snapshot` instead. Left
+    pointing at the real file it would be a door back out of the immutable copy:
+    a translation unit that includes itself under that name reads whatever is on
+    disk *now*, and its ``#define``s then decide which units the snapshot
+    enumerates (issue #141's own race, one include deep). Compared by
+    ``(st_dev, st_ino)`` so a hard link counts, and an entry that cannot be
+    stat'd is still linked to the real path — one extra `stat` per entry beside
+    the `lexists` already spent.
+    """
+    with os.scandir(real_dir) as entries:
+        for entry in entries:
+            dest = os.path.join(into, entry.name)
+            if os.path.lexists(dest):
+                continue
+            checkable = snapshot is not None and source_id is not None
+            if checkable and _file_id(entry.path) == source_id:
+                os.symlink(str(snapshot), dest)  # another name for the source
+            else:
+                os.symlink(entry.path, dest)
+
+
+def _mirror_plan(
+    src_dir: str, project_dir: str
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """How to reproduce `src_dir`'s ancestry: real directories, symlink components.
+
+    Returns the directories to recreate as *real* directories (each mirroring its
+    own entries) and the ``(spelled link, its target)`` pairs to recreate as
+    *symlinks*, so that both ways of resolving a ``..`` agree with the in-place
+    parse:
+
+    * **The kernel walks it.** ``..`` from a directory reached through a symlink
+      is the parent of the link's *target*, not of the link — clang concatenates
+      the including file's directory with the spelled path and hands the result
+      to ``open``, so this is the resolution that actually happens (measured, not
+      assumed). Reproducing a symlinked component as a real directory would make
+      ``..`` climb the spelled chain instead, silently selecting a different
+      header — which flips ``#if`` branches, so enumeration reports units the
+      verify never sees, prunes the rest, and stamps the file.
+    * **The caller normalizes it lexically.** The spelled chain is reproduced
+      *as spelled*, so ``foo/../bar`` collapsed before the open lands on the
+      mirror of the same directory it lands on in place.
+
+    The walk stops at the first symlinked component, hops to its target, and
+    resumes from that target's own `_mirror_root` — so a link into the project
+    keeps the full ancestry, and a link out of it mirrors the target directory
+    (entries yes, parent no) exactly as a source outside the project does.
+    """
+    real_dirs: list[str] = []
+    links: list[tuple[str, str]] = []
+    hops = 0
+    base = _mirror_root(src_dir, project_dir)
+    steps = [] if src_dir == base else os.path.relpath(src_dir, base).split(os.sep)
+    while True:
+        if base not in real_dirs:
+            real_dirs.append(base)
+        cur, hop = base, None
+        for i, step in enumerate(steps):
+            nxt = os.path.join(cur, step)
+            if os.path.islink(nxt):
+                hop = (nxt, steps[i + 1 :])
+                break
+            cur = nxt
+            if cur not in real_dirs:
+                real_dirs.append(cur)
+        if hop is None:
+            return real_dirs, links
+        link, rest = hop
+        # A cyclic component would loop here forever, and `os.path.realpath` will
+        # not say so: it gives up and hands back a path that is *not* resolved —
+        # `a -> a` unchanged, `a -> a/x` one component longer every time. The
+        # second shape is why this is a **budget**, not a seen-set: with the target
+        # growing, no (link, rest) state ever recurs, so a repeat-detector spins.
+        #
+        # The budget is the kernel's own: `MAXSYMLINKS` traversals for one path
+        # resolution. Anything past it could not have been `open`ed either — this
+        # walk only runs for a source already read — so blocking is the honest
+        # answer, and it leaves room for the legitimate repeat this must not
+        # reject (`self -> .` walked as `self/self/x.c` visits one component
+        # twice, and the kernel counts that the same way).
+        hops += 1
+        if hops > _MAX_SYMLINK_HOPS:
+            raise OSError(errno.ELOOP, "symlinked directory component loops", link)
+        target = os.path.realpath(link)
+        # Deduped: the same component can legitimately be reached twice (the
+        # `self -> .` walk again), and staging one plan entry twice would raise
+        # `FileExistsError` at `os.symlink` — a blocking `error` by another route.
+        if (link, target) not in links:
+            links.append((link, target))
+        # Against the *resolved* project dir: `target` is fully resolved, so that
+        # is the apples-to-apples comparison, and a link that lands back inside a
+        # project which is itself reached through a symlink keeps its full
+        # ancestry rather than being treated as foreign.
+        base = _mirror_root(target, os.path.realpath(project_dir))
+        below = [] if target == base else os.path.relpath(target, base).split(os.sep)
+        # `target` is fully resolved, so nothing in `below` can be a symlink; only
+        # the not-yet-walked `rest` can hop again.
+        steps = below + rest
+
+
+@contextlib.contextmanager
+def _enumerable_source(
+    file_path: str | os.PathLike[str], content: bytes | None, *, project_dir: str
+) -> Iterator[str]:
+    """Yield the path to enumerate for `file_path` — itself, or an immutable copy.
+
+    With `content` ``None`` the file is enumerated where it lies. Given `content`,
+    those exact bytes are written to a snapshot in a private temp directory and
+    *that* is what gets parsed — so the enumeration is of the caller's bytes by
+    construction, not of whatever the file happens to hold when the CLI re-reads
+    it (issue #141). Write the bytes; never `shutil.copy` or re-read `file_path`,
+    or the race walks straight back in.
+
+    The temp tree is then made to **stand in for the source's own
+    neighbourhood**, because clang resolves a quoted ``#include`` against the
+    directory of the file it is reading — so the snapshot has to *be* in an
+    equivalent directory, including for headers reached through it, which clang
+    opens by their linked path and whose own quoted includes therefore resolve
+    the same way. Two things make it equivalent:
+
+    * **Siblings.** Every other entry of the source's directory is symlinked
+      beside the snapshot, so ``#include "sibling.h"`` resolves to the real one —
+      except a sibling that *is* the source under another name, which leads back
+      to the snapshot (`_mirror_entries`).
+
+    Immutability is the *top-level* file's, and two ways of naming the source
+    still reach the live one: an **absolute** include (clang opens the spelled
+    path, which no mirrored neighbourhood can stand in for) and an alias *below*
+    a mirrored directory (``sub/alias.c -> ../x.c``, since a directory is linked
+    whole). A translation unit that includes itself that way, during a transient
+    A -> B -> A, can enumerate B — the same residual the verify loop already
+    carries, and the same fix: enumeration of content the parser cannot reach
+    around, which means a Core CLI taking content on stdin with an explicit
+    include root, not a deeper mirror. Mirroring subdirectories entry-by-entry
+    instead would `scandir` and `stat` the source's whole subtree on every edit.
+    Pinned by ``test_a_nested_source_alias_is_a_known_residual``.
+    * **Ancestry.** The chain from `_mirror_root` down to the source's directory
+      is reproduced level by level, each mirroring its own entries bar the names
+      the chain itself already occupies, so ``#include "../common.h"`` — the
+      ordinary shape for a ``src/foo.c`` — resolves too. A real directory where
+      the source has a real directory and a *symlink* where it has a symlink
+      (`_mirror_plan`): ``..`` is then the same directory the in-place parse
+      reaches whether the caller normalizes ``foo/../bar`` lexically or lets the
+      kernel walk it.
+
+    The tree also reproduces the source's **absolute depth** (``/a/b/x.c`` stages
+    at ``<tmp>/a/b/x.c``), with the levels above the mirror root real but empty.
+    A ``..`` chain that climbs past the root then lands on an empty private
+    directory instead of on ``/tmp``, where a same-named file — anyone's, the
+    directory is world-writable — would silently be included.
+
+    Above the mirror root, resolution is **not** reproduced, and the miss is not
+    the end of it: clang falls through to the ``-I`` search with the *spelled*
+    path, so ``#include "../above.h"`` from a file at the project root ends at
+    whatever ``<-I dir>/../above.h`` finds — a blocking `error` when there is no
+    such flag, and otherwise a header the in-place parse need not have picked.
+    ``-I.`` is the spelling that reproduces it (the CLI runs with
+    ``cwd=project_dir``). Unchanged from the siblings-only staging this replaces;
+    what the padding removes is the far worse variant where the miss landed in
+    ``/tmp`` itself. Pinned by
+    ``test_include_above_the_mirror_root_is_a_known_residual``.
+
+    An ``-I <source dir>`` looks like a cheaper substitute for all this and is not
+    one: ``-I`` also joins the **angle-bracket** search, and it appends *after*
+    any ``-iquote`` from `FORSETI_BUILD_FLAGS` instead of taking the source
+    directory's first-place precedence. Either one silently selects a different
+    header than the in-place parse would — ``#include <config.h>`` next to a
+    generated ``config.h`` is the standard shape — which flips ``#if`` branches,
+    so enumeration reports units the verify never sees, prunes the rest, and
+    stamps the file. (ESBMC 8.3.0 offers no quoted-only include flag: it rejects
+    clang's ``-iquote``, exposing only ``-I``/``--idirafter``.) Mirroring needs no
+    flag at all and leaves every search path exactly as it was.
+
+    The source's own path is derived **as spelled** — absolutized against
+    `project_dir` (the subprocess's cwd) but never `resolve()`d — and the
+    snapshot is staged there. clang searches the directory of the path it was
+    *given*, so for a symlinked source file resolving would mirror the link
+    target's directory instead: a header beside the link would go missing, and a
+    same-named header beside the target would be silently preferred.
+
+    One part of it is not spelled: a ``..`` in the given path is resolved the way
+    the kernel walks it (`_kernel_dir`). The kernel is what picked the file whose
+    bytes were hashed and what will pick it again for the verify, so collapsing
+    ``proj/link/../x.c`` lexically to ``proj/x.c`` would surround content read
+    from the link target's parent with the *project's* headers — a different
+    translation unit, which is the failure this staging exists to prevent.
+    Symlinked directory components not followed by a ``..`` stay spelled and are
+    reproduced as symlinks; see `_mirror_plan`.
+    """
+    if content is None:
+        yield str(file_path)
+        return
+    spelled = os.path.join(project_dir, os.fspath(file_path))
+    src_dir, name = _kernel_dir(os.path.dirname(spelled)), os.path.basename(spelled)
+    target = os.path.join(src_dir, name)
+    # Every `OSError` the staging can raise — an unwritable/missing `TMPDIR`,
+    # `ENOSPC`, `EDQUOT`, an unreadable directory anywhere on the mirrored chain,
+    # a failed cleanup — has to land as `UnitsUnavailable`, the one exception
+    # `verify_and_record` turns into a blocking `error`. Left bare it escapes to
+    # the hook, which installs no handler: the process dies with a traceback and
+    # exit 1 (not the blocking exit 2) before any verdict or `scanned` stamp is
+    # written, so the edit passes with the file unverified. Outside a git work
+    # tree nothing backstops that — the same reason the post-verify drift check
+    # blocks rather than deferring to the out-of-band scan. Mirrors how
+    # `_list_units` already converts `OSError` from the spawn.
+    try:
+        with tempfile.TemporaryDirectory(prefix="forseti-units-") as tmp:
+            real_dirs, links = _mirror_plan(src_dir, project_dir)
+            # Order is load-bearing. The whole skeleton — every level of the
+            # chain, every reproduced symlink component, and the snapshot itself
+            # — has to exist before any level mirrors its entries, because
+            # `_mirror_entries` yields to whatever is already staged. Mirror the
+            # source's directory first and its own name would become a link back
+            # to the real file, which `write_bytes` would then follow and
+            # *truncate the user's source*.
+            for real in real_dirs:
+                os.makedirs(_staged(tmp, real), exist_ok=True)
+            for link, link_target in links:
+                os.symlink(_staged(tmp, link_target), _staged(tmp, link))
+            snapshot = Path(_staged(tmp, target))
+            snapshot.write_bytes(content)
+            # Taken before the mirroring, off the real file: any entry that turns
+            # out to be this same inode is another name for the source and must
+            # lead to the snapshot, not back out to the live file.
+            source_id = _file_id(target)
+            for real in real_dirs:
+                _mirror_entries(
+                    real,
+                    _staged(tmp, real),
+                    source_id=source_id,
+                    snapshot=str(snapshot),
+                )
+            yield str(snapshot)
+    except OSError as exc:
+        raise UnitsUnavailable(
+            f"could not stage a snapshot of {name} for enumeration (check "
+            f"TMPDIR, free space, and read access to {src_dir} and the "
+            f"directories `_mirror_plan` reproduces for it): {exc}"
+        ) from exc
+
+
 def extract_function_defs(
-    file_path: str | os.PathLike[str], *, project_dir: str
+    file_path: str | os.PathLike[str],
+    *,
+    project_dir: str,
+    content: bytes | None = None,
 ) -> list[FuncDef]:
     """Enumerate `file_path`'s function definitions via ``forseti list-units``.
 
@@ -246,6 +587,11 @@ def extract_function_defs(
     fails (missing binary, C parse error, timeout, unreadable file), so the caller
     records a blocking `error` verdict instead of silently skipping the file.
 
+    Pass `content` to enumerate exactly those bytes rather than re-reading the
+    file (`_enumerable_source`): the caller has already hashed them, and a
+    concurrent rewrite between the hash and the CLI's read is what issue #141
+    closes. Omit it to parse the file in place.
+
     Only ``.c`` translation units are enumerated: ESBMC cannot parse a header
     standalone (``forseti verify`` errors on a ``.h`` too — "failed to figure out
     type of file"), and clang's path-match keeps a header-resident definition out
@@ -255,10 +601,16 @@ def extract_function_defs(
     """
     if Path(file_path).suffix.lower() != ".c":
         return []
+    with _enumerable_source(file_path, content, project_dir=project_dir) as source:
+        return _list_units(source, project_dir=project_dir)
+
+
+def _list_units(source: str, *, project_dir: str) -> list[FuncDef]:
+    """Run ``forseti list-units`` on `source` and map its payload to `FuncDef`s."""
     argv = [
         *resolve_forseti_cmd(),
         "list-units",
-        str(file_path),
+        source,
         "--json",
         # Pass the float through, don't truncate. `list-units` hands its --timeout
         # straight to `subprocess.run(timeout=...)` (esbmc's own --timeout is not
@@ -273,7 +625,9 @@ def extract_function_defs(
     # `#include` cannot be resolved makes esbmc exit nonzero, which is a blocking
     # `error` on every edited file rather than a listing. Only the build flags go
     # here: `SAFETY_FLAGS` is for the verify, and a property flag on a
-    # `--parse-tree-only` run is at best inert.
+    # `--parse-tree-only` run is at best inert. Nothing is added for a snapshot —
+    # `_enumerable_source` mirrors the source's directory precisely so the search
+    # paths stay identical to the in-place parse.
     build_flags = _build_flags()
     if build_flags:
         argv += ["--", *build_flags]
@@ -345,22 +699,6 @@ def content_hash(path: str | os.PathLike[str]) -> str | None:
         return hashlib.sha256(Path(path).read_bytes()).hexdigest()
     except OSError:
         return None
-
-
-def _source_fingerprint(path: str | os.PathLike[str]) -> tuple[int, ...] | None:
-    """Identity + change stamp for `path`, or ``None`` if it cannot be stat'd.
-
-    Pairs with `content_hash` to detect a rewrite that happened *while* we were
-    enumerating. A digest alone cannot: the dangerous interleaving restores the
-    original bytes afterwards (A → B → A), so the content compares equal even
-    though the enumeration saw B. `st_mtime_ns`/`st_ctime_ns` still move for that
-    rewrite, and `st_dev`/`st_ino` catch a replace-by-rename.
-    """
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
 def _globs(value: str | None) -> tuple[str, ...]:
@@ -597,9 +935,13 @@ def discover_changed_c_sources(
     # is verified once).
     committed = git_committed_files_since(project_dir, baseline_head)
     rels = list(dict.fromkeys([*rels, *committed]))
-    # Keep the returned path expressed relative to the raw `project_dir` so its
-    # `unit_id`/`scanned` key matches what `verify_and_record` stamps; realpath is
-    # used only to compare against the (possibly symlinked) project subtree.
+    # `realpath` is used only to compare against the (possibly symlinked) project
+    # subtree; the returned path keeps git's own root, so scoping never restages a
+    # file. That is *not* the same as the `unit_id` key agreeing with the one a
+    # PostToolUse edit produces: `git rev-parse --show-toplevel` reports the root
+    # resolved, so when `project_dir` is a symlinked spelling the same file keys as
+    # `../real/src/x.c` here and `src/x.c` there — measured, and filed as #152 with
+    # the other half of that aliasing class, since the fix changes a persisted key.
     proj_real = os.path.realpath(project_dir)
     found: list[str] = []
     for rel in rels:
@@ -1159,21 +1501,74 @@ def verify_and_record(
     the run that recorded that marker, never by one that finds a concurrent run's —
     so a killed run is *retried* by the next scan instead of being skipped as
     content-fresh (issue #140), bounded by `MAX_PENDING_VERIFY_ATTEMPTS`.
+
+    None of that happens when the bytes this run enumerated have already been
+    superseded on disk by a concurrent run whose `scanned` stamp vouches for what
+    is there now: that run owns the file, so this one returns **no verdicts and
+    writes nothing at all** — no stamp, no `pending` marker, no reconcile, not even
+    a `stop_attempts` reset. An empty return is therefore not by itself "the file
+    defines no functions"; see the deferral below for why blocking instead would
+    strand a `rel::?` nothing can clear.
+
+    The same deference applies wherever else this run would publish a block: an
+    enumeration that failed for bytes now gone, and a post-verify drift check that
+    has just withdrawn this run's own stamp. Each is re-decided atomically with the
+    record it would write (`unless_superseded`) rather than by whatever the state
+    said when the lock was last held.
+
+    One more path returns nothing without deferring to anyone: a run whose content
+    drifted away and whose stamp is *not* its own to withdraw — whether a
+    concurrent run replaced it or nothing holds one at all. Its verdicts describe
+    bytes that are no longer on disk, and the returned list is what the hooks
+    report and act on, so it says nothing. Safety there is not the return value's:
+    the per-unit writes are ownership-scoped, so an un-overwritten unit is still
+    the owner's pending `unknown`, and with no stamp the file reads stale and is
+    re-offered.
     """
     rel = unit_id(project_dir, file_path)
 
-    def _blocking_error(detail: str, *, digest: str | None = None) -> list[UnitVerdict]:
+    def _blocking_error(
+        detail: str, *, digest: str | None = None, unless_superseded: bool = False
+    ) -> list[UnitVerdict]:
         """Record a blocking `error` verdict for the whole file and return it.
 
         No caller stamps `scanned`: a file we could not read or enumerate must not
         be recorded as already-scanned, or the out-of-band scan would treat it as
         handled and the edit would pass unverified.
 
+        `unless_superseded` drops the *verdict* — never the charge below — when a
+        `scanned` stamp vouches for the bytes on disk at that instant. Only two
+        things write a stamp: this function, in the same lock as the units it
+        pre-records as blocking and its `pending` claim, and the session baseline's
+        deliberate "already handled". So a stamp equal to what is on disk means
+        some run has gated exactly that content, and this run's failure to
+        enumerate it adds nothing — while the `rel::?` it would record cannot be
+        cleared: the file hashes equal to the stamp, so once the owning run
+        finishes and drops its claim, `stale_sources` reads the file as fresh, the
+        reconcile that prunes `?` never runs, and the Stop-gate blocks its way to a
+        loud residual on a file that was legitimately verified. The condition is
+        tested *here*, not by the caller: outside the lock it would only move the
+        gap to between the test and this one.
+
+        What still blocks in the meantime is the owning run's own record — its
+        pre-recorded `unknown` units if it was killed, its real verdicts if it
+        finished. That is why deferring is not a silent pass, and it is what makes
+        the *charge* independent: a killed run's claim keeps its file a retry
+        candidate, so a persistently-erroring file has to spend that budget or
+        re-verify forever (issue #140/#148). Suppressing the verdict without
+        charging would spin; charging without suppressing is the stranded `?`. So
+        this path does both — quiet, but one attempt poorer.
+
+        A stamp for *other* content is not superseding: the file reads stale, the
+        `?` is clearable by the next scan, and nobody has gated what is on disk —
+        that block must land.
+
         An unfinished-verify marker for `digest` is *spent one attempt*, never
         deleted (PR #148 review). Deleting is what the ownership rule forbids: this
-        path can never own the marker — every error caller returns before the block
-        that creates one, and `pending` holds a single claim per file — so the marker
-        it would drop always belongs to another run, whose pre-recorded `unknown`
+        path can never own the marker — an error caller either returns before the
+        block that creates one or (the post-verify drift caller) has already
+        released its own claim, and `pending` holds a single claim per file — so the
+        marker it would drop always belongs to another run, whose pre-recorded `unknown`
         units would then sit content-fresh (that run stamped `scanned` with these
         same bytes) with nothing left to retry, the exact hole issue #140 closes.
         Bumping keeps that retry claim alive while still making progress: leaving the
@@ -1190,30 +1585,38 @@ def verify_and_record(
         Only a marker recording exactly `digest` is charged: a concurrent run of
         *other* content is verifying bytes this error says nothing about.
 
-        Two callers pass no `digest` and so touch nothing, for different reasons. The
-        read failure never learned which bytes it was scanning, so it cannot name the
-        claim to charge — and such a file also fails `content_hash`, so `stale_sources`
-        skips it entirely and no frozen counter can spin. The enumeration-race caller
-        *did* read bytes, but the interleaving it guards against (A → B → A) means the
-        file on disk may no longer hold them, so charging that content's retry budget
-        would spend a claim this run never really raced; the counter is bumped by the
-        next run that gets past enumeration.
+        Three callers pass no `digest` and so touch nothing. The read failure never
+        learned which bytes it was scanning, so it cannot name the claim to charge —
+        and such a file also fails `content_hash`, so `stale_sources` skips it
+        entirely and no frozen counter can spin. The other two are the drift checks,
+        around the enumeration and around the verify loop, and they share a reason:
+        each fires precisely *because* the file no longer hashes to `digest`, so
+        charging that content's retry budget would spend a claim on bytes this run is
+        no longer speaking for. The counter is bumped by the next run that scans
+        whatever the file now holds.
         """
         verdict = UnitVerdict(f"{rel}::?", rel, "?", "error", k, detail=detail)
         with gate_lock(project_dir):
             state = load_state(project_dir)
-            record(state, verdict)
-            state["stop_attempts"] = 0
+            on_disk_now = content_hash(file_path)
+            superseded = unless_superseded and (
+                on_disk_now is not None
+                and state.get("scanned", {}).get(rel) == on_disk_now
+            )
             pending = state.setdefault("pending", {})
             attempts = _pending_attempts(pending.get(rel), digest) if digest else None
+            if superseded and attempts is None:
+                return []  # nothing to record, and no claim to charge
+            if not superseded:
+                record(state, verdict)
+                state["stop_attempts"] = 0
             if attempts is not None:
                 pending[rel]["attempts"] = min(
                     attempts + 1, MAX_PENDING_VERIFY_ATTEMPTS
                 )
             save_state(project_dir, state)
-        return [verdict]
+        return [] if superseded else [verdict]
 
-    before = _source_fingerprint(file_path)
     try:
         raw = Path(file_path).read_bytes()
     except OSError as exc:
@@ -1225,68 +1628,110 @@ def verify_and_record(
     digest = hashlib.sha256(raw).hexdigest()
 
     try:
-        defs = extract_function_defs(file_path, project_dir=project_dir)
+        # `content=raw` — enumerate a snapshot of the very bytes we are about to
+        # hash, never a re-read of the file. Without it `list-units` reads the
+        # path again and can land on a transient rewrite: an *empty* `.c`
+        # enumerates as a successful empty list (exit 0), so the zero-byte
+        # instant a `> f.c`/heredoc passes through would prune every unit this
+        # file has — dropping an already-recorded blocking verdict — and then
+        # stamp `scanned` with the final content's digest, leaving the Stop-gate
+        # and the out-of-band scan both satisfied (issue #141).
+        defs = extract_function_defs(file_path, project_dir=project_dir, content=raw)
     except UnitsUnavailable as exc:
-        # Couldn't enumerate the file's units (esbmc missing, C parse error, …).
-        # Record a blocking `error` verdict rather than skip: a file that was
-        # edited but can't be parsed must not pass silently.
-        return _blocking_error(str(exc)[:800], digest=digest)
+        # Couldn't enumerate the file's units (esbmc missing, C parse error, a
+        # snapshot that would not stage, …). Record a blocking `error` verdict
+        # rather than skip: a file that was edited but can't be parsed must not
+        # pass silently. Unless a stamp already vouches for what is on disk — then
+        # those bytes are gated by a run that *did* enumerate them, and a block
+        # here would be an unclearable one on top of a verified file, whether the
+        # bytes moved on or this is a no-op edit of content already verified.
+        return _blocking_error(str(exc)[:800], digest=digest, unless_superseded=True)
 
-    # `list-units` re-reads the file, so it may have enumerated bytes other than
-    # the ones we hashed. Fail closed on any sign of that: an *empty* `.c`
-    # enumerates as a successful empty list (exit 0), so the zero-byte instant a
-    # `> f.c`/heredoc rewrite passes through would prune every unit this file has
-    # — dropping an already-recorded blocking verdict — and then stamp `scanned`
-    # with the final content's digest, leaving the Stop-gate and the out-of-band
-    # scan both satisfied. The block clears on the next edit's reconcile.
-    if before is None or _source_fingerprint(file_path) != before:
-        return _blocking_error(
-            "source changed while its units were being enumerated; not recording "
-            "a scan of content that was not enumerated — re-edit to re-verify"
-        )
-
-    # Reconcile + record every current function BEFORE the slow verifies: drop
-    # functions the file no longer defines, reset the Stop-gate's patience, and
-    # pre-record each — a pointer/array-taking unit as its final `needs_contract`
-    # (we skip its meaningless function-level verify), every other as pending
-    # `unknown` so a mid-run kill leaves the not-yet-verified ones blocking
-    # rather than absent.
+    # Acquiring the stamp is a claim to be authoritative for this file, so the
+    # check that we *are* happens under the same lock that writes it — a
+    # concurrent hook can stamp in any gap left between the two. The snapshot
+    # guarantees we enumerated `raw`; the re-hash guarantees `raw` is still what
+    # the file holds at the instant we claim it. Together they give the stamping
+    # invariant: if `scanned[rel]` was set to H, the units recorded alongside it
+    # were enumerated from content hashing to H *and* the file still hashed to H
+    # when the stamp was taken. A rewrite that lands and stays (A → B) fails
+    # closed here rather than relying on the out-of-band scan to re-gate B later —
+    # which it cannot do at all outside a git work tree. Compared by content, not
+    # by `stat` metadata, so it holds on a filesystem with coarse timestamp
+    # granularity too. The block clears on the next edit's reconcile.
+    #
+    # It is also the ownership test. Hashing equal means the bytes we enumerated
+    # are the bytes on disk *now*, so re-stamping over a concurrent run's entry is
+    # correct — that run's content has been superseded. Hashing unequal means it
+    # has superseded ours, and the reconcile below would then prune and pre-record
+    # against content nobody has on disk.
+    marker: dict[str, object] = {}  # only ever read on the path that fills it
     with gate_lock(project_dir):
         state = load_state(project_dir)
-        state["stop_attempts"] = 0
-        # Stamp the content hash so a later out-of-band scan treats this exact content
-        # as already verified — that dedup is what keeps the Stop-gate from re-blocking
-        # (and resetting its patience) on a file nothing has touched since.
-        state.setdefault("scanned", {})[rel] = digest
-        # Mark this content's scan unfinished, counting the start. The stamp above
-        # makes the file content-fresh, so without this marker a kill before the
-        # verdicts land would leave the pending `unknown` units unretryable
-        # (issue #140). Cleared once every verdict is final.
+        on_disk = content_hash(file_path)
+        if on_disk == digest:
+            # Reconcile + record every current function BEFORE the slow verifies:
+            # drop functions the file no longer defines, reset the Stop-gate's
+            # patience, and pre-record each — a pointer/array-taking unit as its
+            # final `needs_contract` (we skip its meaningless function-level
+            # verify), every other as pending `unknown` so a mid-run kill leaves
+            # the not-yet-verified ones blocking rather than absent.
+            state["stop_attempts"] = 0
+            # Stamp the content hash so a later out-of-band scan treats this exact
+            # content as already verified — that dedup is what keeps the Stop-gate
+            # from re-blocking (and resetting its patience) on a file nothing has
+            # touched since.
+            state.setdefault("scanned", {})[rel] = digest
+            # Mark this content's scan unfinished, counting the start. The stamp
+            # above makes the file content-fresh, so without this marker a kill
+            # before the verdicts land would leave the pending `unknown` units
+            # unretryable (issue #140). Cleared once every verdict is final.
+            #
+            # The marker doubles as this run's ownership token so the cleanup below
+            # can tell it from one a *concurrent* run stored — see `_pending_owner`
+            # for what identifies it. The counter is bumped under the lock, so a
+            # concurrent run of the same content still reads this start when it
+            # computes its own.
+            prior = _pending_attempts(state.setdefault("pending", {}).get(rel), digest)
+            marker = {"hash": digest, "attempts": (prior or 0) + 1, "pid": os.getpid()}
+            state["pending"][rel] = marker
+            prune_missing_units(state, project_dir, file_path, {d.name for d in defs})
+            for d in defs:
+                if d.takes_pointer:
+                    record(state, _needs_contract_verdict(rel, d.name, k))
+                else:
+                    record(
+                        state,
+                        UnitVerdict(
+                            f"{rel}::{d.name}",
+                            rel,
+                            d.name,
+                            "unknown",
+                            k,
+                            detail="verification pending",
+                        ),
+                    )
+            save_state(project_dir, state)
+
+    if on_disk != digest:
+        # Someone else's content is on disk. If a stamp already vouches for
+        # exactly that content, a concurrent run owns this file: it enumerated
+        # what is there and pre-recorded every unit as blocking until it verifies
+        # them, so defer to it — silently. Blocking anyway would strand a `rel::?`
+        # error nothing can clear, the same trap the post-verify withdrawal below
+        # avoids: the file hashes equal to the surviving stamp, so the out-of-band
+        # scan reads it as fresh and never re-runs the reconcile that prunes `?`.
+        # With nothing vouching for it, nobody has gated what is on disk — block.
         #
-        # The marker doubles as this run's ownership token so the cleanup below can
-        # tell it from one a *concurrent* run stored — see `_pending_owner` for what
-        # identifies it. The counter is bumped under the lock, so a concurrent run of
-        # the same content still reads this start when it computes its own.
-        prior = _pending_attempts(state.setdefault("pending", {}).get(rel), digest)
-        marker = {"hash": digest, "attempts": (prior or 0) + 1, "pid": os.getpid()}
-        state["pending"][rel] = marker
-        prune_missing_units(state, project_dir, file_path, {d.name for d in defs})
-        for d in defs:
-            if d.takes_pointer:
-                record(state, _needs_contract_verdict(rel, d.name, k))
-            else:
-                record(
-                    state,
-                    UnitVerdict(
-                        f"{rel}::{d.name}",
-                        rel,
-                        d.name,
-                        "unknown",
-                        k,
-                        detail="verification pending",
-                    ),
-                )
-        save_state(project_dir, state)
+        # Both halves of that test are `_blocking_error`'s, re-read under the lock
+        # that records the verdict. Deciding it out here — off the `on_disk` read
+        # from the stamp lock, now released — would leave a concurrent run room to
+        # stamp in between and strand the `?`.
+        return _blocking_error(
+            "source changed while its units were being enumerated; not recording "
+            "a scan of content that was not enumerated — re-edit to re-verify",
+            unless_superseded=True,
+        )
 
     verdicts: list[UnitVerdict] = []
     for d in defs:
@@ -1301,26 +1746,112 @@ def verify_and_record(
         verdicts.append(verdict)
         with gate_lock(project_dir):  # overwrite the pending entry
             state = load_state(project_dir)
-            record(state, verdict)
-            save_state(project_dir, state)
+            # Ownership-scoped, exactly like the stamp withdrawal below: a
+            # concurrent hook that has re-stamped `scanned` for this file owns
+            # its units too — it re-enumerated and pre-recorded them. This run's
+            # verdict describes content that hook has already superseded, so
+            # writing it could replace that run's fresh `violated` with a stale
+            # `verified`, after which the file hashes fresh and nothing blocks.
+            # Dropping it is safe in the other direction: the owner pre-records
+            # every unit as pending `unknown`, so an un-overwritten unit still
+            # blocks. (The stale verdict stays in the returned list — the
+            # PostToolUse message — but the Stop-gate reads state, not this.)
+            if state.get("scanned", {}).get(rel) == digest:
+                record(state, verdict)
+                save_state(project_dir, state)
 
-    # Every verdict for this content is final: clear THIS RUN's unfinished-verify
-    # marker so later scans trust the up-front `scanned` stamp again. Only this run's
-    # — the gate explicitly supports concurrent PostToolUse hooks on the same path
-    # across successive edits, so an older run can reach this point after a newer one
-    # has stamped `scanned` with *its* digest and stored its own marker. Popping that
-    # newer marker would leave the file hashing fresh with nothing to retry, so a kill
-    # of the newer run would never be re-verified — the exact hole this closes
-    # (PR #148 review) — and its pre-recorded `unknown` units, which this run's
-    # verdicts for the older bytes overwrote, would never be re-decided either.
-    # A kill in the sliver between the last verdict and this write just costs one
-    # redundant re-verify — the safe direction. Ownership is `_pending_owner`, not
-    # whole-marker equality: a concurrent `_blocking_error` may have charged this
-    # marker an attempt, which changes its bytes without changing whose claim it is.
+    # The verifies read the *real* path, not the snapshot: a verdict has to
+    # describe the translation unit that actually ships, and the snapshot's
+    # mirrored neighbourhood reproduces in-place include resolution only up to
+    # its root — an include reaching above that fails to resolve, which is a
+    # tolerable blocking `error` for an enumeration and an intolerable one for
+    # the verify the whole gate rests on. Plus every counterexample and the
+    # trace's `argv` would name a temp file that no longer exists. So this
+    # boundary is guarded, not eliminated: re-hash once after the
+    # loop and fail closed on drift. Un-stamping is what makes the out-of-band
+    # scan re-gate the file, and the `error` blocks when there is no scan to fall
+    # back on (outside a git work tree); both clear on the next edit's reconcile.
+    #
+    # What this catches: a rewrite that lands and *stays* (A → B) during the
+    # verifies. What it does NOT catch — the acknowledged residual — is a
+    # transient A → B → A: a verdict computed against B stays attached to A's
+    # stamp, because the final bytes compare equal. Detecting that needs
+    # verification of immutable content, which costs more than it buys (above).
+    # So the invariant is precisely: if `scanned[rel]` is H, the units were
+    # enumerated from content hashing to H and the file hashed to H both then and
+    # after the loop — NOT that every verdict was computed against H.
+    withdrawn = False
+    drifted = content_hash(file_path) != digest
+    if drifted:
+        with gate_lock(project_dir):
+            state = load_state(project_dir)
+            scanned = state.setdefault("scanned", {})
+            # Ownership-scoped, and the *whole* response hinges on it. A stamp
+            # that is still ours means nothing else vouches for this file, so
+            # withdraw it (that is what makes the out-of-band scan re-gate) and
+            # block. A stamp some concurrent hook has replaced belongs to that
+            # run: it stamped content it is itself reconciling, so leave it be
+            # AND do not block. Blocking anyway would strand a `rel::?` error
+            # that nothing can clear — the file now hashes equal to the surviving
+            # stamp, so the out-of-band scan reads it as fresh and never re-runs
+            # the reconcile that prunes `?`, and the Stop-gate would block on a
+            # file a newer run legitimately verified.
+            withdrawn = scanned.get(rel) == digest
+            if withdrawn:
+                scanned.pop(rel, None)
+                save_state(project_dir, state)
+
+    # Every verdict for this content is final — or, on the drift path just above,
+    # this run has concluded that none of them can be trusted. Either way the run
+    # *finished*: clear THIS RUN's unfinished-verify marker so later scans trust
+    # the up-front `scanned` stamp again. Only a kill should leave a claim behind,
+    # because a claim is precisely what makes the next scan retry (issue #140).
+    #
+    # Only this run's — the gate explicitly supports concurrent PostToolUse hooks
+    # on the same path across successive edits, so an older run can reach this
+    # point after a newer one has stamped `scanned` with *its* digest and stored
+    # its own marker. Popping that newer marker would leave the file hashing fresh
+    # with nothing to retry, so a kill of the newer run would never be re-verified
+    # — the exact hole this closes (PR #148 review) — and its pre-recorded
+    # `unknown` units, which this run's verdicts for the older bytes overwrote,
+    # would never be re-decided either. A kill in the sliver between the last
+    # verdict and this write just costs one redundant re-verify — the safe
+    # direction. Ownership is `_pending_owner`, not whole-marker equality: a
+    # concurrent `_blocking_error` may have charged this marker an attempt, which
+    # changes its bytes without changing whose claim it is.
     with gate_lock(project_dir):
         state = load_state(project_dir)
         pending = state.setdefault("pending", {})
         if _pending_owner(pending.get(rel)) == _pending_owner(marker):
             del pending[rel]
         save_state(project_dir, state)
+
+    # Blocking comes *after* releasing the claim, which is what keeps
+    # `_blocking_error`'s no-ownership rule true for this caller too: by the time
+    # it looks, any marker under `rel` belongs to a concurrent run. (It is passed
+    # no `digest` regardless — the bytes it would name are no longer the ones on
+    # disk, so charging their retry budget would spend a claim on content this
+    # run is no longer speaking for.)
+    #
+    # The withdrawal above released the lock, so a concurrent hook can stamp and
+    # fully verify what is on disk before this block lands — after which a
+    # `rel::?` would be unclearable. `unless_superseded` re-tests ownership under
+    # the same lock that records the verdict; a test out here would only shrink
+    # that window, not close it.
+    if withdrawn:
+        return _blocking_error(
+            "source changed while its units were being verified; the verdicts "
+            "describe content that is no longer on disk — re-edit to re-verify",
+            unless_superseded=True,
+        )
+    if drifted:
+        # Not ours to withdraw, so nothing is written — and nothing is *said*
+        # either. The returned list is the PostToolUse message, and the hooks act
+        # on it: a stale `violated` exits 2 and hands Claude a counterexample for
+        # code that is no longer on disk, a stale `verified` is logged and shown as
+        # a pass for content this run never saw. The verdicts stay out of the
+        # state by the same ownership test in the loop above, so the honest answer
+        # here is the same one every other supersession gives — say nothing, and
+        # let the run that owns the file speak.
+        return []
     return verdicts

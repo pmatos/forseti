@@ -78,7 +78,17 @@ def main() -> int:
         )
 
     if not verdicts:
-        return 0  # no functions in the file; any stale units were just reconciled
+        # Either the file defines no functions (any stale units were just
+        # reconciled), or the bytes `verify_and_record` gated are no longer the
+        # ones on disk, so it has nothing it can honestly report about the file as
+        # it now stands. Passing here is safe in both cases, and in the second it
+        # is not this list that makes it so: a concurrent run that stamped the new
+        # content records — and blocks on — its own units, and if nothing stamped
+        # it, the file reads stale and the scan re-offers it. What must not happen
+        # is reporting the superseded verdicts, which would exit 2 with a
+        # counterexample for code no longer on disk. The `edit` event above logs an
+        # empty `functions` list either way.
+        return 0
 
     # NEEDS_CONTRACT (pointer/array units the gate can't check without a harness)
     # is honestly-unverified but NOT a fixable counterexample — never feed it back

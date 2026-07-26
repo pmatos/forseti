@@ -190,7 +190,51 @@ turns a verdict into an error.
   missing, C parse error) the file's units are recorded as a blocking ERROR
   verdict rather than silently skipped. A file that only parses with the
   project's include paths needs `FORSETI_BUILD_FLAGS` set — an unresolvable
-  `#include` is such a failure.
+  `#include` is such a failure. What gets parsed is an **immutable snapshot** of
+  the exact bytes the gate hashed, written to a private temp directory (issue
+  #141), so a rewrite concurrent with the parse cannot make the gate enumerate
+  one version of the file while stamping another. That temp tree is made to
+  stand in for the source's own neighbourhood, with no extra flag: every entry
+  beside the source is symlinked next to the snapshot, and the directory chain
+  from the project root down is reproduced level by level, each mirroring its own
+  entries — so `#include "sibling.h"` *and* `#include "../common.h"` resolve to
+  the same headers an in-place parse would pick. A symlinked directory component
+  is reproduced as a **symlink**, and the chain then continues from its target:
+  the kernel resolves such a component before it applies `..`, so a climb past
+  one leaves the spelled chain, and a real directory there would silently select
+  a different header. (Naming the directory with
+  `-I` instead would be wrong: `-I` also joins the *angle-bracket* search and
+  lands after any `-iquote`, so `#include <config.h>` next to a generated
+  `config.h` would pick the wrong one, flip an `#if`, and hide a unit from the
+  gate.) A quoted include that climbs *above* the project root is the one shape
+  the mirror does not reproduce: it misses there, and clang then falls through to
+  the `-I` search with the *spelled* path — a blocking ERROR when no such flag is
+  set, and otherwise whatever `<-I dir>/../above.h` finds, which need not be the
+  header an in-place parse picks. `FORSETI_BUILD_FLAGS="-I."` is the spelling
+  that reproduces the in-place answer (the CLI runs with `cwd` = project dir).
+  This is unchanged from mirroring the siblings alone; the padded depth only
+  removes the worse variant, where the miss landed in `/tmp` itself. A symlink
+  pointing *out* of the project has the same limit one level down — the mirror
+  claims no ancestry above the link's target, exactly as it claims none above the
+  project root — so a climb past that target misses too, and blocks.
+- **The verify step runs on the real path, so its own freshness is guarded, not
+  guaranteed.** A verdict has to describe the translation unit that actually
+  ships, and the snapshot reproduces include resolution only up to its mirror
+  root — plus every counterexample and the trace's `argv` would name a
+  temp file that no longer exists. Instead the file is re-hashed once after the
+  verify loop and the run fails closed on drift: it withdraws its `scanned`
+  stamp and records a blocking ERROR rather than let a verdict stand for content
+  no longer on disk. That catches a rewrite that lands and **stays** during the
+  verifies. It does **not** catch a transient `A → B → A` — a verdict computed
+  against `B` stays attached to `A`'s stamp, since the final bytes compare
+  equal. So the guarantee is precisely: if `scanned` records digest `H`, the
+  units were enumerated from content hashing to `H` and the file hashed to `H`
+  both then and after the loop — *not* that every verdict was computed against
+  `H`. Taking that stamp is itself ownership-scoped: the re-hash happens under
+  the same lock that writes it, so concurrent hooks cannot interleave between the
+  two, and a run whose bytes have already been superseded by another run's stamp
+  defers to it silently instead of reclaiming the entry or blocking on a file
+  that run legitimately verified.
 - **Only `.c` translation units are verified; header definitions are out of
   scope.** ESBMC cannot parse a `.h` standalone (`forseti verify`/`list-units`
   both error with "failed to figure out type of file"), and a function defined in
