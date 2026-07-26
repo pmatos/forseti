@@ -1,3 +1,10 @@
+## [1.6.4](https://github.com/pmatos/forseti/compare/v1.6.3...v1.6.4) (2026-07-26)
+
+
+### Bug Fixes
+
+* **harness:** treat a buffer index-use of the length as renderable ([#123](https://github.com/pmatos/forseti/issues/123)) ([#154](https://github.com/pmatos/forseti/issues/154)) ([aeed02a](https://github.com/pmatos/forseti/commit/aeed02a3927dcbd2aa1c1670be43bb5e6deba1b5))
+
 ## [1.6.3](https://github.com/pmatos/forseti/compare/v1.6.2...v1.6.3) (2026-07-26)
 
 
