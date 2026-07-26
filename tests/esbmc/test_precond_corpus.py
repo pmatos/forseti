@@ -353,6 +353,42 @@ uint32_t frame_checksum(const uint8_t *frame, size_t len) {
 uint32_t via_alias(const uint8_t frame[4]) { return sum_alias(frame, 64); }
 """
 
+_LABELLED_LEAF = """\
+#include <stddef.h>
+#include <stdint.h>
+
+static uint32_t sum_bytes(const uint8_t *buf, size_t len) {
+    uint32_t acc = 0;
+    for (size_t i = 0; i < len; i++) acc += buf[i];
+    return acc;
+}
+
+uint32_t sum_labelled(const uint8_t *buf, size_t len) __asm__("sum_bytes");
+
+uint32_t frame_checksum(const uint8_t *frame, size_t len) {
+    return sum_bytes(frame, len);
+}
+
+uint32_t via_label(const uint8_t frame[4]) { return sum_labelled(frame, 64); }
+"""
+
+
+def test_an_assembly_label_naming_the_leaf_opens_the_caller_set(
+    tmp_path: Path,
+) -> None:
+    # Only `sum_labelled` carries a label, and it spells the leaf's own default
+    # symbol name — so the two are one function at link time with nothing marked
+    # on the leaf's side, and `via_label`'s call reaches it under a name the
+    # enumeration never sees.
+    src = tmp_path / "labelled.c"
+    src.write_text(_LABELLED_LEAF)
+    result = discharge_precondition(src, function="sum_bytes", max_len=MAX_LEN)
+    assert result.assessment is Assessment.ASSUMED_VERIFIED, result.label
+    outcomes = {c.caller: c.outcome for c in result.callers}
+    assert outcomes["frame_checksum"] is CallerOutcome.DISCHARGED
+    assert outcomes["sum_labelled"] is CallerOutcome.UNRESOLVED
+    assert "another name for sum_bytes()" in result.label
+
 
 def test_an_alias_opens_the_caller_set(tmp_path: Path) -> None:
     # `sum_alias` *is* `sum_bytes` at link time, but `via_alias`'s call references

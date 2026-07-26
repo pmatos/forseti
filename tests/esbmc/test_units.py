@@ -815,6 +815,32 @@ def test_a_shared_assembly_label_makes_two_names_one_function() -> None:
     assert parse_symbol_aliases(_ATTRIBUTE_PATH_AST, "scope") == ()
 
 
+# The asymmetric case: only one side carries a label, and it spells the *default*
+# symbol name of the other. A declaration's symbol is its label when it has one
+# and its C name otherwise, so these two are one function with one side unmarked.
+_DEFAULT_LABEL_AST = """\
+TranslationUnitDecl 0xb000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0xb001 </tmp/foo.c:1:1, col:42> col:13 used leaf 'void (int *)' static
+| |-ParmVarDecl 0xb002 <col:15, col:20> col:20 used p 'int *'
+| `-CompoundStmt 0xb003 <col:30, col:42>
+|-FunctionDecl 0xb010 <line:2:1, col:35> col:6 used twin 'void (int *)'
+| |-ParmVarDecl 0xb011 <col:15, col:20> col:20 p 'int *'
+| `-AsmLabelAttr 0xb012 <col:32> "leaf" IsLiteralLabel
+`-FunctionDecl 0xb020 <line:3:1, col:38> col:6 other 'void (int *)'
+  |-ParmVarDecl 0xb021 <col:15, col:20> col:20 p 'int *'
+  `-CompoundStmt 0xb022 <col:30, col:38>
+"""
+
+
+def test_an_assembly_label_matches_an_unlabelled_default_name() -> None:
+    assert parse_symbol_aliases(_DEFAULT_LABEL_AST, "leaf") == ("twin",)
+    assert parse_symbol_aliases(_DEFAULT_LABEL_AST, "twin") == ("leaf",)
+    # and a TU where nothing is labelled stays free of phantom aliases: two
+    # distinct C names are two distinct symbols
+    assert parse_symbol_aliases(_DEFAULT_LABEL_AST, "other") == ()
+    assert parse_symbol_aliases(_NESTED_DECL_AST, "leaf") == ()
+
+
 def test_parse_address_escapes_keeps_a_reference_it_cannot_name() -> None:
     # A reference under no named declaration is still a reference; naming it
     # `<file scope>` keeps the escape (and the withheld discharge) rather than

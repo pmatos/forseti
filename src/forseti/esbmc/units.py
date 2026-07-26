@@ -449,6 +449,12 @@ def parse_address_escapes(ast_text: str, symbol: str) -> tuple[str, ...]:
     return tuple(sites)
 
 
+def _declared_name(rest: str) -> str:
+    """The identifier a declaration line names, or ``""`` when it names none."""
+    found = _NAME_RE.search(rest)
+    return found.group(1) if found else ""
+
+
 def parse_symbol_aliases(ast_text: str, symbol: str) -> tuple[str, ...]:
     """Declarations that are **another name** for `symbol`, by name.
 
@@ -460,12 +466,12 @@ def parse_symbol_aliases(ast_text: str, symbol: str) -> tuple[str, ...]:
     upgrade, rather than claiming a set of callers that was complete only for one
     of the function's names.
 
-    An **assembly label** (``static void fa(int *) __asm__("impl")`` next to an
-    ``f`` labelled the same) is the same identity by a different route: the label,
-    not the C name, is what the linker joins, so two declarations sharing one are
-    one function. Clang prints ``AsmLabelAttr <loc> "impl"`` on each, which is why
-    the labels are collected per declaration and matched against `symbol`'s own
-    rather than being read as a name.
+    An **assembly label** is the same identity by a different route: what the
+    linker joins is a declaration's *symbol* name, which is its ``__asm__`` label
+    when it has one and its C name otherwise. So the comparison is between those
+    effective names — which catches two declarations sharing an explicit label,
+    and equally ``void fa(int *) __asm__("f")`` next to a plain ``f``, where only
+    one side carries a label at all.
 
     What this does *not* cover is a function named by an attribute rather than
     aliased by one — a ``cleanup`` handler, say. That is `parse_address_escapes`'
@@ -475,15 +481,17 @@ def parse_symbol_aliases(ast_text: str, symbol: str) -> tuple[str, ...]:
     aliases: dict[str, None] = {}
     labels: dict[str, set[str]] = {}
     for stack, kind, rest, _file in _walk(ast_text):
-        if kind == "AliasAttr" and symbol in _TARGET_NAME_RE.findall(rest):
+        if kind == "FunctionDecl":
+            labels.setdefault(_declared_name(rest), set())
+        elif kind == "AliasAttr" and symbol in _TARGET_NAME_RE.findall(rest):
             aliases[_enclosing_name(stack)] = None
         elif kind == "AsmLabelAttr":
             labels.setdefault(_enclosing_name(stack), set()).update(
                 _TARGET_NAME_RE.findall(rest)
             )
-    shared = labels.get(symbol, set())
+    target = labels.get(symbol) or {symbol}
     for name, own in labels.items():
-        if name != symbol and own & shared:
+        if name != symbol and (own or {name}) & target:
             aliases[name] = None
     return tuple(aliases)
 
