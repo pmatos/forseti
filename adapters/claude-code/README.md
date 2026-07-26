@@ -233,10 +233,19 @@ turns a verdict into an error.
   that `#include`s **itself by its own literal name** still reaches the live
   file for that nested read, since a private snapshot cannot occupy the
   original's name (it needs a random one to avoid colliding with a concurrent
-  verify of the same file). The snapshot's name is excluded from the gate's own
-  discovery unconditionally — never subject to `FORSETI_GATE_INCLUDE`/`_EXCLUDE`
-  — so one a killed hook could not clean up is never itself offered back as a
-  source to verify. Every path the CLI's own response names — the trace's
+  verify of the same file). That random name would otherwise leak into
+  `__FILE__`/`__BASE_FILE__` too — code that branches on its own presumed name
+  (`strcmp(__FILE__, "expected.c")`, say) would take a different path than the
+  real file does — so the snapshot's first line is a `#line 1 "<real path>"`
+  directive, fixing the presumed name back to the original without touching
+  where its bytes sit; verified against a live `esbmc` run. The snapshot's name
+  is excluded from the gate's own discovery unconditionally — never subject to
+  `FORSETI_GATE_INCLUDE`/`_EXCLUDE` — so one a killed hook could not clean up
+  is never itself offered back as a source to verify. Staging it at all is
+  skipped when every definition in the file takes a pointer/array parameter
+  (`NEEDS_CONTRACT`, no ESBMC call ever reached): a directory that could not
+  host a snapshot must not gate an edit that would never have needed one.
+  Every path the CLI's own response names — the trace's
   `argv` and any counterexample — is rewritten from the snapshot back to the
   real file before it is recorded, so the loop trace and any fix Claude is asked
   to make still point at a file that exists on disk. The file is still

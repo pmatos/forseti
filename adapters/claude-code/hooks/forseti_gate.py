@@ -1253,6 +1253,18 @@ def baseline_scanned(project_dir: str) -> int | None:
     return len(baseline)
 
 
+def _line_directive(path: str) -> bytes:
+    r"""A `#line 1 "path"` directive, escaped as a single C string literal.
+
+    Backslashes and double quotes are the only characters that would otherwise
+    end the literal early or corrupt it (a Windows-style path, or the rare `"`
+    in a filename); everything else passes through unescaped, same as a C
+    string literal allows.
+    """
+    escaped = path.replace("\\", "\\\\").replace('"', '\\"')
+    return f'#line 1 "{escaped}"\n'.encode()
+
+
 @contextlib.contextmanager
 def _verifiable_source(
     file_path: str | os.PathLike[str], content: bytes, *, project_dir: str
@@ -1290,6 +1302,33 @@ def _verifiable_source(
     needs an unusual C construct (a `.c` including itself by name) rather than
     an ordinary `#include "../common.h"` from a project-root source.
 
+    The random name is also a problem the moment a translation unit reads its
+    own identity back: `__FILE__` (standard) and `__BASE_FILE__` (a GCC/clang
+    extension) are the *presumed* source name, and without correction that
+    presumed name would be the snapshot's random one — not `file_path` — so
+    code that branches on it (`strcmp(__FILE__, "expected.c")`, an `#include`
+    built from `__BASE_FILE__`, …) would take a different path than the real
+    file does, silently verifying a different program. A leading `#line 1
+    "file_path"` directive fixes the *presumed* name back to `file_path`
+    without touching the physical bytes `content` holds or where they sit:
+    verified empirically against a live `esbmc` — a `strcmp(__FILE__, ...)`
+    branch (and the same for `__BASE_FILE__`) taken by the real file is taken
+    identically by the snapshot once the directive is prepended, and every
+    reported counterexample line number still lines up with `file_path`'s own
+    (`#line 1` re-bases the immediately following line to 1, matching
+    `content`'s own first line).
+
+    This directive must stay verify-only, never grow onto `_enumerable_source`'s
+    snapshot: `forseti list-units` (`parse_units`) attributes a `FunctionDecl` to
+    the source by a normalized match against the literal CLI path it was given,
+    and a `#line`-carrying file reports every location as the directive's target
+    instead — so every function would fail that match and `list-units` would
+    report a clean, function-free file, which `_list_units` (correctly, for a
+    file that genuinely has none) treats as a legitimate pass. `verify_function`
+    has no such filter — it looks a function up by name in the whole compiled
+    unit — which is exactly why this directive is safe here and would not be
+    there.
+
     The name carries `_VERIFY_SNAPSHOT_PREFIX` so `_included` excludes it from
     the gate's own discovery unconditionally — see there for why that has to be
     unconditional. `git status` still lists it until the `finally` below runs
@@ -1299,6 +1338,7 @@ def _verifiable_source(
     """
     spelled = os.path.join(project_dir, os.fspath(file_path))
     src_dir = os.path.dirname(spelled) or "."
+    directive = _line_directive(os.fspath(file_path))
     try:
         fd, path = tempfile.mkstemp(
             prefix=_VERIFY_SNAPSHOT_PREFIX, suffix=".c", dir=src_dir
@@ -1310,6 +1350,7 @@ def _verifiable_source(
         ) from exc
     try:
         with os.fdopen(fd, "wb") as handle:
+            handle.write(directive)
             handle.write(content)
     except OSError as exc:
         with contextlib.suppress(OSError):
@@ -1863,8 +1904,20 @@ def verify_and_record(
         )
 
     verdicts: list[UnitVerdict] = []
+    # Staging costs a write into the user's tree (`_verifiable_source`), so pay it
+    # only when some `d` will actually reach `verify_function` below — never for a
+    # file whose definitions are all pointer/array-taking (classified NEEDS_CONTRACT
+    # a priori, no ESBMC call) or that defines no functions at all. Skipping it then
+    # means a directory ESBMC could never even be asked to read from (unwritable, out
+    # of space) still lets a pointer-only edit through non-blocking, instead of
+    # gating and retrying for a snapshot nothing downstream would have used.
+    verify_ctx: contextlib.AbstractContextManager[str] = (
+        _verifiable_source(file_path, raw, project_dir=project_dir)
+        if any(not d.takes_pointer for d in defs)
+        else contextlib.nullcontext(file_path)
+    )
     try:
-        with _verifiable_source(file_path, raw, project_dir=project_dir) as verify_path:
+        with verify_ctx as verify_path:
             for d in defs:
                 if d.takes_pointer:
                     # Signature-based, a priori: skip the (meaningless)
