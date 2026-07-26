@@ -134,6 +134,26 @@ def test_mixed_length_and_buffer_precondition_is_error() -> None:
         )
 
 
+def test_last_element_precondition_renders_after_the_buffer() -> None:
+    # `a[n - 1]` names the length only as an *index*, so it is a buffer-content
+    # predicate like `a[0] >= 0`: emitted after the VLA + fill, where `n` is an
+    # already-bound scalar. The genuine size bound is its own domain entry.
+    out = render_semantic_harness(
+        unit_source="int last(const int *a, unsigned n) { return a[n - 1]; }",
+        signature=UnitSignature(
+            "last",
+            "int",
+            (BufferParam("int", "a", "n", const=True), ScalarParam("unsigned", "n")),
+        ),
+        spec=SemanticSpec("result == a[n - 1]", ("n >= 1 && n <= 4", "a[n - 1] >= 0")),
+    )
+    content_assume = "__ESBMC_assume((a[n - 1] >= 0));"
+    assert content_assume in out
+    assert out.index("__ESBMC_assume((n >= 1 && n <= 4));") < out.index("int a[n];")
+    assert out.index("a[_i] = nondet_int();") < out.index(content_assume)
+    assert out.index(content_assume) < out.index("last(a, n)")
+
+
 def test_output_buffer_captured() -> None:
     out = render_semantic_harness(
         unit_source="int decode(const unsigned char *b, unsigned len, uint32_t *cp)"
@@ -336,6 +356,83 @@ def test_static_gate_and_renderer_agree_on_mixed_clause() -> None:
             signature=_BUF_SIG,
             spec=spec,
         )
+
+
+def test_renderability_reason_allows_length_used_only_as_an_index() -> None:
+    # A length identifier inside a subscript is an index use, not a size
+    # constraint, so `a[n - 1] >= 0` has a valid emission point (after the VLA +
+    # fill) and the static gate must not discard it (#123).
+    spec = SemanticSpec("result == a[n - 1]", ("n >= 1", "a[n - 1] >= 0"))
+    assert renderability_reason(_BUF_SIG, spec) is None
+
+
+def test_renderability_reason_flags_index_use_mixed_with_a_size_bound() -> None:
+    # The index use is fine on its own, but `&& n >= 1` is a genuine size bound
+    # that must precede the VLA -- one clause, two required positions.
+    reason = renderability_reason(
+        _BUF_SIG, SemanticSpec("result == a[n - 1]", ("a[n - 1] >= 0 && n >= 1",))
+    )
+    assert reason is not None and "constrains both a buffer" in reason
+
+
+def test_renderability_reason_flags_constant_index_mixed_with_a_size_bound() -> None:
+    # The rule is "a length identifier outside a subscript", not "any subscript
+    # makes the clause renderable": a constant index plus a real bound still has
+    # no single emission point.
+    reason = renderability_reason(
+        _BUF_SIG, SemanticSpec("result == a[0]", ("a[0] >= 0 && n <= 4",))
+    )
+    assert reason is not None and "constrains both a buffer" in reason
+
+
+_TWO_BUF_SIG = UnitSignature(
+    "pick",
+    "int",
+    (
+        BufferParam("int", "a", "n", const=True),
+        ScalarParam("unsigned", "n"),
+        BufferParam("int", "b", "m", const=True),
+        ScalarParam("unsigned", "m"),
+    ),
+)
+
+
+def test_index_use_of_another_buffers_length_allowed() -> None:
+    # Multi-buffer: every buffer's length ident is stripped from every buffer's
+    # subscript, so indexing `a` by `b`'s length `m` is still an index use.
+    spec = SemanticSpec("result == a[m - 1]", ("n >= 1", "m >= 1", "a[m - 1] >= 0"))
+    assert renderability_reason(_TWO_BUF_SIG, spec) is None
+
+
+def test_index_use_of_another_buffers_length_mixed_with_bound_rejected() -> None:
+    reason = renderability_reason(
+        _TWO_BUF_SIG, SemanticSpec("result == a[m - 1]", ("a[m - 1] >= 0 && m >= 1",))
+    )
+    assert reason is not None and "constrains both a buffer" in reason
+
+
+def test_nested_buffer_index_collapses_to_an_index_use() -> None:
+    # `a[b[0]]` needs the fixpoint strip: the inner `b[0]` goes first, then the
+    # outer `a[b]`. Nothing is left outside a subscript, so it is renderable.
+    spec = SemanticSpec("result >= 0", ("a[b[0]] >= 0",))
+    assert renderability_reason(_TWO_BUF_SIG, spec) is None
+    reason = renderability_reason(
+        _TWO_BUF_SIG, SemanticSpec("result >= 0", ("a[b[0]] >= 0 && n >= 1",))
+    )
+    assert reason is not None and "constrains both a buffer" in reason
+
+
+def test_static_gate_and_renderer_agree_on_index_use() -> None:
+    # Parity in the accepting direction: what the static authority now admits, the
+    # renderer emits -- the same single-authority invariant, read the other way.
+    spec = SemanticSpec("result == a[n - 1]", ("n >= 1", "a[n - 1] >= 0"))
+    assert renderability_reason(_BUF_SIG, spec) is None
+    out = render_semantic_harness(
+        unit_source="int first(const int *a, unsigned n) { return a[0]; }",
+        signature=_BUF_SIG,
+        spec=spec,
+    )
+    assert "__ESBMC_assume((a[n - 1] >= 0));" in out
 
 
 _SUFFIX_OUT_SLICE = "int f(int64_t x, uint32_t *u) { *u = 0; return 1; }"
