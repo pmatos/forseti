@@ -37,6 +37,19 @@ _NODE_RE = re.compile(r"^([ |`]*)-(\w+)\b(.*)$")
 # `PATH:line:col`, `line:line:col`, `col:col`, or `<built-in>:...`.
 _LOC_RE = re.compile(r"<([^,>]+)")
 
+# One location token: `<built-in>:line:col`, `PATH:line:col`/`line:line:col`, or a
+# same-line abbreviation `col:col`. `<built-in>` is spelled out (rather than
+# `[^\s,<>]+`) because it contains its own literal `<`/`>`, which would otherwise
+# be mistaken for the enclosing range's brackets.
+_LOC_TOKEN_RE = r"<built-in>:\d+:\d+|[^\s,<>]+:\d+:\d+|col:\d+"
+
+# A node's full location: `<start[, end]> point`. `point` is a `Decl`'s own
+# identifier location, distinct from `start` — the range's beginning — whenever
+# they fall on different lines (see `_loc_line`).
+_LOC_CHAIN_RE = re.compile(
+    rf"<({_LOC_TOKEN_RE})(?:,\s*({_LOC_TOKEN_RE}))?>\s*({_LOC_TOKEN_RE})?"
+)
+
 # The identifier a Decl names: the last word immediately before its `'type'`.
 _NAME_RE = re.compile(r"\s(\w+)\s+'")
 
@@ -85,6 +98,18 @@ _STATIC_MIN_RE = re.compile(r"\bstatic\b")
 # right after `#`, so `#define`/`#if`/... (which start with a non-digit, non-
 # "line" word) never do.
 _LINE_DIRECTIVE_RE = re.compile(r"^[ \t]*#[ \t]*(?:line[ \t]+)?(\d+)\b", re.MULTILINE)
+
+# `#if 0` (the literal, always-false form) is the one conditional this scan can
+# resolve without a preprocessor: cpp never processes anything up to its `#else`/
+# `#endif`, so a `#line` inside it never reaches the compiler either. `#ifdef`,
+# `#ifndef`, and any other `#if <expr>` are opaque — their condition needs macro
+# state this scan does not have — so they are tracked only to balance nesting, not
+# to judge liveness (matching `_param_list_text`'s own stance on such bodies: it
+# leaves picking the *right* one to `def_line`, not to evaluating the condition).
+_IF_ZERO_RE = re.compile(r"^[ \t]*#[ \t]*if\s+0\b", re.MULTILINE)
+_IF_OPAQUE_RE = re.compile(r"^[ \t]*#[ \t]*(?:ifdef|ifndef|if\s+(?!0\b))", re.MULTILINE)
+_COND_ELSE_RE = re.compile(r"^[ \t]*#[ \t]*(?:elif|else)\b", re.MULTILINE)
+_COND_ENDIF_RE = re.compile(r"^[ \t]*#[ \t]*endif\b", re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -163,6 +188,12 @@ def _loc_file(rest: str, current: str) -> str:
     abbreviates to ``line:``/``col:`` for following nodes in the same file. So a
     bare ``line``/``col`` inherits `current`; anything else names a new file
     (a path, a header, or ``<built-in>``).
+
+    Reads the range's *start*, unlike `_loc_line` (which reads `point`): file
+    identity does not move within a same-file macro expansion, and a macro whose
+    own definition lives in a *different* file (a header) still drops the unit
+    via `fn_in_target`, so the asymmetry is harmless for every case this module
+    handles.
     """
     match = _LOC_RE.search(rest)
     if not match:
@@ -173,19 +204,39 @@ def _loc_file(rest: str, current: str) -> str:
     return head
 
 
-def _loc_line(rest: str, current: int) -> int:
-    """The 1-based source line a node line refers to.
+def _token_line(token: str | None, inherited: int) -> int:
+    """`token`'s line, or `inherited` if `token` is absent or a bare ``col:N``.
 
-    Mirrors `_loc_file`: a bare ``col:N`` inherits `current` (same line as the
-    enclosing location); ``line:N:...`` or a full ``PATH:N:...`` gives the new line.
+    Every other `_LOC_TOKEN_RE` alternative ends in a colon-separated digit run
+    for line and column, so the second-to-last split component is always a
+    decimal string here — no fallback needed.
     """
-    match = _LOC_RE.search(rest)
+    if token is None or token.startswith("col:"):
+        return inherited
+    return int(token.split(":")[-2])
+
+
+def _loc_line(rest: str, current: int) -> int:
+    """The 1-based source line a node's own location — not its range's *start* —
+    refers to.
+
+    A node line reads ``<start[, end]> point ...``; `point` is a `Decl`'s own
+    identifier location, printed right after the range and, like `end`, inherits
+    its line from the location before it when abbreviated to a bare ``col:N``
+    (mirroring `_loc_file`).
+
+    Deliberately reads `point`, not `start`: they diverge when a `FunctionDecl`'s
+    return type is a macro defined earlier in the file — clang's range then
+    *starts* at the macro's spelling location, but `point` still names the
+    function identifier's real line. Anchoring `Unit.def_line` on `start` would
+    pick up the macro definition's line instead (issue #145 follow-up).
+    """
+    match = _LOC_CHAIN_RE.search(rest)
     if not match:
         return current
-    parts = match.group(1).split(":")
-    if len(parts) >= 2 and parts[0] != "col" and parts[-2].isdecimal():
-        return int(parts[-2])
-    return current
+    start_line = _token_line(match.group(1), current)
+    end_line = _token_line(match.group(2), start_line)
+    return _token_line(match.group(3), end_line)
 
 
 def _depth(art: str) -> int:
@@ -278,20 +329,62 @@ def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
 
 def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
     """``(physical_line, presumed_line)`` pairs from `source_no_comments`'s
-    ``#line``/linemarker directives, one per directive, in physical order.
+    ``#line``/linemarker directives, one per directive reachable by cpp, in
+    physical order.
 
     Each pair says the *next* physical line reads as `presumed_line`, and every
     physical line after it reads one higher — until the next directive — mirroring
     how ``#line N`` (or GNU's ``# N "file"``) resets clang's own line counter.
 
-    A textual scan, not a preprocessor: a directive inside a false ``#if 0``/
-    ``#ifdef`` group is skipped by cpp (and so never seen by clang) but is still
-    picked up here, which can misalign the mapping in that narrow case.
+    A directive inside a literal ``#if 0`` block is excluded: cpp never processes
+    anything up to its ``#else``/``#endif``, so such a directive never resets
+    clang's own counter either — including it would let a duplicate ``#line``
+    guarding an inactive body collide with the one guarding the active definition
+    (PR #156 follow-up to issue #145). Nesting is tracked (an ``#if``/``#ifdef``/
+    ``#ifndef`` inside a dead ``#if 0`` stays dead regardless of its own
+    condition), but any conditional *other* than a literal ``#if 0`` is opaque —
+    its condition needs macro state this textual scan does not have — and is
+    assumed live, exactly as `_param_list_text` itself leaves picking the right
+    ``#ifdef`` branch to `def_line`, not to evaluating the condition.
     """
-    return [
-        (source_no_comments.count("\n", 0, m.start()) + 1, int(m.group(1)))
-        for m in _LINE_DIRECTIVE_RE.finditer(source_no_comments)
-    ]
+
+    def _events(
+        pattern: re.Pattern[str], kind: str, *, keep_match: bool = False
+    ) -> list[tuple[int, str, re.Match[str] | None]]:
+        return [
+            (m.start(), kind, m if keep_match else None)
+            for m in pattern.finditer(source_no_comments)
+        ]
+
+    events = sorted(
+        _events(_IF_ZERO_RE, "if0")
+        + _events(_IF_OPAQUE_RE, "ifop")
+        + _events(_COND_ELSE_RE, "else")
+        + _events(_COND_ENDIF_RE, "endif")
+        + _events(_LINE_DIRECTIVE_RE, "line", keep_match=True),
+        key=lambda event: event[0],
+    )
+    dead_stack: list[bool] = []  # one entry per open conditional; True = dead branch
+    zero_stack: list[bool] = []  # parallel: was this frame opened by a literal `#if 0`
+    breakpoints: list[tuple[int, int]] = []
+    for pos, kind, match in events:
+        if kind == "if0":
+            dead_stack.append(True)
+            zero_stack.append(True)
+        elif kind == "ifop":
+            dead_stack.append(False)
+            zero_stack.append(False)
+        elif kind == "else":
+            if dead_stack and zero_stack[-1]:
+                dead_stack[-1] = False
+        elif kind == "endif":
+            if dead_stack:
+                dead_stack.pop()
+                zero_stack.pop()
+        elif match is not None and not any(dead_stack):
+            physical = source_no_comments.count("\n", 0, pos) + 1
+            breakpoints.append((physical, int(match.group(1))))
+    return breakpoints
 
 
 def _presumed_line(physical_line: int, breakpoints: list[tuple[int, int]]) -> int:
@@ -337,6 +430,20 @@ def _param_list_text(
     comparison (issue #145 follow-up: a directive after an inactive ``#if 0`` body
     can make the active definition's presumed line collide with, or fall behind,
     the inactive one's physical line).
+
+    Two candidates can still translate to the *same* presumed line even after
+    `_line_breakpoints` excludes a ``#line`` sitting inside a literal ``#if 0`` —
+    e.g. two directives outside any conditional at all, each immediately ahead of
+    a definition-shaped occurrence. `min`'s stability would otherwise silently
+    keep whichever candidate is textually first. As a last resort, ties are
+    broken by physical line, preferring the later occurrence — consistent with
+    this anchor's own default assumption (issue #145): an inactive alternative
+    more often sits *before* the active one than after.
+
+    A duplicate directive inside an *opaque* conditional (``#ifdef``) is not this
+    case: this textual scan cannot tell which branch cpp took, so nothing here —
+    this tiebreak included — can pick the right candidate in both compiles of
+    such an input; it is a residual, not a target.
     """
     candidates: list[tuple[int, str]] = []
     for match in re.finditer(rf"\b{re.escape(fn_name)}\s*\(", source_no_comments):
@@ -366,12 +473,15 @@ def _param_list_text(
     breakpoints = _line_breakpoints(source_no_comments)
     # Sort key: candidates at or after `def_line` (key[0] == False) all sort before
     # any that are only before it, then nearest wins within each group — "at or
-    # nearest after", falling back to nearest-before only if none qualify.
+    # nearest after", falling back to nearest-before only if none qualify. `-c[0]`
+    # (physical line) only breaks a tie left by the first two components — two
+    # candidates translated to the same presumed distance from `def_line`.
     return min(
         candidates,
         key=lambda c: (
             _presumed_line(c[0], breakpoints) < def_line,
             abs(_presumed_line(c[0], breakpoints) - def_line),
+            -c[0],
         ),
     )[1]
 

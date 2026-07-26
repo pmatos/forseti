@@ -17,6 +17,7 @@ from forseti.esbmc.units import (
     Param,
     Unit,
     _blank_comment,
+    _line_breakpoints,
     annotate_array_extents,
     list_units,
     parse_units,
@@ -91,6 +92,30 @@ def test_parse_units_captures_definition_line() -> None:
     assert units["scal"].def_line == 3  # <line:3:1, col:29>
     assert units["hash"].def_line == 4  # <line:4:1, col:77>
     assert units["reg"].def_line == 6  # <line:6:1, col:27>
+
+
+# PR #156 follow-up: when a `FunctionDecl`'s return type is a macro defined
+# earlier in the file, clang's range *starts* at the macro's spelling location —
+# here line 1 — not the function's own line. This is a real `esbmc
+# --parse-tree-only` dump (captured against `#define API void` / `API f(int *p)
+# { *p = 1; }` on line 5), trimmed to the one FunctionDecl.
+_MACRO_RETURN_TYPE_AST = """\
+TranslationUnitDecl 0x1000 <<invalid sloc>> <invalid sloc>
+`-FunctionDecl 0x2000 </tmp/macro.c:1:13, line:5:25> col:5 f 'void (int *)'
+  |-ParmVarDecl 0x2001 <col:7, col:12> col:12 used p 'int *'
+  `-CompoundStmt 0x2002 <col:15, col:25>
+"""
+
+
+def test_parse_units_macro_return_type_uses_identifier_line_not_range_start() -> None:
+    # The range start (`1:13`) is the macro definition's line; `def_line` must be
+    # the function identifier's own line (5), which the AST separately states as
+    # its abbreviated point location (`col:5`, inheriting from the range end
+    # `line:5:25`). Anchoring on the range start instead would land `def_line` on
+    # the macro's line, letting an inactive alternative definition sitting between
+    # the macro and the real one donate its array extent (issue #145 follow-up).
+    unit = next(iter(parse_units(_MACRO_RETURN_TYPE_AST, "/tmp/macro.c")))
+    assert unit.def_line == 5
 
 
 def test_parse_units_empty_on_declarations_only() -> None:
@@ -309,6 +334,77 @@ def test_annotate_array_extents_anchors_across_a_line_directive(directive: str) 
     assert (out.array_extent, out.array_extent_unresolved) == (None, False)
 
 
+# PR #156 follow-up: a naive textual scan would see two legal `#line 11`
+# directives — one ahead of an inactive `#if 0` body, one ahead of the active
+# definition — and translate both candidates to presumed line 11, tying with
+# `def_line` (11, what clang reports for the active definition) equidistant from
+# both. `_line_breakpoints` avoids the tie outright by excluding a `#line` inside
+# a literal `#if 0`: only the second directive ever becomes a breakpoint, so the
+# inactive candidate's presumed line falls back to its own (much more distant)
+# physical line instead of colliding with the active one's.
+def test_annotate_array_extents_ignores_a_line_directive_inside_a_dead_if0_body() -> (
+    None
+):
+    source = (
+        "#if 0\n#line 11\nvoid f(int p[20]) { }\n#endif\n"
+        "#line 11\nvoid f(int *p) { *p = 1; }\n"
+    )
+    unit = Unit("f", (Param("p", "int *"),), def_line=11)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
+def test_annotate_array_extents_ignores_a_dead_if0_line_directive_mirrored() -> None:
+    # The mirror of the case above — the active definition physically *first*,
+    # the inactive `#if 0` body (with its own colliding `#line 11`) second. A
+    # naive tiebreak that always prefers the physically later occurrence would
+    # get this arrangement backwards; the dead-region exclusion above avoids the
+    # tie in both directions, so no such preference is needed at all.
+    source = (
+        "#line 11\nvoid f(int *p) { *p = 1; }\n"
+        "#if 0\n#line 11\nvoid f(int p[20]) { }\n#endif\n"
+    )
+    unit = Unit("f", (Param("p", "int *"),), def_line=11)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
+def test_line_breakpoints_excludes_a_directive_inside_a_dead_if0_body() -> None:
+    source = "#if 0\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(5, 9)]
+
+
+def test_line_breakpoints_else_reactivates_a_dead_if0_branch() -> None:
+    # `#else` after a literal `#if 0` is exactly the branch cpp *does* compile —
+    # a `#line` inside it is reachable and must count, even though it sits inside
+    # the same `#if 0`/`#endif` pair whose primary branch is dead.
+    source = "#if 0\n#line 5\nx\n#else\n#line 9\ny\n#endif\n"
+    assert _line_breakpoints(source) == [(5, 9)]
+
+
+def test_line_breakpoints_ignores_an_unbalanced_endif() -> None:
+    # A stray `#endif` with no matching `#if` must not raise — this scan reads
+    # arbitrary real-world source, not a validated preprocessor input.
+    source = "#endif\n#line 5\nx\n"
+    assert _line_breakpoints(source) == [(2, 5)]
+
+
+def test_annotate_array_extents_breaks_a_genuine_presumed_tie_by_physical_line() -> (
+    None
+):
+    # A tie unrelated to `#if 0`/`#ifdef` entirely — two `#line 5` directives
+    # outside any conditional, each immediately ahead of a definition-shaped `f`.
+    # Nothing here is preprocessor-dead, so both directives are real breakpoints
+    # and both candidates translate to presumed line 5, genuinely equidistant
+    # from `def_line`. This is what the physical-line tiebreak (`-c[0]`) exists
+    # for: `min`'s stability would otherwise keep the textually-first (here,
+    # wrong) candidate.
+    source = "#line 5\nvoid f(int p[20]) { }\n#line 5\nvoid f(int *p) { *p = 1; }\n"
+    unit = Unit("f", (Param("p", "int *"),), def_line=5)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
 def test_blank_comment_preserves_line_numbers_across_a_multiline_comment() -> None:
     # `_param_list_text` compares byte-offset-derived line numbers in the
     # comment-stripped text against `Unit.def_line`, which clang reports against
@@ -452,6 +548,46 @@ def test_list_units_anchors_extent_across_a_line_directive(tmp_path: Path) -> No
     src = tmp_path / "sig.c"
     src.write_text(
         "#if 0\nvoid f(int p[20]) { }\n#endif\n#line 1\nvoid f(int *p) { *p = 1; }\n"
+    )
+    f = next(u for u in list_units(src) if u.name == "f")
+    assert f.params[0].array_extent is None
+    assert f.params[0].array_extent_unresolved is False
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_anchors_extent_past_a_macro_return_type(tmp_path: Path) -> None:
+    # End-to-end (PR #156 follow-up): with a macro'd return type, clang's
+    # `FunctionDecl` range starts at the macro's *definition* line, not the
+    # function's own line. Anchoring `def_line` on the range start would land it
+    # on the `#define` line, ahead of the inactive `#if 0` body sitting between
+    # the macro and the active definition — donating the inactive body's extent.
+    src = tmp_path / "sig.c"
+    src.write_text(
+        "#define API void\n"
+        "#if 0\n"
+        "API f(int p[20]) { }\n"
+        "#endif\n"
+        "API f(int *p) { *p = 1; }\n"
+    )
+    f = next(u for u in list_units(src) if u.name == "f")
+    assert f.params[0].array_extent is None
+    assert f.params[0].array_extent_unresolved is False
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_ignores_a_line_directive_inside_a_dead_if0_body(
+    tmp_path: Path,
+) -> None:
+    # End-to-end (PR #156 follow-up): two `#line 11` directives, one ahead of an
+    # inactive `#if 0` body and one ahead of the active definition, would
+    # translate both candidates to presumed line 11 if both counted — the same
+    # value clang reports for the active definition's `def_line`, an unbreakable
+    # tie. `_line_breakpoints` excludes the one inside the dead `#if 0`, so the
+    # inactive candidate never collides with the active one in the first place.
+    src = tmp_path / "sig.c"
+    src.write_text(
+        "#if 0\n#line 11\nvoid f(int p[20]) { }\n#endif\n"
+        "#line 11\nvoid f(int *p) { *p = 1; }\n"
     )
     f = next(u for u in list_units(src) if u.name == "f")
     assert f.params[0].array_extent is None
