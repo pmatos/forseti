@@ -1,3 +1,10 @@
+## [1.6.6](https://github.com/pmatos/forseti/compare/v1.6.5...v1.6.6) (2026-07-26)
+
+
+### Bug Fixes
+
+* **claude-adapter:** resolve `..` the kernel's way before keying unit_id ([#152](https://github.com/pmatos/forseti/issues/152)) ([#162](https://github.com/pmatos/forseti/issues/162)) ([c1862fb](https://github.com/pmatos/forseti/commit/c1862fb75abe710601e1d52cc2ac180988b96664))
+
 ## [1.6.5](https://github.com/pmatos/forseti/compare/v1.6.4...v1.6.5) (2026-07-26)
 
 
