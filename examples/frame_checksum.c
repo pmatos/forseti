@@ -6,8 +6,8 @@
  * *assumes* that (`malloc(len)`), which is honest but nobody's obligation. S3
  * injects the same predicate into a generated copy of this file as a **checked**
  * obligation at `sum_bytes`'s entry, then verifies each caller's own sidecar
- * against that copy — so the assumption is discharged by proof at every call
- * site in the translation unit:
+ * against that copy — so the assumption is checked, and discharged, at every
+ * call site in the translation unit:
  *
  *   `forseti discharge examples/frame_checksum.c --function sum_bytes`
  *

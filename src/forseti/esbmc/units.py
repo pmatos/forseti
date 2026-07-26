@@ -23,8 +23,8 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 # One AST node line: leading tree art, then `-Kind`, then the rest. The art is
@@ -63,6 +63,9 @@ _CALLEE_WRAPPERS = frozenset({"ImplicitCastExpr", "ParenExpr", "UnaryOperator"})
 
 # The site name reported for an escape with no named enclosing declaration.
 _FILE_SCOPE = "<file scope>"
+
+# The symbol an attribute names, as clang prints it: `AliasAttr <loc> "target"`.
+_TARGET_NAME_RE = re.compile(r'"(\w+)"')
 
 # The storage class clang prints *after* a declaration's quoted type — `static`,
 # `extern`, and modifiers like `inline`. Read from the tail so a source path that
@@ -214,6 +217,56 @@ def _error_line(text: str) -> str:
     return ""
 
 
+@dataclass
+class _AstNode:
+    """One node of the walked AST, with its position among its parent's children."""
+
+    depth: int
+    kind: str
+    rest: str
+    index: int
+    children: int = 0
+
+
+@dataclass
+class _OpenFunction:
+    """A ``FunctionDecl`` being assembled, and the nodes seen under it so far."""
+
+    name: str | None
+    depth: int
+    file: str
+    params: list[Param] = field(default_factory=list)
+    calls: dict[str, None] = field(default_factory=dict)  # an ordered set
+    is_definition: bool = False
+
+
+def _walk(ast_text: str) -> Iterator[tuple[list[_AstNode], str, str, str]]:
+    """Every node of `ast_text`, with its ancestor stack and current file.
+
+    The single traversal every parser here shares: it yields the node's stack
+    (root first, the node itself last, each entry knowing its position among its
+    parent's children) so a parser can ask about *structure* — who encloses this,
+    is it the first child — rather than guessing from a line in isolation.
+    """
+    stack: list[_AstNode] = []
+    current_file = ""
+    for line in ast_text.splitlines():
+        node = _NODE_RE.match(line)
+        if not node:
+            continue
+        art, kind, rest = node.group(1), node.group(2), node.group(3)
+        depth = _depth(art)
+        current_file = _loc_file(rest, current_file)
+        while stack and stack[-1].depth >= depth:
+            stack.pop()
+        index = 0
+        if stack:
+            index = stack[-1].children
+            stack[-1].children += 1
+        stack.append(_AstNode(depth, kind, rest, index))
+        yield stack, kind, rest, current_file
+
+
 def parse_definitions(ast_text: str) -> list[tuple[str, Unit]]:
     """Every function *definition* in an ``esbmc --parse-tree-only`` dump.
 
@@ -231,66 +284,57 @@ def parse_definitions(ast_text: str) -> list[tuple[str, Unit]]:
     ``static`` is harvested from *every* declaration of a name, not just the
     definition: clang prints the storage class on the declaration that carried it,
     so ``static void f(int *); void f(int *p) {}`` marks only the prototype.
+
+    Function declarations **nest** — C allows one at block scope
+    (``void g(void) { extern void h(void); f(p); }``) and GNU C a whole nested
+    definition — so the open declarations are a *stack*. Closing the enclosing
+    ``g`` at the inner one, as a single slot would, silently drops every call
+    written after it, and a dropped call edge is a caller the discharge never
+    sees.
     """
     found: list[tuple[str, Unit]] = []
     internal: set[str] = set()
-    current_file = ""
+    open_fns: list[_OpenFunction] = []
 
-    # State for the FunctionDecl currently being assembled.
-    fn_name: str | None = None
-    fn_depth = -1
-    fn_file = ""
-    params: list[Param] = []
-    calls: dict[str, None] = {}  # an ordered set of referenced function names
-    is_definition = False
-
-    def flush() -> None:
-        nonlocal fn_name
-        if fn_name and is_definition:
-            found.append((fn_file, Unit(fn_name, tuple(params), tuple(calls))))
-        fn_name = None
-
-    for line in ast_text.splitlines():
-        node = _NODE_RE.match(line)
-        if not node:
-            continue
-        art, kind, rest = node.group(1), node.group(2), node.group(3)
-        depth = _depth(art)
-        current_file = _loc_file(rest, current_file)
-
-        # A node at or above the open FunctionDecl's depth ends its subtree.
-        if fn_name is not None and depth <= fn_depth:
-            flush()
-
-        if kind == "FunctionDecl":
-            flush()  # close a same-depth previous function first
-            name_match = _NAME_RE.search(rest)
-            fn_name = name_match.group(1) if name_match else None
-            if fn_name and _STATIC_STORAGE in rest.rsplit("'", 1)[-1].split():
-                internal.add(fn_name)
-            fn_depth = depth
-            fn_file = current_file
-            params = []
-            calls = {}
-            is_definition = False
-        elif fn_name is not None and depth > fn_depth:
-            if kind == "ParmVarDecl" and depth == fn_depth + 1:
-                types = _TYPE_RE.findall(rest)
-                name_match = _NAME_RE.search(rest)
-                params.append(
-                    Param(
-                        name_match.group(1) if name_match else "",
-                        types[-1] if types else "",
-                    )
+    def close(down_to: int) -> None:
+        """Finish every open declaration the node at `down_to` is not inside."""
+        while open_fns and open_fns[-1].depth >= down_to:
+            fn = open_fns.pop()
+            if fn.name and fn.is_definition:
+                found.append(
+                    (fn.file, Unit(fn.name, tuple(fn.params), tuple(fn.calls)))
                 )
-            elif kind == "CompoundStmt":
-                is_definition = True
-            elif kind == "DeclRefExpr":
-                callee = _CALLEE_RE.search(rest)
-                if callee is not None:
-                    calls[callee.group(1)] = None
 
-    flush()
+    for stack, kind, rest, file in _walk(ast_text):
+        depth = stack[-1].depth
+        close(depth)
+        if kind == "FunctionDecl":
+            name_match = _NAME_RE.search(rest)
+            name = name_match.group(1) if name_match else None
+            if name and _STATIC_STORAGE in rest.rsplit("'", 1)[-1].split():
+                internal.add(name)
+            open_fns.append(_OpenFunction(name, depth, file))
+            continue
+        if not open_fns:
+            continue
+        fn = open_fns[-1]
+        if kind == "ParmVarDecl" and depth == fn.depth + 1:
+            types = _TYPE_RE.findall(rest)
+            name_match = _NAME_RE.search(rest)
+            fn.params.append(
+                Param(
+                    name_match.group(1) if name_match else "",
+                    types[-1] if types else "",
+                )
+            )
+        elif kind == "CompoundStmt":
+            fn.is_definition = True
+        elif kind == "DeclRefExpr":
+            callee = _CALLEE_RE.search(rest)
+            if callee is not None:
+                fn.calls[callee.group(1)] = None
+
+    close(0)
     return [(f, replace(u, internal_linkage=u.name in internal)) for f, u in found]
 
 
@@ -344,17 +388,6 @@ def parse_external_callers(
     return tuple(names)
 
 
-@dataclass
-class _AstNode:
-    """One node of the walked AST, with its position among its parent's children."""
-
-    depth: int
-    kind: str
-    rest: str
-    index: int
-    children: int = 0
-
-
 def _is_call_callee(stack: list[_AstNode]) -> bool:
     """Whether the node on top of `stack` is the callee of a direct call.
 
@@ -401,20 +434,7 @@ def parse_address_escapes(ast_text: str, symbol: str) -> tuple[str, ...]:
     recursive unit would be permanently undischargeable.
     """
     sites: dict[str, None] = {}
-    stack: list[_AstNode] = []
-    for line in ast_text.splitlines():
-        node = _NODE_RE.match(line)
-        if not node:
-            continue
-        art, kind, rest = node.group(1), node.group(2), node.group(3)
-        depth = _depth(art)
-        while stack and stack[-1].depth >= depth:
-            stack.pop()
-        index = 0
-        if stack:
-            index = stack[-1].children
-            stack[-1].children += 1
-        stack.append(_AstNode(depth, kind, rest, index))
+    for stack, kind, rest, _file in _walk(ast_text):
         if kind != "DeclRefExpr":
             continue
         referenced = _CALLEE_RE.search(rest)
@@ -423,6 +443,28 @@ def parse_address_escapes(ast_text: str, symbol: str) -> tuple[str, ...]:
         if not _is_call_callee(stack):
             sites[_enclosing_name(stack)] = None
     return tuple(sites)
+
+
+def parse_symbol_aliases(ast_text: str, symbol: str) -> tuple[str, ...]:
+    """Declarations that are **another name** for `symbol`, by name.
+
+    GNU C's ``static void fa(int *) __attribute__((alias("f")))`` makes ``fa``
+    and ``f`` the same function at link time, but a call to ``fa`` prints a
+    reference to ``fa`` alone: nothing in the AST joins that call site to ``f``,
+    so the caller enumeration cannot see it. Compositional discharge (RFC-0003 S3)
+    therefore treats an alias as a caller path it cannot follow and withholds the
+    upgrade, rather than claiming a set of callers that was complete only for one
+    of the function's names.
+
+    Only ``AliasAttr`` is read. Any other way a symbol can acquire a second name
+    is, by the same argument, a hole — one we would rather leave visible here than
+    paper over with a guess about attributes we have not measured.
+    """
+    aliases: dict[str, None] = {}
+    for stack, kind, rest, _file in _walk(ast_text):
+        if kind == "AliasAttr" and symbol in _TARGET_NAME_RE.findall(rest):
+            aliases[_enclosing_name(stack)] = None
+    return tuple(aliases)
 
 
 def mask_comments(source_text: str) -> str:
@@ -633,6 +675,26 @@ def list_address_escapes(
     """
     ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
     return parse_address_escapes(ast_text, symbol)
+
+
+def list_symbol_aliases(
+    source: Path,
+    symbol: str,
+    *,
+    esbmc_bin: str = "esbmc",
+    timeout_s: float = 30.0,
+    extra_flags: Sequence[str] = (),
+) -> tuple[str, ...]:
+    """Declarations in `source`'s translation unit that alias `symbol`.
+
+    The third way the caller enumeration can be incomplete — see
+    `parse_symbol_aliases`. Each of the three asks its own question of its own
+    dump, which costs a parse run apiece; sharing one dump across them is a
+    worthwhile follow-up, not a reason to fuse the questions. Raises
+    `ListUnitsError` on the same conditions as `list_units`.
+    """
+    ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
+    return parse_symbol_aliases(ast_text, symbol)
 
 
 def list_units(

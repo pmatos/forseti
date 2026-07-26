@@ -60,7 +60,10 @@ rather than called (``UNRESOLVED``) — the caller set is not enumerable, and a
 sweep of the callers we *could* see says nothing about the ones we could not.
 That makes a function in a dispatch table permanently ``ASSUMED_VERIFIED``, which
 is the honest reading: it really can be invoked from anywhere in the TU with
-anything. Following an indirect call to its targets is L1/S4 work.
+anything. A GNU ``__attribute__((alias("f")))`` opens the set the same way and for
+the same reason — a call written through the alias references only *its* name —
+so `parse_symbol_aliases` withholds too. Following an indirect call to its
+targets is L1/S4 work.
 
 **A recursive callee is a call site of itself.** Asserting at the entry rather than
 transplanting a contract has one property a modular check would not: the assert
@@ -120,6 +123,7 @@ from forseti.esbmc import (
     Violated,
     list_address_escapes,
     list_external_callers,
+    list_symbol_aliases,
     list_units,
 )
 from forseti.orchestrator.ladder import verify_ladder
@@ -202,17 +206,23 @@ class DischargeResult:
 
     @property
     def label(self) -> str:
-        """The one-line honest verdict."""
+        """The one-line honest verdict.
+
+        The S2 label passes through **only** when S2's own verdict is what this
+        result carries. A failure of the discharge machinery itself (an unreadable
+        source, an uninjectable definition, a failed TU listing) leaves S2's
+        ``ASSUMED_VERIFIED`` label attached to an ``ERROR``, which the CLI would
+        print as if verification had succeeded.
+        """
         if self.assessment is Assessment.DISCHARGED_VERIFIED:
-            return (
-                f"VERIFIED (discharged — {self.detail}; up to "
-                f"k={self.unit_result.settled_k}, len<={self.unit_result.max_len})"
-            )
+            return f"VERIFIED (discharged — {self.detail})"
         if self.assessment is Assessment.ASSUMED_VERIFIED:
             return f"{self.unit_result.label} [{self.detail}]"
         if self.callers:
             return f"VIOLATED at the call site ({self.detail})"
-        return self.unit_result.label
+        if self.assessment is self.unit_result.assessment:
+            return self.unit_result.label
+        return f"{self.assessment.value.upper()} ({self.detail})"
 
     def to_dict(self) -> dict[str, Any]:
         payload = self.unit_result.to_dict()
@@ -281,15 +291,16 @@ def discharge_precondition(
     list_units_fn: Callable[[Path], list[Unit]] | None = None,
     external_callers_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
     address_escapes_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
+    aliases_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
 ) -> DischargeResult:
     """Verify `source::function` against its precondition, then discharge it.
 
     Runs S2 first and *only ever upgrades* its verdict: anything other than
     ``ASSUMED_VERIFIED`` (a real violation, ``NEEDS_CONTRACT``, an error) passes
     through untouched, because there is no assumption to discharge. `raw_verify`,
-    `list_units_fn`, `external_callers_fn` and `address_escapes_fn` inject the
-    esbmc calls for tests; production adds a ``-I`` for the source's own directory
-    so the generated copy's relative ``#include``\\ s still resolve.
+    `list_units_fn`, `external_callers_fn`, `address_escapes_fn` and `aliases_fn`
+    inject the esbmc calls for tests; production adds a ``-I`` for the source's
+    own directory so the generated copy's relative ``#include``\\ s still resolve.
     """
     lister = _memoized(
         list_units_fn or (lambda src: list_units(src, esbmc_bin=esbmc_bin))
@@ -324,6 +335,9 @@ def discharge_precondition(
     escapes = address_escapes_fn or (
         lambda src, sym: list_address_escapes(src, sym, esbmc_bin=esbmc_bin)
     )
+    aliases = aliases_fn or (
+        lambda src, sym: list_symbol_aliases(src, sym, esbmc_bin=esbmc_bin)
+    )
     args = (
         source,
         function,
@@ -331,6 +345,7 @@ def discharge_precondition(
         lister(source),
         external,
         escapes,
+        aliases,
         max_len,
         ladder_cap,
         raw,
@@ -348,6 +363,7 @@ def _discharge(
     units: list[Unit],
     external_callers_fn: Callable[[Path, str], tuple[str, ...]],
     address_escapes_fn: Callable[[Path, str], tuple[str, ...]],
+    aliases_fn: Callable[[Path, str], tuple[str, ...]],
     max_len: int,
     ladder_cap: int,
     raw: VerifyPort,
@@ -394,34 +410,49 @@ def _discharge(
     # named from another one, so "every caller here" is every caller; an
     # externally visible one exports the obligation to clients we never see.
     internal = any(u.internal_linkage for u in units if u.name == function)
-    # The two ways the caller set can be wider than what `units` shows. Counting
-    # both is what keeps "every caller in this TU" from being a claim about a set
-    # we never saw: a `static inline` in an included header is part of this
-    # translation unit but is not a unit `list_units` reports, and an address
-    # taken rather than called can be invoked from anywhere through the pointer
-    # that holds it, under a name no call-graph edge leads back from.
+    # The three ways the caller set can be wider than what `units` shows, each of
+    # which keeps "every caller in this TU" from being a claim about a set we
+    # never saw: a `static inline` in an included header is part of this
+    # translation unit but is not a unit `list_units` reports; an address taken
+    # rather than called can be invoked from anywhere through the pointer that
+    # holds it; and an alias attribute gives the callee a second name whose call
+    # sites reference only that name.
     try:
         foreign = external_callers_fn(source, function)
         escaped = address_escapes_fn(source, function)
+        aliased = aliases_fn(source, function)
     except ListUnitsError as exc:
         return DischargeResult(function, Assessment.ERROR, str(exc), unit_result)
-    unenumerable = tuple(
-        CallerCheck(
-            name,
-            CallerOutcome.UNCHECKED,
-            f"defined outside {source}, so the gate cannot enumerate it as a unit "
-            "or build a harness for it",
+    unenumerable = (
+        tuple(
+            CallerCheck(
+                name,
+                CallerOutcome.UNCHECKED,
+                f"defined outside {source}, so the gate cannot enumerate it as a unit "
+                "or build a harness for it",
+            )
+            for name in foreign
         )
-        for name in foreign
-    ) + tuple(
-        CallerCheck(
-            site,
-            CallerOutcome.UNRESOLVED,
-            f"takes the address of {function}() rather than calling it, so an "
-            "indirect call the caller enumeration cannot follow may reach it from "
-            "anywhere in this translation unit",
+        + tuple(
+            CallerCheck(
+                site,
+                CallerOutcome.UNRESOLVED,
+                f"takes the address of {function}() rather than calling it, so an "
+                "indirect call the caller enumeration cannot follow may reach it from "
+                "anywhere in this translation unit",
+            )
+            for site in escaped
         )
-        for site in escaped
+        + tuple(
+            CallerCheck(
+                name,
+                CallerOutcome.UNRESOLVED,
+                f"is another name for {function}() (an alias attribute), and a call "
+                "written through it references only that name, so its callers are not "
+                "in the set that was checked",
+            )
+            for name in aliased
+        )
     )
     # A re-entry is never an *anchor*: something outside the recursion has to
     # enter the callee in the first place, so with no other caller the obligation
@@ -650,7 +681,7 @@ def _aggregate(
     pointer parameters), so their harness allocates real objects and nothing is
     left assumed on their side. When every discharging caller is anchored the
     chain is closed outright; otherwise the discharge is **relative** to those
-    callers' own still-assumed preconditions, and says so — a caller `g` proven
+    callers' own still-assumed preconditions, and says so — a caller `g` verified
     to call `f` correctly under `g`'s precondition tells you nothing about a
     third function calling `g` badly, and claiming otherwise would over-state
     exactly the way this stage exists to stop.
@@ -695,11 +726,16 @@ def _aggregate(
         else " — relative to each caller's own synthesised precondition, which "
         "stays assumed until that caller is itself discharged"
     )
+    # The bound belongs *inside* the claim, not appended by the label: `detail` is
+    # what `--json` hands a consumer on its own, and an unqualified "every caller
+    # satisfies it" would read as a statement for all inputs rather than one up to
+    # k (CLAUDE.md's vocabulary discipline).
     return DischargeResult(
         function,
         Assessment.DISCHARGED_VERIFIED,
-        f"every caller of {function}() in this translation unit is proven to "
-        f"satisfy its memory precondition{relative}",
+        f"every caller of {function}() in this translation unit is verified to "
+        f"satisfy its memory precondition up to k={unit_result.settled_k}, "
+        f"len<={unit_result.max_len}{relative}",
         unit_result,
         checks,
     )

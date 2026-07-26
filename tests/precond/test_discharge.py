@@ -121,6 +121,7 @@ def _run(
     source_text: str = SOURCE,
     external: Callable[[Path, str], tuple[str, ...]] = lambda _s, _f: (),
     escapes: Callable[[Path, str], tuple[str, ...]] = lambda _s, _f: (),
+    aliases: Callable[[Path, str], tuple[str, ...]] = lambda _s, _f: (),
     raw: Callable[..., EsbmcResult] | None = None,
 ) -> DischargeResult:
     src = tmp / "frame.c"
@@ -135,6 +136,7 @@ def _run(
         list_units_fn=lambda _s: list(units),
         external_callers_fn=external,
         address_escapes_fn=escapes,
+        aliases_fn=aliases,
     )
 
 
@@ -287,6 +289,7 @@ def test_one_broken_caller_outranks_the_clean_ones(tmp_path: Path) -> None:
         list_units_fn=lambda _s: [CALLEE, CALLER, second],
         external_callers_fn=lambda _s, _f: (),
         address_escapes_fn=lambda _s, _f: (),
+        aliases_fn=lambda _s, _f: (),
     )
     assert result.assessment is Assessment.VIOLATED
     assert "payload_checksum()" in result.detail
@@ -519,9 +522,15 @@ def test_unreadable_source_is_an_error(tmp_path: Path) -> None:
         list_units_fn=lambda _s: [CALLEE, CALLER],
         external_callers_fn=lambda _s, _f: (),
         address_escapes_fn=lambda _s, _f: (),
+        aliases_fn=lambda _s, _f: (),
     )
     assert result.assessment is Assessment.ERROR
     assert "could not read" in result.detail
+    # and the *label* says so too: the S2 label belongs to S2's verdict, and
+    # printing "VERIFIED (assuming valid caller pointers…)" for a failure of the
+    # discharge machinery is what the CLI would show a user.
+    assert result.label == f"ERROR ({result.detail})"
+    assert "VERIFIED" not in result.label
 
 
 def test_to_dict_carries_the_per_caller_verdicts(tmp_path: Path) -> None:

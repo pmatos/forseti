@@ -22,6 +22,7 @@ from forseti.esbmc.units import (
     parse_address_escapes,
     parse_definitions,
     parse_external_callers,
+    parse_symbol_aliases,
     parse_units,
 )
 
@@ -671,6 +672,34 @@ TranslationUnitDecl 0x6000 <<invalid sloc>> <invalid sloc>
 """
 
 
+# A caller whose body opens with a block-scope function declaration — legal ISO C,
+# and clang prints the inner `FunctionDecl` *inside* the outer one's subtree. The
+# call to `leaf` comes after it, so a parser that closes `local_client` at the
+# inner declaration loses the edge that makes it a caller at all.
+_NESTED_DECL_AST = """\
+TranslationUnitDecl 0x8000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0x8001 </tmp/foo.c:1:1, col:42> col:13 used leaf 'void (int *)' static
+| |-ParmVarDecl 0x8002 <col:15, col:20> col:20 used p 'int *'
+| `-CompoundStmt 0x8003 <col:30, col:42>
+`-FunctionDecl 0x8010 <line:2:1, col:60> col:6 local_client 'void (int *)'
+  |-ParmVarDecl 0x8011 <col:8, col:13> col:13 used q 'int *'
+  `-CompoundStmt 0x8012 <col:23, col:60>
+    |-DeclStmt 0x8013 <col:25, col:49>
+    | `-FunctionDecl 0x8014 parent 0x8000 <col:25, col:48> col:37 helper 'v ()' extern
+    `-CallExpr 0x8015 <col:51, col:57> 'void'
+      |-ImplicitCastExpr 0x8016 <col:51> 'void (*)(i)' <FunctionToPointerDecay>
+      | `-DeclRefExpr 0x8017 <col:51> 'void (i)' Function 0x8001 'leaf' 'void (i)'
+      `-DeclRefExpr 0x8018 <col:53> 'int *' lvalue ParmVar 0x8011 'q' 'int *'
+"""
+
+
+def test_parse_units_keeps_calls_written_after_a_block_scope_declaration() -> None:
+    units = {u.name: u for u in parse_units(_NESTED_DECL_AST, _TARGET)}
+    assert units["local_client"].calls == ("leaf",)
+    # the inner declaration has no body, so it is not a unit of its own
+    assert "helper" not in units
+
+
 # Linkage, in the shapes esbmc 8.3.0 prints it: the storage class follows the
 # quoted type, and a `static` written on a *prototype* is printed there and not on
 # the definition it forward-declares. The directory is called `static` on purpose —
@@ -714,6 +743,39 @@ def test_annotate_array_extents_keeps_linkage() -> None:
     out = annotate_array_extents([unit], "static void f(uint8_t p[20]) {}")[0]
     assert out.params[0].array_extent == 20
     assert out.internal_linkage is True
+
+
+# A GNU alias: `fa` *is* `leaf` at link time, but the call in `client` references
+# only `fa`, so nothing in the AST joins that call site to `leaf`.
+_ALIAS_AST = """\
+TranslationUnitDecl 0x9000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0x9001 </tmp/foo.c:1:1, col:42> col:13 used leaf 'void (int *)' static
+| |-ParmVarDecl 0x9002 <col:15, col:20> col:20 used p 'int *'
+| `-CompoundStmt 0x9003 <col:30, col:42>
+|-FunctionDecl 0x9010 <line:2:1, col:57> col:13 used fa 'void (int *)' static
+| |-ParmVarDecl 0x9011 <col:15, col:20> col:20 p 'int *'
+| `-AliasAttr 0x9012 <col:46, col:55> "leaf"
+`-FunctionDecl 0x9020 <line:3:1, col:39> col:6 client 'void (int *)'
+  |-ParmVarDecl 0x9021 <col:13, col:18> col:18 used q 'int *'
+  `-CompoundStmt 0x9022 <col:21, col:39>
+    `-CallExpr 0x9023 <col:23, col:36> 'void'
+      |-ImplicitCastExpr 0x9024 <col:23> 'void (*)(i)' <FunctionToPointerDecay>
+      | `-DeclRefExpr 0x9025 <col:23> 'void (i)' Function 0x9010 'fa' 'void (i)'
+      `-DeclRefExpr 0x9026 <col:29> 'int *' lvalue ParmVar 0x9021 'q' 'int *'
+"""
+
+
+def test_parse_symbol_aliases_reports_a_second_name_for_the_symbol() -> None:
+    assert parse_symbol_aliases(_ALIAS_AST, "leaf") == ("fa",)
+    # ... and the reason it has to: the call site names `fa` alone, so neither the
+    # caller enumeration nor the escape scan sees a path to `leaf`.
+    client = next(u for u in parse_units(_ALIAS_AST, _TARGET) if u.name == "client")
+    assert client.calls == ("fa",)
+    assert parse_address_escapes(_ALIAS_AST, "leaf") == ()
+
+
+def test_parse_symbol_aliases_ignores_an_alias_to_another_symbol() -> None:
+    assert parse_symbol_aliases(_ALIAS_AST, "client") == ()
 
 
 def test_parse_address_escapes_keeps_a_reference_it_cannot_name() -> None:

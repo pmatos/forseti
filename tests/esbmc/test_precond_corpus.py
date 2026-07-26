@@ -138,7 +138,7 @@ def _discharge(name: str, function: str = "sum_bytes"):  # type: ignore[no-untyp
 
 def test_correct_callers_discharge_the_precondition() -> None:
     # The S3 exit criterion: not "VERIFIED assuming valid caller pointers" but
-    # VERIFIED *because every caller was proven to supply them*.
+    # VERIFIED *because every caller was verified to supply them, up to k*.
     result = _discharge("frame_checksum.c")
     assert result.assessment is Assessment.DISCHARGED_VERIFIED, result.label
     assert "discharged" in result.label
@@ -293,6 +293,80 @@ def test_a_re_entry_that_breaks_the_obligation_names_the_recursion(
     assert outcomes["clean"] is CallerOutcome.UNATTRIBUTED
     assert "skip() passes skip()" in result.label
     assert "clean()" not in result.label
+
+
+_BLOCK_SCOPE_DECL_CALLER = """\
+#include <stddef.h>
+#include <stdint.h>
+
+static uint32_t sum_bytes(const uint8_t *buf, size_t len) {
+    uint32_t acc = 0;
+    for (size_t i = 0; i < len; i++) acc += buf[i];
+    return acc;
+}
+
+uint32_t frame_checksum(const uint8_t *frame, size_t len) {
+    return sum_bytes(frame, len);
+}
+
+uint32_t over_read(const uint8_t frame[4]) {
+    extern void unrelated(void);   /* legal ISO C: a block-scope declaration */
+    return sum_bytes(frame, 64);
+}
+"""
+
+
+def test_a_caller_hidden_behind_a_block_scope_declaration_is_still_checked(
+    tmp_path: Path,
+) -> None:
+    # clang nests the block-scope `FunctionDecl` inside `over_read`'s subtree, and
+    # the call to `sum_bytes` comes after it. Closing `over_read` at the inner
+    # declaration would drop that edge — leaving a caller that asks for 64 bytes
+    # of a 4-byte frame out of the sweep entirely, while `frame_checksum` alone
+    # carried the verdict to "discharged".
+    src = tmp_path / "blockscope.c"
+    src.write_text(_BLOCK_SCOPE_DECL_CALLER)
+    result = discharge_precondition(src, function="sum_bytes", max_len=MAX_LEN)
+    assert result.assessment is Assessment.VIOLATED, result.label
+    outcomes = {c.caller: c.outcome for c in result.callers}
+    assert outcomes["over_read"] is CallerOutcome.OBLIGATION_VIOLATED
+    assert outcomes["frame_checksum"] is CallerOutcome.DISCHARGED
+
+
+_ALIASED_LEAF = """\
+#include <stddef.h>
+#include <stdint.h>
+
+static uint32_t sum_bytes(const uint8_t *buf, size_t len) {
+    uint32_t acc = 0;
+    for (size_t i = 0; i < len; i++) acc += buf[i];
+    return acc;
+}
+
+static uint32_t sum_alias(const uint8_t *buf, size_t len)
+    __attribute__((alias("sum_bytes")));
+
+uint32_t frame_checksum(const uint8_t *frame, size_t len) {
+    return sum_bytes(frame, len);
+}
+
+uint32_t via_alias(const uint8_t frame[4]) { return sum_alias(frame, 64); }
+"""
+
+
+def test_an_alias_opens_the_caller_set(tmp_path: Path) -> None:
+    # `sum_alias` *is* `sum_bytes` at link time, but `via_alias`'s call references
+    # only the alias — no AST edge joins it to the callee, and no address is taken
+    # either. Upgrading on the strength of `frame_checksum` would claim a caller
+    # set that was complete for just one of the function's two names.
+    src = tmp_path / "aliased.c"
+    src.write_text(_ALIASED_LEAF)
+    result = discharge_precondition(src, function="sum_bytes", max_len=MAX_LEN)
+    assert result.assessment is Assessment.ASSUMED_VERIFIED, result.label
+    outcomes = {c.caller: c.outcome for c in result.callers}
+    assert outcomes["frame_checksum"] is CallerOutcome.DISCHARGED
+    assert outcomes["sum_alias"] is CallerOutcome.UNRESOLVED
+    assert "another name for sum_bytes()" in result.label
 
 
 _PUBLIC_LEAF = """\
