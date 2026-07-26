@@ -122,6 +122,7 @@ def _run(
     external: Callable[[Path, str], tuple[str, ...]] = lambda _s, _f: (),
     escapes: Callable[[Path, str], tuple[str, ...]] = lambda _s, _f: (),
     aliases: Callable[[Path, str], tuple[str, ...]] = lambda _s, _f: (),
+    implicit_invocations: Callable[[Path, str], tuple[str, ...]] = lambda _s, _f: (),
     raw: Callable[..., EsbmcResult] | None = None,
 ) -> DischargeResult:
     src = tmp / "frame.c"
@@ -137,6 +138,7 @@ def _run(
         external_callers_fn=external,
         address_escapes_fn=escapes,
         aliases_fn=aliases,
+        implicit_invocations_fn=implicit_invocations,
     )
 
 
@@ -290,6 +292,7 @@ def test_one_broken_caller_outranks_the_clean_ones(tmp_path: Path) -> None:
         external_callers_fn=lambda _s, _f: (),
         address_escapes_fn=lambda _s, _f: (),
         aliases_fn=lambda _s, _f: (),
+        implicit_invocations_fn=lambda _s, _f: (),
     )
     assert result.assessment is Assessment.VIOLATED
     assert "payload_checksum()" in result.detail
@@ -544,6 +547,7 @@ def test_unreadable_source_is_an_error(tmp_path: Path) -> None:
         external_callers_fn=lambda _s, _f: (),
         address_escapes_fn=lambda _s, _f: (),
         aliases_fn=lambda _s, _f: (),
+        implicit_invocations_fn=lambda _s, _f: (),
     )
     assert result.assessment is Assessment.ERROR
     assert "could not read" in result.detail
@@ -613,3 +617,57 @@ def test_every_assessment_has_an_exit_code() -> None:
     # mypy cannot catch a missing dict key; a new member without one would be a
     # KeyError at the moment the CLI reports it.
     assert set(ASSESSMENT_EXIT_CODES) == set(Assessment)
+
+
+def test_discharge_forwards_the_requested_timeout_to_every_listing_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `-t/--timeout` maps to `timeout_s`; every ESBMC parse-tree listing call this
+    # driver makes on its own — not just the actual verification runs — must
+    # honour it, or a short user-requested timeout still lets up to five
+    # independent 30-second defaults run before verification even begins.
+    seen: dict[str, float | None] = {}
+
+    def _list_units(_src, *, esbmc_bin, timeout_s):  # type: ignore[no-untyped-def]
+        seen["list_units"] = timeout_s
+        return [CALLEE, CALLER]
+
+    def _recorder(name: str):  # type: ignore[no-untyped-def]
+        def _fn(_src, _sym, *, esbmc_bin, timeout_s):  # type: ignore[no-untyped-def]
+            seen[name] = timeout_s
+            return ()
+
+        return _fn
+
+    monkeypatch.setattr("forseti.precond.discharge.list_units", _list_units)
+    monkeypatch.setattr(
+        "forseti.precond.discharge.list_external_callers", _recorder("external")
+    )
+    monkeypatch.setattr(
+        "forseti.precond.discharge.list_address_escapes", _recorder("escapes")
+    )
+    monkeypatch.setattr(
+        "forseti.precond.discharge.list_symbol_aliases", _recorder("aliases")
+    )
+    monkeypatch.setattr(
+        "forseti.precond.discharge.list_implicit_invocations", _recorder("implicit")
+    )
+
+    src = tmp_path / "frame.c"
+    src.write_text(SOURCE)
+    discharge_precondition(
+        src,
+        function="sum_bytes",
+        max_len=8,
+        timeout_s=1.0,
+        ladder_cap=32,
+        work_dir=tmp_path,
+        raw_verify=_raw({}),
+    )
+    assert seen == {
+        "list_units": 1.0,
+        "external": 1.0,
+        "escapes": 1.0,
+        "aliases": 1.0,
+        "implicit": 1.0,
+    }

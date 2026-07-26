@@ -276,7 +276,9 @@ def verify_precondition(
     (the sidecar ``#include``\\ s the source by absolute path, so it can live
     anywhere).
     """
-    lister = list_units_fn or (lambda src: list_units(src, esbmc_bin=esbmc_bin))
+    lister = list_units_fn or (
+        lambda src: list_units(src, esbmc_bin=esbmc_bin, timeout_s=timeout_s)
+    )
     try:
         plan = plan_for(source, function, lister)
     except PreconditionUnavailable as exc:

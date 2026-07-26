@@ -324,7 +324,8 @@ def discharge_precondition(
     ``#include``\\ s still resolve.
     """
     lister = _memoized(
-        list_units_fn or (lambda src: list_units(src, esbmc_bin=esbmc_bin))
+        list_units_fn
+        or (lambda src: list_units(src, esbmc_bin=esbmc_bin, timeout_s=timeout_s))
     )
     unit_result = verify_precondition(
         source,
@@ -351,16 +352,24 @@ def discharge_precondition(
         extra_flags=(f"-I{source.resolve().parent}",),
     )
     external = external_callers_fn or (
-        lambda src, sym: list_external_callers(src, sym, esbmc_bin=esbmc_bin)
+        lambda src, sym: list_external_callers(
+            src, sym, esbmc_bin=esbmc_bin, timeout_s=timeout_s
+        )
     )
     escapes = address_escapes_fn or (
-        lambda src, sym: list_address_escapes(src, sym, esbmc_bin=esbmc_bin)
+        lambda src, sym: list_address_escapes(
+            src, sym, esbmc_bin=esbmc_bin, timeout_s=timeout_s
+        )
     )
     aliases = aliases_fn or (
-        lambda src, sym: list_symbol_aliases(src, sym, esbmc_bin=esbmc_bin)
+        lambda src, sym: list_symbol_aliases(
+            src, sym, esbmc_bin=esbmc_bin, timeout_s=timeout_s
+        )
     )
     implicit_invocations = implicit_invocations_fn or (
-        lambda src, sym: list_implicit_invocations(src, sym, esbmc_bin=esbmc_bin)
+        lambda src, sym: list_implicit_invocations(
+            src, sym, esbmc_bin=esbmc_bin, timeout_s=timeout_s
+        )
     )
     args = (
         source,
