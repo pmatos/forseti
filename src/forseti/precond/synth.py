@@ -22,8 +22,11 @@ The shapes (L0):
   ``malloc(count * sizeof(*p))`` (equal only when ``sizeof(*p) == 1``). The
   length is a **symbolic** ``nondet`` bounded by ``max_len`` — exact sizing, so an
   off-by-one ``p[len]`` is out of bounds (a constant ``buf[MAX]`` would hide it).
-- **fixed array ``T p[N]``** → ``malloc(N * sizeof(*p))``, ``N`` from the
-  signature (`Param.array_extent`, recovered by `list_units`).
+- **fixed array ``T p[N]`` with no accompanying length** → ``malloc(N *
+  sizeof(*p))``, ``N`` from the signature (`Param.array_extent`, recovered by
+  `list_units`). A companion length pairs instead and sizes the object by
+  itself — a conventional ``T p[N]`` binds nobody (C adjusts the parameter to
+  ``T *``), so the length is the better authority (issue #147).
 - **``T p[static N]`` next to a length** → ``malloc(max(length, N))``. C99's
   ``static N`` is a *minimum* the caller must supply, not the object's size, so a
   valid caller satisfies both it and the length convention.
@@ -187,17 +190,28 @@ def _is_pointee_materialisable(type_str: str) -> bool:
 def plan_unit(unit: Unit) -> UnitPlan:
     """Classify each parameter into its L0 materialisation plan (pure).
 
-    Pointers are classified first (a conventional fixed extent wins over
-    length-pairing, which wins over a lone fresh object); a following integer
-    consumed as a pointer's length is then marked ``LENGTH``; every remaining
-    non-pointer is a plain ``SCALAR``. The pairing looks only at the *next*
-    parameter — the dominant ``(ptr, len)`` idiom (RFC-0003 OQ2 flags richer
-    pairing as L1).
+    Pointers are classified first (length-pairing wins over a fixed extent,
+    which wins over a lone fresh object); a following integer consumed as a
+    pointer's length is then marked ``LENGTH``; every remaining non-pointer is a
+    plain ``SCALAR``. The pairing looks only at the *next* parameter — the
+    dominant ``(ptr, len)`` idiom (RFC-0003 OQ2 flags richer pairing as L1).
 
-    A ``T p[static N]`` extent is the one that does *not* win outright: it binds
-    the caller to at least ``N`` elements without capping the object, so it pairs
-    with a companion length and becomes that plan's `static_min_extent` floor,
-    falling back to `FIXED_ARRAY` only when there is no length to pair with.
+    Neither a conventional ``T p[N]`` nor C99's ``T p[static N]`` wins outright
+    over an accompanying length — the written extent is documentation the
+    signature carries, not an allocation the callee itself demands:
+
+    - **conventional ``T p[N]``** binds nobody (C adjusts the parameter to
+      ``T *``), so a companion length is simply the better authority: the
+      object is sized by the length alone, with ``N`` dropped entirely (issue
+      #147). A body that reads all ``N`` elements regardless of what a smaller
+      ``length`` says is the accepted trade-off — this is documentation, not a
+      caller obligation, so there is nothing to floor against.
+    - **``T p[static N]``** *is* a caller obligation: the argument must give
+      access to at least ``N`` elements no matter what the length says, so it
+      pairs with the length and becomes that plan's `static_min_extent` floor
+      instead (``max(length, N)``, issue #137).
+
+    Both fall back to `FIXED_ARRAY` only when there is no length to pair with.
     """
     n = len(unit.params)
     roles: list[ParamRole | None] = [None] * n
@@ -211,13 +225,6 @@ def plan_unit(unit: Unit) -> UnitPlan:
             continue
         if not _is_pointee_materialisable(param.type):
             roles[i] = ParamRole.UNRESOLVED
-            continue
-        # A *conventional* `T p[N]` states the only size the signature carries, so
-        # it wins outright. `T p[static N]` falls through to length-pairing below:
-        # its `N` is a floor the caller must meet, not the object's whole size.
-        if param.array_extent is not None and not param.array_static_min:
-            roles[i] = ParamRole.FIXED_ARRAY
-            extents[i] = param.array_extent
             continue
         # `T p[static <macro>]`: the caller *must* give access to the declared
         # extent, so the function may touch all of it however small a companion
@@ -234,8 +241,9 @@ def plan_unit(unit: Unit) -> UnitPlan:
                 static_mins[i] = param.array_extent if param.array_static_min else None
                 consumed_as_length.add(i + 1)
                 continue
-        # A readable `T p[static N]` with no length to pair with: the weakest valid
-        # caller supplies exactly `N`, which is the fixed-array shape.
+        # A readable extent with no length to pair with: `T p[N]` states the only
+        # size the signature carries, and the weakest valid caller for `T p[static
+        # N]` supplies exactly `N` — either way, the fixed-array shape.
         if param.array_extent is not None:
             roles[i] = ParamRole.FIXED_ARRAY
             extents[i] = param.array_extent
