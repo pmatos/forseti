@@ -475,8 +475,26 @@ def _obligation_targets(plan: UnitPlan) -> tuple[ParamPlan, ...]:
     return pointers
 
 
+def _line_directive(source_path: str) -> str:
+    """A ``#line`` directive that reports `source_path` from line 1 onward.
+
+    ``#line N "file"`` tells the preprocessor that the *next* physical line is
+    line ``N`` of ``file`` — so inserting it as an extra physical line renumbers
+    everything after it without shifting where anything actually sits, which is
+    what keeps `inject_obligations`'s "every line number matches the original"
+    promise even with this line prepended. Quotes and backslashes are escaped;
+    the string is otherwise opaque to the preprocessor.
+    """
+    escaped = source_path.replace("\\", "\\\\").replace('"', '\\"')
+    return f'#line 1 "{escaped}"\n'
+
+
 def inject_obligations(
-    source_text: str, plan: UnitPlan, *, site_probe: bool = False
+    source_text: str,
+    plan: UnitPlan,
+    *,
+    site_probe: bool = False,
+    source_path: str | None = None,
 ) -> str:
     """`source_text` with `plan`'s memory precondition injected as caller checks.
 
@@ -495,6 +513,15 @@ def inject_obligations(
     call makes FAIL — the reachability discharge that keeps a dead call site from
     passing vacuously.
 
+    The copy is written to disk under its own path, not the source's — so
+    without `source_path`, ``__FILE__`` inside it would report *that* path
+    instead, and a caller whose behaviour or object sizing depends on
+    ``__FILE__`` would be checked against a program that is not quite the one
+    being verified. Passing `source_path` prepends a ``#line`` directive that
+    restores it, without disturbing any other line's reported number.
+    ``None`` when the copy is never written under a different name (a pure or
+    testing call, where there is no path to restore).
+
     Raises `SynthError` when the plan has an unresolved or unnameable parameter,
     or when no definition of the unit is isolable in `source_text`.
     """
@@ -512,4 +539,7 @@ def inject_obligations(
             for p in pointers
         ]
     injected = "".join(f" {check}" for check in checks)
-    return source_text[: brace + 1] + injected + source_text[brace + 1 :]
+    copy = source_text[: brace + 1] + injected + source_text[brace + 1 :]
+    if source_path is None:
+        return copy
+    return _line_directive(source_path) + copy

@@ -475,6 +475,32 @@ def test_a_cleanup_handler_opens_the_caller_set(tmp_path: Path) -> None:
     assert "names zero_byte() outside a direct call" in result.label
 
 
+_CONSTRUCTOR_TARGET = """\
+#include <stddef.h>
+#include <stdint.h>
+
+static void zero_byte(uint8_t *p) __attribute__((constructor));
+static void zero_byte(uint8_t *p) { *p = 0; }
+
+void clean(uint8_t *q) { zero_byte(q); }
+"""
+
+
+def test_a_constructor_attribute_opens_the_caller_set(tmp_path: Path) -> None:
+    # The loader invokes `zero_byte` directly at load time, with none of the
+    # arguments `clean` supplies — a call to `clean` names nothing that joins it
+    # to the constructor invocation, so upgrading on `clean` alone would claim a
+    # caller set that never included the loader's own call.
+    src = tmp_path / "constructor.c"
+    src.write_text(_CONSTRUCTOR_TARGET)
+    result = discharge_precondition(src, function="zero_byte", max_len=MAX_LEN)
+    assert result.assessment is Assessment.ASSUMED_VERIFIED, result.label
+    outcomes = {c.caller: c.outcome for c in result.callers}
+    assert outcomes["clean"] is CallerOutcome.DISCHARGED
+    assert outcomes["<constructor>"] is CallerOutcome.UNRESOLVED
+    assert "carries a constructor attribute" in result.label
+
+
 _PUBLIC_LEAF = """\
 #include <stddef.h>
 #include <stdint.h>
@@ -541,3 +567,38 @@ def test_an_escaped_address_withholds_the_upgrade(tmp_path: Path) -> None:
     assert outcomes["frame_checksum"] is CallerOutcome.DISCHARGED
     assert outcomes["dispatch"] is CallerOutcome.UNRESOLVED
     assert "names sum_bytes() outside a direct call" in result.label
+
+
+_FILE_IDENTITY_TEMPLATE = """\
+#include <string.h>
+#include <stddef.h>
+#include <stdint.h>
+
+static uint32_t sum_bytes(const uint8_t *buf, size_t len) {{
+    uint32_t acc = 0;
+    for (size_t i = 0; i < len; i++) acc += buf[i];
+    return acc;
+}}
+
+uint32_t frame_checksum(const uint8_t *frame, size_t len) {{
+    __ESBMC_assert(strcmp(__FILE__, "{path}") == 0, "file identity preserved");
+    return sum_bytes(frame, len);
+}}
+"""
+
+
+def test_discharge_preserves_file_identity_in_the_generated_copy(
+    tmp_path: Path,
+) -> None:
+    # The obligation-injected copy is written to disk under its own temp path,
+    # not the source's. Without a `#line` directive, `__FILE__` inside
+    # `frame_checksum`'s body — copied verbatim into that file — would report
+    # the temp path instead, changing the program a `__FILE__`-dependent caller
+    # is actually checked against. The path is computed *before* writing the
+    # file, so the assert can only pass if the copy's `__FILE__` reports the
+    # original source's resolved path, not wherever the copy itself lives.
+    src = tmp_path / "file_identity.c"
+    src.write_text(_FILE_IDENTITY_TEMPLATE.format(path=str(src.resolve())))
+    result = discharge_precondition(src, function="sum_bytes", max_len=MAX_LEN)
+    assert result.assessment is Assessment.DISCHARGED_VERIFIED, result.label
+    assert result.callers[0].outcome is CallerOutcome.DISCHARGED

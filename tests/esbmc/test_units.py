@@ -22,6 +22,7 @@ from forseti.esbmc.units import (
     parse_address_escapes,
     parse_definitions,
     parse_external_callers,
+    parse_implicit_invocations,
     parse_symbol_aliases,
     parse_units,
 )
@@ -800,6 +801,42 @@ def test_an_alias_names_a_labelled_targets_linker_symbol() -> None:
     # the direction that matters for discharge: asking for callers of `fa` itself
     # (which names no one) still finds nothing, exactly as a plain alias would
     assert parse_symbol_aliases(_ALIAS_TO_LABELLED_TARGET_AST, "fa") == ()
+
+
+# A `constructor` attribute names no one: unlike every other attribute-borne
+# path this module follows, it sits on the callee's own `FunctionDecl` with no
+# `Function 0x… 'name'` reference anywhere — the loader invokes `f` directly.
+_CONSTRUCTOR_ATTR_AST = """\
+TranslationUnitDecl 0xe000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0xe001 </tmp/foo.c:1:1, col:60> col:20 used f 'void (int *)' static
+| |-ParmVarDecl 0xe002 <col:22, col:27> col:27 used p 'int *'
+| |-CompoundStmt 0xe003 <col:37, col:60>
+| `-ConstructorAttr 0xe004 <col:8, col:19>
+`-FunctionDecl 0xe010 <line:2:1, col:39> col:6 g 'void (int *)'
+  |-ParmVarDecl 0xe011 <col:13, col:18> col:18 used q 'int *'
+  `-CompoundStmt 0xe012 <col:21, col:39>
+    `-CallExpr 0xe013 <col:23, col:36> 'void'
+      |-ImplicitCastExpr 0xe014 <col:23> 'void (*)(i)' <FunctionToPointerDecay>
+      | `-DeclRefExpr 0xe015 <col:23> 'void (i)' Function 0xe001 'f' 'void (i)'
+      `-DeclRefExpr 0xe016 <col:29> 'int *' lvalue ParmVar 0xe011 'q' 'int *'
+"""
+
+_DESTRUCTOR_ATTR_AST = _CONSTRUCTOR_ATTR_AST.replace(
+    "ConstructorAttr", "DestructorAttr"
+)
+
+
+def test_parse_implicit_invocations_reports_a_constructor_attribute() -> None:
+    assert parse_implicit_invocations(_CONSTRUCTOR_ATTR_AST, "f") == ("constructor",)
+    # neither of the other two attribute-borne paths sees it: it names no one
+    assert parse_address_escapes(_CONSTRUCTOR_ATTR_AST, "f") == ()
+    assert parse_symbol_aliases(_CONSTRUCTOR_ATTR_AST, "f") == ()
+    # and a function with no such attribute reports none
+    assert parse_implicit_invocations(_CONSTRUCTOR_ATTR_AST, "g") == ()
+
+
+def test_parse_implicit_invocations_reports_a_destructor_attribute() -> None:
+    assert parse_implicit_invocations(_DESTRUCTOR_ATTR_AST, "f") == ("destructor",)
 
 
 # Two more attribute-borne paths esbmc 8.3.0 prints: a `cleanup` handler, which

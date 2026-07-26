@@ -139,6 +139,7 @@ from forseti.esbmc import (
     Violated,
     list_address_escapes,
     list_external_callers,
+    list_implicit_invocations,
     list_symbol_aliases,
     list_units,
 )
@@ -283,7 +284,9 @@ def emit_obligations(
     lister = list_units_fn or (lambda src: list_units(src, esbmc_bin=esbmc_bin))
     plan = plan_for(source, function, lister)
     try:
-        return inject_obligations(source.read_text(), plan)
+        return inject_obligations(
+            source.read_text(), plan, source_path=str(source.resolve())
+        )
     except SynthError as exc:
         raise PreconditionUnavailable(
             Assessment.NEEDS_CONTRACT, str(exc), plan
@@ -308,15 +311,17 @@ def discharge_precondition(
     external_callers_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
     address_escapes_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
     aliases_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
+    implicit_invocations_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
 ) -> DischargeResult:
     """Verify `source::function` against its precondition, then discharge it.
 
     Runs S2 first and *only ever upgrades* its verdict: anything other than
     ``ASSUMED_VERIFIED`` (a real violation, ``NEEDS_CONTRACT``, an error) passes
     through untouched, because there is no assumption to discharge. `raw_verify`,
-    `list_units_fn`, `external_callers_fn`, `address_escapes_fn` and `aliases_fn`
-    inject the esbmc calls for tests; production adds a ``-I`` for the source's
-    own directory so the generated copy's relative ``#include``\\ s still resolve.
+    `list_units_fn`, `external_callers_fn`, `address_escapes_fn`, `aliases_fn` and
+    `implicit_invocations_fn` inject the esbmc calls for tests; production adds a
+    ``-I`` for the source's own directory so the generated copy's relative
+    ``#include``\\ s still resolve.
     """
     lister = _memoized(
         list_units_fn or (lambda src: list_units(src, esbmc_bin=esbmc_bin))
@@ -354,6 +359,9 @@ def discharge_precondition(
     aliases = aliases_fn or (
         lambda src, sym: list_symbol_aliases(src, sym, esbmc_bin=esbmc_bin)
     )
+    implicit_invocations = implicit_invocations_fn or (
+        lambda src, sym: list_implicit_invocations(src, sym, esbmc_bin=esbmc_bin)
+    )
     args = (
         source,
         function,
@@ -362,6 +370,7 @@ def discharge_precondition(
         external,
         escapes,
         aliases,
+        implicit_invocations,
         max_len,
         ladder_cap,
         raw,
@@ -380,6 +389,7 @@ def _discharge(
     external_callers_fn: Callable[[Path, str], tuple[str, ...]],
     address_escapes_fn: Callable[[Path, str], tuple[str, ...]],
     aliases_fn: Callable[[Path, str], tuple[str, ...]],
+    implicit_invocations_fn: Callable[[Path, str], tuple[str, ...]],
     max_len: int,
     ladder_cap: int,
     raw: VerifyPort,
@@ -402,9 +412,18 @@ def _discharge(
         return DischargeResult(
             function, Assessment.ERROR, f"could not read {source}: {exc}", unit_result
         )
+    # The obligation-injected copy is written under its own path in `work_dir`,
+    # not the user's — so without a `#line` directive, `__FILE__` inside it would
+    # report *that* path rather than the source's, and a caller whose behaviour
+    # or object sizing depends on `__FILE__` would be checked against a program
+    # that is not quite the one being verified (RFC-0003 OQ1's "generated copy"
+    # promise is about the check, not about what the copy claims to be).
+    resolved_source = str(source.resolve())
     try:
-        obligations = inject_obligations(source_text, plan)
-        site_probe = inject_obligations(source_text, plan, site_probe=True)
+        obligations = inject_obligations(source_text, plan, source_path=resolved_source)
+        site_probe = inject_obligations(
+            source_text, plan, site_probe=True, source_path=resolved_source
+        )
     except SynthError as exc:
         return DischargeResult(
             function, Assessment.NEEDS_CONTRACT, str(exc), unit_result
@@ -426,17 +445,20 @@ def _discharge(
     # named from another one, so "every caller here" is every caller; an
     # externally visible one exports the obligation to clients we never see.
     internal = any(u.internal_linkage for u in units if u.name == function)
-    # The three ways the caller set can be wider than what `units` shows, each of
+    # The four ways the caller set can be wider than what `units` shows, each of
     # which keeps "every caller in this TU" from being a claim about a set we
     # never saw: a `static inline` in an included header is part of this
     # translation unit but is not a unit `list_units` reports; an address taken
     # rather than called can be invoked from anywhere through the pointer that
-    # holds it; and an alias attribute gives the callee a second name whose call
-    # sites reference only that name.
+    # holds it; an alias attribute gives the callee a second name whose call
+    # sites reference only that name; and a constructor/destructor attribute
+    # names no one at all — the loader invokes the callee's own declaration
+    # directly, supplying none of the arguments any explicit caller does.
     try:
         foreign = external_callers_fn(source, function)
         escaped = address_escapes_fn(source, function)
         aliased = aliases_fn(source, function)
+        implicit = implicit_invocations_fn(source, function)
     except ListUnitsError as exc:
         return DischargeResult(function, Assessment.ERROR, str(exc), unit_result)
     unenumerable = (
@@ -469,6 +491,16 @@ def _discharge(
                 "that name, so its callers are not in the set that was checked",
             )
             for name in aliased
+        )
+        + tuple(
+            CallerCheck(
+                f"<{kind}>",
+                CallerOutcome.UNRESOLVED,
+                f"carries a {kind} attribute, so the loader invokes {function}() "
+                "directly at load/unload time, supplying none of the arguments "
+                "any explicit call site in this translation unit does",
+            )
+            for kind in implicit
         )
     )
     # A re-entry is never an *anchor*: something outside the recursion has to

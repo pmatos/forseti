@@ -103,6 +103,26 @@ def test_site_probe_replaces_the_obligations_with_a_reachability_assert() -> Non
     assert "__ESBMC_r_ok" not in injected
 
 
+def test_a_source_path_prepends_a_line_directive() -> None:
+    # The copy is written to disk under its own path, not the source's — without
+    # this, `__FILE__` inside it would report *that* path instead. `#line`
+    # renumbers everything after it, so nothing but this one new line changes.
+    without = inject_obligations(SOURCE, _plan())
+    with_path = inject_obligations(SOURCE, _plan(), source_path="/orig/frame.c")
+    lines = with_path.splitlines()
+    assert lines[0] == '#line 1 "/orig/frame.c"'
+    assert lines[1:] == without.splitlines()
+
+
+def test_a_source_path_escapes_quotes_and_backslashes() -> None:
+    # Either character would otherwise close the directive's string literal
+    # early or corrupt the path it names.
+    quoted = inject_obligations(SOURCE, _plan(), source_path='weird"path.c')
+    assert quoted.splitlines()[0] == '#line 1 "weird\\"path.c"'
+    backslashed = inject_obligations(SOURCE, _plan(), source_path=r"C:\path.c")
+    assert backslashed.splitlines()[0] == '#line 1 "C:\\\\path.c"'
+
+
 def test_unresolved_plan_is_declined() -> None:
     plan = plan_unit(Unit("f", (Param("p", "void *"),)))
     with pytest.raises(SynthError, match="unresolved"):

@@ -439,6 +439,12 @@ def parse_address_escapes(ast_text: str, symbol: str) -> tuple[str, ...]:
     that no expression in the AST spells — is caught by the same rule as an
     address-of, and so is any attribute of that shape we have not seen yet.
 
+    What that rule cannot catch is an attribute on the callee's **own**
+    declaration rather than a reference sitting elsewhere — a
+    ``constructor``/``destructor`` attribute prints no ``Function 0x… 'name'``
+    text at all, since it names no one; the loader invokes the callee directly.
+    `parse_implicit_invocations` covers that shape.
+
     A *direct* call is not an escape, however it is written (`_is_call_callee`),
     including the recursive call in ``symbol``'s own body — otherwise every
     recursive unit would be permanently undischargeable.
@@ -451,6 +457,39 @@ def parse_address_escapes(ast_text: str, symbol: str) -> tuple[str, ...]:
         if not _is_call_callee(stack):
             sites[_enclosing_name(stack)] = None
     return tuple(sites)
+
+
+# `kind` -> the human word for the AST node clang emits directly on a function's
+# own `FunctionDecl` when a `constructor`/`destructor` attribute marks it: the
+# loader calls it at load/unload time, with none of the arguments any call site
+# in this translation unit supplies.
+_IMPLICIT_INVOCATION_ATTRS = {
+    "ConstructorAttr": "constructor",
+    "DestructorAttr": "destructor",
+}
+
+
+def parse_implicit_invocations(ast_text: str, symbol: str) -> tuple[str, ...]:
+    """Constructor/destructor attributes on `symbol`'s **own** declaration.
+
+    ``__attribute__((constructor))``/``destructor`` is unlike every other
+    attribute-borne path this module follows: it names no one. It sits on the
+    callee's own ``FunctionDecl`` as a bare ``ConstructorAttr``/``DestructorAttr``
+    child, with no ``Function 0x… 'name'`` reference anywhere — so neither
+    `parse_address_escapes` (which keys off that reference shape) nor
+    `parse_symbol_aliases` (a second *name*, not a second *invoker*) can see it.
+    The loader calls the function directly at load/unload time, supplying none
+    of the arguments any explicit caller in this translation unit does, so an
+    otherwise-clean sweep of explicit callers says nothing about that
+    invocation. Compositional discharge (RFC-0003 S3) withholds the upgrade
+    instead of claiming a caller set that omits it.
+    """
+    found: dict[str, None] = {}
+    for stack, kind, _rest, _file in _walk(ast_text):
+        label = _IMPLICIT_INVOCATION_ATTRS.get(kind)
+        if label is not None and _enclosing_name(stack) == symbol:
+            found[label] = None
+    return tuple(found)
 
 
 def _declared_name(rest: str) -> str:
@@ -488,7 +527,10 @@ def parse_symbol_aliases(ast_text: str, symbol: str) -> tuple[str, ...]:
     What this does *not* cover is a function named by an attribute rather than
     aliased by one — a ``cleanup`` handler, say. That is `parse_address_escapes`'
     job: clang prints those as an ordinary ``Function 0x… 'name'`` reference, and
-    a reference outside a direct call already opens the caller set.
+    a reference outside a direct call already opens the caller set. A
+    ``constructor``/``destructor`` attribute is neither a second name nor a
+    reference — it sits on `symbol`'s own declaration with the loader as the
+    invoker; `parse_implicit_invocations` covers that.
     """
     aliases: dict[str, None] = {}
     labels: dict[str, set[str]] = {}
@@ -736,13 +778,31 @@ def list_symbol_aliases(
     """Declarations in `source`'s translation unit that alias `symbol`.
 
     The third way the caller enumeration can be incomplete — see
-    `parse_symbol_aliases`. Each of the three asks its own question of its own
+    `parse_symbol_aliases`. Each of these asks its own question of its own
     dump, which costs a parse run apiece; sharing one dump across them is a
     worthwhile follow-up, not a reason to fuse the questions. Raises
     `ListUnitsError` on the same conditions as `list_units`.
     """
     ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
     return parse_symbol_aliases(ast_text, symbol)
+
+
+def list_implicit_invocations(
+    source: Path,
+    symbol: str,
+    *,
+    esbmc_bin: str = "esbmc",
+    timeout_s: float = 30.0,
+    extra_flags: Sequence[str] = (),
+) -> tuple[str, ...]:
+    """Constructor/destructor attributes on `symbol`'s own declaration.
+
+    The fourth way the caller enumeration can be incomplete — see
+    `parse_implicit_invocations`. Raises `ListUnitsError` on the same conditions
+    as `list_units`.
+    """
+    ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
+    return parse_implicit_invocations(ast_text, symbol)
 
 
 def list_units(
