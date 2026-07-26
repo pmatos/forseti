@@ -275,6 +275,48 @@ def _kernel_dir(path: str) -> str:
     return cur
 
 
+def _index_ignore_snapshot(project_dir: str, prefix: str) -> None:
+    """Register `prefix*` in the project's ``.git/info/exclude``, idempotently.
+
+    `_enumerable_source` calls this *before* staging a snapshot, so a
+    concurrent `git add -A`/`git status` never has a window in which the
+    snapshot exists but is not yet excluded. ``.git/info/exclude`` — not the
+    tracked `.gitignore` — is the right place: it is local, un-versioned repo
+    state, exactly like the snapshot itself, so no tracked file is touched and
+    nothing needs to be undone.
+
+    A no-op outside a git work tree (`_git` returns ``None``): there is no
+    index there to protect against in the first place. Everywhere else, an
+    `OSError` writing the exclude file fails the same way every other one in
+    this module does — closed, as `UnitsUnavailable` — rather than silently
+    proceeding to stage the snapshot unprotected.
+    """
+    exclude_rel = _git(project_dir, "rev-parse", "--git-path", "info/exclude")
+    if exclude_rel is None:
+        return
+    exclude_rel = exclude_rel.strip()
+    exclude_path = (
+        exclude_rel
+        if os.path.isabs(exclude_rel)
+        else os.path.join(project_dir, exclude_rel)
+    )
+    pattern = f"{prefix}*"
+    try:
+        with open(exclude_path, "a+", encoding="utf-8") as handle:
+            handle.seek(0)
+            existing = handle.read()
+            if pattern in existing.splitlines():
+                return
+            if existing and not existing.endswith("\n"):
+                handle.write("\n")
+            handle.write(f"{pattern}\n")
+    except OSError as exc:
+        raise UnitsUnavailable(
+            f"could not register {pattern!r} in {exclude_path} to keep the "
+            f"enumeration snapshot out of the git index: {exc}"
+        ) from exc
+
+
 @contextlib.contextmanager
 def _enumerable_source(
     file_path: str | os.PathLike[str], content: bytes | None, *, project_dir: str
@@ -348,14 +390,22 @@ def _enumerable_source(
 
     The name carries `_ENUM_SNAPSHOT_PREFIX` so `_included` excludes it from the
     gate's own discovery unconditionally — see there for why that has to be
-    unconditional. `git status` lists it until the `finally` below runs (or,
-    if this process is killed first, until something else removes it) — the
-    cost of staging beside the source at all, the same one `_verifiable_source`
-    pays at the verify boundary (issue #150).
+    unconditional. That guard only keeps the snapshot out of the *gate's own*
+    scans, though; nothing about it stops a concurrent `git add -A`, IDE, or
+    automation job from staging the file while it exists on disk.
+    `_index_ignore_snapshot` registers `_ENUM_SNAPSHOT_PREFIX*` in the project's
+    `.git/info/exclude` *before* `mkstemp` runs (below), so there is no window
+    where the snapshot sits in the tree unprotected — inside a git work tree,
+    `git status`/`git add -A` never see it, so a `finally`-block failure to
+    clean up (or this process being killed first) cannot be committed by an
+    unrelated `git add -A` in the meantime. An explicit, forced
+    `git add -f <path>` is the one thing left that can still stage it, the same
+    residual `_verifiable_source` documents at the verify boundary (issue #150).
     """
     if content is None:
         yield str(file_path)
         return
+    _index_ignore_snapshot(project_dir, _ENUM_SNAPSHOT_PREFIX)
     spelled = os.path.join(project_dir, os.fspath(file_path))
     src_dir = _kernel_dir(os.path.dirname(spelled))
     # Every `OSError` the staging can raise — an unwritable directory, `ENOSPC`,
@@ -388,9 +438,27 @@ def _enumerable_source(
         ) from exc
     try:
         yield path
-    finally:
+    except BaseException:
+        # A real failure is already in flight (from the caller's use of `path`,
+        # e.g. `_list_units` raising `UnitsUnavailable`) — a cleanup error here
+        # would replace it with a less useful one, so it's suppressed the same
+        # way the write-failure path above suppresses it, and best-effort
+        # cleanup is attempted anyway.
         with contextlib.suppress(OSError):
             os.unlink(path)
+        raise
+    else:
+        # The happy path: nothing else is failing, so a cleanup error must not
+        # be swallowed — that's exactly what would leave a complete source
+        # snapshot sitting in the tree indefinitely while enumeration reports
+        # success.
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            raise UnitsUnavailable(
+                f"enumerated {file_path} but could not remove the snapshot left "
+                f"at {path} (check write access to {src_dir}): {exc}"
+            ) from exc
 
 
 def extract_function_defs(

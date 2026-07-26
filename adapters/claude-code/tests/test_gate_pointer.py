@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -115,6 +116,10 @@ def _echoing_forseti_cmd(
     ]
     script.write_text("\n".join(body) + "\n")
     return [sys.executable, str(script)]
+
+
+def _git_init(path: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
 
 
 def _seed_scanned(tmp_path: Path) -> None:
@@ -566,6 +571,129 @@ def test_unstageable_snapshot_blocks_and_does_not_stamp(
     assert "x.c" not in after["scanned"]
     assert after["scanned"]["sentinel.c"] == "deadbeef"
     assert gate.blocking_units(after)
+
+
+def test_snapshot_is_excluded_from_the_git_index_before_it_exists(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A concurrent `git add -A` — an IDE, another automation job, a user's own
+    # habit — can land at any point while the snapshot sits on disk for the
+    # whole enumeration. Running `git add -A` from *inside* the fake CLI is the
+    # moment the snapshot is guaranteed to exist, so it is the sharpest test of
+    # whether `_index_ignore_snapshot`'s registration (which has to happen
+    # before `mkstemp`, not after) actually keeps git from seeing it.
+    _git_init(tmp_path)
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            before_read=(
+                "import subprocess as sp; sp.run(['git', 'add', '-A'], check=True)"
+            ),
+        ),
+    )
+
+    gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+    staged = subprocess.run(
+        ["git", "-C", str(tmp_path), "diff", "--cached", "--name-only"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert gate._ENUM_SNAPSHOT_PREFIX not in staged
+    assert "x.c" in staged  # the real edit is still staged normally
+
+
+def test_snapshot_exclusion_is_a_noop_outside_a_git_work_tree(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # No git index exists outside a work tree, so registering the exclude
+    # pattern must not become a hard dependency of enumeration succeeding —
+    # `tmp_path` here is deliberately never `git init`ed.
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+
+    defs = gate.extract_function_defs(
+        str(src), project_dir=str(tmp_path), content=b"f\n"
+    )
+
+    assert [d.name for d in defs] == ["f"]
+
+
+def test_unregisterable_git_exclude_blocks_with_units_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Every OSError this staging path can raise has to land as UnitsUnavailable
+    # (fail closed) — including one from registering the exclude pattern
+    # itself, or the snapshot would end up staged unprotected rather than not
+    # staged at all.
+    monkeypatch.setattr(gate, "_git", lambda project_dir, *args: "no/such/dir/exclude")
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    with pytest.raises(gate.UnitsUnavailable, match="exclude"):
+        gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+
+def test_snapshot_cleanup_failure_after_success_blocks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The happy path: enumeration itself succeeds, but the final `os.unlink`
+    # fails (a lost-write-permission race, an NFS hiccup). That must not be
+    # suppressed into a silent success — it would leave a complete source
+    # snapshot in the worktree indefinitely while reporting the enumeration as
+    # fine.
+    real_unlink = os.unlink
+
+    def _boom(path: str, *, dir_fd: int | None = None) -> None:
+        if os.path.basename(path).startswith(gate._ENUM_SNAPSHOT_PREFIX):
+            raise OSError("permission denied")
+        real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(gate.os, "unlink", _boom)
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    with pytest.raises(gate.UnitsUnavailable, match="remove"):
+        gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+
+def test_snapshot_cleanup_failure_does_not_mask_a_pending_enumeration_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # When the CLI call itself already failed, a *secondary* cleanup failure
+    # must not replace that primary, more actionable exception — cleanup is
+    # still attempted (best-effort) but its error is suppressed here, mirroring
+    # the write-failure path just above.
+    real_unlink = os.unlink
+
+    def _boom(path: str, *, dir_fd: int | None = None) -> None:
+        if os.path.basename(path).startswith(gate._ENUM_SNAPSHOT_PREFIX):
+            raise OSError("permission denied")
+        real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(gate.os, "unlink", _boom)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _fake_forseti_cmd(
+            tmp_path, stderr="boom-original-failure", exit_code=1
+        ),
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    with pytest.raises(gate.UnitsUnavailable, match="boom-original-failure"):
+        gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
 
 
 def test_transient_rewrite_during_enumeration_is_enumerated_faithfully(

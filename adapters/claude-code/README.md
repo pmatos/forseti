@@ -204,7 +204,10 @@ turns a verdict into an error.
   gate — same-directory staging needs no flag at all.) The snapshot's name is
   excluded from the gate's own discovery unconditionally — never subject to
   `FORSETI_GATE_INCLUDE`/`_EXCLUDE` — so one a killed hook could not clean up is
-  never itself offered back as a source. The trade for dropping the earlier
+  never itself offered back as a source. Inside a git work tree the snapshot's
+  name is also registered in `.git/info/exclude` before it is staged, so a
+  concurrent `git add -A`/`git status` never sees it either — only an explicit,
+  forced `git add -f <path>` can still index it. The trade for dropping the earlier
   mirrored design (which had a project-root boundary a quoted include could
   climb past, silently landing on a different translation unit) is a narrower
   residual: a translation unit that `#include`s the source under any name that
