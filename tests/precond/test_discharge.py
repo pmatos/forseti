@@ -121,6 +121,7 @@ def _run(
     source_text: str = SOURCE,
     external: Callable[[Path, str], tuple[str, ...]] = lambda _s, _f: (),
     escapes: Callable[[Path, str], tuple[str, ...]] = lambda _s, _f: (),
+    raw: Callable[..., EsbmcResult] | None = None,
 ) -> DischargeResult:
     src = tmp / "frame.c"
     src.write_text(source_text)
@@ -130,7 +131,7 @@ def _run(
         max_len=8,
         ladder_cap=32,
         work_dir=tmp,
-        raw_verify=_raw(caller_verdicts or {}),
+        raw_verify=raw or _raw(caller_verdicts or {}),
         list_units_fn=lambda _s: list(units),
         external_callers_fn=external,
         address_escapes_fn=escapes,
@@ -356,6 +357,94 @@ def test_a_precondition_free_caller_anchors_the_chain(tmp_path: Path) -> None:
     result = _run(tmp_path, units=(CALLEE, entry))
     assert result.assessment is Assessment.DISCHARGED_VERIFIED
     assert "relative to" not in result.label
+
+
+RECURSIVE_CALLEE = Unit(
+    CALLEE.name, CALLEE.params, ("sum_bytes",), internal_linkage=True
+)
+
+
+def _per_harness(broken: str) -> Callable[..., EsbmcResult]:
+    """Verdicts where only `broken`'s obligation run fails the obligation."""
+
+    def raw(source: Path, *, unwind: int) -> EsbmcResult:
+        if _phase(source) == "caller" and source.name.startswith(broken):
+            return _violated(
+                f"Violated property:\n  {OBLIGATION_LABEL_PREFIX}sum_bytes:buf"
+            )
+        return _raw({})(source, unwind=unwind)
+
+    return raw
+
+
+def test_a_recursive_callee_is_checked_as_its_own_call_site(tmp_path: Path) -> None:
+    # The obligation is asserted at the entry, so a re-entry that breaks it fails
+    # inside *whatever* caller's run reached it. Verifying the callee against its
+    # own harness is what names the recursion instead of the caller.
+    result = _run(
+        tmp_path,
+        units=(RECURSIVE_CALLEE, CALLER),
+        raw=_per_harness("sum_bytes"),
+    )
+    assert result.assessment is Assessment.VIOLATED
+    outcomes = {c.caller: c.outcome for c in result.callers}
+    assert outcomes["sum_bytes"] is CallerOutcome.OBLIGATION_VIOLATED
+    assert "sum_bytes() passes sum_bytes()" in result.detail
+
+
+def test_a_re_entry_failure_is_not_blamed_on_the_caller(tmp_path: Path) -> None:
+    # Both runs fail the obligation, and the callee's own harness satisfies it at
+    # the outer entry by construction — so the re-entry is the explanation and
+    # `frame_checksum`, which passed a valid pointer, must not be accused.
+    result = _run(
+        tmp_path,
+        units=(RECURSIVE_CALLEE, CALLER),
+        raw=_per_harness(""),  # every obligation run fails
+    )
+    assert result.assessment is Assessment.VIOLATED
+    outcomes = {c.caller: c.outcome for c in result.callers}
+    assert outcomes["sum_bytes"] is CallerOutcome.OBLIGATION_VIOLATED
+    assert outcomes["frame_checksum"] is CallerOutcome.UNATTRIBUTED
+    assert "frame_checksum()" not in result.detail
+
+
+def test_a_clean_re_entry_still_blames_a_bad_caller(tmp_path: Path) -> None:
+    # The mirror case: the callee's own harness discharges, so the re-entry keeps
+    # the obligation and an obligation failure elsewhere *is* that caller's.
+    result = _run(
+        tmp_path,
+        units=(RECURSIVE_CALLEE, CALLER),
+        raw=_per_harness("frame_checksum"),
+    )
+    assert result.assessment is Assessment.VIOLATED
+    outcomes = {c.caller: c.outcome for c in result.callers}
+    assert outcomes["sum_bytes"] is CallerOutcome.DISCHARGED
+    assert outcomes["frame_checksum"] is CallerOutcome.OBLIGATION_VIOLATED
+    assert "frame_checksum()" in result.detail
+
+
+def test_an_indirect_cycle_counts_as_a_re_entry(tmp_path: Path) -> None:
+    # `sum_bytes` → `helper` → `sum_bytes` re-enters just as a self-call does, so
+    # the callee is checked as its own call site here too.
+    cycle = Unit(CALLEE.name, CALLEE.params, ("helper",), internal_linkage=True)
+    helper = Unit(
+        "helper",
+        (Param("frame", "const unsigned char *"), Param("len", "unsigned long")),
+        ("sum_bytes",),
+    )
+    result = _run(tmp_path, units=(cycle, helper))
+    assert {c.caller for c in result.callers} == {"sum_bytes", "helper"}
+
+
+def test_a_recursive_callee_with_no_other_caller_exports_its_obligation(
+    tmp_path: Path,
+) -> None:
+    # A re-entry cannot anchor a chain: something outside the recursion has to
+    # enter the callee in the first place, and this TU does not.
+    result = _run(tmp_path, units=(RECURSIVE_CALLEE,))
+    assert result.assessment is Assessment.ASSUMED_VERIFIED
+    assert result.callers == ()
+    assert "no caller" in result.label
 
 
 def test_an_externally_visible_callee_exports_its_obligation(tmp_path: Path) -> None:

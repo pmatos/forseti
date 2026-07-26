@@ -248,6 +248,19 @@ while such a definition exists would be a claim about a set that was never fully
 caller that withholds the upgrade. Enumerating and harnessing header‑defined units is L1/S4
 territory; until then the honest answer is that the discharge is incomplete and *why*.
 
+**A recursive callee is a call site of itself.** Asserting at the entry rather than transplanting a
+contract has one property the modular check would not have had: the assert fires at *every* entry, so
+a re-entry that breaks the precondition cannot slip past — it fails inside whatever caller's run
+reached it. What it costs is **blame**, since one failing run cannot say which entry broke it. So a
+callee that can re-enter itself (directly or round a cycle, over `Unit.calls`) is verified against its
+own harness too; that harness satisfies the obligation at the outer entry by construction, so a
+failure there is the re-entry's. If it settles clean, an obligation failure elsewhere *is* that
+caller's and is named as before; if it does not, the caller's failure is `UNATTRIBUTED` and the
+recursion is named instead — accusing a caller that handed over exactly the object it was given is
+the same phantom-blame this stage exists to avoid. A re-entry never *anchors* a chain: something
+outside the recursion has to enter the callee first, so a callee whose only in-TU call site is its own
+recursion still exports its obligation.
+
 **And a translation unit is only the whole world for a `static` callee.** An externally visible one
 can be named — and handed anything — by any other TU of the linked program, and this command sees
 one TU. So the upgrade also requires internal linkage (`Unit.internal_linkage`, read off the same

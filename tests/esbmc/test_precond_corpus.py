@@ -260,6 +260,41 @@ def test_a_caller_defined_in_a_header_withholds_the_upgrade(tmp_path: Path) -> N
     assert "defined outside" in result.label
 
 
+_RECURSIVE_LEAF = """\
+#include <stddef.h>
+#include <stdint.h>
+
+/* Terminating recursion that still breaks the L0 pair: advances two bytes while
+ * shrinking `len` by one, so `(buf, len)` walks off the object — without ever
+ * dereferencing it, so the callee's own S2 run is memory-safe. */
+static uint32_t skip(const uint8_t *buf, size_t len) {
+    if (len <= 1) return 0;
+    return skip(buf + 2, len - 1);
+}
+
+uint32_t clean(const uint8_t *frame, size_t len) { return skip(frame, len); }
+"""
+
+
+def test_a_re_entry_that_breaks_the_obligation_names_the_recursion(
+    tmp_path: Path,
+) -> None:
+    # `clean` hands `skip` exactly the object it was given — a valid caller. The
+    # obligation fails inside its run all the same, because the assert sits at
+    # `skip`'s entry and `skip` re-enters itself with a pair that walks off the
+    # object. Blaming `clean` would accuse correct code; the recursion is named
+    # instead, and `clean` is reported as not attributable.
+    src = tmp_path / "recursive.c"
+    src.write_text(_RECURSIVE_LEAF)
+    result = discharge_precondition(src, function="skip", max_len=MAX_LEN)
+    assert result.assessment is Assessment.VIOLATED, result.label
+    outcomes = {c.caller: c.outcome for c in result.callers}
+    assert outcomes["skip"] is CallerOutcome.OBLIGATION_VIOLATED
+    assert outcomes["clean"] is CallerOutcome.UNATTRIBUTED
+    assert "skip() passes skip()" in result.label
+    assert "clean()" not in result.label
+
+
 _PUBLIC_LEAF = """\
 #include <stddef.h>
 #include <stdint.h>

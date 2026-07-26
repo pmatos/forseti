@@ -62,6 +62,19 @@ That makes a function in a dispatch table permanently ``ASSUMED_VERIFIED``, whic
 is the honest reading: it really can be invoked from anywhere in the TU with
 anything. Following an indirect call to its targets is L1/S4 work.
 
+**A recursive callee is a call site of itself.** Asserting at the entry rather than
+transplanting a contract has one property a modular check would not: the assert
+fires at *every* entry, so a re-entry that breaks the precondition cannot slip
+past — it fails inside whatever caller's run reached it. What that costs is
+*blame*: one failing run cannot say which entry broke it. So a callee that can
+re-enter itself (`_self_reachable`, direct or through a cycle) is verified against
+its own harness too, which satisfies the obligation at the outer entry by
+construction; if that settles the re-entry as safe, a failure elsewhere is the
+caller's and is named, and if it does not, the caller's failure is
+``UNATTRIBUTED`` and the recursion is what the report names. A re-entry never
+*anchors* a chain, so a callee whose only in-TU call site is its own recursion
+still exports its obligation.
+
 **What a discharge is relative to.** Each caller's own parameters are materialised
 by *its* S2 assumption, so one run proves ``caller precondition => callee
 precondition`` at every call site: one link of the chain, not the whole chain.
@@ -94,7 +107,7 @@ from __future__ import annotations
 
 import tempfile
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -147,6 +160,7 @@ class CallerOutcome(Enum):
     UNREACHABLE = "unreachable"  # never reaches the call — discharges nothing
     UNCHECKED = "unchecked"  # not materialisable / inconclusive — not a discharge
     UNRESOLVED = "unresolved"  # takes the callee's address — the caller set is open
+    UNATTRIBUTED = "unattributed"  # a failure the callee's own re-entry can explain
 
 
 @dataclass(frozen=True)
@@ -364,7 +378,18 @@ def _discharge(
             function, Assessment.NEEDS_CONTRACT, str(exc), unit_result
         )
 
-    callers = tuple(u for u in units if u.name != function and function in u.calls)
+    referrers = tuple(u for u in units if u.name != function and function in u.calls)
+    # A callee that can re-enter itself is a call site of its own, and one the
+    # obligation *already* checks: the assert sits at the entry, so it fires for
+    # every re-entry inside whatever caller's run reached it. Verifying the callee
+    # against its own harness is what tells the two apart — that harness satisfies
+    # the obligation at the outer entry by construction, so a failure there is the
+    # re-entry's, and no caller should be blamed for it.
+    reentrant = (
+        tuple(u for u in units if u.name == function)
+        if _self_reachable(units, function)
+        else ()
+    )
     # Whether this TU is the callee's whole world. A `static` callee cannot be
     # named from another one, so "every caller here" is every caller; an
     # externally visible one exports the obligation to clients we never see.
@@ -398,7 +423,10 @@ def _discharge(
         )
         for site in escaped
     )
-    if not callers:
+    # A re-entry is never an *anchor*: something outside the recursion has to
+    # enter the callee in the first place, so with no other caller the obligation
+    # is still exported rather than discharged here.
+    if not referrers:
         if unenumerable:
             return _aggregate(function, unit_result, unenumerable, internal=internal)
         return DischargeResult(
@@ -415,14 +443,74 @@ def _discharge(
     site_path = work_dir / f"{function}__obligation_site.c"
     site_path.write_text(site_probe)
 
-    checks = tuple(
-        _check_caller(
-            caller, obligations_path, site_path, max_len, ladder_cap, raw, work_dir
-        )
-        for caller in callers
+    callers = reentrant + referrers
+    checks = _attributed(
+        tuple(
+            _check_caller(
+                caller, obligations_path, site_path, max_len, ladder_cap, raw, work_dir
+            )
+            for caller in callers
+        ),
+        function,
+        reentrant=bool(reentrant),
     )
     anchored = frozenset(u.name for u in callers if not plan_unit(u).pointer_params)
     return _aggregate(function, unit_result, checks + unenumerable, anchored, internal)
+
+
+def _self_reachable(units: list[Unit], function: str) -> bool:
+    """Whether `function` can re-enter itself through this TU's references.
+
+    A breadth-first walk of `Unit.calls`, so an indirect cycle (``f`` → ``g`` →
+    ``f``) counts as well as a direct self-call. `Unit.calls` over-approximates
+    (an address taken reads as a reference), so this can report a re-entry that
+    cannot happen — costing one extra verification and a softer blame, never a
+    claimed discharge.
+    """
+    calls = {u.name: u.calls for u in units}
+    seen: set[str] = set()
+    frontier = set(calls.get(function, ()))
+    while frontier:
+        if function in frontier:
+            return True
+        seen |= frontier
+        frontier = {c for name in frontier for c in calls.get(name, ())} - seen
+    return False
+
+
+def _attributed(
+    checks: tuple[CallerCheck, ...], function: str, *, reentrant: bool
+) -> tuple[CallerCheck, ...]:
+    """`checks` with obligation failures a re-entry can explain taken off callers.
+
+    The obligation is asserted at the callee's entry, so one failing run cannot
+    say *which* entry broke it — this caller's, or a re-entry reached from it. When
+    the callee's own harness settles that the re-entry keeps the obligation, a
+    failure elsewhere is the caller's and is named. When it does not, blaming the
+    caller would accuse code that passed a perfectly valid pointer, so the failure
+    becomes ``UNATTRIBUTED``: the upgrade is withheld and the recursion is what
+    the report names.
+    """
+    if not reentrant:
+        return checks
+    settled = any(
+        c.caller == function and c.outcome is CallerOutcome.DISCHARGED for c in checks
+    )
+    if settled:
+        return checks
+    return tuple(
+        replace(
+            check,
+            outcome=CallerOutcome.UNATTRIBUTED,
+            detail=f"{function}() can re-enter itself and the obligation is checked "
+            "at every entry, so this failure is as likely the re-entry's as this "
+            "caller's, and is not attributable to it",
+        )
+        if check.caller != function
+        and check.outcome is CallerOutcome.OBLIGATION_VIOLATED
+        else check
+        for check in checks
+    )
 
 
 def _weakest_read_pointers(plan: UnitPlan) -> tuple[str, ...]:
