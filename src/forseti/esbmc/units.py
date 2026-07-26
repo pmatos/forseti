@@ -65,7 +65,11 @@ _CALLEE_WRAPPERS = frozenset({"ImplicitCastExpr", "ParenExpr", "UnaryOperator"})
 _FILE_SCOPE = "<file scope>"
 
 # The symbol an attribute names, as clang prints it: `AliasAttr <loc> "target"`.
-_TARGET_NAME_RE = re.compile(r'"(\w+)"')
+# The quoted text is a linker symbol, not a C identifier — GNU `__asm__` labels
+# may carry punctuation a C name cannot (`__asm__("impl.sym")` prints unchanged
+# as `AsmLabelAttr <loc> "impl.sym"`), so everything but the closing quote is
+# captured, not just `\w`.
+_TARGET_NAME_RE = re.compile(r'"([^"]+)"')
 
 # The storage class clang prints *after* a declaration's quoted type — `static`,
 # `extern`, and modifiers like `inline`. Read from the tail so a source path that

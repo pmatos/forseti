@@ -815,6 +815,28 @@ def test_a_shared_assembly_label_makes_two_names_one_function() -> None:
     assert parse_symbol_aliases(_ATTRIBUTE_PATH_AST, "scope") == ()
 
 
+# A shared label that carries punctuation a C identifier cannot, exactly as clang
+# 8.3.0 prints `__asm__("impl.sym")` (verified live against esbmc
+# --parse-tree-only): unescaped, period intact. `_TARGET_NAME_RE` used to require
+# `\w+` between the quotes, which cannot match a period and so silently dropped
+# this label — leaving `twin` looking like it shares nothing with `leaf`.
+_PUNCTUATED_LABEL_AST = """\
+TranslationUnitDecl 0xc000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0xc001 </tmp/foo.c:1:1, col:42> col:13 used leaf 'void (int *)' static
+| |-ParmVarDecl 0xc002 <col:15, col:20> col:20 used p 'int *'
+| |-CompoundStmt 0xc003 <col:30, col:42>
+| `-AsmLabelAttr 0xc004 <col:39> "impl.sym" IsLiteralLabel
+`-FunctionDecl 0xc010 <line:2:1, col:50> col:13 used twin 'void (int *)' static
+  |-ParmVarDecl 0xc011 <col:15, col:20> col:20 p 'int *'
+  `-AsmLabelAttr 0xc012 <col:40> "impl.sym" IsLiteralLabel
+"""
+
+
+def test_a_punctuated_assembly_label_still_makes_two_names_one_function() -> None:
+    assert parse_symbol_aliases(_PUNCTUATED_LABEL_AST, "leaf") == ("twin",)
+    assert parse_symbol_aliases(_PUNCTUATED_LABEL_AST, "twin") == ("leaf",)
+
+
 # The asymmetric case: only one side carries a label, and it spells the *default*
 # symbol name of the other. A declaration's symbol is its label when it has one
 # and its C name otherwise, so these two are one function with one side unmarked.
