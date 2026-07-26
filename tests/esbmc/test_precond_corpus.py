@@ -260,6 +260,35 @@ def test_a_caller_defined_in_a_header_withholds_the_upgrade(tmp_path: Path) -> N
     assert "defined outside" in result.label
 
 
+_PUBLIC_LEAF = """\
+#include <stddef.h>
+#include <stdint.h>
+
+uint32_t sum_bytes(const uint8_t *buf, size_t len) {
+    uint32_t acc = 0;
+    for (size_t i = 0; i < len; i++) acc += buf[i];
+    return acc;
+}
+
+uint32_t frame_checksum(const uint8_t *frame, size_t len) {
+    return sum_bytes(frame, len);
+}
+"""
+
+
+def test_an_externally_visible_leaf_exports_its_obligation(tmp_path: Path) -> None:
+    # `examples/frame_checksum.c`'s leaf is `static`, which is what makes its two
+    # callers *every* caller. Without it the same clean sweep proves strictly less:
+    # any other translation unit of the program can call `sum_bytes` with anything,
+    # so the obligation is exported there rather than discharged here.
+    src = tmp_path / "public.c"
+    src.write_text(_PUBLIC_LEAF)
+    result = discharge_precondition(src, function="sum_bytes", max_len=MAX_LEN)
+    assert result.assessment is Assessment.ASSUMED_VERIFIED, result.label
+    assert result.callers[0].outcome is CallerOutcome.DISCHARGED
+    assert "externally visible" in result.label
+
+
 _TU_WITH_INDIRECT_CALLER = """\
 #include <stddef.h>
 #include <stdint.h>

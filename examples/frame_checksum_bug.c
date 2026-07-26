@@ -21,8 +21,10 @@
 
 #define HEADER_BYTES 2
 
-/* The leaf: sums `len` bytes of `buf`. */
-uint32_t sum_bytes(const uint8_t *buf, size_t len) {
+/* The leaf: sums `len` bytes of `buf`. `static`, so this translation unit is
+ * its whole world — the two callers below are *every* caller, which is what
+ * lets the discharge close here instead of exporting the obligation. */
+static uint32_t sum_bytes(const uint8_t *buf, size_t len) {
     uint32_t acc = 0;
     for (size_t i = 0; i < len; i++) {
         acc += buf[i];

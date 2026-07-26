@@ -671,6 +671,51 @@ TranslationUnitDecl 0x6000 <<invalid sloc>> <invalid sloc>
 """
 
 
+# Linkage, in the shapes esbmc 8.3.0 prints it: the storage class follows the
+# quoted type, and a `static` written on a *prototype* is printed there and not on
+# the definition it forward-declares. The directory is called `static` on purpose —
+# a path is printed *before* the type, and must not be read as a storage class.
+_LINKAGE_TARGET = "/tmp/static/foo.c"
+_LINKAGE_AST = """\
+TranslationUnitDecl 0x7000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0x7001 </tmp/static/foo.c:1:1, col:36> col:13 priv 'void (int *)' static
+| |-ParmVarDecl 0x7002 <col:11, col:16> col:16 used p 'int *'
+| `-CompoundStmt 0x7003 <col:26, col:36>
+|-FunctionDecl 0x7010 <line:2:1, col:28> col:6 pub 'void (int *)'
+| |-ParmVarDecl 0x7011 <col:11, col:16> col:16 used p 'int *'
+| `-CompoundStmt 0x7012 <col:20, col:28>
+|-FunctionDecl 0x7020 <line:3:1, col:23> col:13 fwd 'void (int *)' static
+| `-ParmVarDecl 0x7021 <col:11, col:16> col:16 'int *'
+`-FunctionDecl 0x7030 prev 0x7020 <line:4:1, col:28> col:6 fwd 'void (int *)'
+  |-ParmVarDecl 0x7031 <col:11, col:16> col:16 used p 'int *'
+  `-CompoundStmt 0x7032 <col:20, col:28>
+"""
+
+
+def test_parse_units_reads_internal_linkage() -> None:
+    units = {u.name: u for u in parse_units(_LINKAGE_AST, _LINKAGE_TARGET)}
+    assert units["priv"].internal_linkage is True
+    # `pub` is in a *directory* called `static`; only the storage class counts.
+    assert units["pub"].internal_linkage is False
+
+
+def test_parse_units_reads_static_written_on_a_prototype() -> None:
+    # `static void fwd(int *); void fwd(int *p) {}` — C gives the definition
+    # internal linkage, but clang prints the marker only on the declaration that
+    # carried it, so the whole TU has to be consulted.
+    units = {u.name: u for u in parse_units(_LINKAGE_AST, _LINKAGE_TARGET)}
+    assert units["fwd"].internal_linkage is True
+
+
+def test_annotate_array_extents_keeps_linkage() -> None:
+    # The extent pass rebuilds the unit; dropping the linkage there would silently
+    # turn every `static` callee external and withhold its discharge.
+    unit = Unit("f", (Param("p", "uint8_t *"),), (), internal_linkage=True)
+    out = annotate_array_extents([unit], "static void f(uint8_t p[20]) {}")[0]
+    assert out.params[0].array_extent == 20
+    assert out.internal_linkage is True
+
+
 def test_parse_address_escapes_keeps_a_reference_it_cannot_name() -> None:
     # A reference under no named declaration is still a reference; naming it
     # `<file scope>` keeps the escape (and the withheld discharge) rather than

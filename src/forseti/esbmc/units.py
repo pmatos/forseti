@@ -64,6 +64,12 @@ _CALLEE_WRAPPERS = frozenset({"ImplicitCastExpr", "ParenExpr", "UnaryOperator"})
 # The site name reported for an escape with no named enclosing declaration.
 _FILE_SCOPE = "<file scope>"
 
+# The storage class clang prints *after* a declaration's quoted type — `static`,
+# `extern`, and modifiers like `inline`. Read from the tail so a source path that
+# happens to contain a `static` directory (printed before the type) cannot be
+# misread as internal linkage.
+_STATIC_STORAGE = "static"
+
 # A named parameter's array declarator: the name followed by *all* its consecutive
 # `[...]` groups, captured together (whitespace between them included) so a
 # multi-dimensional `p[2][3]` — or a spaced `p[2] [3]` — is recognised as such
@@ -155,11 +161,19 @@ class Unit:
     What it is *not* is a call graph closed under function pointers: a body that
     calls through ``fp`` references the variable, not what it holds. That blind
     spot is reported separately by `parse_address_escapes`, not papered over here.
+
+    `internal_linkage` is True when some declaration of this name in the
+    translation unit is marked ``static``, i.e. the TU is the whole world for it.
+    Compositional discharge (RFC-0003 S3) needs that to know whether "every caller
+    in this TU" is every caller at all. It reads the marker and nothing else, so a
+    definition whose ``static`` is not printed reads as external — which costs a
+    withheld discharge, never a claimed one.
     """
 
     name: str
     params: tuple[Param, ...]
     calls: tuple[str, ...] = ()
+    internal_linkage: bool = False
 
     @property
     def takes_pointer(self) -> bool:
@@ -213,8 +227,13 @@ def parse_definitions(ast_text: str) -> list[tuple[str, Unit]]:
     Neither filtered nor deduped: `parse_units` narrows this to the file under
     test (what the gate can verify), while `parse_external_callers` needs exactly
     the part `parse_units` drops.
+
+    ``static`` is harvested from *every* declaration of a name, not just the
+    definition: clang prints the storage class on the declaration that carried it,
+    so ``static void f(int *); void f(int *p) {}`` marks only the prototype.
     """
     found: list[tuple[str, Unit]] = []
+    internal: set[str] = set()
     current_file = ""
 
     # State for the FunctionDecl currently being assembled.
@@ -247,6 +266,8 @@ def parse_definitions(ast_text: str) -> list[tuple[str, Unit]]:
             flush()  # close a same-depth previous function first
             name_match = _NAME_RE.search(rest)
             fn_name = name_match.group(1) if name_match else None
+            if fn_name and _STATIC_STORAGE in rest.rsplit("'", 1)[-1].split():
+                internal.add(fn_name)
             fn_depth = depth
             fn_file = current_file
             params = []
@@ -270,7 +291,7 @@ def parse_definitions(ast_text: str) -> list[tuple[str, Unit]]:
                     calls[callee.group(1)] = None
 
     flush()
-    return found
+    return [(f, replace(u, internal_linkage=u.name in internal)) for f, u in found]
 
 
 def _is_target(file: str, source_norm: str) -> bool:
@@ -546,7 +567,7 @@ def annotate_array_extents(units: list[Unit], source_text: str) -> list[Unit]:
         params = tuple(
             _annotated_param(p, param_list) if p.is_pointer else p for p in unit.params
         )
-        annotated.append(Unit(unit.name, params, unit.calls))
+        annotated.append(replace(unit, params=params))
     return annotated
 
 

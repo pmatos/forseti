@@ -248,6 +248,16 @@ while such a definition exists would be a claim about a set that was never fully
 caller that withholds the upgrade. Enumerating and harnessing header‑defined units is L1/S4
 territory; until then the honest answer is that the discharge is incomplete and *why*.
 
+**And a translation unit is only the whole world for a `static` callee.** An externally visible one
+can be named — and handed anything — by any other TU of the linked program, and this command sees
+one TU. So the upgrade also requires internal linkage (`Unit.internal_linkage`, read off the same
+clang dump, harvested from *every* declaration of the name since clang prints `static` only on the
+declaration that carried it): without it a clean local sweep leaves `ASSUMED_VERIFIED` with the
+obligation **exported**, the same answer a callee with no local caller gets, because it is the same
+fact. `examples/frame_checksum.c`'s leaf is `static` for exactly this reason — that is what makes its
+two callers *every* caller and lets the discharge close in one file. For a public entry point the
+honest closure is its clients' own `forseti discharge` runs, one per TU.
+
 **And a caller set is only as complete as the call graph.** Callers are found by *name*, so a body
 that calls `fp(...)` references the variable and no edge leads back to what it holds: a
 `static cb_t fp = sum_bytes;` plus one indirect call is a caller that no enumeration built from

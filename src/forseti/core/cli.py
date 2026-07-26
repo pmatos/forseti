@@ -300,9 +300,10 @@ def _add_discharge_parser(
             "(S3): the same precondition is injected into a generated *copy* of "
             "the translation unit as a checked obligation at the unit's entry, and "
             "every caller in that TU is verified against the copy. The verdict is "
-            "upgraded to VERIFIED (discharged) only when every caller was checked "
-            "and every check passed; a caller that passes an invalid or too-small "
-            "pointer is VIOLATED at the call site."
+            "upgraded to VERIFIED (discharged) only when the unit is `static` (so "
+            "this TU holds every caller), every caller was checked, and every "
+            "check passed; a caller that passes an invalid or too-small pointer is "
+            "VIOLATED at the call site."
         ),
     )
     _add_precondition_arguments(

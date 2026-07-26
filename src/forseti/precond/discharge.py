@@ -43,6 +43,14 @@ but is not a unit `list_units` reports, so `parse_external_callers` counts them
 from the same clang dump — each leaves the verdict at ``ASSUMED_VERIFIED`` with a
 loud "discharge incomplete", never an upgrade.
 
+**And a translation unit is only the whole world for a ``static`` callee.** An
+externally visible one can be named — and handed anything — by any other TU of
+the linked program, none of which this command sees. So a clean local sweep of a
+non-``static`` callee leaves ``ASSUMED_VERIFIED`` with its obligation *exported*,
+exactly as a callee with no local caller at all does; only internal linkage makes
+"every caller in this translation unit" mean every caller. `Unit.internal_linkage`
+reads the ``static`` marker off the same clang dump.
+
 **A caller set is only as complete as the call graph.** Callers are found by name,
 so a body that calls ``fp(...)`` references the *variable* and no edge leads back
 to whatever ``fp`` holds: a ``static cb_t fp = f;`` plus one indirect call is a
@@ -357,6 +365,10 @@ def _discharge(
         )
 
     callers = tuple(u for u in units if u.name != function and function in u.calls)
+    # Whether this TU is the callee's whole world. A `static` callee cannot be
+    # named from another one, so "every caller here" is every caller; an
+    # externally visible one exports the obligation to clients we never see.
+    internal = any(u.internal_linkage for u in units if u.name == function)
     # The two ways the caller set can be wider than what `units` shows. Counting
     # both is what keeps "every caller in this TU" from being a claim about a set
     # we never saw: a `static inline` in an included header is part of this
@@ -388,7 +400,7 @@ def _discharge(
     )
     if not callers:
         if unenumerable:
-            return _aggregate(function, unit_result, unenumerable)
+            return _aggregate(function, unit_result, unenumerable, internal=internal)
         return DischargeResult(
             function,
             Assessment.ASSUMED_VERIFIED,
@@ -410,7 +422,7 @@ def _discharge(
         for caller in callers
     )
     anchored = frozenset(u.name for u in callers if not plan_unit(u).pointer_params)
-    return _aggregate(function, unit_result, checks + unenumerable, anchored)
+    return _aggregate(function, unit_result, checks + unenumerable, anchored, internal)
 
 
 def _weakest_read_pointers(plan: UnitPlan) -> tuple[str, ...]:
@@ -536,8 +548,15 @@ def _aggregate(
     unit_result: PreconditionResult,
     checks: tuple[CallerCheck, ...],
     anchored: frozenset[str] = frozenset(),
+    internal: bool = False,
 ) -> DischargeResult:
     """Fold the per-caller checks into one verdict — upgrading only on a clean sweep.
+
+    A clean sweep upgrades only when `internal` says the callee is ``static``:
+    for an externally visible one, every caller *here* is not every caller, since
+    any other translation unit of the program can name it and pass what it likes.
+    That obligation is exported exactly as it is for a callee with no local caller
+    at all, and is reported the same way.
 
     `anchored` names the callers whose *own* memory precondition is empty (no
     pointer parameters), so their harness allocates real objects and nothing is
@@ -566,6 +585,18 @@ def _aggregate(
             function,
             Assessment.ASSUMED_VERIFIED,
             f"discharge incomplete — {why}",
+            unit_result,
+            checks,
+        )
+    if not internal:
+        return DischargeResult(
+            function,
+            Assessment.ASSUMED_VERIFIED,
+            f"discharge incomplete — every caller of {function}() in this "
+            "translation unit satisfies its memory precondition, but the function "
+            "is externally visible, so a client in another translation unit can "
+            "call it with anything; the obligation is exported there, and closing "
+            f"it needs {function}() to be static or discharged in that TU too",
             unit_result,
             checks,
         )

@@ -46,7 +46,7 @@ from forseti.precond.verify import PreconditionUnavailable
 SOURCE = """\
 #include <stddef.h>
 
-unsigned sum_bytes(const unsigned char *buf, size_t len) {
+static unsigned sum_bytes(const unsigned char *buf, size_t len) {
     unsigned acc = 0;
     for (size_t i = 0; i < len; i++) acc += buf[i];
     return acc;
@@ -57,9 +57,12 @@ unsigned frame_checksum(const unsigned char *frame, size_t len) {
 }
 """
 
+# `static`, like the source above: this TU is the leaf's whole world, which is
+# what lets a clean local sweep close the discharge rather than export it.
 CALLEE = Unit(
     "sum_bytes",
     (Param("buf", "const unsigned char *"), Param("len", "unsigned long")),
+    internal_linkage=True,
 )
 CALLER = Unit(
     "frame_checksum",
@@ -353,6 +356,30 @@ def test_a_precondition_free_caller_anchors_the_chain(tmp_path: Path) -> None:
     result = _run(tmp_path, units=(CALLEE, entry))
     assert result.assessment is Assessment.DISCHARGED_VERIFIED
     assert "relative to" not in result.label
+
+
+def test_an_externally_visible_callee_exports_its_obligation(tmp_path: Path) -> None:
+    # Drop the leaf's `static` and this TU stops being its whole world: another
+    # `.c` file can call it with anything, so a clean sweep of the callers *here*
+    # is not a sweep of every caller. The obligation is exported, exactly as it is
+    # for a callee with no local caller at all.
+    public = Unit(CALLEE.name, CALLEE.params, CALLEE.calls)
+    result = _run(tmp_path, units=(public, CALLER))
+    assert result.assessment is Assessment.ASSUMED_VERIFIED
+    assert result.callers[0].outcome is CallerOutcome.DISCHARGED  # locally, it did
+    assert "externally visible" in result.label
+    assert "exported" in result.label
+
+
+def test_an_escape_outranks_an_anchored_caller(tmp_path: Path) -> None:
+    # The one combination where a wrong answer would *over*-claim: an anchored
+    # caller is what lets the label drop its "relative to" caveat, and an
+    # unenumerable path must still withhold the whole upgrade rather than be
+    # counted as one more caller the anchor speaks for.
+    entry = Unit("run", (), ("sum_bytes",))
+    result = _run(tmp_path, units=(CALLEE, entry), escapes=lambda _s, _f: ("fp",))
+    assert result.assessment is Assessment.ASSUMED_VERIFIED
+    assert "discharge incomplete" in result.label
 
 
 def test_no_caller_in_the_translation_unit_stays_assumed(tmp_path: Path) -> None:
