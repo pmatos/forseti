@@ -1598,15 +1598,27 @@ def test_a_component_walked_twice_is_not_a_loop(tmp_path: Path) -> None:
     assert snapshotted == in_place
 
 
-def test_a_genuine_symlink_cycle_still_blocks(tmp_path: Path) -> None:
-    # The guard the fix above must not remove: `a -> b`, `b -> a`. `realpath` gives
-    # up and hands back the link unchanged, so the walk would revisit the identical
-    # state forever. Blocking is the honest answer — the kernel cannot read a
-    # source through that chain either.
+@pytest.mark.parametrize(
+    ("name", "points_to"),
+    [
+        ("mutual", "b"),  # a -> b, b -> a: `realpath` hands the link back unchanged
+        ("expanding", "a/x"),  # a -> a/x: ...and here, one component LONGER each time
+    ],
+)
+def test_a_symlink_cycle_blocks_instead_of_spinning(
+    tmp_path: Path, name: str, points_to: str
+) -> None:
+    # The guard the fix above must not remove — and the reason it is a budget and
+    # not a seen-set. `realpath` never reports ELOOP; it gives up and returns
+    # something unresolved. For `a -> a/x` that something *grows*, so no (link,
+    # rest) state ever recurs and a repeat-detector would spin forever inside a
+    # hook. The kernel's own `MAXSYMLINKS` bounds it: past that, the source could
+    # not have been read either, so blocking is the honest answer.
     proj = tmp_path / "proj"
     proj.mkdir()
-    (proj / "a").symlink_to(proj / "b")
-    (proj / "b").symlink_to(proj / "a")
+    (proj / "a").symlink_to(proj / points_to)
+    if name == "mutual":
+        (proj / "b").symlink_to(proj / "a")
 
     with pytest.raises(OSError) as excinfo:
         gate._mirror_plan(str(proj / "a"), str(proj))

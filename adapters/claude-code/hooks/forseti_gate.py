@@ -115,6 +115,11 @@ MAX_STOP_ATTEMPTS = 3
 # via MAX_STOP_ATTEMPTS.
 MAX_PENDING_VERIFY_ATTEMPTS = 3
 
+# Symlinked directory components the snapshot's mirror plan will follow before it
+# calls the chain a loop — Linux's own `MAXSYMLINKS` for one path resolution. A
+# source reached through more than this could not have been `open`ed either.
+_MAX_SYMLINK_HOPS = 40
+
 C_SUFFIXES = {".c", ".h"}
 
 # Out-of-band discovery (issue #99): a C file written via the `Bash` tool
@@ -356,7 +361,7 @@ def _mirror_plan(
     """
     real_dirs: list[str] = []
     links: list[tuple[str, str]] = []
-    hopped: set[tuple[str, tuple[str, ...]]] = set()
+    hops = 0
     base = _mirror_root(src_dir, project_dir)
     steps = [] if src_dir == base else os.path.relpath(src_dir, base).split(os.sep)
     while True:
@@ -374,23 +379,21 @@ def _mirror_plan(
         if hop is None:
             return real_dirs, links
         link, rest = hop
-        # A component that resolves back onto itself would loop here forever.
-        # `os.path.realpath` reports ELOOP by giving up and returning the path
-        # unchanged, so the guard has to be ours. The source could not have been
-        # read through such a chain anyway; block rather than spin.
+        # A cyclic component would loop here forever, and `os.path.realpath` will
+        # not say so: it gives up and hands back a path that is *not* resolved —
+        # `a -> a` unchanged, `a -> a/x` one component longer every time. The
+        # second shape is why this is a **budget**, not a seen-set: with the target
+        # growing, no (link, rest) state ever recurs, so a repeat-detector spins.
         #
-        # Keyed on the *state* — the link plus what is left to walk — not on the
-        # link alone. Each hop consumes at least one of `rest`, and a resolved
-        # target contributes no further links, so the only way to spin is for the
-        # whole state to recur; a repeat is therefore a cycle by construction. The
-        # spelled link alone is not: `self -> .` walked as `self/self/x.c` reaches
-        # the same component twice with a shorter `rest` each time, terminates,
-        # and must not be turned into a blocking `error` on a path the kernel
-        # resolves fine.
-        state = (link, tuple(rest))
-        if state in hopped:
+        # The budget is the kernel's own: `MAXSYMLINKS` traversals for one path
+        # resolution. Anything past it could not have been `open`ed either — this
+        # walk only runs for a source already read — so blocking is the honest
+        # answer, and it leaves room for the legitimate repeat this must not
+        # reject (`self -> .` walked as `self/self/x.c` visits one component
+        # twice, and the kernel counts that the same way).
+        hops += 1
+        if hops > _MAX_SYMLINK_HOPS:
             raise OSError(errno.ELOOP, "symlinked directory component loops", link)
-        hopped.add(state)
         target = os.path.realpath(link)
         # Deduped: the same component can legitimately be reached twice (the
         # `self -> .` walk again), and staging one plan entry twice would raise
