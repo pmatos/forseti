@@ -419,24 +419,28 @@ def _enclosing_name(stack: list[_AstNode]) -> str:
 
 
 def parse_address_escapes(ast_text: str, symbol: str) -> tuple[str, ...]:
-    """Sites where `symbol`'s **address** is taken rather than called, by name.
+    """Sites naming `symbol` **outside a direct call**, by enclosing declaration.
 
     A function whose address is stored in a pointer can be invoked through it
     from anywhere in the translation unit, and an indirect ``fp(...)`` names only
     the *variable* — so no `Unit.calls` edge leads back to `symbol` and the caller
-    enumeration silently misses that path. This reports the escapes so
+    enumeration silently misses that path. This reports those sites so
     compositional discharge (RFC-0003 S3) can withhold its upgrade instead:
     ``static cb_t fp = f;`` at file scope yields ``fp``, an ``fp = f`` inside a
     body yields the enclosing function.
+
+    The test is deliberately on *position*, not on node kind: clang prints the
+    same ``Function 0x… 'name'`` reference wherever a function is named without
+    being called, so ``char c __attribute__((cleanup(f)))`` — a call at scope exit
+    that no expression in the AST spells — is caught by the same rule as an
+    address-of, and so is any attribute of that shape we have not seen yet.
 
     A *direct* call is not an escape, however it is written (`_is_call_callee`),
     including the recursive call in ``symbol``'s own body — otherwise every
     recursive unit would be permanently undischargeable.
     """
     sites: dict[str, None] = {}
-    for stack, kind, rest, _file in _walk(ast_text):
-        if kind != "DeclRefExpr":
-            continue
+    for stack, _kind, rest, _file in _walk(ast_text):
         referenced = _CALLEE_RE.search(rest)
         if referenced is None or referenced.group(1) != symbol:
             continue
@@ -456,14 +460,31 @@ def parse_symbol_aliases(ast_text: str, symbol: str) -> tuple[str, ...]:
     upgrade, rather than claiming a set of callers that was complete only for one
     of the function's names.
 
-    Only ``AliasAttr`` is read. Any other way a symbol can acquire a second name
-    is, by the same argument, a hole — one we would rather leave visible here than
-    paper over with a guess about attributes we have not measured.
+    An **assembly label** (``static void fa(int *) __asm__("impl")`` next to an
+    ``f`` labelled the same) is the same identity by a different route: the label,
+    not the C name, is what the linker joins, so two declarations sharing one are
+    one function. Clang prints ``AsmLabelAttr <loc> "impl"`` on each, which is why
+    the labels are collected per declaration and matched against `symbol`'s own
+    rather than being read as a name.
+
+    What this does *not* cover is a function named by an attribute rather than
+    aliased by one — a ``cleanup`` handler, say. That is `parse_address_escapes`'
+    job: clang prints those as an ordinary ``Function 0x… 'name'`` reference, and
+    a reference outside a direct call already opens the caller set.
     """
     aliases: dict[str, None] = {}
+    labels: dict[str, set[str]] = {}
     for stack, kind, rest, _file in _walk(ast_text):
         if kind == "AliasAttr" and symbol in _TARGET_NAME_RE.findall(rest):
             aliases[_enclosing_name(stack)] = None
+        elif kind == "AsmLabelAttr":
+            labels.setdefault(_enclosing_name(stack), set()).update(
+                _TARGET_NAME_RE.findall(rest)
+            )
+    shared = labels.get(symbol, set())
+    for name, own in labels.items():
+        if name != symbol and own & shared:
+            aliases[name] = None
     return tuple(aliases)
 
 

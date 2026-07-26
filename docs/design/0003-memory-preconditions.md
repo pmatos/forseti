@@ -280,9 +280,12 @@ direct call's callee — a file‑scope initialiser, an `&f`, an `fp = f`, a cal
 them apart by AST *position* (a callee is the first child of its `CallExpr`, however it is
 parenthesised or dereferenced; an argument is not), and each becomes an `UNRESOLVED` entry that
 withholds the upgrade. An unfamiliar shape counts as an escape, so the failure direction is a
-withheld discharge and never a claimed one. A GNU `__attribute__((alias("f")))` opens the set the
-same way and for the same reason — the alias *is* `f` at link time, but a call written through it
-references only the alias, so `parse_symbol_aliases` reports it and the upgrade is withheld too. The
+withheld discharge and never a claimed one — and because the test is on *position* rather than node
+kind, it covers every way clang prints a function being named without being called, including an
+attribute like a `cleanup` handler whose call at scope exit no expression in the AST spells. A second
+*name* for the callee opens the set for the adjacent reason — the alias **is** `f` at link time, but
+a call written through it references only the alias — so `parse_symbol_aliases` reports a GNU
+`alias` attribute and a shared `__asm__` label (the linker joins on the label, not the C name). The
 consequence, stated plainly: a function in a dispatch table is permanently `ASSUMED_VERIFIED` here —
 which is the honest reading, since it really can be invoked from anywhere in the TU with anything.
 Resolving an indirect call to its targets is L1/S4 work.

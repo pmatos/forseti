@@ -369,6 +369,36 @@ def test_an_alias_opens_the_caller_set(tmp_path: Path) -> None:
     assert "another name for sum_bytes()" in result.label
 
 
+_CLEANUP_HANDLER = """\
+#include <stddef.h>
+#include <stdint.h>
+
+static void zero_byte(uint8_t *p) { *p = 0; }
+
+void with_cleanup(void) {
+    uint8_t c __attribute__((cleanup(zero_byte))) = 1;
+    (void)c;
+}
+
+void clean(uint8_t *q) { zero_byte(q); }
+"""
+
+
+def test_a_cleanup_handler_opens_the_caller_set(tmp_path: Path) -> None:
+    # `with_cleanup` calls `zero_byte` at scope exit, and no expression in the AST
+    # spells that call — clang prints it as an attribute on the variable. Upgrading
+    # on the strength of `clean` alone would claim a caller set that never included
+    # the scope-exit invocation.
+    src = tmp_path / "cleanup.c"
+    src.write_text(_CLEANUP_HANDLER)
+    result = discharge_precondition(src, function="zero_byte", max_len=MAX_LEN)
+    assert result.assessment is Assessment.ASSUMED_VERIFIED, result.label
+    outcomes = {c.caller: c.outcome for c in result.callers}
+    assert outcomes["clean"] is CallerOutcome.DISCHARGED
+    assert outcomes["c"] is CallerOutcome.UNRESOLVED
+    assert "names zero_byte() outside a direct call" in result.label
+
+
 _PUBLIC_LEAF = """\
 #include <stddef.h>
 #include <stdint.h>
@@ -434,4 +464,4 @@ def test_an_escaped_address_withholds_the_upgrade(tmp_path: Path) -> None:
     outcomes = {c.caller: c.outcome for c in result.callers}
     assert outcomes["frame_checksum"] is CallerOutcome.DISCHARGED
     assert outcomes["dispatch"] is CallerOutcome.UNRESOLVED
-    assert "takes the address of sum_bytes()" in result.label
+    assert "names sum_bytes() outside a direct call" in result.label

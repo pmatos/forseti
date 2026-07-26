@@ -322,7 +322,7 @@ def test_an_escaped_address_withholds_the_upgrade(tmp_path: Path) -> None:
     assert result.assessment is Assessment.ASSUMED_VERIFIED
     unresolved = [c for c in result.callers if c.caller == "fp"]
     assert unresolved and unresolved[0].outcome is CallerOutcome.UNRESOLVED
-    assert "takes the address of sum_bytes()" in result.label
+    assert "names sum_bytes() outside a direct call" in result.label
     # the caller that *was* checked still reports what it established
     assert any(c.outcome is CallerOutcome.DISCHARGED for c in result.callers)
 

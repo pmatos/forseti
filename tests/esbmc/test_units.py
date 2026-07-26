@@ -778,6 +778,43 @@ def test_parse_symbol_aliases_ignores_an_alias_to_another_symbol() -> None:
     assert parse_symbol_aliases(_ALIAS_AST, "client") == ()
 
 
+# Two more attribute-borne paths esbmc 8.3.0 prints: a `cleanup` handler, which
+# clang renders as an ordinary `Function 0x… 'name'` reference on the variable
+# (so it is a *reference outside a call*, not an alias), and a shared `__asm__`
+# label, which is one function under two C names with no reference at all.
+_ATTRIBUTE_PATH_AST = """\
+TranslationUnitDecl 0xa000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0xa001 </tmp/foo.c:1:1, col:42> col:13 used leaf 'void (int *)' static
+| |-ParmVarDecl 0xa002 <col:15, col:20> col:20 used p 'int *'
+| |-CompoundStmt 0xa003 <col:30, col:42>
+| `-AsmLabelAttr 0xa004 <col:39> "impl_sym" IsLiteralLabel
+|-FunctionDecl 0xa010 <line:2:1, col:50> col:13 used twin 'void (int *)' static
+| |-ParmVarDecl 0xa011 <col:15, col:20> col:20 p 'int *'
+| `-AsmLabelAttr 0xa012 <col:40> "impl_sym" IsLiteralLabel
+`-FunctionDecl 0xa020 <line:3:1, col:71> col:6 scope 'void (void)'
+  `-CompoundStmt 0xa021 <col:15, col:71>
+    `-DeclStmt 0xa022 <col:17, col:60>
+      `-VarDecl 0xa023 <col:17, col:59> col:22 used c 'char' cinit
+        `-CleanupAttr 0xa024 <col:38, col:53> Function 0xa001 'leaf' 'void (i)'
+"""
+
+
+def test_a_cleanup_handler_is_a_reference_outside_a_call() -> None:
+    # `char c __attribute__((cleanup(leaf)))` calls `leaf` at scope exit, and no
+    # expression in the AST spells that call — but clang still prints the same
+    # `Function 0x…` reference an address-of would, which is why the escape scan
+    # tests *position* rather than node kind.
+    assert parse_address_escapes(_ATTRIBUTE_PATH_AST, "leaf") == ("c",)
+
+
+def test_a_shared_assembly_label_makes_two_names_one_function() -> None:
+    # The linker joins on the label, not the C name, so a call to `twin` reaches
+    # `leaf` while referencing neither it nor its address.
+    assert parse_symbol_aliases(_ATTRIBUTE_PATH_AST, "leaf") == ("twin",)
+    assert parse_symbol_aliases(_ATTRIBUTE_PATH_AST, "twin") == ("leaf",)
+    assert parse_symbol_aliases(_ATTRIBUTE_PATH_AST, "scope") == ()
+
+
 def test_parse_address_escapes_keeps_a_reference_it_cannot_name() -> None:
     # A reference under no named declaration is still a reference; naming it
     # `<file scope>` keeps the escape (and the withheld discharge) rather than

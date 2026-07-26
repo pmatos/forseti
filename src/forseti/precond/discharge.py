@@ -55,14 +55,17 @@ reads the ``static`` marker off the same clang dump.
 so a body that calls ``fp(...)`` references the *variable* and no edge leads back
 to whatever ``fp`` holds: a ``static cb_t fp = f;`` plus one indirect call is a
 caller of ``f`` that no enumeration built from `Unit.calls` will ever list. So the
-upgrade is withheld whenever `parse_address_escapes` finds ``f``'s address taken
-rather than called (``UNRESOLVED``) — the caller set is not enumerable, and a
-sweep of the callers we *could* see says nothing about the ones we could not.
+upgrade is withheld whenever `parse_address_escapes` finds ``f`` named outside a
+direct call (``UNRESOLVED``) — an address taken, or an attribute like a
+``cleanup`` handler, which clang prints as the same kind of reference. The caller
+set is then not enumerable, and a sweep of the callers we *could* see says
+nothing about the ones we could not.
 That makes a function in a dispatch table permanently ``ASSUMED_VERIFIED``, which
 is the honest reading: it really can be invoked from anywhere in the TU with
-anything. A GNU ``__attribute__((alias("f")))`` opens the set the same way and for
-the same reason — a call written through the alias references only *its* name —
-so `parse_symbol_aliases` withholds too. Following an indirect call to its
+anything. A second *name* for the callee opens the set the same way and for the
+same reason — a call written through it references only that name — so
+`parse_symbol_aliases` withholds for a GNU ``alias`` attribute and for a shared
+``__asm__`` label alike. Following an indirect call to its
 targets is L1/S4 work.
 
 **A recursive callee is a call site of itself.** Asserting at the entry rather than
@@ -437,9 +440,10 @@ def _discharge(
             CallerCheck(
                 site,
                 CallerOutcome.UNRESOLVED,
-                f"takes the address of {function}() rather than calling it, so an "
-                "indirect call the caller enumeration cannot follow may reach it from "
-                "anywhere in this translation unit",
+                f"names {function}() outside a direct call — an address taken, or "
+                "an attribute such as a cleanup handler — so a call path the "
+                "enumeration cannot follow may reach it from anywhere in this "
+                "translation unit",
             )
             for site in escaped
         )
@@ -447,9 +451,9 @@ def _discharge(
             CallerCheck(
                 name,
                 CallerOutcome.UNRESOLVED,
-                f"is another name for {function}() (an alias attribute), and a call "
-                "written through it references only that name, so its callers are not "
-                "in the set that was checked",
+                f"is another name for {function}() (an alias attribute or a shared "
+                "assembly label), and a call written through it references only "
+                "that name, so its callers are not in the set that was checked",
             )
             for name in aliased
         )
