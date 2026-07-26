@@ -176,12 +176,9 @@ def _loc_line(rest: str, current: int) -> int:
     if not match:
         return current
     parts = match.group(1).split(":")
-    if parts[0] == "col" or len(parts) < 2:
-        return current
-    try:
+    if len(parts) >= 2 and parts[0] != "col" and parts[-2].isdecimal():
         return int(parts[-2])
-    except ValueError:
-        return current
+    return current
 
 
 def _depth(art: str) -> int:
