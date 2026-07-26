@@ -1,6 +1,8 @@
-"""Acceptance: the memory-precondition gate over the sha1 corpus (RFC-0003 S2).
+"""Acceptance: the memory-precondition gate over the corpus (RFC-0003 S2 + S3).
 
-The issue's exit criteria, pinned end-to-end against the real esbmc binary:
+The issues' exit criteria, pinned end-to-end against the real esbmc binary.
+
+S2 (#125), over ``examples/sha1.c``:
 
 - ``sha1_init/update/final/transform`` each reach **ASSUMED_VERIFIED** up to
   ``max_len`` under their synthesised precondition (a fresh ``sha1_ctx``, a
@@ -9,6 +11,14 @@ The issue's exit criteria, pinned end-to-end against the real esbmc binary:
 - the off-by-one twin ``sha1_bug.c::sha1_update`` (``i <= len`` reads
   ``data[len]``) is **VIOLATED** with a real ``array bounds violated``
   counterexample — a non-vacuous failure, not a phantom.
+
+S3 (#126), over ``examples/frame_checksum.c``:
+
+- a correct caller makes ``sum_bytes``'s assumed precondition **discharged**,
+  not merely assumed;
+- the twin whose caller drops its short-frame guard is **VIOLATED at the call
+  site**, naming the caller — while the callee itself is untouched and its
+  sibling caller still discharges.
 
 Skipped when esbmc is not on PATH, exactly like `test_corpus.py`; CI installs a
 pinned esbmc so it always runs there.
@@ -21,7 +31,12 @@ from pathlib import Path
 
 import pytest
 
-from forseti.precond import Assessment, verify_precondition
+from forseti.precond import (
+    Assessment,
+    CallerOutcome,
+    discharge_precondition,
+    verify_precondition,
+)
 
 pytestmark = pytest.mark.skipif(
     shutil.which("esbmc") is None, reason="esbmc binary not on PATH"
@@ -115,3 +130,90 @@ def test_static_minimum_floor_still_explores_the_weakest_caller(
     assert result.esbmc_result is not None
     raw = getattr(result.esbmc_result, "raw_counterexample", "")
     assert "array bounds violated" in raw
+
+
+def _discharge(name: str, function: str = "sum_bytes"):  # type: ignore[no-untyped-def]
+    return discharge_precondition(EXAMPLES / name, function=function, max_len=MAX_LEN)
+
+
+def test_correct_callers_discharge_the_precondition() -> None:
+    # The S3 exit criterion: not "VERIFIED assuming valid caller pointers" but
+    # VERIFIED *because every caller was proven to supply them*.
+    result = _discharge("frame_checksum.c")
+    assert result.assessment is Assessment.DISCHARGED_VERIFIED, result.label
+    assert "discharged" in result.label
+    assert {c.caller for c in result.callers} == {
+        "frame_checksum",
+        "payload_checksum",
+    }
+    assert all(c.outcome is CallerOutcome.DISCHARGED for c in result.callers)
+    # the upgrade is on top of a real S2 pass, never instead of one
+    assert result.unit_result.assessment is Assessment.ASSUMED_VERIFIED
+
+
+def test_a_bad_caller_is_violated_at_the_call_site() -> None:
+    # `payload_checksum` loses its short-frame guard, so `len - HEADER_BYTES`
+    # underflows and it asks `sum_bytes` for a span the frame does not have.
+    result = _discharge("frame_checksum_bug.c")
+    assert result.assessment is Assessment.VIOLATED, result.label
+    assert "payload_checksum()" in result.label
+    broken = {
+        c.caller
+        for c in result.callers
+        if c.outcome is CallerOutcome.OBLIGATION_VIOLATED
+    }
+    assert broken == {"payload_checksum"}
+    # the leaf is not at fault and its other caller still discharges
+    assert result.unit_result.assessment is Assessment.ASSUMED_VERIFIED
+    clean = {c.caller for c in result.callers if c.outcome is CallerOutcome.DISCHARGED}
+    assert clean == {"frame_checksum"}
+
+
+def test_the_users_source_is_never_modified() -> None:
+    # RFC-0003 OQ1: contracts are injected into a generated *copy*.
+    source = EXAMPLES / "frame_checksum.c"
+    before = source.read_text()
+    _discharge("frame_checksum.c")
+    assert source.read_text() == before
+
+
+def test_a_unit_with_no_caller_here_stays_honestly_assumed() -> None:
+    # Nothing in sha1.c calls sha1_update, so this TU discharges nothing about
+    # it — the obligation is exported to its clients, and saying otherwise would
+    # be the over-claim S3 exists to prevent.
+    result = discharge_precondition(
+        EXAMPLES / "sha1.c", function="sha1_update", max_len=MAX_LEN
+    )
+    assert result.assessment is Assessment.ASSUMED_VERIFIED, result.label
+    assert result.callers == ()
+    assert "no caller" in result.label
+
+
+_BARE_POINTER_CALLER = """\
+#include <stddef.h>
+#include <stdint.h>
+
+uint32_t sum_bytes(const uint8_t *buf, size_t len) {
+    uint32_t acc = 0;
+    for (size_t i = 0; i < len; i++) acc += buf[i];
+    return acc;
+}
+
+uint32_t hash_block(const uint8_t *blk) {
+    return sum_bytes(blk, 16);
+}
+"""
+
+
+def test_an_underdetermined_caller_is_not_a_phantom_violation(tmp_path: Path) -> None:
+    # `hash_block` is *correct code* whose contract ("blk points to a 16-byte
+    # block") its signature does not state, so L0 materialises it as one byte and
+    # the obligation cannot hold. Reporting VIOLATED would move RFC-0003's phantom
+    # from the callee to the call site; the honest answer is that this caller
+    # discharges nothing and nobody is accused.
+    src = tmp_path / "block.c"
+    src.write_text(_BARE_POINTER_CALLER)
+    result = discharge_precondition(src, function="sum_bytes", max_len=MAX_LEN)
+    assert result.assessment is Assessment.ASSUMED_VERIFIED, result.label
+    assert result.callers[0].outcome is CallerOutcome.UNDERDETERMINED
+    assert "hash_block" in result.label

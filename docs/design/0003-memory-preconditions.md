@@ -141,6 +141,10 @@ harnesses are the **fallback** for what `is_fresh` can't express and the **fast 
 *Open question:* keeping contracts out of the user's source implies verifying a **generated copy**
 of the translation unit with contracts injected — acceptable, but to be prototyped in Stage 3.
 
+> **Superseded by measurement in S3 (see below).** The "Maturity note" row was optimistic: on our
+> pinned esbmc 8.3.0 the contract *vehicle* cannot carry a memory precondition at all, so discharge
+> landed on an injected obligation instead. The generated‑copy idea survived intact.
+
 ## Reframing "no gaps"
 
 We can fully close the **pointer‑provenance** gap. Two gaps are irreducible and are handled by
@@ -161,7 +165,7 @@ Q.E.D.‑up‑to‑k vocabulary. Anything stronger over‑claims.
 |---|---|---|
 | **S1** | **Stop the phantoms.** Signature‑based `NEEDS_CONTRACT`; don't feed the havoc cex back as fixable; non‑blocking residual. | Unblocks the demo today; ends the thrash. |
 | **S2** ✅ | **L0 mechanical synthesis + right ESBMC config** (assertions ON, k‑ladder, non‑vacuity). Sidecar harness for scalar `T*` / `ptr,len` / `T p[N]`. | sha1's pointer units **verify** (assumed, up to MAX_LEN). Demo lands. |
-| **S3** | **Compositional discharge** (`--replace-call-with-contract`); prototype transparent contract injection; upgrade "assumed" → "discharged". | Closes the soundness hole. |
+| **S3** ✅ | **Compositional discharge**; transparent contract injection; upgrade "assumed" → "discharged". | Closes the soundness hole. |
 | **S4** | **L1 structural inference** (context‑via‑init, aliasing, sentinels) — a structural analyzer, *not* the semantic proposer. | Genericity beyond the easy shapes. |
 | **S5** | **Unboundedness** via loop invariants, where "all lengths" matters. | Escapes the bound where it counts. |
 
@@ -192,21 +196,96 @@ touches all of `N`, and sizing at exactly `N` would phantom‑VIOLATE one that t
 elements when `length > N`. With `N` unreadable (`T p[static MACRO]`) there is no floor to raise the
 length to, so L0 declines instead.
 
+**S3 landed** ([#126](https://github.com/pmatos/forseti/issues/126)): `forseti discharge <source>
+--function NAME` runs S2 and then turns its assumption into an obligation. The *same* `UnitPlan`
+that sizes the sidecar's `malloc` renders a predicate injected into a **generated copy** of the
+translation unit at the unit's entry (`src/forseti/precond/synth.py::inject_obligations`), on the
+definition's own line so every other line number matches the user's file; every unit in the TU whose
+body references the callee (`Unit.calls`, read off the clang AST) is then verified through *its own*
+S2 sidecar against that copy, so the obligation is evaluated with that caller's actual arguments. A
+caller that passes an invalid or too‑small pointer is **VIOLATED at the call site**, named; a caller
+that passes a valid one **discharges** — but only after a site probe confirms it reaches the call at
+all, so a dead call site cannot discharge vacuously. The upgrade to `DISCHARGED_VERIFIED` **fails
+closed**: it requires that *every* caller was checked and every check passed. An unmaterialisable
+caller, an inconclusive ladder, an unreachable site, or no caller at all in this TU each leave the
+honest S2 verdict standing with a loud "discharge incomplete" (for the last case, the obligation is
+*exported* to the TU's clients — `examples/sha1.c` discharges nothing, and says so). Corpus:
+`examples/frame_checksum.c` / `_bug.c`, pinned by `tests/esbmc/test_precond_corpus.py`.
+
+**And it fails closed in the other direction — the phantom must not move to the call site.** The
+mirror‑image hazard of discharge is that the *caller* is itself an L0 unit. A caller whose signature
+states no extent (`void hash_block(const uint8_t *blk)` for a 16‑byte block) is materialised by the
+weakest fallback — one pointee — so it *cannot* satisfy a wider obligation however correct it is,
+and blaming it would flag working code: exactly the phantom VIOLATED this RFC exists to remove,
+relocated from the callee to the call site. So the discriminator is **length authority**: only a
+caller whose every pointer is sized by something the signature actually states (a companion length,
+a written array extent) can be `VIOLATED` at the call site; one carrying a bare `SCALAR_PTR` is
+`UNDERDETERMINED` — it withholds the upgrade without accusing anyone. Reading such a caller's true
+extent is L1's job (S4), and until then the honest S2 verdict stands. Deliberately conservative: a
+caller mixing an authoritative pointer with a bare one suppresses a possibly‑real finding rather
+than risk a phantom.
+
+**Exit codes remain a statement about the unit under discharge.** A caller that faults on a memory
+property of its own before the obligation is reached is reported loudly, with its counterexample,
+but the process status stays the callee's `ASSUMED_VERIFIED` 0 — that caller is a *different*
+verification unit and its own gate run is what should redden. Only a silent pass is forbidden, which
+is why every withheld discharge is spelled out in the label.
+
+**OQ1 answered — verify a generated copy.** Injecting into a copy works and keeps the promise S2
+made: `forseti discharge --emit-only` prints exactly what the checker sees, and the acceptance suite
+asserts the user's file is byte‑identical afterwards. Source annotations were never a live option
+(they would put Forseti's scaffolding in the user's repo); harness‑only cannot discharge at all.
+
+**OQ3 answered — the warning is *not* cosmetic, and it cost us the vehicle.** Measured against esbmc
+8.3.0 (pinned by `tests/esbmc/test_contract_vehicle.py`): a `__ESBMC_requires` over plain parameter
+arithmetic transplants correctly under `--replace-call-with-contract` (good caller SUCCESSFUL, bad
+caller FAILED — so the machinery itself works), but a `requires` whose expression contains an
+intrinsic **call** — `__ESBMC_is_fresh`, `__ESBMC_r_ok`, `__ESBMC_get_object_size` — is transplanted
+into the caller still referring to a callee‑local temporary that no longer exists. esbmc says
+`WARNING: Could not find definition for temporary variable: …return_value$___ESBMC_is_fresh$1` and
+then FAILS **every** call site regardless of what it passes; hoisting the intrinsic into a local
+first does not help. Under `--enforce-contract` the same `requires` simply has no effect, leaving
+the phantom VIOLATED S1 exists to remove. Both directions fail *closed* — never a false VERIFIED —
+but neither discharges anything, so `--replace-call-with-contract` is unusable for a **memory**
+precondition until our fork fixes the transplant. (`__ESBMC_same_object(p, p + n)` is no substitute:
+ESBMC's pointer arithmetic preserves object identity, so it cannot express an extent.)
+
+**The vehicle that does work, and what it gives up.** The obligation is an
+`__ESBMC_assert(<predicate>, "forseti:obligation:<fn>:<param>")` at the callee's entry, checking the
+same predicate against the same arguments a contract would. What that gives up is **modularity** —
+the callee's body is still explored — not soundness; and the label is what tells a caller‑side break
+from a bug inside the callee, so classification stays structural rather than counterexample‑prose
+matching. Two ESBMC quirks shape the predicate itself and are pinned as tests:
+`__ESBMC_r_ok(p, n)` answers *true* when `p`'s offset already lies past its object's end
+(`r_ok(malloc(8) + 9, 4)` passes), so the check is **rebased to offset zero** — ask for `offset + n`
+bytes from the object's base, where `r_ok` is exact — and guarded against a `size_t` wrap, since a
+caller's underflowed length (`len - HEADER`) would otherwise ask for a *tiny*, satisfiable span.
+`__ESBMC_get_object_size` would have expressed this directly but aborts without a verdict on exactly
+those pointers. `r_ok` is also *weaker* than `is_fresh` — it admits an interior pointer into a larger
+live object, which is what makes a caller like `payload_checksum(frame + 2, len - 2)` dischargeable
+at all — and it says nothing about write permission; ESBMC checks that separately (`dereference
+failure: write access to const object`) in the same run, because the callee's body is explored.
+
 ## Decisions (recommended) & open questions
 
 - **D1 — Structural, not functional.** Memory preconditions are synthesized by a dedicated
   signature‑driven module, **not** the LLM proposer/GEPA path. *(Recommended — settled with
   reviewers.)*
 - **D2 — Vehicle.** Contracts as the sound/compositional target; generated sidecar harnesses as
-  fallback + fast first step. *(Recommended.)*
+  fallback + fast first step. *(Recommended — **revised by S3**: ESBMC contracts cannot carry a
+  memory precondition on the pinned build, so the discharge vehicle is an injected obligation
+  asserted at the callee's entry. Sidecar harnesses remain the assumption side. See OQ3.)*
 - **D3 — Ship S2 before S3 with honest labeling** ("VERIFIED assuming valid caller pointers"),
   upgraded to discharged in S3. *(Recommended; alternative: hold S2 until discharge — never
   over‑claim vs. velocity.)*
-- **OQ1** — Transparent contract injection: verify a generated copy of the TU vs. accept
-  source annotations vs. harness‑only for the transparent path.
+- ~~**OQ1**~~ **— answered (S3): verify a generated copy of the TU.** Source annotations were never
+  live; harness‑only cannot discharge.
 - **OQ2** — `ptr,len` pairing heuristic robustness (multiple buffers; length in a struct; sentinel
   strings) — how much is L0 vs. L1.
-- **OQ3** — Validate the `is_fresh` temporary warning is cosmetic, not a soundness gap.
+- ~~**OQ3**~~ **— answered (S3): not cosmetic.** The temporary‑variable warning marks a transplant
+  failure that makes *any* intrinsic‑call `requires` unusable under `--replace-call-with-contract`
+  (and inert under `--enforce-contract`). Fails closed, discharges nothing. Fixing it in our fork
+  (ADR‑0004) would restore true modular discharge; until then the injected obligation stands.
 
 ## References
 

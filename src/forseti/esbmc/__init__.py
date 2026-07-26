@@ -26,7 +26,15 @@ from .result import (
     Violated,
 )
 from .runner import build_argv, classify, verify
-from .units import ListUnitsError, Param, Unit, list_units, parse_units
+from .units import (
+    ListUnitsError,
+    Param,
+    Unit,
+    find_definition_brace,
+    list_units,
+    mask_comments,
+    parse_units,
+)
 from .verify_cli import (
     add_esbmc_invocation_arguments,
     add_verify_arguments,
@@ -56,7 +64,9 @@ __all__ = [
     "add_verify_arguments",
     "build_argv",
     "classify",
+    "find_definition_brace",
     "list_units",
+    "mask_comments",
     "parse_counterexample",
     "parse_units",
     "render_result",

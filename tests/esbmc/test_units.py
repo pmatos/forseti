@@ -16,7 +16,9 @@ from forseti.esbmc.units import (
     Param,
     Unit,
     annotate_array_extents,
+    find_definition_brace,
     list_units,
+    mask_comments,
     parse_units,
 )
 
@@ -433,3 +435,62 @@ def test_list_units_raises_on_failed_parse(tmp_path: Path) -> None:
     bad.write_text("int f( {\n")  # malformed C → parse error
     with pytest.raises(ListUnitsError):
         list_units(bad)
+
+
+# --- the call set and the body locator (RFC-0003 S3) ---------------------------
+
+_CALLS_AST = """\
+TranslationUnitDecl 0x2000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0x2001 </tmp/foo.c:1:1, col:40> col:6 leaf 'void (int *)'
+| |-ParmVarDecl 0x2002 <col:12, col:18> col:18 used p 'int *'
+| `-CompoundStmt 0x2003 <col:24, col:40>
+`-FunctionDecl 0x2010 <line:2:1, col:60> col:6 caller 'void (int *)'
+  |-ParmVarDecl 0x2011 <col:12, col:18> col:18 used q 'int *'
+  `-CompoundStmt 0x2012 <col:24, col:60>
+    |-CallExpr 0x2013 <col:26, col:36> 'void'
+    | `-ImplicitCastExpr 0x2014 <col:26> 'void (*)(int *)' <FunctionToPointerDecay>
+    |   `-DeclRefExpr 0x2015 <col:26> 'void (int *)' Function 0x2001 'leaf' 'void (i)'
+    |-DeclRefExpr 0x2016 <col:31> 'int *' lvalue ParmVar 0x2011 'q' 'int *'
+    `-CallExpr 0x2017 <col:40, col:50> 'void'
+      `-DeclRefExpr 0x2018 <col:40> 'void (int *)' Function 0x2001 'leaf' 'void (i)'
+"""
+
+
+def test_parse_units_collects_the_call_set() -> None:
+    units = {u.name: u for u in parse_units(_CALLS_AST, _TARGET)}
+    assert units["caller"].calls == ("leaf",)  # deduped, and only *functions*
+    assert units["leaf"].calls == ()
+
+
+def test_annotate_array_extents_keeps_the_call_set() -> None:
+    unit = Unit("caller", (Param("q", "int *"),), ("leaf",))
+    out = annotate_array_extents([unit], "void caller(int *q){ leaf(q); }")[0]
+    assert out.calls == ("leaf",)
+
+
+def test_mask_comments_preserves_offsets_and_lines() -> None:
+    text = "int a; /* hidden {\n brace */ int b; // trailing {\nint c;\n"
+    masked = mask_comments(text)
+    assert len(masked) == len(text)
+    assert masked.count("\n") == text.count("\n")
+    assert "{" not in masked
+    assert masked.startswith("int a; ")
+
+
+def test_find_definition_brace_indexes_the_body_opener() -> None:
+    source = "/* f(int *p) { decoy } */\nvoid f(int *p) { *p = 0; }\n"
+    index = find_definition_brace(source, "f")
+    assert index is not None
+    assert source[index] == "{"
+    assert source[:index].count("\n") == 1  # the real one, not the comment's
+
+
+def test_find_definition_brace_skips_prototypes_and_call_sites() -> None:
+    source = "void f(int *p);\nvoid g(int *p) { f(p); }\nvoid f(int *p) { *p = 0; }\n"
+    index = find_definition_brace(source, "f")
+    assert index is not None
+    assert source[:index].count("\n") == 2
+
+
+def test_find_definition_brace_absent_without_a_definition() -> None:
+    assert find_definition_brace("void f(int *p);\n", "f") is None

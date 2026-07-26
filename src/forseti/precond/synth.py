@@ -35,6 +35,11 @@ accompanying length — is **UNRESOLVED**: L0 cannot justify a precondition, so 
 unit is reported ``NEEDS_CONTRACT`` (loud, non-blocking) rather than materialized
 wrongly. Rendering is pure (returns C text, no ESBMC, no disk); the verify
 driver owns the effects and the honest labeling.
+
+The same plan renders the *other half* of the story (S3, `inject_obligations`):
+the precondition the sidecar **assumes** by allocating, written into a generated
+copy of the translation unit as a **checked** obligation on every caller. One
+renderer, so the check can never be weaker or stronger than the assumption.
 """
 
 from __future__ import annotations
@@ -44,7 +49,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 
-from forseti.esbmc.units import Param, Unit
+from forseti.esbmc.units import Param, Unit, find_definition_brace
 
 # The default symbolic-length ceiling. A pointer sized by a symbolic length is
 # `malloc(len)` with `len <= max_len`; the loop that consumes it then needs an
@@ -59,6 +64,17 @@ DEFAULT_INCLUDES: tuple[str, ...] = ("stdlib.h",)
 # The property label the non-vacuity probe (`__ESBMC_assert(0, ...)`) carries, so
 # a reachable call site is a recognisable FAILED rather than an anonymous one.
 NON_VACUITY_LABEL = "forseti:non-vacuity"
+
+# Prefix of the label each injected *caller obligation* carries (RFC-0003 S3), so
+# a FAILED that is the caller breaking the precondition is told apart from one
+# that is a bug inside the callee. Followed by `<function>:<parameter>`.
+OBLIGATION_LABEL_PREFIX = "forseti:obligation:"
+
+# Prefix of the label the obligation *site* probe carries. It marks the callee's
+# entry with `__ESBMC_assert(0, ...)`: a caller that reaches the call makes it
+# FAIL, so a VERIFIED obligation run is credited only when the site was actually
+# reached — a dead call site would otherwise discharge vacuously.
+OBLIGATION_SITE_LABEL_PREFIX = "forseti:obligation-site:"
 
 # Parameter-name heuristics for the (pointer, length) idiom. A *byte length*
 # sizes the object in bytes; an *element count* sizes it in `sizeof(*p)` units.
@@ -97,6 +113,16 @@ class ParamRole(Enum):
     UNRESOLVED = "unresolved"  # L0 cannot justify a precondition → NEEDS_CONTRACT
 
 
+_POINTER_ROLES = frozenset(
+    {
+        ParamRole.SCALAR_PTR,
+        ParamRole.PTR_BYTE_LEN,
+        ParamRole.PTR_ELEM_COUNT,
+        ParamRole.FIXED_ARRAY,
+    }
+)
+
+
 @dataclass(frozen=True)
 class ParamPlan:
     """The materialisation plan for one parameter."""
@@ -127,6 +153,15 @@ class UnitPlan:
     def unresolved_params(self) -> tuple[str, ...]:
         """Names (or ``argN``) of the parameters L0 could not resolve."""
         return tuple(p.var for p in self.params if p.role is ParamRole.UNRESOLVED)
+
+    @property
+    def pointer_params(self) -> tuple[ParamPlan, ...]:
+        """The parameters materialised as objects — the ones a precondition binds.
+
+        A unit with none of these has an *empty* memory precondition: nothing was
+        assumed about a caller, so there is nothing to discharge.
+        """
+        return tuple(p for p in self.params if p.role in _POINTER_ROLES)
 
 
 def _var_name(index: int, param: Param) -> str:
@@ -318,16 +353,6 @@ def _pointer_alloc(plan: ParamPlan) -> str:
     raise SynthError(f"not a pointer plan: {plan.role}")  # pragma: no cover
 
 
-_POINTER_ROLES = frozenset(
-    {
-        ParamRole.SCALAR_PTR,
-        ParamRole.PTR_BYTE_LEN,
-        ParamRole.PTR_ELEM_COUNT,
-        ParamRole.FIXED_ARRAY,
-    }
-)
-
-
 def render_sidecar(
     plan: UnitPlan,
     source_include: str,
@@ -356,7 +381,7 @@ def render_sidecar(
         )
 
     scalars = [p for p in plan.params if p.role in (ParamRole.SCALAR, ParamRole.LENGTH)]
-    pointers = [p for p in plan.params if p.role in _POINTER_ROLES]
+    pointers = plan.pointer_params
 
     # One prototype per distinct scalar type; ESBMC treats an undefined `nondet_*`
     # as an unconstrained value of its return type.
@@ -387,3 +412,104 @@ def render_sidecar(
     lines.append("    return 0;")
     lines.append("}")
     return "\n".join(lines) + "\n"
+
+
+def obligation_expr(plan: ParamPlan) -> str:
+    """The C predicate a caller must satisfy for one pointer parameter (pure).
+
+    The *same* size expression the sidecar allocates, turned from an assumption
+    into a check: where S2 writes ``malloc(len)`` to materialise a valid object,
+    S3 demands the caller supplied one that big. Reusing `_pointer_alloc` is
+    load-bearing — an obligation weaker than the assumption would discharge
+    nothing, and one stronger would reject valid callers.
+
+    ``__ESBMC_r_ok`` rather than ``__ESBMC_is_fresh`` because it is what esbmc
+    8.3.0 can actually *check*, and because it is the weaker, more honest
+    obligation: it admits an interior pointer into a larger live object, which a
+    caller may legitimately pass. (`is_fresh` is unusable here for a second
+    reason — the contract machinery cannot transplant an intrinsic call's
+    temporary into the checking context; RFC-0003 OQ3, pinned by
+    `tests/esbmc/test_contract_vehicle.py`.)
+
+    The expression **rebases to the object start** rather than calling
+    ``r_ok(p, n)`` directly, which is not a stylistic choice: on our pinned build
+    ``r_ok`` answers *true* for a pointer whose offset already lies past its
+    object's end (``r_ok(malloc(1) + 2, 4)`` passes), so the direct form would
+    silently discharge exactly the caller bug that matters — a run-off interior
+    pointer. Asking instead for ``offset + n`` bytes *from offset zero*, where
+    ``r_ok`` is exact, restores the intended meaning. The two guards in front are
+    equally load-bearing: a negative offset is not a rebasable pointer, and
+    ``offset + n`` wrapping around ``size_t`` (a caller's underflowed length,
+    the classic ``len - HEADER`` bug) would otherwise ask for a *tiny* span and
+    pass.
+    """
+    ptr = f"(const void *){plan.var}"
+    offset = f"__ESBMC_POINTER_OFFSET({ptr})"
+    size = f"(__SIZE_TYPE__)({_pointer_alloc(plan)})"
+    span = f"((__SIZE_TYPE__){offset} + {size})"
+    base = f"(void *)((const char *){plan.var} - {offset})"
+    return f"({offset} >= 0 && {span} >= {size} && __ESBMC_r_ok({base}, {span}))"
+
+
+def _obligation_targets(plan: UnitPlan) -> tuple[ParamPlan, ...]:
+    """The pointer parameters an injected obligation can name, or raise.
+
+    Injection writes C *inside the callee's body*, so every identifier it uses
+    must be a real parameter name. A pointer the signature left unnamed is
+    spelled ``argN`` by the sidecar — fine there, since the sidecar declares it,
+    but unwritable here. Rather than inject a reference to a name that does not
+    exist, decline: the driver reports ``NEEDS_CONTRACT``. Only the pointers need
+    checking; a length is paired by *name*, so an unnamed parameter is never one.
+    """
+    if not plan.resolvable:
+        raise SynthError(
+            f"{plan.unit.name}: unresolved parameters {plan.unresolved_params}"
+        )
+    pointers = plan.pointer_params
+    unnameable = tuple(p.var for p in pointers if not p.param.name)
+    if unnameable:
+        raise SynthError(
+            f"{plan.unit.name}: cannot inject an obligation naming unnamed "
+            f"parameter(s) {unnameable}"
+        )
+    return pointers
+
+
+def inject_obligations(
+    source_text: str, plan: UnitPlan, *, site_probe: bool = False
+) -> str:
+    """`source_text` with `plan`'s memory precondition injected as caller checks.
+
+    The *transparent contract injection* of RFC-0003 OQ1: the returned text is a
+    **generated copy** of the translation unit, so the user's file stays pristine
+    (S2's promise) while the callee carries a checkable obligation. One labelled
+    ``__ESBMC_assert`` per pointer parameter is inserted immediately after the
+    definition's ``{``, on that same line — so every line number in the copy
+    matches the original and a counterexample reads against the user's source.
+
+    Verified from a *caller's* entry point, each assert is evaluated with that
+    caller's actual arguments: an invalid or too-small pointer FAILS the callee's
+    obligation rather than producing a dereference failure attributable to the
+    callee. With `site_probe` the obligations are replaced by a single
+    ``__ESBMC_assert(0, ...)`` marking the entry, which a caller that reaches the
+    call makes FAIL — the reachability discharge that keeps a dead call site from
+    passing vacuously.
+
+    Raises `SynthError` when the plan has an unresolved or unnameable parameter,
+    or when no definition of the unit is isolable in `source_text`.
+    """
+    pointers = _obligation_targets(plan)
+    function = plan.unit.name
+    brace = find_definition_brace(source_text, function)
+    if brace is None:
+        raise SynthError(f"no definition of {function}() found in the source text")
+    if site_probe:
+        checks = [f'__ESBMC_assert(0, "{OBLIGATION_SITE_LABEL_PREFIX}{function}");']
+    else:
+        checks = [
+            f"__ESBMC_assert({obligation_expr(p)}, "
+            f'"{OBLIGATION_LABEL_PREFIX}{function}:{p.var}");'
+            for p in pointers
+        ]
+    injected = "".join(f" {check}" for check in checks)
+    return source_text[: brace + 1] + injected + source_text[brace + 1 :]

@@ -119,6 +119,88 @@ def test_synth_macro_array_extent_needs_contract_not_violated(
     assert "NEEDS_CONTRACT" in capsys.readouterr().out
 
 
+# --- forseti discharge (compositional discharge, RFC-0003 S3) ---------------
+
+
+def test_discharge_upgrades_a_clean_translation_unit(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(
+        ["discharge", str(EXAMPLES / "frame_checksum.c"), "--function", "sum_bytes"]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "discharged" in out
+    # each caller is reported by name, not folded into a bare verdict
+    assert "frame_checksum(): discharged" in out
+    assert "payload_checksum(): discharged" in out
+
+
+def test_discharge_bad_caller_exits_one_and_names_it(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = main(
+        ["discharge", str(EXAMPLES / "frame_checksum_bug.c"), "--function", "sum_bytes"]
+    )
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "VIOLATED at the call site" in out
+    assert "payload_checksum(): obligation_violated" in out
+
+
+def test_discharge_json_payload(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(
+        [
+            "discharge",
+            str(EXAMPLES / "frame_checksum.c"),
+            "--function",
+            "sum_bytes",
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["assessment"] == "discharged_verified"
+    assert payload["discharged"] is True
+    assert payload["assumed"] is False
+    assert {c["caller"] for c in payload["callers"]} == {
+        "frame_checksum",
+        "payload_checksum",
+    }
+
+
+def test_discharge_emit_only_prints_the_injected_copy(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = EXAMPLES / "frame_checksum.c"
+    before = source.read_text()
+    code = main(["discharge", str(source), "--function", "sum_bytes", "--emit-only"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "forseti:obligation:sum_bytes:buf" in out
+    assert source.read_text() == before  # the user's file stays pristine
+
+
+def test_discharge_needs_contract_exits_five(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src = tmp_path / "opaque.c"
+    src.write_text("void g(void *p) { (void)p; }\n")
+    code = main(["discharge", str(src), "--function", "g"])
+    assert code == 5
+    assert "NEEDS_CONTRACT" in capsys.readouterr().out
+
+
+def test_discharge_emit_only_declines_an_unsynthesisable_unit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src = tmp_path / "opaque.c"
+    src.write_text("void g(void *p) { (void)p; }\n")
+    code = main(["discharge", str(src), "--function", "g", "--emit-only"])
+    assert code == 5
+    assert capsys.readouterr().out == ""
+
+
 # --- forseti list-units (authoritative unit enumeration, #131) ---------------
 
 

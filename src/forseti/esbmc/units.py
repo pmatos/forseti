@@ -44,9 +44,14 @@ _NAME_RE = re.compile(r"\s(\w+)\s+'")
 # so the *last* match is the canonical (typedef-resolved) type.
 _TYPE_RE = re.compile(r"'([^']*)'")
 
-# Line (`// ...`) and block (`/* ... */`) comments, stripped before harvesting an
+# Line (`// ...`) and block (`/* ... */`) comments, blanked before harvesting an
 # array extent so a `[N]` inside a comment can never be misread as a declarator.
 _COMMENT_RE = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
+
+# A `DeclRefExpr` naming a function: clang prints `Function 0x<addr> '<name>'`.
+# Matches a direct call's callee and an address-of, which is why `Unit.calls` is
+# documented as *referenced*, not *called* — an over-approximation.
+_CALLEE_RE = re.compile(r"\bFunction 0x[0-9a-fA-F]+ '(\w+)'")
 
 # A named parameter's array declarator: the name followed by *all* its consecutive
 # `[...]` groups, captured together (whitespace between them included) so a
@@ -126,10 +131,20 @@ class Param:
 
 @dataclass(frozen=True)
 class Unit:
-    """A function *definition* found in the source: its name and parameters."""
+    """A function *definition* found in the source: its name and parameters.
+
+    `calls` names the functions this definition's body *references* — every
+    callee of a direct call, plus any function whose address is merely taken
+    (both print the same ``Function 0x… 'name'`` reference in the AST). It is
+    therefore an over-approximation, which is the safe direction for its user:
+    compositional discharge (RFC-0003 S3) verifies every caller of a unit, so a
+    spurious edge costs one extra verification while a missing one would let an
+    undischarged obligation pass as discharged.
+    """
 
     name: str
     params: tuple[Param, ...]
+    calls: tuple[str, ...] = ()
 
     @property
     def takes_pointer(self) -> bool:
@@ -175,10 +190,10 @@ def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
 
     Walks the textual AST tracking the current file; for each ``FunctionDecl`` in
     `source` it collects the immediate ``ParmVarDecl`` children (with their
-    canonical types) and keeps the unit only if the subtree contains a
-    ``CompoundStmt`` — i.e. it is a *definition*, not a prototype (so a header of
-    declarations yields nothing, matching what the gate can verify). Deduped by
-    name, first definition wins.
+    canonical types), every function the subtree *references* (`Unit.calls`), and
+    keeps the unit only if the subtree contains a ``CompoundStmt`` — i.e. it is a
+    *definition*, not a prototype (so a header of declarations yields nothing,
+    matching what the gate can verify). Deduped by name, first definition wins.
     """
     # Attribute a function to `source` by a normalized full-path match against
     # clang's location (clang echoes the input path verbatim), so a definition
@@ -194,13 +209,14 @@ def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
     fn_depth = -1
     fn_in_target = False
     params: list[Param] = []
+    calls: dict[str, None] = {}  # an ordered set of referenced function names
     is_definition = False
 
     def flush() -> None:
         nonlocal fn_name
         if fn_name and fn_in_target and is_definition and fn_name not in seen:
             seen.add(fn_name)
-            units.append(Unit(fn_name, tuple(params)))
+            units.append(Unit(fn_name, tuple(params), tuple(calls)))
         fn_name = None
 
     for line in ast_text.splitlines():
@@ -224,6 +240,7 @@ def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
                 os.path.normpath(current_file) == source_norm
             )
             params = []
+            calls = {}
             is_definition = False
         elif fn_name is not None and depth > fn_depth:
             if kind == "ParmVarDecl" and depth == fn_depth + 1:
@@ -237,13 +254,35 @@ def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
                 )
             elif kind == "CompoundStmt":
                 is_definition = True
+            elif kind == "DeclRefExpr":
+                callee = _CALLEE_RE.search(rest)
+                if callee is not None:
+                    calls[callee.group(1)] = None
 
     flush()
     return units
 
 
-def _param_list_text(source_no_comments: str, fn_name: str) -> str | None:
-    """The parameter-list text of `fn_name`'s *definition*, or ``None``.
+def mask_comments(source_text: str) -> str:
+    """`source_text` with every comment blanked out, **preserving every offset**.
+
+    Each comment character becomes a space (newlines kept, so line numbering is
+    untouched), rather than the whole comment collapsing to one space. Length
+    preservation is what lets an index found in the masked text be used verbatim
+    against the original — which `find_definition_brace` relies on to inject
+    text at an exact position in the user's source.
+    """
+
+    def blank(match: re.Match[str]) -> str:
+        return "".join("\n" if ch == "\n" else " " for ch in match.group(0))
+
+    return _COMMENT_RE.sub(blank, source_text)
+
+
+def _definition_signature(
+    source_no_comments: str, fn_name: str
+) -> tuple[str, int] | None:
+    """`fn_name`'s definition: its parameter-list text and its ``{`` index.
 
     Scans for ``fn_name (`` and balances parentheses to the matching ``)``; the
     occurrence whose ``)`` is followed (past whitespace) by ``{`` is the
@@ -270,8 +309,21 @@ def _param_list_text(source_no_comments: str, fn_name: str) -> str | None:
         while k < len(source_no_comments) and source_no_comments[k].isspace():
             k += 1
         if k < len(source_no_comments) and source_no_comments[k] == "{":
-            return source_no_comments[match.end() : j]
+            return source_no_comments[match.end() : j], k
     return None
+
+
+def find_definition_brace(source_text: str, fn_name: str) -> int | None:
+    """Index of the ``{`` opening `fn_name`'s definition body in `source_text`.
+
+    ``None`` when no definition of that name is isolable (a prototype-only
+    declaration, a name that appears solely at call sites, an unbalanced
+    signature). The index is into the **original** text — comments are masked
+    length-preservingly first, so a ``{`` inside a comment cannot be mistaken for
+    the body's while the offset stays usable for injection (RFC-0003 S3).
+    """
+    found = _definition_signature(mask_comments(source_text), fn_name)
+    return None if found is None else found[1]
 
 
 @dataclass(frozen=True)
@@ -342,17 +394,18 @@ def annotate_array_extents(units: list[Unit], source_text: str) -> list[Unit]:
     comes from the *source declarator*, not the clang type — which has adjusted
     ``T p[N]`` to ``T *`` and discarded ``N``.
     """
-    stripped = _COMMENT_RE.sub(" ", source_text)
+    stripped = mask_comments(source_text)
     annotated: list[Unit] = []
     for unit in units:
-        param_list = _param_list_text(stripped, unit.name)
-        if param_list is None:
+        found = _definition_signature(stripped, unit.name)
+        if found is None:
             annotated.append(unit)
             continue
+        param_list = found[0]
         params = tuple(
             _annotated_param(p, param_list) if p.is_pointer else p for p in unit.params
         )
-        annotated.append(Unit(unit.name, params))
+        annotated.append(Unit(unit.name, params, unit.calls))
     return annotated
 
 
