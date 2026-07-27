@@ -841,6 +841,51 @@ def test_rev_parse_error_other_than_confirmed_non_worktree_blocks(
     assert leftover == []
 
 
+def test_git_ceiling_directories_does_not_defeat_the_exclude(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # `GIT_CEILING_DIRECTORIES` only stops git's *upward* repository discovery
+    # at a listed boundary — it does not mean no repository exists past it.
+    # Verified empirically: probing a subdirectory with the ceiling set at its
+    # own repo root produces the exact same "not a git repository (or any of
+    # the parent directories)" diagnostic as a genuine non-repo directory,
+    # while `git add -A` run from the repo root still stages a file placed in
+    # that subdirectory normally (review feedback, issue #151, thread
+    # PRRT_kwDOS8LAxM6T-adc). Both the initial rev-parse probe and the
+    # follow-up check-ignore verification have to ignore this env var, or the
+    # snapshot ends up staged with no exclude entry protecting it at all.
+    _git_init(tmp_path)
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    src = sub / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            before_read=(
+                "import subprocess as sp; sp.run(['git', 'add', '-A'], check=True)"
+            ),
+        ),
+    )
+
+    defs = gate.extract_function_defs(
+        str(src), project_dir=str(tmp_path), content=b"f\n"
+    )
+
+    assert [d.name for d in defs] == ["f"]
+    staged = subprocess.run(
+        ["git", "-C", str(tmp_path), "diff", "--cached", "--name-only"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert gate._ENUM_SNAPSHOT_PREFIX not in staged
+    assert "sub/x.c" in staged  # the real edit is still staged normally
+
+
 def test_gitignore_whitelist_defeats_exclude_blocks_with_units_unavailable(
     tmp_path: Path, monkeypatch
 ) -> None:

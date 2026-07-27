@@ -296,6 +296,31 @@ def _kernel_dir(path: str) -> str:
     return cur
 
 
+def _git_probe_env() -> dict[str, str]:
+    """Environment for a git call whose job is "does a work tree exist here at
+    all", not "respect the caller's ambient discovery constraints".
+
+    `GIT_CEILING_DIRECTORIES` stops git's *upward* repository discovery at a
+    listed boundary — it does not mean no repository exists past it, and an
+    ancestor repository's own `git add -A`, invoked directly from its own
+    directory (which never needs discovery from `start_dir` at all), still
+    stages `start_dir`'s contents normally: verified empirically that probing
+    a subdirectory with the ceiling set at its parent repo produces the exact
+    same `fatal: not a git repository (or any of the parent directories)`
+    diagnostic as a genuine no-repository-anywhere answer, while `git add -A`
+    run from the parent still stages a file placed in that subdirectory
+    (review feedback, issue #151). Removing the variable here — rather than
+    leaving each caller to inherit whatever the ambient environment
+    happens to impose — makes the probe answer the only question that
+    matters for deciding whether to protect a snapshot. `LC_ALL=C` keeps the
+    stderr substring match immune to a translated git.
+    """
+    env = dict(os.environ)
+    env.pop("GIT_CEILING_DIRECTORIES", None)
+    env["LC_ALL"] = "C"
+    return env
+
+
 def _index_ignore_snapshot(start_dir: str, prefix: str) -> bool:
     """Register `prefix*` in `start_dir`'s own ``.git/info/exclude``, idempotently.
 
@@ -324,15 +349,19 @@ def _index_ignore_snapshot(start_dir: str, prefix: str) -> bool:
     worktree (``fatal: not a git repository: (null)``), a bad ``GIT_DIR``
     (``fatal: not a git repository: '<path>'``) — and the parent's own
     `git add -A` still stages this directory's contents in every one of
-    those cases (measured, not assumed). Only git's own affirmative "no
-    repository anywhere in the ancestry" diagnostic is trusted: both phrasings
-    it uses (``not a git repository (or any parent up to mount point`` /
+    those cases (measured, not assumed). A fourth non-genuine case is
+    environmental rather than repository-level: `GIT_CEILING_DIRECTORIES` set
+    in the ambient environment can stop `git rev-parse` from discovering an
+    ancestor repository that is still very much there and still tracks
+    `start_dir` normally — `_git_probe_env` strips it (alongside forcing
+    `LC_ALL=C`) so this probe answers "does a repository genuinely exist
+    anywhere in the ancestry", not "what does the caller's ambient discovery
+    boundary happen to allow". Only git's own affirmative "no repository
+    anywhere in the ancestry" diagnostic is trusted: both phrasings it uses
+    (``not a git repository (or any parent up to mount point`` /
     ``...(or any of the parent directories)``) share the ``not a git
-    repository (or any`` anchor, which the three false-positive messages
-    above do not — checked with `LC_ALL=C` forced so a translated git on a
-    non-C locale can't silently defeat the match (verified empirically:
-    `LC_ALL=C` still reports the English message even under an explicit
-    non-C `LANGUAGE`). Every other non-zero exit — an unrecognized message,
+    repository (or any`` anchor, which the four false-positive cases above do
+    not. Every other non-zero exit — an unrecognized message,
     the anchor absent — raises `UnitsUnavailable` instead of assuming safety,
     matching this file's convention elsewhere (`_untracked_snapshot`) that an
     indeterminate git query must never relax a guard. `git rev-parse` failing
@@ -359,7 +388,7 @@ def _index_ignore_snapshot(start_dir: str, prefix: str) -> bool:
             capture_output=True,
             text=True,
             timeout=30,
-            env={**os.environ, "LC_ALL": "C"},
+            env=_git_probe_env(),
         )
     except (FileNotFoundError, OSError, subprocess.SubprocessError) as exc:
         raise UnitsUnavailable(
@@ -541,7 +570,16 @@ def _enumerable_source(
         ) from exc
     if (
         is_work_tree
-        and _git(src_dir, "check-ignore", "-q", "--no-index", "--", path) is None
+        and _git(
+            src_dir,
+            "check-ignore",
+            "-q",
+            "--no-index",
+            "--",
+            path,
+            env=_git_probe_env(),
+        )
+        is None
     ):
         # `_index_ignore_snapshot` only proves the pattern is registered, not
         # that it protects anything: a higher-precedence tracked `.gitignore`
@@ -831,13 +869,18 @@ def _staged_paths_from_porcelain(out: str) -> list[str]:
     return [path for status, path in _iter_porcelain_z(out) if status[0] not in " ?"]
 
 
-def _git(project_dir: str, *args: str) -> str | None:
+def _git(project_dir: str, *args: str, env: dict[str, str] | None = None) -> str | None:
     """Run a git subcommand in `project_dir`; its stdout, or ``None`` on failure.
 
     ``None`` covers git being absent, `project_dir` not being a work tree, or a
     non-zero exit — the caller treats all three as "out-of-band discovery is
     unavailable" (distinct from a clean tree), so it can report the degraded scope
     loudly instead of silently skipping.
+
+    `env` defaults to inheriting the ambient environment unmodified, same as
+    before this parameter existed. Pass `_git_probe_env()` for a call whose
+    job is confirming whether a work tree genuinely exists — see that
+    function for why the ambient environment isn't trusted there.
     """
     try:
         proc = subprocess.run(
@@ -845,6 +888,7 @@ def _git(project_dir: str, *args: str) -> str | None:
             capture_output=True,
             text=True,
             timeout=30,
+            env=env,
         )
     except (FileNotFoundError, OSError, subprocess.SubprocessError):
         return None
