@@ -339,6 +339,55 @@ def test_discover_preserves_a_symlinked_source_alias(tmp_path: Path) -> None:
     assert gate.stale_sources(str(tmp_path), state, found) == found
 
 
+def test_in_scope_c_abspath_rejects_a_leaf_symlink_whose_target_leaves_the_project(
+    tmp_path: Path,
+) -> None:
+    # review feedback on PR #171 (issue #161): the directory-only scope check
+    # (`real_dir`) passes an untracked `alias.c -> ../outside.c` straight through,
+    # since its *parent* is in-project — only the leaf's own target escapes. Left
+    # unchecked, discovery would hand back the alias and the gate would hash and
+    # verify whatever lives outside the project under the alias's key. Called
+    # directly so the assertion isn't laundered through `discover_changed_c_sources`'s
+    # `os.path.isfile` existence filter, which would drop a *dangling* symlink for
+    # an unrelated reason and never exercise this check at all.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.c").write_text("int leak(void){return 0;}\n")
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    _git_init(proj)
+    (proj / "sub").mkdir()
+    (proj / "sub" / "alias.c").symlink_to(outside / "secret.c")  # untracked, escapes
+
+    root = str(proj)
+    proj_real = os.path.realpath(str(proj))
+    rel = os.path.join("sub", "alias.c")
+    assert gate._in_scope_c_abspath(str(proj), root, proj_real, rel) is None
+
+
+def test_discover_rejects_a_leaf_symlink_whose_target_leaves_the_project(
+    tmp_path: Path,
+) -> None:
+    # Same scenario end to end through `discover_changed_c_sources`, alongside a
+    # legitimately dirty in-project source — so the assertion pins "the escaping
+    # alias is excluded" rather than "everything happens to come back empty".
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.c").write_text("int leak(void){return 0;}\n")
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    _git_init(proj)
+    (proj / "sub").mkdir()
+    (proj / "sub" / "x.c").write_text("int f(void){return 0;}\n")
+    _git_commit_all(proj)
+    (proj / "sub" / "x.c").write_text("int f(void){return 1;}\n")  # legit, dirty
+    (proj / "sub" / "alias.c").symlink_to(outside / "secret.c")  # untracked, escapes
+
+    found = gate.discover_changed_c_sources(str(proj))
+
+    assert found == [str(proj / "sub" / "x.c")]
+
+
 def test_discover_preserves_directory_spelling_when_a_symlink_replaces_it(
     tmp_path: Path,
 ) -> None:

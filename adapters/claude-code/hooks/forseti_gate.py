@@ -1074,10 +1074,20 @@ def _in_scope_c_abspath(
 
     Whether `rel` is *in scope* and how it is *spelled* are answered by two
     separate checks, deliberately not conflated. Scope is answered by resolving
-    `rel`'s directory and comparing it against `proj_real` (`project_dir`,
-    resolved): that has to follow every symlink on the way, in or out of
-    `project_dir`, since a component pointing outside the project makes a file
+    `rel`'s directory, and separately `rel`'s full path (leaf included), and
+    comparing each against `proj_real` (`project_dir`, resolved): both have to
+    follow every symlink on the way, in or out of `project_dir`, since a
+    component — or the leaf itself — pointing outside the project makes a file
     that is lexically nested under it genuinely a different, out-of-project file.
+    The leaf check catches what the directory check alone cannot: an untracked
+    ``alias.c`` sitting in an in-scope directory but whose own target escapes
+    `project_dir` (e.g. ``alias.c -> ../outside.c``) passes the directory check —
+    its parent is in-project — and without also resolving the leaf, discovery
+    would hand back the alias and the gate would hash and verify whatever lives
+    outside the project under the alias's own key (review feedback, issue #161).
+    Either check failing drops `rel` from this scan the same way an out-of-scope
+    path always has — it is not a new, separate blocking condition, just the
+    existing out-of-scope exit reached by a path the directory-only check missed.
     Spelling only ever translates the *boundary* between `root` and `project_dir`
     — `proj_real`'s offset from `root`, both already resolved — and rejoins `rel`
     onto `project_dir` past that boundary exactly as git spelled it, nothing
@@ -1102,12 +1112,14 @@ def _in_scope_c_abspath(
     that is rejected too, since a spelling with ``..`` in it would no longer be
     "through `project_dir`" at all.
 
-    `rel`'s own basename is never resolved either, by the same reasoning: `rel`
-    itself can be a symlink git reports as its own path (an untracked
-    ``alias.c -> target.c``, both inside the project), and substituting
-    `target.c` for it would misfile the change the same way. Leaving it lexical
-    mirrors `unit_id` itself, which resolves only `os.path.dirname(file_path)` and
-    never its basename.
+    `rel`'s own basename is never resolved for the *returned spelling*, by the
+    same reasoning: `rel` itself can be a symlink git reports as its own path (an
+    untracked ``alias.c -> target.c``, both inside the project), and
+    substituting `target.c` for it would misfile the change the same way.
+    Leaving the spelling lexical mirrors `unit_id` itself, which resolves only
+    `os.path.dirname(file_path)` and never its basename — the leaf-target
+    resolution above exists purely to decide *whether* to gate `rel` at all,
+    never to change what gets returned once it passes.
     """
     abspath = os.path.join(root, rel)
     if not is_c_source(abspath):
@@ -1116,6 +1128,9 @@ def _in_scope_c_abspath(
         real_dir = os.path.realpath(os.path.dirname(abspath))
         if os.path.commonpath([proj_real, real_dir]) != proj_real:
             return None  # changed outside this project subtree — out of scope
+        real_leaf = os.path.realpath(abspath)
+        if os.path.commonpath([proj_real, real_leaf]) != proj_real:
+            return None  # leaf symlink's own target escapes the project
         boundary = os.path.relpath(proj_real, root)
         offset = os.path.relpath(rel, boundary)
     except ValueError:
