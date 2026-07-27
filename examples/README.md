@@ -104,3 +104,28 @@ digest is the IV, independent of the input). That is fine here because S2 verifi
 each pointer *signature* in isolation, not the hash; a real digest would need a
 block/padding driver that is out of scope. Pinned by
 [`tests/esbmc/test_precond_corpus.py`](../tests/esbmc/test_precond_corpus.py).
+
+## Compositional-discharge corpus (RFC-0003 S3)
+
+`frame_checksum.c` / `frame_checksum_bug.c` are the S2 corpus's sequel: a leaf unit
+plus the callers that owe it a precondition. S2 leaves `sum_bytes` VERIFIED
+*assuming* `buf` holds `len` bytes; `forseti discharge` injects that same
+predicate into a generated **copy** of the translation unit as a checked
+obligation at `sum_bytes`'s entry (the user's file stays pristine — `--emit-only`
+prints the copy) and verifies every caller in the TU against it. The verdict is
+upgraded to **discharged** only when every caller was checked and every check
+passed; a caller whose pointer does not satisfy the precondition is VIOLATED **at
+the call site**, named.
+
+| File | Unit | Callers | Assessment | Run |
+|------|------|---------|------------|-----|
+| `frame_checksum.c` | `frame_checksum.c::sum_bytes` | `frame_checksum` (whole buffer), `payload_checksum` (interior pointer + adjusted length) | DISCHARGED_VERIFIED (k=9) | `forseti discharge examples/frame_checksum.c --function sum_bytes` |
+| `frame_checksum_bug.c` | `frame_checksum.c::sum_bytes` | — (`payload_checksum` drops its short-frame guard, so `len - HEADER_BYTES` underflows) | VIOLATED at the call site | `forseti discharge examples/frame_checksum_bug.c --function sum_bytes` |
+
+The leaf is byte-identical in both files and stays ASSUMED_VERIFIED in both — the
+defect lives in a *caller*, which is precisely what an undischarged precondition
+hides. `frame_checksum` still discharges in the buggy twin, so the failure is
+attributed to one caller rather than to the leaf. Pinned by
+[`tests/esbmc/test_precond_corpus.py`](../tests/esbmc/test_precond_corpus.py); the
+ESBMC contract behaviour that shaped the vehicle is pinned separately by
+[`tests/esbmc/test_contract_vehicle.py`](../tests/esbmc/test_contract_vehicle.py).

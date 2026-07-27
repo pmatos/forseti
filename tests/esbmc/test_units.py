@@ -16,7 +16,14 @@ from forseti.esbmc.units import (
     Param,
     Unit,
     annotate_array_extents,
+    find_definition_brace,
     list_units,
+    mask_comments,
+    parse_address_escapes,
+    parse_definitions,
+    parse_external_callers,
+    parse_implicit_invocations,
+    parse_symbol_aliases,
     parse_units,
 )
 
@@ -433,3 +440,492 @@ def test_list_units_raises_on_failed_parse(tmp_path: Path) -> None:
     bad.write_text("int f( {\n")  # malformed C → parse error
     with pytest.raises(ListUnitsError):
         list_units(bad)
+
+
+# --- the call set and the body locator (RFC-0003 S3) ---------------------------
+
+_CALLS_AST = """\
+TranslationUnitDecl 0x2000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0x2001 </tmp/foo.c:1:1, col:40> col:6 leaf 'void (int *)'
+| |-ParmVarDecl 0x2002 <col:12, col:18> col:18 used p 'int *'
+| `-CompoundStmt 0x2003 <col:24, col:40>
+`-FunctionDecl 0x2010 <line:2:1, col:60> col:6 caller 'void (int *)'
+  |-ParmVarDecl 0x2011 <col:12, col:18> col:18 used q 'int *'
+  `-CompoundStmt 0x2012 <col:24, col:60>
+    |-CallExpr 0x2013 <col:26, col:36> 'void'
+    | `-ImplicitCastExpr 0x2014 <col:26> 'void (*)(int *)' <FunctionToPointerDecay>
+    |   `-DeclRefExpr 0x2015 <col:26> 'void (int *)' Function 0x2001 'leaf' 'void (i)'
+    |-DeclRefExpr 0x2016 <col:31> 'int *' lvalue ParmVar 0x2011 'q' 'int *'
+    `-CallExpr 0x2017 <col:40, col:50> 'void'
+      `-DeclRefExpr 0x2018 <col:40> 'void (int *)' Function 0x2001 'leaf' 'void (i)'
+"""
+
+
+def test_parse_units_collects_the_call_set() -> None:
+    units = {u.name: u for u in parse_units(_CALLS_AST, _TARGET)}
+    assert units["caller"].calls == ("leaf",)  # deduped, and only *functions*
+    assert units["leaf"].calls == ()
+
+
+def test_annotate_array_extents_keeps_the_call_set() -> None:
+    unit = Unit("caller", (Param("q", "int *"),), ("leaf",))
+    out = annotate_array_extents([unit], "void caller(int *q){ leaf(q); }")[0]
+    assert out.calls == ("leaf",)
+
+
+def test_mask_comments_preserves_offsets_and_lines() -> None:
+    text = "int a; /* hidden {\n brace */ int b; // trailing {\nint c;\n"
+    masked = mask_comments(text)
+    assert len(masked) == len(text)
+    assert masked.count("\n") == text.count("\n")
+    assert "{" not in masked
+    assert masked.startswith("int a; ")
+
+
+def test_find_definition_brace_indexes_the_body_opener() -> None:
+    source = "/* f(int *p) { decoy } */\nvoid f(int *p) { *p = 0; }\n"
+    index = find_definition_brace(source, "f")
+    assert index is not None
+    assert source[index] == "{"
+    assert source[:index].count("\n") == 1  # the real one, not the comment's
+
+
+def test_find_definition_brace_skips_prototypes_and_call_sites() -> None:
+    source = "void f(int *p);\nvoid g(int *p) { f(p); }\nvoid f(int *p) { *p = 0; }\n"
+    index = find_definition_brace(source, "f")
+    assert index is not None
+    assert source[:index].count("\n") == 2
+
+
+def test_find_definition_brace_absent_without_a_definition() -> None:
+    assert find_definition_brace("void f(int *p);\n", "f") is None
+
+
+_HEADER_CALLER_AST = """\
+TranslationUnitDecl 0x3000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0x3001 </tmp/foo.c:1:1, col:40> col:6 leaf 'void (int *)'
+| |-ParmVarDecl 0x3002 <col:12, col:18> col:18 used p 'int *'
+| `-CompoundStmt 0x3003 <col:24, col:40>
+|-FunctionDecl 0x3010 </tmp/helper.h:2:1, col:60> col:20 header_client 'void (int *)'
+| |-ParmVarDecl 0x3011 <col:12, col:18> col:18 used q 'int *'
+| `-CompoundStmt 0x3012 <col:24, col:60>
+|   `-DeclRefExpr 0x3013 <col:26> 'void (int *)' Function 0x3001 'leaf' 'void (i)'
+|-FunctionDecl 0x3020 </tmp/helper.h:9:1, col:30> col:20 header_proto 'void (int *)'
+| `-DeclRefExpr 0x3021 <col:26> 'void (int *)' Function 0x3001 'leaf' 'void (i)'
+|-FunctionDecl 0x3025 </tmp/helper.h:14:1, col:30> col:20 header_other 'int ()'
+| `-CompoundStmt 0x3026 <col:24, col:30>
+`-FunctionDecl 0x3030 </tmp/foo.c:12:1, col:60> col:6 local_client 'void (int *)'
+  |-ParmVarDecl 0x3031 <col:12, col:18> col:18 used q 'int *'
+  `-CompoundStmt 0x3032 <col:24, col:60>
+    `-DeclRefExpr 0x3033 <col:26> 'void (int *)' Function 0x3001 'leaf' 'void (i)'
+"""
+
+
+def test_parse_definitions_keeps_every_file() -> None:
+    files = {name for name, _ in parse_definitions(_HEADER_CALLER_AST)}
+    assert files == {"/tmp/foo.c", "/tmp/helper.h"}
+
+
+def test_parse_external_callers_finds_header_definitions() -> None:
+    # The blind spot `parse_units` has by construction: a definition in an
+    # included header is in the same TU but is not a unit the gate enumerates.
+    assert "header_client" not in {
+        u.name for u in parse_units(_HEADER_CALLER_AST, _TARGET)
+    }
+    assert parse_external_callers(_HEADER_CALLER_AST, _TARGET, "leaf") == (
+        "header_client",
+    )
+
+
+def test_parse_external_callers_ignores_prototypes_and_local_callers() -> None:
+    external = parse_external_callers(_HEADER_CALLER_AST, _TARGET, "leaf")
+    assert "header_proto" not in external  # no CompoundStmt → not a definition
+    assert "local_client" not in external  # in the target file → an enumerable unit
+    assert "header_other" not in external  # a header definition that never calls it
+
+
+def test_parse_external_callers_is_relative_to_the_given_source() -> None:
+    # Same dump, different file under test: what counts as "outside" flips.
+    assert parse_external_callers(_HEADER_CALLER_AST, "/tmp/helper.h", "leaf") == (
+        "local_client",
+    )
+
+
+_RECURSIVE_AST = """\
+TranslationUnitDecl 0x4000 <<invalid sloc>> <invalid sloc>
+`-FunctionDecl 0x4001 </tmp/helper.h:1:1, col:40> col:6 leaf 'void (int)'
+  |-ParmVarDecl 0x4002 <col:12, col:18> col:18 used n 'int'
+  `-CompoundStmt 0x4003 <col:24, col:40>
+    `-DeclRefExpr 0x4004 <col:26> 'void (int)' Function 0x4001 'leaf' 'void (i)'
+"""
+
+
+def test_parse_external_callers_never_reports_the_symbol_itself() -> None:
+    # A recursive definition outside the file under test references its own name;
+    # reporting it would make every recursive callee permanently undischargeable
+    # for a reason that is not a caller at all.
+    assert parse_external_callers(_RECURSIVE_AST, _TARGET, "leaf") == ()
+
+
+# Every way a C source can name `leaf` without calling it, in the shapes esbmc
+# 8.3.0 prints them (captured from a probe, abbreviated): a file-scope
+# initialiser, an `&leaf`, an `fp = leaf` inside a body, and a callback argument
+# — against the shapes that *are* a direct call: `leaf(...)`, `(leaf)(...)`,
+# `(*leaf)(...)`, and a recursive self-call. `indirect` calls through `fp` and so
+# names only the variable, which is the whole reason the escapes must be found.
+_FUNCTION_POINTER_AST = """\
+TranslationUnitDecl 0x5000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0x5001 </tmp/foo.c:1:1, col:38> col:6 used leaf 'void (int *, int)'
+| |-ParmVarDecl 0x5002 <col:11, col:16> col:16 used p 'int *'
+| `-CompoundStmt 0x5003 <col:26, col:38>
+|   `-CallExpr 0x5004 <col:28, col:37> 'void'
+|     |-ImplicitCastExpr 0x5005 <col:28> 'void (*)(i)' <FunctionToPointerDecay>
+|     | `-DeclRefExpr 0x5006 <col:28> 'void (i)' Function 0x5001 'leaf' 'void (i)'
+|     `-DeclRefExpr 0x5007 <col:33> 'int *' lvalue ParmVar 0x5002 'p' 'int *'
+|-VarDecl 0x5010 <line:4:1, col:18> col:13 used fp 'cb_t':'void (*)(i)' static cinit
+| `-ImplicitCastExpr 0x5011 <col:18> 'void (*)(i)' <FunctionToPointerDecay>
+|   `-DeclRefExpr 0x5012 <col:18> 'void (i)' Function 0x5001 'leaf' 'void (i)'
+|-VarDecl 0x5020 <line:5:1, col:22> col:13 alias 'cb_t':'void (*)(i)' static cinit
+| `-UnaryOperator 0x5021 <col:21, col:22> 'void (*)(i)' prefix '&' cannot overflow
+|   `-DeclRefExpr 0x5022 <col:22> 'void (i)' Function 0x5001 'leaf' 'void (i)'
+|-FunctionDecl 0x5030 <line:7:1, col:42> col:6 direct 'void (int *, int)'
+| |-ParmVarDecl 0x5031 <col:13, col:18> col:18 used q 'int *'
+| `-CompoundStmt 0x5032 <col:28, col:42>
+|   `-CallExpr 0x5033 <col:30, col:39> 'void'
+|     |-ImplicitCastExpr 0x5034 <col:30> 'void (*)(i)' <FunctionToPointerDecay>
+|     | `-DeclRefExpr 0x5035 <col:30> 'void (i)' Function 0x5001 'leaf' 'void (i)'
+|     `-DeclRefExpr 0x5036 <col:35> 'int *' lvalue ParmVar 0x5031 'q' 'int *'
+|-FunctionDecl 0x5040 <line:8:1, col:43> col:6 paren 'void (int *, int)'
+| `-CompoundStmt 0x5041 <col:27, col:43>
+|   `-CallExpr 0x5042 <col:29, col:40> 'void'
+|     `-ImplicitCastExpr 0x5043 <col:29, col:34> 'void (*)(i)' <FunctionToPointerDecay>
+|       `-ParenExpr 0x5044 <col:29, col:34> 'void (i)'
+|         `-DeclRefExpr 0x5045 <col:30> 'void (i)' Function 0x5001 'leaf' 'void (i)'
+|-FunctionDecl 0x5050 <line:9:1, col:44> col:6 deref 'void (int *, int)'
+| `-CompoundStmt 0x5051 <col:27, col:44>
+|   `-CallExpr 0x5052 <col:29, col:41> 'void'
+|     `-ImplicitCastExpr 0x5053 <col:29, col:35> 'void (*)(i)' <FunctionToPointerDecay>
+|       `-ParenExpr 0x5054 <col:29, col:35> 'void (i)'
+|         `-UnaryOperator 0x5055 <col:30, col:31> 'void (i)' prefix '*' cannot overflow
+|           `-ImplicitCastExpr 0x5056 <col:31> 'void (*)(i)' <FunctionToPointerDecay>
+|             `-DeclRefExpr 0x5057 <col:31> 'void (i)' Function 0x5001 'leaf' 'void (i)'
+|-FunctionDecl 0x5060 <line:10:1, col:42> col:6 indirect 'void (int *, int)'
+| |-ParmVarDecl 0x5061 <col:15, col:20> col:20 used q 'int *'
+| `-CompoundStmt 0x5062 <col:30, col:42>
+|   `-CallExpr 0x5063 <col:32, col:39> 'void'
+|     |-ImplicitCastExpr 0x5064 <col:32> 'cb_t':'void (*)(i)' <LValueToRValue>
+|     | `-DeclRefExpr 0x5065 <col:32> 'cb_t':'void (*)(i)' lvalue Var 0x5010 'fp' 'cb_t'
+|     `-DeclRefExpr 0x5066 <col:35> 'int *' lvalue ParmVar 0x5061 'q' 'int *'
+|-FunctionDecl 0x5070 <line:11:1, col:31> col:6 taker 'void (void)'
+| `-CompoundStmt 0x5071 <col:18, col:31>
+|   `-BinaryOperator 0x5072 <col:20, col:25> 'cb_t':'void (*)(i)' '='
+|     |-DeclRefExpr 0x5073 <col:20> 'cb_t':'void (*)(i)' lvalue Var 0x5010 'fp' 'cb_t'
+|     `-ImplicitCastExpr 0x5074 <col:25> 'void (*)(i)' <FunctionToPointerDecay>
+|       `-DeclRefExpr 0x5075 <col:25> 'void (i)' Function 0x5001 'leaf' 'void (i)'
+|-FunctionDecl 0x5080 <line:12:1, col:39> col:6 used apply 'void (cb_t, int *)'
+| |-ParmVarDecl 0x5081 <col:12, col:17> col:17 used c 'cb_t':'void (*)(i)'
+| `-CompoundStmt 0x5082 <col:28, col:39>
+`-FunctionDecl 0x5090 <line:13:1, col:39> col:6 passer 'void (int *)'
+  |-ParmVarDecl 0x5091 <col:13, col:18> col:18 used q 'int *'
+  `-CompoundStmt 0x5092 <col:21, col:39>
+    `-CallExpr 0x5093 <col:23, col:36> 'void'
+      |-ImplicitCastExpr 0x5094 <col:23> 'void (*)(c)' <FunctionToPointerDecay>
+      | `-DeclRefExpr 0x5095 <col:23> 'void (c)' Function 0x5080 'apply' 'void (c)'
+      |-ImplicitCastExpr 0x5096 <col:29> 'void (*)(i)' <FunctionToPointerDecay>
+      | `-DeclRefExpr 0x5097 <col:29> 'void (i)' Function 0x5001 'leaf' 'void (i)'
+      `-DeclRefExpr 0x5098 <col:35> 'int *' lvalue ParmVar 0x5091 'q' 'int *'
+"""
+
+
+def test_parse_address_escapes_reports_every_site_that_takes_the_address() -> None:
+    # `fp`/`alias` are file-scope objects holding it, `taker` stores it, `passer`
+    # hands it to a callback parameter. Each is a path to `leaf` that no name in
+    # `Unit.calls` leads back from.
+    assert parse_address_escapes(_FUNCTION_POINTER_AST, "leaf") == (
+        "fp",
+        "alias",
+        "taker",
+        "passer",
+    )
+
+
+def test_parse_address_escapes_ignores_every_way_of_writing_a_direct_call() -> None:
+    # `leaf(...)`, `(leaf)(...)` and `(*leaf)(...)` all reach the callee through
+    # the same decay cast an *argument* does; only the child position tells them
+    # apart. Treating one as an escape would make ordinary code undischargeable.
+    escapes = parse_address_escapes(_FUNCTION_POINTER_AST, "leaf")
+    assert not {"direct", "paren", "deref"} & set(escapes)
+    # ... including the recursive self-call in `leaf`'s own body.
+    assert "leaf" not in escapes
+
+
+def test_an_indirect_call_leaves_no_trace_in_unit_calls() -> None:
+    # Why the escapes have to be reported separately: `indirect` calls `leaf`
+    # through `fp`, and its body names only the variable.
+    units = {u.name: u for u in parse_units(_FUNCTION_POINTER_AST, _TARGET)}
+    assert "leaf" not in units["indirect"].calls
+    assert units["direct"].calls == ("leaf",)
+
+
+_ORPHAN_REFERENCE_AST = """\
+TranslationUnitDecl 0x6000 <<invalid sloc>> <invalid sloc>
+`-DeclRefExpr 0x6001 <col:18> 'void (i)' Function 0x6002 'leaf' 'void (i)'
+"""
+
+
+# A caller whose body opens with a block-scope function declaration — legal ISO C,
+# and clang prints the inner `FunctionDecl` *inside* the outer one's subtree. The
+# call to `leaf` comes after it, so a parser that closes `local_client` at the
+# inner declaration loses the edge that makes it a caller at all.
+_NESTED_DECL_AST = """\
+TranslationUnitDecl 0x8000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0x8001 </tmp/foo.c:1:1, col:42> col:13 used leaf 'void (int *)' static
+| |-ParmVarDecl 0x8002 <col:15, col:20> col:20 used p 'int *'
+| `-CompoundStmt 0x8003 <col:30, col:42>
+`-FunctionDecl 0x8010 <line:2:1, col:60> col:6 local_client 'void (int *)'
+  |-ParmVarDecl 0x8011 <col:8, col:13> col:13 used q 'int *'
+  `-CompoundStmt 0x8012 <col:23, col:60>
+    |-DeclStmt 0x8013 <col:25, col:49>
+    | `-FunctionDecl 0x8014 parent 0x8000 <col:25, col:48> col:37 helper 'v ()' extern
+    `-CallExpr 0x8015 <col:51, col:57> 'void'
+      |-ImplicitCastExpr 0x8016 <col:51> 'void (*)(i)' <FunctionToPointerDecay>
+      | `-DeclRefExpr 0x8017 <col:51> 'void (i)' Function 0x8001 'leaf' 'void (i)'
+      `-DeclRefExpr 0x8018 <col:53> 'int *' lvalue ParmVar 0x8011 'q' 'int *'
+"""
+
+
+def test_parse_units_keeps_calls_written_after_a_block_scope_declaration() -> None:
+    units = {u.name: u for u in parse_units(_NESTED_DECL_AST, _TARGET)}
+    assert units["local_client"].calls == ("leaf",)
+    # the inner declaration has no body, so it is not a unit of its own
+    assert "helper" not in units
+
+
+# Linkage, in the shapes esbmc 8.3.0 prints it: the storage class follows the
+# quoted type, and a `static` written on a *prototype* is printed there and not on
+# the definition it forward-declares. The directory is called `static` on purpose —
+# a path is printed *before* the type, and must not be read as a storage class.
+_LINKAGE_TARGET = "/tmp/static/foo.c"
+_LINKAGE_AST = """\
+TranslationUnitDecl 0x7000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0x7001 </tmp/static/foo.c:1:1, col:36> col:13 priv 'void (int *)' static
+| |-ParmVarDecl 0x7002 <col:11, col:16> col:16 used p 'int *'
+| `-CompoundStmt 0x7003 <col:26, col:36>
+|-FunctionDecl 0x7010 <line:2:1, col:28> col:6 pub 'void (int *)'
+| |-ParmVarDecl 0x7011 <col:11, col:16> col:16 used p 'int *'
+| `-CompoundStmt 0x7012 <col:20, col:28>
+|-FunctionDecl 0x7020 <line:3:1, col:23> col:13 fwd 'void (int *)' static
+| `-ParmVarDecl 0x7021 <col:11, col:16> col:16 'int *'
+`-FunctionDecl 0x7030 prev 0x7020 <line:4:1, col:28> col:6 fwd 'void (int *)'
+  |-ParmVarDecl 0x7031 <col:11, col:16> col:16 used p 'int *'
+  `-CompoundStmt 0x7032 <col:20, col:28>
+"""
+
+
+def test_parse_units_reads_internal_linkage() -> None:
+    units = {u.name: u for u in parse_units(_LINKAGE_AST, _LINKAGE_TARGET)}
+    assert units["priv"].internal_linkage is True
+    # `pub` is in a *directory* called `static`; only the storage class counts.
+    assert units["pub"].internal_linkage is False
+
+
+def test_parse_units_reads_static_written_on_a_prototype() -> None:
+    # `static void fwd(int *); void fwd(int *p) {}` — C gives the definition
+    # internal linkage, but clang prints the marker only on the declaration that
+    # carried it, so the whole TU has to be consulted.
+    units = {u.name: u for u in parse_units(_LINKAGE_AST, _LINKAGE_TARGET)}
+    assert units["fwd"].internal_linkage is True
+
+
+def test_annotate_array_extents_keeps_linkage() -> None:
+    # The extent pass rebuilds the unit; dropping the linkage there would silently
+    # turn every `static` callee external and withhold its discharge.
+    unit = Unit("f", (Param("p", "uint8_t *"),), (), internal_linkage=True)
+    out = annotate_array_extents([unit], "static void f(uint8_t p[20]) {}")[0]
+    assert out.params[0].array_extent == 20
+    assert out.internal_linkage is True
+
+
+# A GNU alias: `fa` *is* `leaf` at link time, but the call in `client` references
+# only `fa`, so nothing in the AST joins that call site to `leaf`.
+_ALIAS_AST = """\
+TranslationUnitDecl 0x9000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0x9001 </tmp/foo.c:1:1, col:42> col:13 used leaf 'void (int *)' static
+| |-ParmVarDecl 0x9002 <col:15, col:20> col:20 used p 'int *'
+| `-CompoundStmt 0x9003 <col:30, col:42>
+|-FunctionDecl 0x9010 <line:2:1, col:57> col:13 used fa 'void (int *)' static
+| |-ParmVarDecl 0x9011 <col:15, col:20> col:20 p 'int *'
+| `-AliasAttr 0x9012 <col:46, col:55> "leaf"
+`-FunctionDecl 0x9020 <line:3:1, col:39> col:6 client 'void (int *)'
+  |-ParmVarDecl 0x9021 <col:13, col:18> col:18 used q 'int *'
+  `-CompoundStmt 0x9022 <col:21, col:39>
+    `-CallExpr 0x9023 <col:23, col:36> 'void'
+      |-ImplicitCastExpr 0x9024 <col:23> 'void (*)(i)' <FunctionToPointerDecay>
+      | `-DeclRefExpr 0x9025 <col:23> 'void (i)' Function 0x9010 'fa' 'void (i)'
+      `-DeclRefExpr 0x9026 <col:29> 'int *' lvalue ParmVar 0x9021 'q' 'int *'
+"""
+
+
+def test_parse_symbol_aliases_reports_a_second_name_for_the_symbol() -> None:
+    assert parse_symbol_aliases(_ALIAS_AST, "leaf") == ("fa",)
+    # ... and the reason it has to: the call site names `fa` alone, so neither the
+    # caller enumeration nor the escape scan sees a path to `leaf`.
+    client = next(u for u in parse_units(_ALIAS_AST, _TARGET) if u.name == "client")
+    assert client.calls == ("fa",)
+    assert parse_address_escapes(_ALIAS_AST, "leaf") == ()
+
+
+def test_parse_symbol_aliases_ignores_an_alias_to_another_symbol() -> None:
+    assert parse_symbol_aliases(_ALIAS_AST, "client") == ()
+
+
+# The two mechanisms combine: `fa`'s alias attribute names `leaf`'s *linker*
+# symbol ("impl.sym") — the assembly label `leaf` is relabelled to — not its bare
+# C name. Comparing an `AliasAttr` target against `symbol` alone (rather than
+# `symbol`'s effective symbol set, the same one the label loop below computes)
+# would miss this alias entirely.
+_ALIAS_TO_LABELLED_TARGET_AST = """\
+TranslationUnitDecl 0xd000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0xd001 </tmp/foo.c:1:1, col:42> col:13 used leaf 'void (int *)' static
+| |-ParmVarDecl 0xd002 <col:15, col:20> col:20 used p 'int *'
+| |-CompoundStmt 0xd003 <col:30, col:42>
+| `-AsmLabelAttr 0xd004 <col:39> "impl.sym" IsLiteralLabel
+`-FunctionDecl 0xd010 <line:2:1, col:57> col:13 used fa 'void (int *)' static
+  |-ParmVarDecl 0xd011 <col:15, col:20> col:20 p 'int *'
+  `-AliasAttr 0xd012 <col:46, col:55> "impl.sym"
+"""
+
+
+def test_an_alias_names_a_labelled_targets_linker_symbol() -> None:
+    assert parse_symbol_aliases(_ALIAS_TO_LABELLED_TARGET_AST, "leaf") == ("fa",)
+    # the direction that matters for discharge: asking for callers of `fa` itself
+    # (which names no one) still finds nothing, exactly as a plain alias would
+    assert parse_symbol_aliases(_ALIAS_TO_LABELLED_TARGET_AST, "fa") == ()
+
+
+# A `constructor` attribute names no one: unlike every other attribute-borne
+# path this module follows, it sits on the callee's own `FunctionDecl` with no
+# `Function 0x… 'name'` reference anywhere — the loader invokes `f` directly.
+_CONSTRUCTOR_ATTR_AST = """\
+TranslationUnitDecl 0xe000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0xe001 </tmp/foo.c:1:1, col:60> col:20 used f 'void (int *)' static
+| |-ParmVarDecl 0xe002 <col:22, col:27> col:27 used p 'int *'
+| |-CompoundStmt 0xe003 <col:37, col:60>
+| `-ConstructorAttr 0xe004 <col:8, col:19>
+`-FunctionDecl 0xe010 <line:2:1, col:39> col:6 g 'void (int *)'
+  |-ParmVarDecl 0xe011 <col:13, col:18> col:18 used q 'int *'
+  `-CompoundStmt 0xe012 <col:21, col:39>
+    `-CallExpr 0xe013 <col:23, col:36> 'void'
+      |-ImplicitCastExpr 0xe014 <col:23> 'void (*)(i)' <FunctionToPointerDecay>
+      | `-DeclRefExpr 0xe015 <col:23> 'void (i)' Function 0xe001 'f' 'void (i)'
+      `-DeclRefExpr 0xe016 <col:29> 'int *' lvalue ParmVar 0xe011 'q' 'int *'
+"""
+
+_DESTRUCTOR_ATTR_AST = _CONSTRUCTOR_ATTR_AST.replace(
+    "ConstructorAttr", "DestructorAttr"
+)
+
+
+def test_parse_implicit_invocations_reports_a_constructor_attribute() -> None:
+    assert parse_implicit_invocations(_CONSTRUCTOR_ATTR_AST, "f") == ("constructor",)
+    # neither of the other two attribute-borne paths sees it: it names no one
+    assert parse_address_escapes(_CONSTRUCTOR_ATTR_AST, "f") == ()
+    assert parse_symbol_aliases(_CONSTRUCTOR_ATTR_AST, "f") == ()
+    # and a function with no such attribute reports none
+    assert parse_implicit_invocations(_CONSTRUCTOR_ATTR_AST, "g") == ()
+
+
+def test_parse_implicit_invocations_reports_a_destructor_attribute() -> None:
+    assert parse_implicit_invocations(_DESTRUCTOR_ATTR_AST, "f") == ("destructor",)
+
+
+# Two more attribute-borne paths esbmc 8.3.0 prints: a `cleanup` handler, which
+# clang renders as an ordinary `Function 0x… 'name'` reference on the variable
+# (so it is a *reference outside a call*, not an alias), and a shared `__asm__`
+# label, which is one function under two C names with no reference at all.
+_ATTRIBUTE_PATH_AST = """\
+TranslationUnitDecl 0xa000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0xa001 </tmp/foo.c:1:1, col:42> col:13 used leaf 'void (int *)' static
+| |-ParmVarDecl 0xa002 <col:15, col:20> col:20 used p 'int *'
+| |-CompoundStmt 0xa003 <col:30, col:42>
+| `-AsmLabelAttr 0xa004 <col:39> "impl_sym" IsLiteralLabel
+|-FunctionDecl 0xa010 <line:2:1, col:50> col:13 used twin 'void (int *)' static
+| |-ParmVarDecl 0xa011 <col:15, col:20> col:20 p 'int *'
+| `-AsmLabelAttr 0xa012 <col:40> "impl_sym" IsLiteralLabel
+`-FunctionDecl 0xa020 <line:3:1, col:71> col:6 scope 'void (void)'
+  `-CompoundStmt 0xa021 <col:15, col:71>
+    `-DeclStmt 0xa022 <col:17, col:60>
+      `-VarDecl 0xa023 <col:17, col:59> col:22 used c 'char' cinit
+        `-CleanupAttr 0xa024 <col:38, col:53> Function 0xa001 'leaf' 'void (i)'
+"""
+
+
+def test_a_cleanup_handler_is_a_reference_outside_a_call() -> None:
+    # `char c __attribute__((cleanup(leaf)))` calls `leaf` at scope exit, and no
+    # expression in the AST spells that call — but clang still prints the same
+    # `Function 0x…` reference an address-of would, which is why the escape scan
+    # tests *position* rather than node kind.
+    assert parse_address_escapes(_ATTRIBUTE_PATH_AST, "leaf") == ("c",)
+
+
+def test_a_shared_assembly_label_makes_two_names_one_function() -> None:
+    # The linker joins on the label, not the C name, so a call to `twin` reaches
+    # `leaf` while referencing neither it nor its address.
+    assert parse_symbol_aliases(_ATTRIBUTE_PATH_AST, "leaf") == ("twin",)
+    assert parse_symbol_aliases(_ATTRIBUTE_PATH_AST, "twin") == ("leaf",)
+    assert parse_symbol_aliases(_ATTRIBUTE_PATH_AST, "scope") == ()
+
+
+# A shared label that carries punctuation a C identifier cannot, exactly as clang
+# 8.3.0 prints `__asm__("impl.sym")` (verified live against esbmc
+# --parse-tree-only): unescaped, period intact. `_TARGET_NAME_RE` used to require
+# `\w+` between the quotes, which cannot match a period and so silently dropped
+# this label — leaving `twin` looking like it shares nothing with `leaf`.
+_PUNCTUATED_LABEL_AST = """\
+TranslationUnitDecl 0xc000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0xc001 </tmp/foo.c:1:1, col:42> col:13 used leaf 'void (int *)' static
+| |-ParmVarDecl 0xc002 <col:15, col:20> col:20 used p 'int *'
+| |-CompoundStmt 0xc003 <col:30, col:42>
+| `-AsmLabelAttr 0xc004 <col:39> "impl.sym" IsLiteralLabel
+`-FunctionDecl 0xc010 <line:2:1, col:50> col:13 used twin 'void (int *)' static
+  |-ParmVarDecl 0xc011 <col:15, col:20> col:20 p 'int *'
+  `-AsmLabelAttr 0xc012 <col:40> "impl.sym" IsLiteralLabel
+"""
+
+
+def test_a_punctuated_assembly_label_still_makes_two_names_one_function() -> None:
+    assert parse_symbol_aliases(_PUNCTUATED_LABEL_AST, "leaf") == ("twin",)
+    assert parse_symbol_aliases(_PUNCTUATED_LABEL_AST, "twin") == ("leaf",)
+
+
+# The asymmetric case: only one side carries a label, and it spells the *default*
+# symbol name of the other. A declaration's symbol is its label when it has one
+# and its C name otherwise, so these two are one function with one side unmarked.
+_DEFAULT_LABEL_AST = """\
+TranslationUnitDecl 0xb000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0xb001 </tmp/foo.c:1:1, col:42> col:13 used leaf 'void (int *)' static
+| |-ParmVarDecl 0xb002 <col:15, col:20> col:20 used p 'int *'
+| `-CompoundStmt 0xb003 <col:30, col:42>
+|-FunctionDecl 0xb010 <line:2:1, col:35> col:6 used twin 'void (int *)'
+| |-ParmVarDecl 0xb011 <col:15, col:20> col:20 p 'int *'
+| `-AsmLabelAttr 0xb012 <col:32> "leaf" IsLiteralLabel
+`-FunctionDecl 0xb020 <line:3:1, col:38> col:6 other 'void (int *)'
+  |-ParmVarDecl 0xb021 <col:15, col:20> col:20 p 'int *'
+  `-CompoundStmt 0xb022 <col:30, col:38>
+"""
+
+
+def test_an_assembly_label_matches_an_unlabelled_default_name() -> None:
+    assert parse_symbol_aliases(_DEFAULT_LABEL_AST, "leaf") == ("twin",)
+    assert parse_symbol_aliases(_DEFAULT_LABEL_AST, "twin") == ("leaf",)
+    # and a TU where nothing is labelled stays free of phantom aliases: two
+    # distinct C names are two distinct symbols
+    assert parse_symbol_aliases(_DEFAULT_LABEL_AST, "other") == ()
+    assert parse_symbol_aliases(_NESTED_DECL_AST, "leaf") == ()
+
+
+def test_parse_address_escapes_keeps_a_reference_it_cannot_name() -> None:
+    # A reference under no named declaration is still a reference; naming it
+    # `<file scope>` keeps the escape (and the withheld discharge) rather than
+    # dropping the one thing that says the caller set is open.
+    assert parse_address_escapes(_ORPHAN_REFERENCE_AST, "leaf") == ("<file scope>",)

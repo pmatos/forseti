@@ -33,7 +33,14 @@ def test_every_subcommand_binds_a_callable_handler() -> None:
     # table. Enumerated generically so a subcommand registered inline (e.g. mcp)
     # is covered too — this closes the register-but-forget-to-dispatch gap.
     subparsers = _registered_subparsers(_build_parser())
-    assert set(subparsers) == {"verify", "list-units", "synth", "propose", "mcp"}
+    assert set(subparsers) == {
+        "verify",
+        "list-units",
+        "synth",
+        "discharge",
+        "propose",
+        "mcp",
+    }
     for name, subparser in subparsers.items():
         handler = subparser.get_default("func")
         assert callable(handler), f"subcommand {name!r} binds no callable handler"
