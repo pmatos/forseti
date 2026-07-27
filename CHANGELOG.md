@@ -1,3 +1,10 @@
+## [1.7.1](https://github.com/pmatos/forseti/compare/v1.7.0...v1.7.1) (2026-07-27)
+
+
+### Bug Fixes
+
+* **claude-adapter:** close the transient A→B→A rewrite race at the verify boundary ([#159](https://github.com/pmatos/forseti/issues/159)) ([a443d79](https://github.com/pmatos/forseti/commit/a443d79a20e8d0b375999f999049687b4b247aa8))
+
 # [1.7.0](https://github.com/pmatos/forseti/compare/v1.6.6...v1.7.0) (2026-07-27)
 
 
