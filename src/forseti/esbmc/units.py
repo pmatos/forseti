@@ -379,13 +379,20 @@ def _error_line(text: str) -> str:
 
 @dataclass
 class _AstNode:
-    """One node of the walked AST, with its position among its parent's children."""
+    """One node of the walked AST, with its position among its parent's children.
+
+    `file` is the presumed file at this node's own line — the same value `_walk`
+    yields alongside it, just pinned to the node rather than to the moment of
+    traversal. Read by `_enclosing_function_file` off a `FunctionDecl` higher up
+    the stack.
+    """
 
     depth: int
     kind: str
     rest: str
     index: int
     children: int = 0
+    file: str = ""
 
 
 @dataclass
@@ -431,7 +438,7 @@ def _walk(ast_text: str) -> Iterator[tuple[list[_AstNode], str, str, str, int]]:
         if stack:
             index = stack[-1].children
             stack[-1].children += 1
-        stack.append(_AstNode(depth, kind, rest, index))
+        stack.append(_AstNode(depth, kind, rest, index, file=current_file))
         yield stack, kind, rest, current_file, current_line
 
 
@@ -601,6 +608,21 @@ def _enclosing_name(stack: list[_AstNode]) -> str:
     return _FILE_SCOPE
 
 
+def _enclosing_function_file(stack: list[_AstNode]) -> str:
+    """The file the nearest enclosing ``FunctionDecl`` was itself declared in.
+
+    Distinct from the current file at the node on top of `stack`: a body
+    statement expanded from a macro *defined in a header* carries that header's
+    location, even though the function enclosing it was declared in `source`
+    (issue #167). Empty when no `FunctionDecl` encloses the node, which
+    `_is_target` already reads as never a match.
+    """
+    for node in reversed(stack[:-1]):
+        if node.kind == "FunctionDecl":
+            return node.file
+    return ""
+
+
 def parse_address_escapes(ast_text: str, symbol: str) -> tuple[str, ...]:
     """Sites naming `symbol` **outside a direct call**, by enclosing declaration.
 
@@ -760,9 +782,24 @@ def parse_asm_statements(ast_text: str, source: str | Path) -> tuple[str, ...]:
     an open caller set for every function in every translation unit that merely
     includes such a header would not make discharge conservative, it would
     disable it. The residual is the same one `parse_external_callers` already
-    documents for a `static inline` header definition: asm inside *any* included
-    header goes unseen here, whether it is a system one like ``sys/io.h`` or the
-    source's own project header pulled in by a local ``#include "..."``.
+    documents for a `static inline` header definition: asm inside a function
+    *defined* in a header goes unseen here, whether it is a system header like
+    ``sys/io.h`` or the source's own project header pulled in by a local
+    ``#include "..."``.
+
+    The scoping check is therefore on the *enclosing function's* declared file
+    (`_enclosing_function_file`), not the `GCCAsmStmt` node's own location: a
+    call written through a macro (``#define CALL_F() asm("call f")``) defined in
+    a header gets that header's location on the statement itself, even when the
+    macro is invoked from an ordinary function defined in `source` — the
+    statement's own file would wrongly read as the header's and drop the site
+    (issue #167). `_enclosing_function_file` still traces back to `_loc_file`,
+    which reads a node's range *start* rather than its `point` — so a
+    return-type macro from a header shifts a `FunctionDecl`'s own presumed file
+    the same way it shifts `Unit.def_line`'s file (`_loc_file`'s docstring): a
+    function's own start-based file already reads as the header's, `parse_units`
+    already drops it as a unit entirely (measured), and an asm site inside it
+    stays unseen here for that same, pre-existing reason.
 
     A file-scope ``asm(...)`` (``FileScopeAsmDecl``) is a different node kind
     that *does* print its string and sits outside any function to begin with —
@@ -771,8 +808,10 @@ def parse_asm_statements(ast_text: str, source: str | Path) -> tuple[str, ...]:
     """
     source_norm = os.path.normpath(str(source))
     sites: dict[str, None] = {}
-    for stack, kind, _rest, file, _line in _walk(ast_text):
-        if kind == "GCCAsmStmt" and _is_target(file, source_norm):
+    for stack, kind, _rest, _file, _line in _walk(ast_text):
+        if kind == "GCCAsmStmt" and _is_target(
+            _enclosing_function_file(stack), source_norm
+        ):
             sites[_enclosing_name(stack)] = None
     return tuple(sites)
 

@@ -1562,3 +1562,34 @@ def test_parse_asm_statements_ignores_file_scope_asm() -> None:
     # it must never surface as a caller-set concern: the full result is exactly
     # `caller`/`bare_asm`, with no third site (named or `<file scope>`) for it.
     assert parse_asm_statements(_ASM_AST, _TARGET) == ("caller", "bare_asm")
+
+
+# Verified empirically (issue #167 follow-up) with a live
+# `esbmc --parse-tree-only` run over `#define CALL_F() asm("call f")` in a
+# header, invoked from an ordinary function in the source file: clang assigns
+# the `GCCAsmStmt` its *spelling* location — the macro definition, in the
+# header — not the location of the call site that expanded it. `macro_caller`
+# stands in for that shape: its own `FunctionDecl` is in `_TARGET`, but its
+# `GCCAsmStmt` reads `/tmp/macro.h`. `header_fn` is the mirror image, pinning
+# the fix's direction: its `FunctionDecl` is in `/tmp/other.h` but its
+# `GCCAsmStmt` reads `_TARGET` — scoping by the statement's own location would
+# wrongly include it, and scoping by *both* locations (an OR) would too.
+_MACRO_ASM_AST = """\
+TranslationUnitDecl 0x8000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0x8010 </tmp/foo.c:3:1, line:6:1> line:3:5 macro_caller 'void (void)'
+| `-CompoundStmt 0x8011 <col:19, line:6:1>
+|   `-GCCAsmStmt 0x8012 </tmp/macro.h:1:18, col:30>
+`-FunctionDecl 0x8020 </tmp/other.h:1:1, col:38> col:6 header_fn 'void (void)'
+  `-CompoundStmt 0x8021 <col:20, col:38>
+    `-GCCAsmStmt 0x8022 </tmp/foo.c:8:5, col:19>
+"""
+
+
+def test_parse_asm_statements_scopes_by_enclosing_function_file() -> None:
+    # `macro_caller` is defined in `_TARGET` and must be reported even though
+    # its `GCCAsmStmt`'s own spelling location is the header the macro came
+    # from. `header_fn` is defined in a header and must stay excluded even
+    # though its `GCCAsmStmt`'s location happens to read `_TARGET` — that
+    # rules out scoping by the statement's own location (drops `macro_caller`)
+    # and scoping by either location (wrongly keeps `header_fn`).
+    assert parse_asm_statements(_MACRO_ASM_AST, _TARGET) == ("macro_caller",)
