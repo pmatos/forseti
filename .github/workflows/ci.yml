@@ -103,7 +103,7 @@ jobs:
         # hashFiles is the precondition itself, so it also covers pytest dying
         # before it writes the XML (e.g. a collection error).
         if: ${{ !cancelled() && hashFiles('coverage.xml') != '' }}
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: pmatos/forseti
