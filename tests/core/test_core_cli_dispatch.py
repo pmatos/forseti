@@ -44,6 +44,14 @@ def test_every_subcommand_binds_a_callable_handler() -> None:
     for name, subparser in subparsers.items():
         handler = subparser.get_default("func")
         assert callable(handler), f"subcommand {name!r} binds no callable handler"
+        # A shared arg-builder (e.g. `synth`/`discharge`'s `_add_precondition_
+        # arguments`) binding a handler itself, rather than leaving it to each
+        # `_add_*_parser`, would silently glue every user of that builder to
+        # the same handler — pin the name→handler identity, not just callable.
+        expected_handler = getattr(cli, f"_run_{name.replace('-', '_')}")
+        assert handler is expected_handler, (
+            f"subcommand {name!r} binds {handler!r}, expected {expected_handler!r}"
+        )
 
 
 def test_main_dispatches_to_the_bound_handler(
