@@ -1486,6 +1486,11 @@ def test_transient_rewrite_during_verify_is_closed_by_the_snapshot(
     after = gate.load_state(str(tmp_path))
     assert after["scanned"]["x.c"] == hashlib.sha256(original.encode()).hexdigest()
     assert gate.blocking_units(after) == []
+    # This restore-write also bumps the live file's mtime on its way back to
+    # `original`'s bytes — tolerating that is deliberate, not an oversight: see
+    # the drift-check comment in `verify_and_record` (issue #164) and
+    # `test_snapshot_mtime_drift_after_staging_is_a_known_residual` for why a
+    # live-mtime recheck here was tried and rejected as a fix.
 
 
 def test_rewrite_during_verify_defers_to_a_concurrent_runs_stamp(
@@ -1726,6 +1731,42 @@ def test_verifiable_source_preserves_mtime_for_timestamp_macro(tmp_path: Path) -
         str(src), content, project_dir=str(tmp_path), mtime_ns=old_ns
     ) as vp:
         assert os.stat(vp).st_mtime_ns == old_ns
+
+
+def test_snapshot_mtime_drift_after_staging_is_a_known_residual(tmp_path: Path) -> None:
+    # Characterization, not an endorsement — the mtime-fidelity sibling of
+    # `test_self_include_by_own_name_is_a_known_residual`. This pins the
+    # mechanism the residual rides on: the snapshot's mtime is frozen at
+    # whatever `mtime_ns` reads at *stage* time, and nothing re-checks that
+    # pairing afterward. The decision not to chase this — closing it would
+    # require holding `gate_lock` across the whole verify subprocess call,
+    # serializing concurrent verifications — lives in the drift-check comment
+    # in `verify_and_record`, not here. A source touched with identical bytes
+    # (editor, backup, unrelated tooling) anywhere between staging and the
+    # drift check's re-hash moves the live file's mtime without moving its
+    # content hash — invisible to a content-only check — so a `__TIMESTAMP__`
+    # branch verified through the snapshot sees the *old* value while the live
+    # file already reads the new one. Issue #164: tried and rejected as a fix
+    # (comparing live mtime against `mtime_ns` in that drift check empirically
+    # breaks `test_transient_rewrite_during_verify_is_closed_by_the_snapshot`,
+    # whose own restore-write bumps mtime on its way back to identical
+    # content) — see the drift-check comment in `verify_and_record` for why
+    # this residual is accepted rather than chased.
+    src = tmp_path / "x.c"
+    content = b"int f(void) { return 0; }\n"
+    src.write_bytes(content)
+    old_ns = 1_577_836_800_000_000_000  # 2020-01-01T00:00:00Z, well before "now"
+    os.utime(src, ns=(old_ns, old_ns))
+
+    with gate._verifiable_source(
+        str(src), content, project_dir=str(tmp_path), mtime_ns=old_ns
+    ) as vp:
+        new_ns = old_ns + 1_000_000_000  # +1s, bytes unchanged
+        os.utime(src, ns=(new_ns, new_ns))
+
+        assert src.read_bytes() == content  # content never drifted...
+        assert os.stat(vp).st_mtime_ns == old_ns  # ...but the snapshot is stale
+        assert os.stat(src).st_mtime_ns != os.stat(vp).st_mtime_ns
 
 
 def test_verifiable_source_keeps_leading_bom_at_byte_zero(tmp_path: Path) -> None:
