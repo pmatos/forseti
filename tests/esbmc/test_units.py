@@ -21,6 +21,7 @@ from forseti.esbmc.units import (
     list_units,
     mask_comments,
     parse_address_escapes,
+    parse_asm_statements,
     parse_definitions,
     parse_external_callers,
     parse_implicit_invocations,
@@ -1497,3 +1498,67 @@ def test_parse_address_escapes_keeps_a_reference_it_cannot_name() -> None:
     # `<file scope>` keeps the escape (and the withheld discharge) rather than
     # dropping the one thing that says the caller set is open.
     assert parse_address_escapes(_ORPHAN_REFERENCE_AST, "leaf") == ("<file scope>",)
+
+
+# Verified empirically against both esbmc's pinned clang and a current upstream
+# clang (issue #167): a `GCCAsmStmt`'s only children are its constraint operand
+# expressions (`result`, `x` below, for `asm("..." : "=a"(result) : "D"(x))`) —
+# the assembly *string* itself, which could spell `call helper`, is never
+# printed. `bare_asm` is the operand-free shape (a bare `asm("nop")`, a leaf
+# node with no children at all). `FileScopeAsmDecl` is a different node kind
+# that *does* print its string (`StringLiteral` child) and sits outside any
+# function — not a call site, so it must never be mistaken for one. And
+# `header_asm` lives in `/tmp/other.h`, not `_TARGET`, standing in for a header
+# like `sys/io.h` whose port-I/O wrappers use inline asm for reasons unrelated
+# to `_TARGET`'s own callers (measured at 18 `GCCAsmStmt` nodes for that one
+# header) — the scan must stay scoped to `_TARGET` or every function in every
+# TU that merely includes such a header would become permanently unresolved.
+_ASM_AST = """\
+TranslationUnitDecl 0x7000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0x7001 </tmp/foo.c:1:1, col:38> col:6 used helper 'int (int)'
+| |-ParmVarDecl 0x7002 <col:18, col:22> col:22 used x 'int'
+| `-CompoundStmt 0x7003 <col:25, col:38>
+|-FunctionDecl 0x7010 <line:2:1, line:6:1> line:2:5 caller 'int (int)'
+| |-ParmVarDecl 0x7011 <col:12, col:16> col:16 used x 'int'
+| `-CompoundStmt 0x7012 <col:19, line:6:1>
+|   |-DeclStmt 0x7013 <line:3:5, col:15>
+|   | `-VarDecl 0x7014 <col:5, col:9> col:9 used result 'int'
+|   |-GCCAsmStmt 0x7015 <line:4:5, col:46>
+|   | |-DeclRefExpr 0x7016 <col:30> 'int' lvalue Var 0x7014 'result' 'int'
+|   | `-ImplicitCastExpr 0x7017 <col:44> 'int' <LValueToRValue>
+|   |   `-DeclRefExpr 0x7018 <col:44> 'int' lvalue ParmVar 0x7011 'x' 'int'
+|   `-ReturnStmt 0x7019 <line:5:5, col:12>
+|     `-DeclRefExpr 0x701a <col:12> 'int' lvalue Var 0x7014 'result' 'int'
+|-FunctionDecl 0x7020 <line:8:1, line:10:1> line:8:5 bare_asm 'int (void)'
+| `-CompoundStmt 0x7021 <col:18, line:10:1>
+|   |-GCCAsmStmt 0x7022 <line:9:5, col:14>
+|   `-ReturnStmt 0x7023 <line:9:6, col:1>
+|-FileScopeAsmDecl 0x7030 <line:12:1, col:24> col:1
+| `-StringLiteral 0x7031 <col:5> 'char[18]' lvalue ".global my_symbol"
+`-FunctionDecl 0x7040 </tmp/other.h:1:1, col:38> col:6 header_asm 'void (void)'
+  `-CompoundStmt 0x7041 <col:20, col:38>
+    `-GCCAsmStmt 0x7042 <col:22, col:36>
+"""
+
+
+def test_parse_asm_statements_reports_every_enclosing_declaration() -> None:
+    # Neither reports which symbol, if any, is invoked — the whole reason both
+    # `caller`'s operand-bearing asm and `bare_asm`'s bare one must be reported
+    # unconditionally, since there is no substring anywhere in this dump to
+    # narrow either down to a specific callee.
+    assert parse_asm_statements(_ASM_AST, _TARGET) == ("caller", "bare_asm")
+
+
+def test_parse_asm_statements_ignores_a_different_translation_unit_file() -> None:
+    # `header_asm`'s asm sits in `/tmp/other.h`, a stand-in for a header whose
+    # inline asm has nothing to do with `_TARGET`'s own callers.
+    sites = parse_asm_statements(_ASM_AST, _TARGET)
+    assert "header_asm" not in sites
+
+
+def test_parse_asm_statements_ignores_file_scope_asm() -> None:
+    # `FileScopeAsmDecl` prints a string and sits outside any function — it
+    # defines/renames a symbol rather than calling one from within a body, so
+    # it must never surface as a caller-set concern: the full result is exactly
+    # `caller`/`bare_asm`, with no third site (named or `<file scope>`) for it.
+    assert parse_asm_statements(_ASM_AST, _TARGET) == ("caller", "bare_asm")

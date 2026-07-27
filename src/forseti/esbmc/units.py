@@ -736,6 +736,47 @@ def parse_symbol_aliases(ast_text: str, symbol: str) -> tuple[str, ...]:
     return tuple(aliases)
 
 
+def parse_asm_statements(ast_text: str, source: str | Path) -> tuple[str, ...]:
+    """Declarations in `source` that contain a GNU inline-assembly statement.
+
+    A `GCCAsmStmt` can invoke any symbol in the translation unit by name
+    (``asm("call f")``), with no ``DeclRefExpr`` and hence no `Unit.calls` edge
+    and no `parse_address_escapes` site for it — exactly the gap this covers.
+    But *which* symbol, if any, a given block invokes is unrecoverable from this
+    format: verified against both esbmc's pinned clang and a current upstream
+    clang, a `GCCAsmStmt` node's only children are its operand expressions
+    (``result``, ``x`` for ``asm("..." : "=a"(result) : "D"(x))``); the asm
+    string itself is never printed. There is therefore no substring to compare
+    against a `symbol` the way `parse_symbol_aliases`' targets or
+    `parse_implicit_invocations`' attributes can be, so every block found is
+    reported, unconditionally, naming the declaration that encloses it — the
+    only reading that does not silently drop a call path this scan cannot see
+    at all.
+
+    Scoped to `source` like `parse_units`, not swept over the whole dump like
+    `parse_address_escapes`: low-level headers genuinely contain inline asm for
+    unrelated reasons (``sys/io.h``'s port-I/O wrappers, measured at 18
+    `GCCAsmStmt` nodes for a single header), and treating every one of those as
+    an open caller set for every function in every translation unit that merely
+    includes such a header would not make discharge conservative, it would
+    disable it. The residual is the same one `parse_external_callers` already
+    documents for a `static inline` header definition: asm inside *any* included
+    header goes unseen here, whether it is a system one like ``sys/io.h`` or the
+    source's own project header pulled in by a local ``#include "..."``.
+
+    A file-scope ``asm(...)`` (``FileScopeAsmDecl``) is a different node kind
+    that *does* print its string and sits outside any function to begin with —
+    it defines or renames a symbol rather than calling one from within a body,
+    so it is not a caller-set concern this module tracks.
+    """
+    source_norm = os.path.normpath(str(source))
+    sites: dict[str, None] = {}
+    for stack, kind, _rest, file, _line in _walk(ast_text):
+        if kind == "GCCAsmStmt" and _is_target(file, source_norm):
+            sites[_enclosing_name(stack)] = None
+    return tuple(sites)
+
+
 def mask_comments(source_text: str) -> str:
     """`source_text` with every comment blanked out, **preserving every offset**.
 
@@ -1205,6 +1246,23 @@ def list_implicit_invocations(
     """
     ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
     return parse_implicit_invocations(ast_text, symbol)
+
+
+def list_asm_statements(
+    source: Path,
+    *,
+    esbmc_bin: str = "esbmc",
+    timeout_s: float = 30.0,
+    extra_flags: Sequence[str] = (),
+) -> tuple[str, ...]:
+    """Declarations in `source` that contain a GNU inline-assembly statement.
+
+    The fifth way the caller enumeration can be incomplete, and unlike the other
+    four, one no `symbol` can narrow — see `parse_asm_statements`. Raises
+    `ListUnitsError` on the same conditions as `list_units`.
+    """
+    ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
+    return parse_asm_statements(ast_text, source)
 
 
 def list_units(

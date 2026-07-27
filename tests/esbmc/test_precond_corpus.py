@@ -569,6 +569,45 @@ def test_an_escaped_address_withholds_the_upgrade(tmp_path: Path) -> None:
     assert "names sum_bytes() outside a direct call" in result.label
 
 
+_ASM_ONLY_CALLER = """\
+#include <stddef.h>
+#include <stdint.h>
+
+static uint32_t sum_bytes(const uint8_t *buf, size_t len) {
+    uint32_t acc = 0;
+    for (size_t i = 0; i < len; i++) acc += buf[i];
+    return acc;
+}
+
+uint32_t frame_checksum(const uint8_t *frame, size_t len) {
+    return sum_bytes(frame, len);
+}
+
+uint32_t via_asm(const uint8_t *frame) {
+    uint32_t result;
+    asm("call sum_bytes" : "=a"(result) : "D"(frame));
+    return result;
+}
+"""
+
+
+def test_an_inline_asm_call_opens_the_caller_set(tmp_path: Path) -> None:
+    # Issue #167: `via_asm` invokes `sum_bytes` only from a GNU inline-asm
+    # string. That produces no `DeclRefExpr` at all — not even the kind
+    # `parse_address_escapes` catches for a function-pointer escape — so no
+    # `Unit.calls` edge and no address-escape site name this path either.
+    # Upgrading on the strength of `frame_checksum` alone would let this
+    # unchecked call ride to DISCHARGED_VERIFIED.
+    src = tmp_path / "asm_caller.c"
+    src.write_text(_ASM_ONLY_CALLER)
+    result = discharge_precondition(src, function="sum_bytes", max_len=MAX_LEN)
+    assert result.assessment is Assessment.ASSUMED_VERIFIED, result.label
+    outcomes = {c.caller: c.outcome for c in result.callers}
+    assert outcomes["frame_checksum"] is CallerOutcome.DISCHARGED
+    assert outcomes["via_asm"] is CallerOutcome.UNRESOLVED
+    assert "GNU inline-assembly statement" in result.label
+
+
 _FILE_IDENTITY_TEMPLATE = """\
 #include <string.h>
 #include <stddef.h>
