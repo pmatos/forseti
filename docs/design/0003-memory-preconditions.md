@@ -141,6 +141,10 @@ harnesses are the **fallback** for what `is_fresh` can't express and the **fast 
 *Open question:* keeping contracts out of the user's source implies verifying a **generated copy**
 of the translation unit with contracts injected — acceptable, but to be prototyped in Stage 3.
 
+> **Superseded by measurement in S3 (see below).** The "Maturity note" row was optimistic: on our
+> pinned esbmc 8.3.0 the contract *vehicle* cannot carry a memory precondition at all, so discharge
+> landed on an injected obligation instead. The generated‑copy idea survived intact.
+
 ## Reframing "no gaps"
 
 We can fully close the **pointer‑provenance** gap. Two gaps are irreducible and are handled by
@@ -161,7 +165,7 @@ Q.E.D.‑up‑to‑k vocabulary. Anything stronger over‑claims.
 |---|---|---|
 | **S1** | **Stop the phantoms.** Signature‑based `NEEDS_CONTRACT`; don't feed the havoc cex back as fixable; non‑blocking residual. | Unblocks the demo today; ends the thrash. |
 | **S2** ✅ | **L0 mechanical synthesis + right ESBMC config** (assertions ON, k‑ladder, non‑vacuity). Sidecar harness for scalar `T*` / `ptr,len` / `T p[N]`. | sha1's pointer units **verify** (assumed, up to MAX_LEN). Demo lands. |
-| **S3** | **Compositional discharge** (`--replace-call-with-contract`); prototype transparent contract injection; upgrade "assumed" → "discharged". | Closes the soundness hole. |
+| **S3** ✅ | **Compositional discharge**; transparent contract injection; upgrade "assumed" → "discharged". | Closes the soundness hole. |
 | **S4** | **L1 structural inference** (context‑via‑init, aliasing, sentinels) — a structural analyzer, *not* the semantic proposer. | Genericity beyond the easy shapes. |
 | **S5** | **Unboundedness** via loop invariants, where "all lengths" matters. | Escapes the bound where it counts. |
 
@@ -194,21 +198,174 @@ touches all of `N`, and sizing at exactly `N` would phantom‑VIOLATE one that t
 elements when `length > N`. With `N` unreadable (`T p[static MACRO]`) there is no floor to raise the
 length to, so L0 declines instead.
 
+**S3 landed** ([#126](https://github.com/pmatos/forseti/issues/126)): `forseti discharge <source>
+--function NAME` runs S2 and then turns its assumption into an obligation. The *same* `UnitPlan`
+that sizes the sidecar's `malloc` renders a predicate injected into a **generated copy** of the
+translation unit at the unit's entry (`src/forseti/precond/synth.py::inject_obligations`), on the
+definition's own line so every other line number matches the user's file; every unit in the TU whose
+body references the callee (`Unit.calls`, read off the clang AST) is then verified through *its own*
+S2 sidecar against that copy, so the obligation is evaluated with that caller's actual arguments. A
+caller that passes an invalid or too‑small pointer is **VIOLATED at the call site**, named; a caller
+that passes a valid one **discharges** — but only after a site probe confirms it reaches the call at
+all, so a dead call site cannot discharge vacuously. The upgrade to `DISCHARGED_VERIFIED` **fails
+closed**: it requires that *every* caller was checked and every check passed. An unmaterialisable
+caller, an inconclusive ladder, an unreachable site, or no caller at all in this TU each leave the
+honest S2 verdict standing with a loud "discharge incomplete" (for the last case, the obligation is
+*exported* to the TU's clients — `examples/sha1.c` discharges nothing, and says so). Corpus:
+`examples/frame_checksum.c` / `_bug.c`, pinned by `tests/esbmc/test_precond_corpus.py`.
+
+**And it fails closed in the other direction — the phantom must not move to the call site.** The
+mirror‑image hazard of discharge is that the *caller* is itself an L0 unit. A caller whose signature
+states no extent (`void hash_block(const uint8_t *blk)` for a 16‑byte block) is materialised by the
+weakest fallback — one pointee — so it *cannot* satisfy a wider obligation however correct it is,
+and blaming it would flag working code: exactly the phantom VIOLATED this RFC exists to remove,
+relocated from the callee to the call site. So the discriminator is **length authority**: only a
+caller whose every pointer is sized by something the signature actually states (a companion length,
+a written array extent) can be `VIOLATED` at the call site; one carrying a bare `SCALAR_PTR` is
+`UNDERDETERMINED` — it withholds the upgrade without accusing anyone. Reading such a caller's true
+extent is L1's job (S4), and until then the honest S2 verdict stands. Deliberately conservative: a
+caller mixing an authoritative pointer with a bare one suppresses a possibly‑real finding rather
+than risk a phantom.
+
+**Exit codes remain a statement about the unit under discharge.** A caller that faults on a memory
+property of its own before the obligation is reached is reported loudly, with its counterexample,
+but the process status stays the callee's `ASSUMED_VERIFIED` 0 — that caller is a *different*
+verification unit and its own gate run is what should redden. Only a silent pass is forbidden, which
+is why every withheld discharge is spelled out in the label.
+
+**A discharge is *relative*, and says so.** Each caller's own parameters are materialised by *its*
+S2 assumption, so what one command proves is `caller precondition ⟹ callee precondition` at every
+call site — one link of the chain, not the whole chain. Proving `frame_checksum` calls `sum_bytes`
+correctly says nothing about a third function calling `frame_checksum` badly; closing that needs
+`forseti discharge --function frame_checksum` in turn. The label carries the caveat verbatim, and
+drops it exactly when the chain is **anchored**: a caller whose own precondition is *empty* (no
+pointer parameters) has a harness that allocates real objects, leaving nothing assumed *about its
+parameters*, so a TU whose every caller is anchored is discharged outright for that dimension.
+
+**A check is one invocation, not every one a real program could make.** Every caller — anchored or
+not — is verified from exactly one call in a harness `main`, with the translation unit's own
+file-scope and `static` variables left at whatever value their own initialisers give them; S2
+materialises *parameters* only, never ambient state. A caller whose forwarded argument depends on
+mutable static/global state a real program could have changed by an earlier call — a `static bool
+seen;` flag picking a smaller buffer the second time a public `g(void)` runs — is therefore checked
+for that one entry, not for every entry a real program could make, whether or not `g` counts as
+anchored. The claim states that scope directly (`for one invocation of each caller from this
+translation unit's initial state`) rather than leaving it implicit, so dropping the "relative"
+caveat is never read as a closure over every possible invocation. Modelling repeated invocations
+and the ambient state they can carry between them is L1/S4 territory, same as resolving an indirect
+call to its targets below.
+
+**A caller the gate cannot enumerate is counted, not ignored.** `list_units` narrows to the file
+under test by design, so a `static inline` defined in an included header is part of the translation
+unit yet is not a unit the gate can plan or build a harness for. Claiming "every caller in this TU"
+while such a definition exists would be a claim about a set that was never fully seen, so
+`parse_external_callers` finds them from the same clang dump and each one becomes an `UNCHECKED`
+caller that withholds the upgrade. Enumerating and harnessing header‑defined units is L1/S4
+territory; until then the honest answer is that the discharge is incomplete and *why*.
+
+**A recursive callee is a call site of itself.** Asserting at the entry rather than transplanting a
+contract has one property the modular check would not have had: the assert fires at *every* entry, so
+a re-entry that breaks the precondition cannot slip past — it fails inside whatever caller's run
+reached it. What it costs is **blame**, since one failing run cannot say which entry broke it. So a
+callee that can re-enter itself (directly or round a cycle, over `Unit.calls`) is verified against its
+own harness too; that harness satisfies the obligation at the outer entry by construction, so a
+failure there is the re-entry's. If it settles clean, an obligation failure elsewhere *is* that
+caller's and is named as before; if it does not, the caller's failure is `UNATTRIBUTED` and the
+recursion is named instead — accusing a caller that handed over exactly the object it was given is
+the same phantom-blame this stage exists to avoid. A re-entry never *anchors* a chain: something
+outside the recursion has to enter the callee first, so a callee whose only in-TU call site is its own
+recursion still exports its obligation.
+
+**And a translation unit is only the whole world for a `static` callee.** An externally visible one
+can be named — and handed anything — by any other TU of the linked program, and this command sees
+one TU. So the upgrade also requires internal linkage (`Unit.internal_linkage`, read off the same
+clang dump, harvested from *every* declaration of the name since clang prints `static` only on the
+declaration that carried it): without it a clean local sweep leaves `ASSUMED_VERIFIED` with the
+obligation **exported**, the same answer a callee with no local caller gets, because it is the same
+fact. `examples/frame_checksum.c`'s leaf is `static` for exactly this reason — that is what makes its
+two callers *every* caller and lets the discharge close in one file. For a public entry point the
+honest closure is its clients' own `forseti discharge` runs, one per TU.
+
+**And a caller set is only as complete as the call graph.** Callers are found by *name*, so a body
+that calls `fp(...)` references the variable and no edge leads back to what it holds: a
+`static cb_t fp = sum_bytes;` plus one indirect call is a caller that no enumeration built from
+`Unit.calls` will ever list, and a clean sweep of the callers we *can* see would say nothing about
+it. So `parse_address_escapes` walks the same dump for references to the callee that are not a
+direct call's callee — a file‑scope initialiser, an `&f`, an `fp = f`, a callback argument — telling
+them apart by AST *position* (a callee is the first child of its `CallExpr`, however it is
+parenthesised or dereferenced; an argument is not), and each becomes an `UNRESOLVED` entry that
+withholds the upgrade. An unfamiliar shape counts as an escape, so the failure direction is a
+withheld discharge and never a claimed one — and because the test is on *position* rather than node
+kind, it covers every way clang prints a function being named without being called, including an
+attribute like a `cleanup` handler whose call at scope exit no expression in the AST spells. A second
+*name* for the callee opens the set for the adjacent reason — the alias **is** `f` at link time, but
+a call written through it references only the alias — so `parse_symbol_aliases` reports a GNU
+`alias` attribute and a shared `__asm__` label (the linker joins on the label, not the C name). The
+consequence, stated plainly: a function in a dispatch table is permanently `ASSUMED_VERIFIED` here —
+which is the honest reading, since it really can be invoked from anywhere in the TU with anything.
+Resolving an indirect call to its targets is L1/S4 work.
+
+Both rest on the call graph being *read* correctly in the first place, which is why the AST walk
+keeps a **stack** of open declarations: C allows a function declaration at block scope
+(`void g(void) { extern void h(void); f(p); }`), and treating the inner one as the end of `g` drops
+every call written after it — a caller that vanishes silently, which is exactly the failure this
+section exists to prevent.
+
+**OQ1 answered — verify a generated copy.** Injecting into a copy works and keeps the promise S2
+made: `forseti discharge --emit-only` prints exactly what the checker sees, and the acceptance suite
+asserts the user's file is byte‑identical afterwards. Source annotations were never a live option
+(they would put Forseti's scaffolding in the user's repo); harness‑only cannot discharge at all.
+
+**OQ3 answered — the warning is *not* cosmetic, and it cost us the vehicle.** Measured against esbmc
+8.3.0 (pinned by `tests/esbmc/test_contract_vehicle.py`): a `__ESBMC_requires` over plain parameter
+arithmetic transplants correctly under `--replace-call-with-contract` (good caller SUCCESSFUL, bad
+caller FAILED — so the machinery itself works), but a `requires` whose expression contains an
+intrinsic **call** — `__ESBMC_is_fresh`, `__ESBMC_r_ok`, `__ESBMC_get_object_size` — is transplanted
+into the caller still referring to a callee‑local temporary that no longer exists. esbmc says
+`WARNING: Could not find definition for temporary variable: …return_value$___ESBMC_is_fresh$1` and
+then FAILS **every** call site regardless of what it passes; hoisting the intrinsic into a local
+first does not help. Under `--enforce-contract` the same `requires` simply has no effect, leaving
+the phantom VIOLATED S1 exists to remove. Both directions fail *closed* — never a false VERIFIED —
+but neither discharges anything, so `--replace-call-with-contract` is unusable for a **memory**
+precondition until our fork fixes the transplant. (`__ESBMC_same_object(p, p + n)` is no substitute:
+ESBMC's pointer arithmetic preserves object identity, so it cannot express an extent.)
+
+**The vehicle that does work, and what it gives up.** The obligation is an
+`__ESBMC_assert(<predicate>, "forseti:obligation:<fn>:<param>")` at the callee's entry, checking the
+same predicate against the same arguments a contract would. What that gives up is **modularity** —
+the callee's body is still explored — not soundness; and the label is what tells a caller‑side break
+from a bug inside the callee, so classification stays structural rather than counterexample‑prose
+matching. Two ESBMC quirks shape the predicate itself and are pinned as tests:
+`__ESBMC_r_ok(p, n)` answers *true* when `p`'s offset already lies past its object's end
+(`r_ok(malloc(8) + 9, 4)` passes), so the check is **rebased to offset zero** — ask for `offset + n`
+bytes from the object's base, where `r_ok` is exact — and guarded against a `size_t` wrap, since a
+caller's underflowed length (`len - HEADER`) would otherwise ask for a *tiny*, satisfiable span.
+`__ESBMC_get_object_size` would have expressed this directly but aborts without a verdict on exactly
+those pointers. `r_ok` is also *weaker* than `is_fresh` — it admits an interior pointer into a larger
+live object, which is what makes a caller like `payload_checksum(frame + 2, len - 2)` dischargeable
+at all — and it says nothing about write permission; ESBMC checks that separately (`dereference
+failure: write access to const object`) in the same run, because the callee's body is explored.
+
 ## Decisions (recommended) & open questions
 
 - **D1 — Structural, not functional.** Memory preconditions are synthesized by a dedicated
   signature‑driven module, **not** the LLM proposer/GEPA path. *(Recommended — settled with
   reviewers.)*
 - **D2 — Vehicle.** Contracts as the sound/compositional target; generated sidecar harnesses as
-  fallback + fast first step. *(Recommended.)*
+  fallback + fast first step. *(Recommended — **revised by S3**: ESBMC contracts cannot carry a
+  memory precondition on the pinned build, so the discharge vehicle is an injected obligation
+  asserted at the callee's entry. Sidecar harnesses remain the assumption side. See OQ3.)*
 - **D3 — Ship S2 before S3 with honest labeling** ("VERIFIED assuming valid caller pointers"),
   upgraded to discharged in S3. *(Recommended; alternative: hold S2 until discharge — never
   over‑claim vs. velocity.)*
-- **OQ1** — Transparent contract injection: verify a generated copy of the TU vs. accept
-  source annotations vs. harness‑only for the transparent path.
+- ~~**OQ1**~~ **— answered (S3): verify a generated copy of the TU.** Source annotations were never
+  live; harness‑only cannot discharge.
 - **OQ2** — `ptr,len` pairing heuristic robustness (multiple buffers; length in a struct; sentinel
   strings) — how much is L0 vs. L1.
-- **OQ3** — Validate the `is_fresh` temporary warning is cosmetic, not a soundness gap.
+- ~~**OQ3**~~ **— answered (S3): not cosmetic.** The temporary‑variable warning marks a transplant
+  failure that makes *any* intrinsic‑call `requires` unusable under `--replace-call-with-contract`
+  (and inert under `--enforce-contract`). Fails closed, discharges nothing. Fixing it in our fork
+  (ADR‑0004) would restore true modular discharge; until then the injected obligation stands.
 
 ## References
 

@@ -16,6 +16,11 @@ Subcommands:
   reporting an honestly-labelled assessment (``--emit-only`` prints the generated
   sidecar instead). Exit follows the assessment contract
   (:data:`forseti.precond.ASSESSMENT_EXIT_CODES`).
+- ``forseti discharge <source> --function NAME`` — the same, then *discharge*
+  the assumption (RFC-0003 S3): the precondition is injected into a generated
+  copy of the translation unit as a checked obligation and verified at every
+  caller, upgrading ``ASSUMED_VERIFIED`` to ``DISCHARGED_VERIFIED`` only when
+  every caller was checked and every check passed.
 - ``forseti propose <source> --function NAME`` — ask the property proposer (#65)
   for candidate properties over that unit and persist the survivors (``--json``
   emits the same payload the MCP tool returns). Exit 0 on a completed run,
@@ -48,6 +53,8 @@ from forseti.precond import (
     DEFAULT_MAX_LEN,
     Assessment,
     PreconditionUnavailable,
+    discharge_precondition,
+    emit_obligations,
     synthesize,
     verify_precondition,
 )
@@ -188,21 +195,8 @@ def _run_list_units(args: argparse.Namespace) -> int:
     return 0
 
 
-def _add_synth_parser(
-    sub: argparse._SubParsersAction[argparse.ArgumentParser],
-) -> None:
-    p = sub.add_parser(
-        "synth",
-        help="synthesise a memory precondition for a unit and verify against it",
-        description=(
-            "Read an L0 memory precondition off <source>::<function>'s type "
-            "signature (RFC-0003 S2), materialise a valid object per pointer in a "
-            "generated sidecar (the source stays pristine), and verify with "
-            "unwinding assertions on + a k-ladder + a non-vacuity check. A pass is "
-            "reported honestly as VERIFIED *assuming valid caller pointers* "
-            "(undischarged)."
-        ),
-    )
+def _add_precondition_arguments(p: argparse.ArgumentParser, *, emit_help: str) -> None:
+    """The argument surface `synth` and `discharge` share (RFC-0003 S2/S3)."""
     p.add_argument("source", type=Path, help="C source file defining the unit")
     p.add_argument(
         "--function",
@@ -233,15 +227,32 @@ def _add_synth_parser(
         default="esbmc",
         help="esbmc binary to invoke (default: esbmc on PATH)",
     )
-    p.add_argument(
-        "--emit-only",
-        action="store_true",
-        help="print the generated sidecar C harness and exit (no verification)",
-    )
+    p.add_argument("--emit-only", action="store_true", help=emit_help)
     p.add_argument(
         "--json",
         action="store_true",
         help="emit the assessment as a JSON object",
+    )
+
+
+def _add_synth_parser(
+    sub: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    p = sub.add_parser(
+        "synth",
+        help="synthesise a memory precondition for a unit and verify against it",
+        description=(
+            "Read an L0 memory precondition off <source>::<function>'s type "
+            "signature (RFC-0003 S2), materialise a valid object per pointer in a "
+            "generated sidecar (the source stays pristine), and verify with "
+            "unwinding assertions on + a k-ladder + a non-vacuity check. A pass is "
+            "reported honestly as VERIFIED *assuming valid caller pointers* "
+            "(undischarged)."
+        ),
+    )
+    _add_precondition_arguments(
+        p,
+        emit_help="print the generated sidecar C harness and exit (no verification)",
     )
 
 
@@ -275,6 +286,62 @@ def _run_synth(args: argparse.Namespace) -> int:
             result.esbmc_result, Violated
         ):
             print(f"\n{result.esbmc_result.raw_counterexample}")
+    return ASSESSMENT_EXIT_CODES[result.assessment]
+
+
+def _add_discharge_parser(
+    sub: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    p = sub.add_parser(
+        "discharge",
+        help="verify a unit's memory precondition and discharge it at its callers",
+        description=(
+            "Run `synth` (RFC-0003 S2), then discharge the assumption it leaves "
+            "(S3): the same precondition is injected into a generated *copy* of "
+            "the translation unit as a checked obligation at the unit's entry, and "
+            "every caller in that TU is verified against the copy. The verdict is "
+            "upgraded to VERIFIED (discharged) only when the unit is `static` (so "
+            "this TU holds every caller), every caller was checked, and every "
+            "check passed; a caller that passes an invalid or too-small pointer is "
+            "VIOLATED at the call site."
+        ),
+    )
+    _add_precondition_arguments(
+        p,
+        emit_help=(
+            "print the obligation-injected copy of the translation unit and exit "
+            "(no verification)"
+        ),
+    )
+
+
+def _run_discharge(args: argparse.Namespace) -> int:
+    if args.emit_only:
+        try:
+            text = emit_obligations(
+                args.source,
+                function=args.function,
+                esbmc_bin=args.esbmc_bin,
+            )
+        except PreconditionUnavailable as exc:
+            print(f"forseti discharge: {exc.detail}", file=sys.stderr)
+            return ASSESSMENT_EXIT_CODES[exc.assessment]
+        print(text, end="")
+        return 0
+
+    result = discharge_precondition(
+        args.source,
+        function=args.function,
+        max_len=args.max_len,
+        timeout_s=args.timeout,
+        esbmc_bin=args.esbmc_bin,
+    )
+    if args.json:
+        print(json.dumps(result.to_dict()))
+    else:
+        print(f"{args.source}::{args.function}: {result.label}")
+        for check in result.callers:
+            print(f"  {check.caller}(): {check.outcome.value} — {check.detail}")
     return ASSESSMENT_EXIT_CODES[result.assessment]
 
 
@@ -404,6 +471,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_verify_parser(sub)
     _add_list_units_parser(sub)
     _add_synth_parser(sub)
+    _add_discharge_parser(sub)
     _add_propose_parser(sub)
     sub.add_parser(
         "mcp",
@@ -421,6 +489,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_list_units(args)
     if args.command == "synth":
         return _run_synth(args)
+    if args.command == "discharge":
+        return _run_discharge(args)
     if args.command == "propose":
         return _run_propose(args)
     if args.command == "mcp":
