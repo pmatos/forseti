@@ -275,6 +275,14 @@ def test_annotate_array_extents_prefers_definition_over_prototype() -> None:
     assert _extent(source, Param("p", "uint8_t *")) == 20
 
 
+def test_annotate_array_extents_recovers_literal_past_a_suffix_attribute() -> None:
+    # A GNU suffix attribute between the declarator and body (issue #163) must
+    # not stop the definition from being recognized at all — the array extent
+    # is still isolable from the declarator.
+    source = "void f(uint8_t p[20]) __attribute__((noinline)) {}"
+    assert _extent(source, Param("p", "uint8_t *")) == 20
+
+
 def test_annotate_array_extents_ignores_bracket_in_comment() -> None:
     # Neither a bogus extent nor a bogus "written as an array" signal: the
     # commented-out bracket is gone before the declarator is read.
@@ -1067,6 +1075,41 @@ def test_find_definition_brace_skips_prototypes_and_call_sites() -> None:
 
 def test_find_definition_brace_absent_without_a_definition() -> None:
     assert find_definition_brace("void f(int *p);\n", "f") is None
+
+
+def test_find_definition_brace_skips_a_suffix_attribute() -> None:
+    # clang (and so ESBMC) accepts a GNU attribute between the declarator and
+    # the body of a *definition* — gcc rejects this placement, but the
+    # construct is real and clang lists/verifies it fine (issue #163).
+    source = "static void f(int *p) __attribute__((noinline)) { *p = 0; }\n"
+    index = find_definition_brace(source, "f")
+    assert index is not None
+    assert source[index] == "{"
+
+
+def test_find_definition_brace_skips_a_suffix_attribute_with_nested_parens() -> None:
+    # `__attribute__((aligned(8)))` nests a paren inside the attribute's own
+    # argument list, which must be balanced on its own terms.
+    source = "void f(int *p) __attribute__((aligned(8))) { *p = 0; }\n"
+    index = find_definition_brace(source, "f")
+    assert index is not None
+    assert source[index] == "{"
+
+
+def test_find_definition_brace_skips_multiple_suffix_attributes() -> None:
+    source = (
+        "void f(int *p) __attribute__((noinline)) __attribute__((used)) { *p = 0; }\n"
+    )
+    index = find_definition_brace(source, "f")
+    assert index is not None
+    assert source[index] == "{"
+
+
+def test_find_definition_brace_rejects_an_unbalanced_suffix_attribute() -> None:
+    # A malformed attribute must not be silently skipped into a match — the
+    # fail-closed outcome (no definition found) is preserved.
+    source = "void f(int *p) __attribute__((noinline) { *p = 0; }\n"
+    assert find_definition_brace(source, "f") is None
 
 
 _HEADER_CALLER_AST = """\
