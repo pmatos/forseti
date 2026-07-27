@@ -138,15 +138,26 @@ def test_readable_static_minimum_without_a_length_is_its_extent() -> None:
     assert plan.params[0].static_min_extent is None
 
 
-def test_conventional_extent_still_outranks_an_accompanying_length() -> None:
-    # Without `static` the bracket binds nobody, so #134's rule is unchanged here:
-    # the written extent is the only size the signature states and the neighbouring
-    # length stays a plain scalar. That leaves its own phantom for `len > N` —
-    # pre-existing, tracked in #147, and deliberately not changed by this fix.
+def test_conventional_extent_defers_to_an_accompanying_length() -> None:
+    # Issue #147: without `static` the bracket binds nobody (C adjusts the
+    # parameter to `T *`), so an accompanying length is the better authority —
+    # unlike `[static N]` (issue #137), there is no caller obligation to floor
+    # against, so `N` is dropped entirely rather than sizing `max(length, N)`.
     unit = _unit(
         Param("buf", "uint8_t *", array_extent=20),
         Param("len", "unsigned long"),
     )
+    plan = plan_unit(unit)
+    assert plan.params[0].role is ParamRole.PTR_BYTE_LEN
+    assert plan.params[0].length_var == "len"
+    assert plan.params[0].static_min_extent is None
+    assert plan.params[1].role is ParamRole.LENGTH
+
+
+def test_conventional_extent_wins_with_no_accompanying_length() -> None:
+    # With nothing to pair with, the written extent is the only size the
+    # signature states, so it still backs the object (unchanged from #134).
+    unit = _unit(Param("buf", "uint8_t *", array_extent=20), Param("flag", "int"))
     plan = plan_unit(unit)
     assert plan.params[0].role is ParamRole.FIXED_ARRAY
     assert plan.params[0].extent == 20
@@ -249,6 +260,18 @@ def test_render_fixed_array_scales_by_extent() -> None:
     unit = _unit(Param("digest", "uint8_t *", array_extent=20), name="sha1_final")
     text = render_sidecar(plan_unit(unit), "s.c")
     assert "uint8_t * digest = malloc((size_t)20 * sizeof(*digest));" in text
+
+
+def test_render_conventional_extent_with_length_sizes_by_length_alone() -> None:
+    # Issue #147: `uint8_t p[16], size_t len` sizes by `len` alone — no `max(len,
+    # 16)` floor, since a conventional (non-`static`) extent binds nobody.
+    unit = _unit(
+        Param("p", "uint8_t *", array_extent=16),
+        Param("len", "unsigned long"),
+        name="g",
+    )
+    text = render_sidecar(plan_unit(unit), "s.c", max_len=8)
+    assert "uint8_t * p = malloc((size_t)len);" in text
 
 
 def test_render_static_minimum_floors_a_byte_length() -> None:

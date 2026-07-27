@@ -23,8 +23,8 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 # One AST node line: leading tree art, then `-Kind`, then the rest. The art is
@@ -67,7 +67,7 @@ _NAME_RE = re.compile(r"\s(\w+)\s+'")
 # so the *last* match is the canonical (typedef-resolved) type.
 _TYPE_RE = re.compile(r"'([^']*)'")
 
-# Line (`// ...`) and block (`/* ... */`) comments, stripped before harvesting an
+# Line (`// ...`) and block (`/* ... */`) comments, blanked before harvesting an
 # array extent so a `[N]` inside a comment can never be misread as a declarator.
 # A `//` comment absorbs a trailing backslash-newline as part of itself: cpp
 # splices lines (translation phase 2) before it ever recognizes a comment
@@ -77,6 +77,35 @@ _TYPE_RE = re.compile(r"'([^']*)'")
 # on this already-blanked text, so a backslash swallowed by an *unspliced* `//`
 # match here would already be gone by the time that exclusion could see it).
 _COMMENT_RE = re.compile(r"//(?:\\\r?\n|[^\n])*|/\*.*?\*/", re.DOTALL)
+
+# A `DeclRefExpr` naming a function: clang prints `Function 0x<addr> '<name>'`.
+# Matches a direct call's callee and an address-of, which is why `Unit.calls` is
+# documented as *referenced*, not *called* — an over-approximation.
+_CALLEE_RE = re.compile(r"\bFunction 0x[0-9a-fA-F]+ '(\w+)'")
+
+# Nodes C allows *between* a `CallExpr` and the `DeclRefExpr` naming its callee:
+# clang's own `FunctionToPointerDecay` cast, and the parentheses/dereferences the
+# grammar permits — `(f)(x)` adds a `ParenExpr`, `(*f)(x)` a `UnaryOperator` and a
+# second cast. Each is transparent only as its parent's *first* child, which is
+# what separates a callee from an argument: `apply(f, q)` wraps `f` in the same
+# decay cast, at index 1.
+_CALLEE_WRAPPERS = frozenset({"ImplicitCastExpr", "ParenExpr", "UnaryOperator"})
+
+# The site name reported for an escape with no named enclosing declaration.
+_FILE_SCOPE = "<file scope>"
+
+# The symbol an attribute names, as clang prints it: `AliasAttr <loc> "target"`.
+# The quoted text is a linker symbol, not a C identifier — GNU `__asm__` labels
+# may carry punctuation a C name cannot (`__asm__("impl.sym")` prints unchanged
+# as `AsmLabelAttr <loc> "impl.sym"`), so everything but the closing quote is
+# captured, not just `\w`.
+_TARGET_NAME_RE = re.compile(r'"([^"]+)"')
+
+# The storage class clang prints *after* a declaration's quoted type — `static`,
+# `extern`, and modifiers like `inline`. Read from the tail so a source path that
+# happens to contain a `static` directory (printed before the type) cannot be
+# misread as internal linkage.
+_STATIC_STORAGE = "static"
 
 # A named parameter's array declarator: the name followed by *all* its consecutive
 # `[...]` groups, captured together (whitespace between them included) so a
@@ -236,8 +265,27 @@ class Param:
 class Unit:
     """A function *definition* found in the source: its name and parameters.
 
+    `calls` names the functions this definition's body *references* — every
+    callee of a direct call, plus any function whose address is merely taken
+    (both print the same ``Function 0x… 'name'`` reference in the AST). It is
+    therefore an over-approximation, which is the safe direction for its user:
+    compositional discharge (RFC-0003 S3) verifies every caller of a unit, so a
+    spurious edge costs one extra verification while a missing one would let an
+    undischarged obligation pass as discharged.
+
+    What it is *not* is a call graph closed under function pointers: a body that
+    calls through ``fp`` references the variable, not what it holds. That blind
+    spot is reported separately by `parse_address_escapes`, not papered over here.
+
+    `internal_linkage` is True when some declaration of this name in the
+    translation unit is marked ``static``, i.e. the TU is the whole world for it.
+    Compositional discharge (RFC-0003 S3) needs that to know whether "every caller
+    in this TU" is every caller at all. It reads the marker and nothing else, so a
+    definition whose ``static`` is not printed reads as external — which costs a
+    withheld discharge, never a claimed one.
+
     `def_line` is the 1-based line of the definition clang actually compiled, as
-    reported by its own AST location — set by `parse_units`, ``None`` for a
+    reported by its own AST location — set by `parse_definitions`, ``None`` for a
     hand-built `Unit` (tests). `annotate_array_extents` anchors its declarator
     search to this line so a `#if 0`/`#ifdef`-excluded alternative body with the
     same name cannot donate its array shape to the active definition (issue #145).
@@ -245,6 +293,8 @@ class Unit:
 
     name: str
     params: tuple[Param, ...]
+    calls: tuple[str, ...] = ()
+    internal_linkage: bool = False
     def_line: int | None = None
 
     @property
@@ -268,7 +318,7 @@ def _loc_file(rest: str, current: str) -> str:
     Reads the range's *start*, unlike `_loc_line` (which reads `point`): file
     identity does not move within a same-file macro expansion, and a macro whose
     own definition lives in a *different* file (a header) still drops the unit
-    via `fn_in_target`, so the asymmetry is harmless for every case this module
+    via `_is_target`, so the asymmetry is harmless for every case this module
     handles.
     """
     match = _LOC_RE.search(rest)
@@ -327,41 +377,46 @@ def _error_line(text: str) -> str:
     return ""
 
 
-def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
-    """Function definitions in `source` from an ``esbmc --parse-tree-only`` dump.
+@dataclass
+class _AstNode:
+    """One node of the walked AST, with its position among its parent's children."""
 
-    Walks the textual AST tracking the current file; for each ``FunctionDecl`` in
-    `source` it collects the immediate ``ParmVarDecl`` children (with their
-    canonical types) and keeps the unit only if the subtree contains a
-    ``CompoundStmt`` — i.e. it is a *definition*, not a prototype (so a header of
-    declarations yields nothing, matching what the gate can verify). Deduped by
-    name, first definition wins.
+    depth: int
+    kind: str
+    rest: str
+    index: int
+    children: int = 0
+
+
+@dataclass
+class _OpenFunction:
+    """A ``FunctionDecl`` being assembled, and the nodes seen under it so far."""
+
+    name: str | None
+    depth: int
+    file: str
+    def_line: int | None = None
+    params: list[Param] = field(default_factory=list)
+    calls: dict[str, None] = field(default_factory=dict)  # an ordered set
+    is_definition: bool = False
+
+
+def _walk(ast_text: str) -> Iterator[tuple[list[_AstNode], str, str, str, int]]:
+    """Every node of `ast_text`, with its ancestor stack, current file, and line.
+
+    The single traversal every parser here shares: it yields the node's stack
+    (root first, the node itself last, each entry knowing its position among its
+    parent's children) so a parser can ask about *structure* — who encloses this,
+    is it the first child — rather than guessing from a line in isolation.
+
+    The current *presumed* line (`_loc_line`) is carried alongside the current
+    file for the same reason the file is: a node's own location can be an
+    abbreviated ``col:N`` that inherits both from whatever came before it. Read
+    by `parse_definitions` to set `Unit.def_line` (issue #145).
     """
-    # Attribute a function to `source` by a normalized full-path match against
-    # clang's location (clang echoes the input path verbatim), so a definition
-    # from a same-basename `#include`d file in another directory is not misread
-    # as belonging to `source`.
-    source_norm = os.path.normpath(str(source))
-    units: list[Unit] = []
-    seen: set[str] = set()
+    stack: list[_AstNode] = []
     current_file = ""
     current_line = 0
-
-    # State for the FunctionDecl currently being assembled.
-    fn_name: str | None = None
-    fn_depth = -1
-    fn_in_target = False
-    fn_def_line: int | None = None
-    params: list[Param] = []
-    is_definition = False
-
-    def flush() -> None:
-        nonlocal fn_name
-        if fn_name and fn_in_target and is_definition and fn_name not in seen:
-            seen.add(fn_name)
-            units.append(Unit(fn_name, tuple(params), fn_def_line))
-        fn_name = None
-
     for line in ast_text.splitlines():
         node = _NODE_RE.match(line)
         if not node:
@@ -370,37 +425,434 @@ def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
         depth = _depth(art)
         current_file = _loc_file(rest, current_file)
         current_line = _loc_line(rest, current_line)
+        while stack and stack[-1].depth >= depth:
+            stack.pop()
+        index = 0
+        if stack:
+            index = stack[-1].children
+            stack[-1].children += 1
+        stack.append(_AstNode(depth, kind, rest, index))
+        yield stack, kind, rest, current_file, current_line
 
-        # A node at or above the open FunctionDecl's depth ends its subtree.
-        if fn_name is not None and depth <= fn_depth:
-            flush()
 
-        if kind == "FunctionDecl":
-            flush()  # close a same-depth previous function first
-            name_match = _NAME_RE.search(rest)
-            fn_name = name_match.group(1) if name_match else None
-            fn_depth = depth
-            fn_in_target = bool(current_file) and (
-                os.path.normpath(current_file) == source_norm
-            )
-            fn_def_line = current_line
-            params = []
-            is_definition = False
-        elif fn_name is not None and depth > fn_depth:
-            if kind == "ParmVarDecl" and depth == fn_depth + 1:
-                types = _TYPE_RE.findall(rest)
-                name_match = _NAME_RE.search(rest)
-                params.append(
-                    Param(
-                        name_match.group(1) if name_match else "",
-                        types[-1] if types else "",
+def parse_definitions(ast_text: str) -> list[tuple[str, Unit]]:
+    """Every function *definition* in an ``esbmc --parse-tree-only`` dump.
+
+    Walks the textual AST tracking the current file and pairs each definition with
+    the file it came from — the whole *translation unit*, headers included, not
+    just the file that was passed to esbmc. For each ``FunctionDecl`` it collects
+    the immediate ``ParmVarDecl`` children (with their canonical types) and every
+    function the subtree references (`Unit.calls`), keeping it only if the subtree
+    contains a ``CompoundStmt`` — i.e. it is a definition, not a prototype.
+
+    Neither filtered nor deduped: `parse_units` narrows this to the file under
+    test (what the gate can verify), while `parse_external_callers` needs exactly
+    the part `parse_units` drops.
+
+    ``static`` is harvested from *every* declaration of a name, not just the
+    definition: clang prints the storage class on the declaration that carried it,
+    so ``static void f(int *); void f(int *p) {}`` marks only the prototype.
+
+    Also records `Unit.def_line` — the definition's own presumed line, from
+    `_walk`'s `_loc_line` tracking — on every ``FunctionDecl`` (cheap to always
+    capture; only definitions survive to `found` anyway). `annotate_array_extents`
+    anchors its declarator search to it so a ``#if 0``/``#ifdef``-excluded
+    alternative body with the same name cannot donate its array shape to the
+    active definition (issue #145).
+
+    Function declarations **nest** — C allows one at block scope
+    (``void g(void) { extern void h(void); f(p); }``) and GNU C a whole nested
+    definition — so the open declarations are a *stack*. Closing the enclosing
+    ``g`` at the inner one, as a single slot would, silently drops every call
+    written after it, and a dropped call edge is a caller the discharge never
+    sees.
+    """
+    found: list[tuple[str, Unit]] = []
+    internal: set[str] = set()
+    open_fns: list[_OpenFunction] = []
+
+    def close(down_to: int) -> None:
+        """Finish every open declaration the node at `down_to` is not inside."""
+        while open_fns and open_fns[-1].depth >= down_to:
+            fn = open_fns.pop()
+            if fn.name and fn.is_definition:
+                found.append(
+                    (
+                        fn.file,
+                        Unit(
+                            fn.name,
+                            tuple(fn.params),
+                            tuple(fn.calls),
+                            def_line=fn.def_line,
+                        ),
                     )
                 )
-            elif kind == "CompoundStmt":
-                is_definition = True
 
-    flush()
+    for stack, kind, rest, file, line in _walk(ast_text):
+        depth = stack[-1].depth
+        close(depth)
+        if kind == "FunctionDecl":
+            name_match = _NAME_RE.search(rest)
+            name = name_match.group(1) if name_match else None
+            if name and _STATIC_STORAGE in rest.rsplit("'", 1)[-1].split():
+                internal.add(name)
+            open_fns.append(_OpenFunction(name, depth, file, def_line=line))
+            continue
+        if not open_fns:
+            continue
+        fn = open_fns[-1]
+        if kind == "ParmVarDecl" and depth == fn.depth + 1:
+            types = _TYPE_RE.findall(rest)
+            name_match = _NAME_RE.search(rest)
+            fn.params.append(
+                Param(
+                    name_match.group(1) if name_match else "",
+                    types[-1] if types else "",
+                )
+            )
+        elif kind == "CompoundStmt":
+            fn.is_definition = True
+        elif kind == "DeclRefExpr":
+            callee = _CALLEE_RE.search(rest)
+            if callee is not None:
+                fn.calls[callee.group(1)] = None
+
+    close(0)
+    return [(f, replace(u, internal_linkage=u.name in internal)) for f, u in found]
+
+
+def _is_target(file: str, source_norm: str) -> bool:
+    """Whether a definition's clang location names `source`.
+
+    A normalized *full-path* match (clang echoes the input path verbatim), so a
+    definition from a same-basename ``#include``\\ d file in another directory is
+    not misread as belonging to `source`. An empty location is never the target.
+    """
+    return bool(file) and os.path.normpath(file) == source_norm
+
+
+def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
+    """Function definitions in `source` from an ``esbmc --parse-tree-only`` dump.
+
+    `parse_definitions` narrowed to the file under test — a header of
+    declarations yields nothing, matching what the gate can verify. Deduped by
+    name, first definition wins.
+    """
+    source_norm = os.path.normpath(str(source))
+    units: list[Unit] = []
+    seen: set[str] = set()
+    for file, unit in parse_definitions(ast_text):
+        if not _is_target(file, source_norm) or unit.name in seen:
+            continue
+        seen.add(unit.name)
+        units.append(unit)
     return units
+
+
+def parse_external_callers(
+    ast_text: str, source: str | Path, symbol: str
+) -> tuple[str, ...]:
+    """Definitions **outside** `source` that reference `symbol`, by name.
+
+    The blind spot `parse_units` has by construction: a ``static inline`` in an
+    included header is part of the same translation unit and can call `symbol`,
+    but it is not a unit the gate enumerates. Compositional discharge (RFC-0003
+    S3) has to know they exist — it cannot claim every caller in the TU was
+    checked while some were never even listed — so it counts them and withholds
+    the upgrade rather than quietly ignoring them.
+    """
+    source_norm = os.path.normpath(str(source))
+    names: dict[str, None] = {}
+    for file, unit in parse_definitions(ast_text):
+        if _is_target(file, source_norm) or unit.name == symbol:
+            continue
+        if symbol in unit.calls:
+            names[unit.name] = None
+    return tuple(names)
+
+
+def _is_call_callee(stack: list[_AstNode]) -> bool:
+    """Whether the node on top of `stack` is the callee of a direct call.
+
+    Climbs the first-child chain of `_CALLEE_WRAPPERS` above the reference and
+    asks whether it lands on a ``CallExpr``'s first child. Anything else — an
+    argument, an initialiser, an ``&f``, an AST shape we have not seen — is *not*
+    a direct call, which is the conservative reading: an unfamiliar shape costs a
+    withheld discharge, never a claimed one.
+    """
+    k = len(stack) - 1
+    while k > 0 and stack[k].index == 0 and stack[k - 1].kind in _CALLEE_WRAPPERS:
+        k -= 1
+    return k > 0 and stack[k].index == 0 and stack[k - 1].kind == "CallExpr"
+
+
+def _enclosing_name(stack: list[_AstNode]) -> str:
+    """What to call the site of the node on top of `stack`.
+
+    The nearest enclosing named declaration: the function a reference sits in,
+    or — at file scope — the object whose initialiser holds it (``static cb_t fp
+    = f``). Reporting only, so a shape with no named ancestor degrades to
+    `_FILE_SCOPE` rather than dropping the escape.
+    """
+    for node in reversed(stack[:-1]):
+        if node.kind in ("FunctionDecl", "VarDecl"):
+            name = _NAME_RE.search(node.rest)
+            return name.group(1) if name else _FILE_SCOPE
+    return _FILE_SCOPE
+
+
+def parse_address_escapes(ast_text: str, symbol: str) -> tuple[str, ...]:
+    """Sites naming `symbol` **outside a direct call**, by enclosing declaration.
+
+    A function whose address is stored in a pointer can be invoked through it
+    from anywhere in the translation unit, and an indirect ``fp(...)`` names only
+    the *variable* — so no `Unit.calls` edge leads back to `symbol` and the caller
+    enumeration silently misses that path. This reports those sites so
+    compositional discharge (RFC-0003 S3) can withhold its upgrade instead:
+    ``static cb_t fp = f;`` at file scope yields ``fp``, an ``fp = f`` inside a
+    body yields the enclosing function.
+
+    The test is deliberately on *position*, not on node kind: clang prints the
+    same ``Function 0x… 'name'`` reference wherever a function is named without
+    being called, so ``char c __attribute__((cleanup(f)))`` — a call at scope exit
+    that no expression in the AST spells — is caught by the same rule as an
+    address-of, and so is any attribute of that shape we have not seen yet.
+
+    What that rule cannot catch is an attribute on the callee's **own**
+    declaration rather than a reference sitting elsewhere — a
+    ``constructor``/``destructor`` attribute prints no ``Function 0x… 'name'``
+    text at all, since it names no one; the loader invokes the callee directly.
+    `parse_implicit_invocations` covers that shape.
+
+    A *direct* call is not an escape, however it is written (`_is_call_callee`),
+    including the recursive call in ``symbol``'s own body — otherwise every
+    recursive unit would be permanently undischargeable.
+    """
+    sites: dict[str, None] = {}
+    for stack, _kind, rest, _file, _line in _walk(ast_text):
+        referenced = _CALLEE_RE.search(rest)
+        if referenced is None or referenced.group(1) != symbol:
+            continue
+        if not _is_call_callee(stack):
+            sites[_enclosing_name(stack)] = None
+    return tuple(sites)
+
+
+# `kind` -> the human word for the AST node clang emits directly on a function's
+# own `FunctionDecl` when a `constructor`/`destructor` attribute marks it: the
+# loader calls it at load/unload time, with none of the arguments any call site
+# in this translation unit supplies.
+_IMPLICIT_INVOCATION_ATTRS = {
+    "ConstructorAttr": "constructor",
+    "DestructorAttr": "destructor",
+}
+
+
+def parse_implicit_invocations(ast_text: str, symbol: str) -> tuple[str, ...]:
+    """Constructor/destructor attributes on `symbol`'s **own** declaration.
+
+    ``__attribute__((constructor))``/``destructor`` is unlike every other
+    attribute-borne path this module follows: it names no one. It sits on the
+    callee's own ``FunctionDecl`` as a bare ``ConstructorAttr``/``DestructorAttr``
+    child, with no ``Function 0x… 'name'`` reference anywhere — so neither
+    `parse_address_escapes` (which keys off that reference shape) nor
+    `parse_symbol_aliases` (a second *name*, not a second *invoker*) can see it.
+    The loader calls the function directly at load/unload time, supplying none
+    of the arguments any explicit caller in this translation unit does, so an
+    otherwise-clean sweep of explicit callers says nothing about that
+    invocation. Compositional discharge (RFC-0003 S3) withholds the upgrade
+    instead of claiming a caller set that omits it.
+    """
+    found: dict[str, None] = {}
+    for stack, kind, _rest, _file, _line in _walk(ast_text):
+        label = _IMPLICIT_INVOCATION_ATTRS.get(kind)
+        if label is not None and _enclosing_name(stack) == symbol:
+            found[label] = None
+    return tuple(found)
+
+
+def _declared_name(rest: str) -> str:
+    """The identifier a declaration line names, or ``""`` when it names none."""
+    found = _NAME_RE.search(rest)
+    return found.group(1) if found else ""
+
+
+def parse_symbol_aliases(ast_text: str, symbol: str) -> tuple[str, ...]:
+    """Declarations that are **another name** for `symbol`, by name.
+
+    GNU C's ``static void fa(int *) __attribute__((alias("f")))`` makes ``fa``
+    and ``f`` the same function at link time, but a call to ``fa`` prints a
+    reference to ``fa`` alone: nothing in the AST joins that call site to ``f``,
+    so the caller enumeration cannot see it. Compositional discharge (RFC-0003 S3)
+    therefore treats an alias as a caller path it cannot follow and withholds the
+    upgrade, rather than claiming a set of callers that was complete only for one
+    of the function's names.
+
+    An **assembly label** is the same identity by a different route: what the
+    linker joins is a declaration's *symbol* name, which is its ``__asm__`` label
+    when it has one and its C name otherwise. So the comparison is between those
+    effective names — which catches two declarations sharing an explicit label,
+    and equally ``void fa(int *) __asm__("f")`` next to a plain ``f``, where only
+    one side carries a label at all.
+
+    The two mechanisms also combine: ``alias("impl.sym")`` names a *linker*
+    symbol, so when `symbol` itself carries ``__asm__("impl.sym")`` the alias
+    that actually links to it names that label, not `symbol`'s bare C name —
+    matching only the literal name would miss it. `AliasAttr` targets are
+    therefore compared against the same effective-symbol set (`symbol`'s own
+    label, or `symbol` itself when it has none) the label loop below computes,
+    not against `symbol` alone.
+
+    What this does *not* cover is a function named by an attribute rather than
+    aliased by one — a ``cleanup`` handler, say. That is `parse_address_escapes`'
+    job: clang prints those as an ordinary ``Function 0x… 'name'`` reference, and
+    a reference outside a direct call already opens the caller set. A
+    ``constructor``/``destructor`` attribute is neither a second name nor a
+    reference — it sits on `symbol`'s own declaration with the loader as the
+    invoker; `parse_implicit_invocations` covers that.
+    """
+    aliases: dict[str, None] = {}
+    labels: dict[str, set[str]] = {}
+    alias_targets: dict[str, set[str]] = {}
+    for stack, kind, rest, _file, _line in _walk(ast_text):
+        if kind == "FunctionDecl":
+            labels.setdefault(_declared_name(rest), set())
+        elif kind == "AliasAttr":
+            alias_targets.setdefault(_enclosing_name(stack), set()).update(
+                _TARGET_NAME_RE.findall(rest)
+            )
+        elif kind == "AsmLabelAttr":
+            labels.setdefault(_enclosing_name(stack), set()).update(
+                _TARGET_NAME_RE.findall(rest)
+            )
+    target = labels.get(symbol) or {symbol}
+    effective_target = target | {symbol}
+    for name, targets in alias_targets.items():
+        if targets & effective_target:
+            aliases[name] = None
+    for name, own in labels.items():
+        if name != symbol and (own or {name}) & target:
+            aliases[name] = None
+    return tuple(aliases)
+
+
+def mask_comments(source_text: str) -> str:
+    """`source_text` with every comment blanked out, **preserving every offset**.
+
+    Each comment character becomes a space (newlines kept, so line numbering is
+    untouched), rather than the whole comment collapsing to one space. Length
+    preservation is what lets an index found in the masked text be used verbatim
+    against the original — which `find_definition_brace` relies on to inject
+    text at an exact position in the user's source.
+    """
+
+    def blank(match: re.Match[str]) -> str:
+        return "".join("\n" if ch == "\n" else " " for ch in match.group(0))
+
+    return _COMMENT_RE.sub(blank, source_text)
+
+
+def _definition_signature(
+    source_no_comments: str, fn_name: str
+) -> tuple[str, int] | None:
+    """`fn_name`'s definition: its parameter-list text and its ``{`` index.
+
+    Scans for ``fn_name (`` and balances parentheses to the matching ``)``; the
+    occurrence whose ``)`` is followed (past whitespace) by ``{`` is the
+    definition — so a prototype (``);``) or a call site (``) ;``, ``))``) is
+    skipped. Deliberately narrow: clang already told us the canonical types and
+    which parameters are pointers, so this only has to isolate the declarator
+    text to harvest an array extent from — never to classify a type.
+    """
+    for match in re.finditer(rf"\b{re.escape(fn_name)}\s*\(", source_no_comments):
+        depth = 0
+        j = match.end() - 1  # index of the '('
+        while j < len(source_no_comments):
+            char = source_no_comments[j]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        else:
+            continue  # unbalanced — not a usable signature
+        k = j + 1
+        while k < len(source_no_comments) and source_no_comments[k].isspace():
+            k += 1
+        if k < len(source_no_comments) and source_no_comments[k] == "{":
+            return source_no_comments[match.end() : j], k
+    return None
+
+
+def find_definition_brace(source_text: str, fn_name: str) -> int | None:
+    """Index of the ``{`` opening `fn_name`'s definition body in `source_text`.
+
+    ``None`` when no definition of that name is isolable (a prototype-only
+    declaration, a name that appears solely at call sites, an unbalanced
+    signature). The index is into the **original** text — comments are masked
+    length-preservingly first, so a ``{`` inside a comment cannot be mistaken for
+    the body's while the offset stays usable for injection (RFC-0003 S3).
+    """
+    found = _definition_signature(mask_comments(source_text), fn_name)
+    return None if found is None else found[1]
+
+
+@dataclass(frozen=True)
+class _ArrayShape:
+    """What a parameter's source declarator says about its extent."""
+
+    extent: int | None = None
+    unresolved: bool = False
+    static_min: bool = False
+
+
+def _array_shape(param_list: str, name: str) -> _ArrayShape:
+    """What ``name``'s declarator in `param_list` says about its array extent.
+
+    Yields `extent` when a single-dimension literal is recovered from ``name[N]``;
+    `unresolved` when ``name`` *is* written as a fixed array whose extent cannot be
+    read from the source — a macro or expression (``name[SHA_DIGEST_LENGTH]``, which
+    needs the preprocessor) or a multi-dimensional ``name[N][M]`` (a
+    pointer-to-array, not an L0 shape); and neither when there is no extent to
+    recover in the first place: a plain pointer, an unsized ``name[]`` or
+    qualifier-only ``name[const]`` (both exactly as informative as ``T *name``),
+    or an unnamed parameter. `static_min` is set independently, for C99's
+    ``name[static N]``.
+
+    The unresolved flag is what keeps an unreadable extent out of the one-element
+    fallback, which would under-size the object. It says nothing about a parameter
+    list `_param_list_text` could not isolate at all — that residual case yields a
+    default shape, i.e. one indistinguishable from a plain pointer.
+    """
+    if not name:
+        return _ArrayShape()
+    match = re.search(_ARRAY_DECL_TEMPLATE.format(name=re.escape(name)), param_list)
+    if not match:
+        return _ArrayShape()
+    brackets = re.findall(r"\[([^\]]*)\]", match.group(1))
+    static_min = any(_STATIC_MIN_RE.search(b) for b in brackets)
+    if len(brackets) != 1:
+        return _ArrayShape(unresolved=True, static_min=static_min)
+    inner = brackets[0]
+    if not inner.strip() or _QUALIFIER_ONLY_RE.match(inner):
+        return _ArrayShape(static_min=static_min)
+    extent = _EXTENT_RE.match(inner)
+    if extent is None:
+        return _ArrayShape(unresolved=True, static_min=static_min)
+    return _ArrayShape(extent=int(extent.group(1)), static_min=static_min)
+
+
+def _annotated_param(param: Param, param_list: str) -> Param:
+    """`param` with its written array shape attached, read off `param_list`."""
+    shape = _array_shape(param_list, param.name)
+    return replace(
+        param,
+        array_extent=shape.extent,
+        array_extent_unresolved=shape.unresolved,
+        array_static_min=shape.static_min,
+    )
 
 
 def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
@@ -437,7 +889,7 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
     say, a multi-line ``#define``'s replacement text is just macro-body text
     to cpp, not a directive this module should react to (PR #156 follow-up to
     issue #145). Splicing inside a comment is handled earlier, by
-    `_COMMENT_RE`/`_blank_comment`, before this function ever sees the text —
+    `_COMMENT_RE`/`mask_comments`, before this function ever sees the text —
     the exclusion here only concerns a whole *directive-shaped line* starting
     on a continuation. A *token within* a directive that is itself split
     across a splice — an ``#if``/``#elif`` condition (``#if \\`` + newline +
@@ -623,77 +1075,6 @@ def _param_list_text(
     )[1]
 
 
-@dataclass(frozen=True)
-class _ArrayShape:
-    """What a parameter's source declarator says about its extent."""
-
-    extent: int | None = None
-    unresolved: bool = False
-    static_min: bool = False
-
-
-def _array_shape(param_list: str, name: str) -> _ArrayShape:
-    """What ``name``'s declarator in `param_list` says about its array extent.
-
-    Yields `extent` when a single-dimension literal is recovered from ``name[N]``;
-    `unresolved` when ``name`` *is* written as a fixed array whose extent cannot be
-    read from the source — a macro or expression (``name[SHA_DIGEST_LENGTH]``, which
-    needs the preprocessor) or a multi-dimensional ``name[N][M]`` (a
-    pointer-to-array, not an L0 shape); and neither when there is no extent to
-    recover in the first place: a plain pointer, an unsized ``name[]`` or
-    qualifier-only ``name[const]`` (both exactly as informative as ``T *name``),
-    or an unnamed parameter. `static_min` is set independently, for C99's
-    ``name[static N]``.
-
-    The unresolved flag is what keeps an unreadable extent out of the one-element
-    fallback, which would under-size the object. It says nothing about a parameter
-    list `_param_list_text` could not isolate at all — that residual case yields a
-    default shape, i.e. one indistinguishable from a plain pointer.
-    """
-    if not name:
-        return _ArrayShape()
-    match = re.search(_ARRAY_DECL_TEMPLATE.format(name=re.escape(name)), param_list)
-    if not match:
-        return _ArrayShape()
-    brackets = re.findall(r"\[([^\]]*)\]", match.group(1))
-    static_min = any(_STATIC_MIN_RE.search(b) for b in brackets)
-    if len(brackets) != 1:
-        return _ArrayShape(unresolved=True, static_min=static_min)
-    inner = brackets[0]
-    if not inner.strip() or _QUALIFIER_ONLY_RE.match(inner):
-        return _ArrayShape(static_min=static_min)
-    extent = _EXTENT_RE.match(inner)
-    if extent is None:
-        return _ArrayShape(unresolved=True, static_min=static_min)
-    return _ArrayShape(extent=int(extent.group(1)), static_min=static_min)
-
-
-def _annotated_param(param: Param, param_list: str) -> Param:
-    """`param` with its written array shape attached, read off `param_list`."""
-    shape = _array_shape(param_list, param.name)
-    return replace(
-        param,
-        array_extent=shape.extent,
-        array_extent_unresolved=shape.unresolved,
-        array_static_min=shape.static_min,
-    )
-
-
-def _blank_comment(match: re.Match[str]) -> str:
-    """A comment's replacement text: its newlines, so line numbers stay aligned.
-
-    A single-line comment (`//...` or a same-line `/*...*/`) becomes one space,
-    same as before. A multi-line comment — a block comment, or a `//` comment
-    that absorbed a backslash-continuation (PR #156 follow-up to issue #145) —
-    becomes that many bare newlines instead — dropping its inline text (fine; a
-    comment holds no declarator) while keeping every following line's number
-    identical to `source_text`'s, which `_param_list_text` relies on to match a
-    `Unit.def_line` from clang.
-    """
-    newlines = match.group(0).count("\n")
-    return "\n" * newlines if newlines else " "
-
-
 def annotate_array_extents(units: list[Unit], source_text: str) -> list[Unit]:
     """Attach each pointer parameter's written fixed-array extent, from `source_text`.
 
@@ -710,7 +1091,7 @@ def annotate_array_extents(units: list[Unit], source_text: str) -> list[Unit]:
     a same-named definition excluded by `#if 0`/`#ifdef` cannot donate its extent
     to the one clang actually compiled (issue #145).
     """
-    stripped = _COMMENT_RE.sub(_blank_comment, source_text)
+    stripped = mask_comments(source_text)
     annotated: list[Unit] = []
     for unit in units:
         param_list = _param_list_text(stripped, unit.name, unit.def_line)
@@ -720,8 +1101,110 @@ def annotate_array_extents(units: list[Unit], source_text: str) -> list[Unit]:
         params = tuple(
             _annotated_param(p, param_list) if p.is_pointer else p for p in unit.params
         )
-        annotated.append(Unit(unit.name, params, unit.def_line))
+        annotated.append(replace(unit, params=params))
     return annotated
+
+
+def _parse_tree(
+    source: Path, esbmc_bin: str, timeout_s: float, extra_flags: Sequence[str]
+) -> str:
+    """The clang AST dump for `source`, or raise `ListUnitsError`.
+
+    Raises when esbmc cannot be invoked (missing/unrunnable binary) **or** when
+    the parse run fails (missing source, bad include path, C parse error — esbmc
+    exits nonzero), so a failed parse is never indistinguishable from a file that
+    happens to define nothing. ESBMC prints the dump to stderr; both streams are
+    combined so the parser is robust to which one a given build uses.
+    """
+    argv = (esbmc_bin, str(source), "--parse-tree-only", *extra_flags)
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ListUnitsError(
+            f"esbmc --parse-tree-only failed: {esbmc_bin}: {exc}"
+        ) from exc
+    if proc.returncode != 0:
+        detail = (
+            _error_line(proc.stderr)
+            or _error_line(proc.stdout)
+            or f"exit {proc.returncode}"
+        )
+        raise ListUnitsError(f"esbmc --parse-tree-only failed ({esbmc_bin}): {detail}")
+    return proc.stdout + "\n" + proc.stderr
+
+
+def list_external_callers(
+    source: Path,
+    symbol: str,
+    *,
+    esbmc_bin: str = "esbmc",
+    timeout_s: float = 30.0,
+    extra_flags: Sequence[str] = (),
+) -> tuple[str, ...]:
+    """Names of definitions *outside* `source` that reference `symbol`.
+
+    The complement of `list_units` over the same translation unit — see
+    `parse_external_callers` for why compositional discharge needs it. Raises
+    `ListUnitsError` on the same conditions as `list_units`.
+    """
+    ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
+    return parse_external_callers(ast_text, source, symbol)
+
+
+def list_address_escapes(
+    source: Path,
+    symbol: str,
+    *,
+    esbmc_bin: str = "esbmc",
+    timeout_s: float = 30.0,
+    extra_flags: Sequence[str] = (),
+) -> tuple[str, ...]:
+    """Sites in `source`'s translation unit that take `symbol`'s address.
+
+    The other way the caller enumeration can be incomplete — see
+    `parse_address_escapes`. Raises `ListUnitsError` on the same conditions as
+    `list_units`.
+    """
+    ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
+    return parse_address_escapes(ast_text, symbol)
+
+
+def list_symbol_aliases(
+    source: Path,
+    symbol: str,
+    *,
+    esbmc_bin: str = "esbmc",
+    timeout_s: float = 30.0,
+    extra_flags: Sequence[str] = (),
+) -> tuple[str, ...]:
+    """Declarations in `source`'s translation unit that alias `symbol`.
+
+    The third way the caller enumeration can be incomplete — see
+    `parse_symbol_aliases`. Each of these asks its own question of its own
+    dump, which costs a parse run apiece; sharing one dump across them is a
+    worthwhile follow-up, not a reason to fuse the questions. Raises
+    `ListUnitsError` on the same conditions as `list_units`.
+    """
+    ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
+    return parse_symbol_aliases(ast_text, symbol)
+
+
+def list_implicit_invocations(
+    source: Path,
+    symbol: str,
+    *,
+    esbmc_bin: str = "esbmc",
+    timeout_s: float = 30.0,
+    extra_flags: Sequence[str] = (),
+) -> tuple[str, ...]:
+    """Constructor/destructor attributes on `symbol`'s own declaration.
+
+    The fourth way the caller enumeration can be incomplete — see
+    `parse_implicit_invocations`. Raises `ListUnitsError` on the same conditions
+    as `list_units`.
+    """
+    ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
+    return parse_implicit_invocations(ast_text, symbol)
 
 
 def list_units(
@@ -740,23 +1223,7 @@ def list_units(
     failed parse as an empty file, which would be indistinguishable from a valid
     one and could let the gate silently skip a unit.
     """
-    argv = (esbmc_bin, str(source), "--parse-tree-only", *extra_flags)
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ListUnitsError(
-            f"esbmc --parse-tree-only failed: {esbmc_bin}: {exc}"
-        ) from exc
-    if proc.returncode != 0:
-        detail = (
-            _error_line(proc.stderr)
-            or _error_line(proc.stdout)
-            or f"exit {proc.returncode}"
-        )
-        raise ListUnitsError(f"esbmc --parse-tree-only failed ({esbmc_bin}): {detail}")
-    # ESBMC prints the AST dump to stderr; combine both streams so the parser is
-    # robust to which stream a given build uses.
-    units = parse_units(proc.stdout + "\n" + proc.stderr, source)
+    units = parse_units(_parse_tree(source, esbmc_bin, timeout_s, extra_flags), source)
     # Enrich with fixed-array extents read from the source declarators (the clang
     # type has adjusted `T p[N]` to `T *`). Best-effort: a successful parse means
     # esbmc read the file, so a read failure here is unexpected — degrade to the

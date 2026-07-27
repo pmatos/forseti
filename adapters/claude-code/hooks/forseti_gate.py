@@ -679,10 +679,25 @@ def extract_functions(
 
 
 def unit_id(project_dir: str, file_path: str) -> str:
+    """The gate's identity key for `file_path`: `project_dir`-relative, `..` resolved.
+
+    A plain `os.path.relpath` normalizes `..` lexically, which is wrong whenever a
+    component before it is a symlink: `proj/link/../x.c` with `link -> external/pkg`
+    collapses to `proj/x.c`, aliasing the key onto a real `proj/x.c` even though the
+    kernel — which is what actually opens, hashes and verifies this path — lands on
+    `external/x.c`. Resolving `..` the way `_kernel_dir` does first (issue #152) makes
+    the key track the same file the rest of the gate reads; a source outside the
+    project then keys as `../external/x.c` rather than colliding with an in-project
+    name. A path with no `..` is untouched by `_kernel_dir`, so its key is unchanged —
+    no migration needed for the common case, only a one-off re-verify for the rare
+    `..`-through-a-symlink unit whose key now differs.
+    """
+    kernel_dir = _kernel_dir(os.path.dirname(file_path))
+    resolved = os.path.join(kernel_dir, os.path.basename(file_path))
     try:
-        return os.path.relpath(file_path, project_dir)
+        return os.path.relpath(resolved, project_dir)
     except ValueError:
-        return file_path
+        return resolved
 
 
 def content_hash(path: str | os.PathLike[str]) -> str | None:
@@ -940,8 +955,9 @@ def discover_changed_c_sources(
     # file. That is *not* the same as the `unit_id` key agreeing with the one a
     # PostToolUse edit produces: `git rev-parse --show-toplevel` reports the root
     # resolved, so when `project_dir` is a symlinked spelling the same file keys as
-    # `../real/src/x.c` here and `src/x.c` there — measured, and filed as #152 with
-    # the other half of that aliasing class, since the fix changes a persisted key.
+    # `../real/src/x.c` here and `src/x.c` there — measured, and filed as #161, the
+    # other half of #152's aliasing class, since canonicalizing `project_dir` would
+    # change the persisted key for every symlinked-root project, not just this one.
     proj_real = os.path.realpath(project_dir)
     found: list[str] = []
     for rel in rels:
