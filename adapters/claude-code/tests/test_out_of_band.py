@@ -275,6 +275,36 @@ def test_discover_resolves_repo_root_and_scopes_to_project_dir(tmp_path: Path) -
     assert os.path.isfile(found[0])  # path resolved correctly against the repo root
 
 
+def test_discover_respells_through_a_symlinked_project_root(tmp_path: Path) -> None:
+    # issue #161: `project_dir` reached through a symlink (`link -> real`). Confirm
+    # the actual mechanism first — `git rev-parse --show-toplevel` must report the
+    # resolved root, not `link` itself, or this divergence has a different cause
+    # than the one this fix targets.
+    real = tmp_path / "real"
+    real.mkdir()
+    _git_init(real)
+    (real / "sub").mkdir()
+    (real / "sub" / "x.c").write_text("int f(void){return 0;}\n")
+    _git_commit_all(real)
+    (real / "sub" / "x.c").write_text("int f(void){return 1;}\n")  # dirty
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    resolved_link = os.path.realpath(str(link))
+    assert resolved_link != str(link)  # sanity: link is genuinely a symlink
+
+    toplevel = gate._git(str(link), "rev-parse", "--show-toplevel")
+    assert toplevel is not None
+    assert toplevel.strip() == resolved_link  # precondition this fix relies on
+
+    # A direct PostToolUse edit spells the file through `link`, never through the
+    # resolved root; that is the key `unit_id` must agree with.
+    direct_path = str(link / "sub" / "x.c")
+    found = gate.discover_changed_c_sources(str(link))
+    assert found == [direct_path]  # not the resolved-root spelling
+    assert gate.unit_id(str(link), found[0]) == gate.unit_id(str(link), direct_path)
+    assert gate.unit_id(str(link), found[0]) == os.path.join("sub", "x.c")
+
+
 # --- committed-since-baseline discovery (issue #99 review) ------------------
 
 
@@ -1127,9 +1157,10 @@ def test_pending_retry_of_stale_content_is_left_to_discovery(
 def test_sources_needing_verify_reports_a_file_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Discovery joins the git root and the pending scan joins `project_dir`, so a
-    # file both scans name arrives under two spellings — verifying it twice in one
-    # scan would double the ESBMC cost and name it twice in the Stop note.
+    # A file both scans name can still arrive under two literal spellings (here, a
+    # trailing `.` path component) even though discovery and the pending scan both
+    # join through `project_dir` now (issue #161) — verifying it twice in one scan
+    # would double the ESBMC cost and name it twice in the Stop note.
     src = tmp_path / "dup.c"
     src.write_text("int f(void){return 0;}\n")
     _enumerate_one_unit(monkeypatch)

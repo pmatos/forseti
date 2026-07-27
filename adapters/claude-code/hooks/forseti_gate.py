@@ -1060,20 +1060,40 @@ def _in_scope_c_abspath(
     staged/committed-blob scan (`divergent_blob_sources`). Deliberately does **not**
     check file existence — a staged or committed blob can outlive its worktree file
     (a `git add`-then-`rm`), and the blob scan must still gate it.
+
+    The returned path is spelled through `project_dir`, never through `root`: `root`
+    is `git rev-parse --show-toplevel`'s answer, which reports the repository root
+    fully *resolved*, while `project_dir` is whatever spelling the caller passed in,
+    unresolved. When `project_dir` is itself reached through a symlink (a git
+    worktree, a symlinked ``/tmp``/``/var``, a symlinked home directory), handing
+    back `root`-joined paths would key the same file two different ways depending on
+    whether it was found by this out-of-band scan or by a direct PostToolUse edit —
+    `unit_id(project_dir, ...)` relativizes against `project_dir` either way, so a
+    `root`-spelled input and a `project_dir`-spelled input for the identical file
+    produce different keys (issue #161, the other half of #152's aliasing class).
+    Rejoining `rel`'s resolved location onto `project_dir` instead — rather than
+    resolving `project_dir` itself, which would change the persisted key for every
+    symlinked-root project, not just the ones this scan touches — keeps every
+    caller's key agreeing without widening the blast radius past this scan's own
+    output. A project whose root is not symlinked is unaffected: `real_abspath`'s
+    offset from `proj_real` is then exactly `rel`.
     """
     abspath = os.path.join(root, rel)
     if not is_c_source(abspath):
         return None
     try:
-        if os.path.commonpath([proj_real, os.path.realpath(abspath)]) != proj_real:
+        real_abspath = os.path.realpath(abspath)
+        if os.path.commonpath([proj_real, real_abspath]) != proj_real:
             return None  # changed outside this project subtree — out of scope
+        offset = os.path.relpath(real_abspath, proj_real)
     except ValueError:
         return None  # different drive/root — cannot be under proj
+    spelled = os.path.join(project_dir, offset)
     if _untracked_snapshot(root, rel) or _untracked_verify_snapshot(root, rel):
         return None
-    if not _included(os.path.relpath(abspath, project_dir)):
+    if not _included(offset):
         return None
-    return abspath
+    return spelled
 
 
 def discover_changed_c_sources(
@@ -1082,8 +1102,9 @@ def discover_changed_c_sources(
     """Absolute paths of changed, still-present C sources under `project_dir`.
 
     git reports paths relative to the *repository root*, which need not be
-    `project_dir`, so they are joined to the resolved root and then scoped back to
-    `project_dir` (a subdir checkout gates only its own changes). Include/exclude
+    `project_dir`, so they are joined to the resolved root, scoped back to
+    `project_dir` (a subdir checkout gates only its own changes), and respelled
+    through `project_dir` (`_in_scope_c_abspath`, issue #161). Include/exclude
     globs are applied to the project-relative path, matching `unit_id`. ``None``
     when discovery is unavailable (not a git repo).
 
@@ -1107,14 +1128,12 @@ def discover_changed_c_sources(
     # is verified once).
     committed = git_committed_files_since(project_dir, baseline_head)
     rels = list(dict.fromkeys([*rels, *committed]))
-    # `realpath` is used only to compare against the (possibly symlinked) project
-    # subtree; the returned path keeps git's own root, so scoping never restages a
-    # file. That is *not* the same as the `unit_id` key agreeing with the one a
-    # PostToolUse edit produces: `git rev-parse --show-toplevel` reports the root
-    # resolved, so when `project_dir` is a symlinked spelling the same file keys as
-    # `../real/src/x.c` here and `src/x.c` there — measured, and filed as #161, the
-    # other half of #152's aliasing class, since canonicalizing `project_dir` would
-    # change the persisted key for every symlinked-root project, not just this one.
+    # `realpath` is used both to scope to the (possibly symlinked) project subtree
+    # and, in `_in_scope_c_abspath`, to respell the result through `project_dir`'s
+    # own route rather than `root`'s resolved one — so the `unit_id` key this
+    # produces agrees with the one a direct PostToolUse edit of the same file
+    # produces, even when `project_dir` is itself a symlinked spelling (issue #161,
+    # the other half of #152's aliasing class; see `_in_scope_c_abspath`).
     proj_real = os.path.realpath(project_dir)
     found: list[str] = []
     for rel in rels:
@@ -1237,9 +1256,11 @@ def sources_needing_verify(
     retries, whose files are named by the gate's own state.
     """
     files = [*(discovered or []), *pending_retry_sources(project_dir, state)]
-    # Discovery joins the *git root* and the pending scan joins `project_dir`, so one
-    # file can arrive under two spellings; dedup on the id both resolve to, keeping
-    # the first (discovery's) spelling.
+    # Discovery and the pending scan both spell a found file through `project_dir`
+    # now (issue #161), but a stored `unit_id` key can itself hold a `..` (issue
+    # #152) that `pending_retry_sources`' literal join does not re-resolve, so the
+    # two scans can still arrive at the same file under different spellings; dedup
+    # on the id both resolve to, keeping the first (discovery's) spelling.
     unique: dict[str, str] = {}
     for abspath in files:
         unique.setdefault(unit_id(project_dir, abspath), abspath)
