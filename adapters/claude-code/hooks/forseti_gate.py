@@ -296,8 +296,9 @@ def _kernel_dir(path: str) -> str:
     return cur
 
 
-def _index_ignore_snapshot(start_dir: str, prefix: str) -> None:
-    """Register `prefix*` in `start_dir`'s own ``.git/info/exclude``, idempotently.
+def _index_ignore_snapshot(start_dir: str, prefix: str, suffix: str) -> None:
+    """Register `prefix*` in `start_dir`'s own ``.git/info/exclude``, and confirm
+    it actually keeps a `prefix`+`suffix` snapshot out of the index.
 
     `_enumerable_source` calls this *before* staging a snapshot, so a
     concurrent `git add -A`/`git status` never has a window in which the
@@ -333,6 +334,21 @@ def _index_ignore_snapshot(start_dir: str, prefix: str) -> None:
     Decoding it as text would raise `UnicodeDecodeError` — a `ValueError`, not
     an `OSError` — which would escape the `except` below uncaught and crash
     the hook process outright instead of failing closed.
+
+    Even a successfully-registered pattern is not by itself a guarantee:
+    gitignore(5) gives a repository's own tracked ``.gitignore`` files higher
+    precedence than ``$GIT_DIR/info/exclude``, so a project that re-includes
+    dotfiles (``!.*``) or whitelists ``.c`` sources (``*`` then ``!*.c``) can
+    silently override this exclude entry — measured empirically: `git
+    check-ignore -v` names the `.gitignore` rule as the decider even with the
+    exclude pattern already present, and `git add -A` then stages the
+    "excluded" snapshot. A `git check-ignore` probe against a name of the
+    same shape the real snapshot will have (`prefix` + a placeholder +
+    `suffix` — a suffix-less probe can pass a whitelist rule the real,
+    suffixed snapshot would not) confirms the exclusion is actually
+    effective; if it is not, or the probe itself cannot be run, this fails
+    closed rather than let the caller believe a snapshot is hidden when it
+    is not (review feedback, issue #151).
     """
     try:
         proc = subprocess.run(
@@ -362,16 +378,23 @@ def _index_ignore_snapshot(start_dir: str, prefix: str) -> None:
         with open(exclude_path, "a+b") as handle:
             handle.seek(0)
             existing = handle.read()
-            if pattern_bytes in existing.splitlines():
-                return
-            if existing and not existing.endswith(b"\n"):
-                handle.write(b"\n")
-            handle.write(pattern_bytes + b"\n")
+            if pattern_bytes not in existing.splitlines():
+                if existing and not existing.endswith(b"\n"):
+                    handle.write(b"\n")
+                handle.write(pattern_bytes + b"\n")
     except OSError as exc:
         raise UnitsUnavailable(
             f"could not register {pattern!r} in {exclude_path} to keep the "
             f"enumeration snapshot out of the git index: {exc}"
         ) from exc
+    probe = f"{prefix}0{suffix}"
+    if _git(start_dir, "check-ignore", "-q", "--no-index", "--", probe) is None:
+        raise UnitsUnavailable(
+            f"{pattern!r} is registered in {exclude_path} but a tracked "
+            f".gitignore rule in {start_dir} appears to override it (a "
+            f"dotfile re-inclusion or a `*`/`!*{suffix}` whitelist, say) — "
+            f"refusing to stage an unprotected snapshot"
+        )
 
 
 @contextlib.contextmanager
@@ -469,7 +492,8 @@ def _enumerable_source(
         return
     spelled = os.path.join(project_dir, os.fspath(file_path))
     src_dir = _kernel_dir(os.path.dirname(spelled))
-    _index_ignore_snapshot(src_dir, _ENUM_SNAPSHOT_PREFIX)
+    suffix = Path(os.fspath(file_path)).suffix
+    _index_ignore_snapshot(src_dir, _ENUM_SNAPSHOT_PREFIX, suffix)
     # Every `OSError` the staging can raise — an unwritable directory, `ENOSPC`,
     # `EDQUOT`, a failed cleanup — has to land as `UnitsUnavailable`, the one
     # exception `verify_and_record` turns into a blocking `error`. Left bare it
@@ -482,7 +506,7 @@ def _enumerable_source(
     try:
         fd, path = tempfile.mkstemp(
             prefix=_ENUM_SNAPSHOT_PREFIX,
-            suffix=Path(os.fspath(file_path)).suffix,
+            suffix=suffix,
             dir=src_dir,
         )
     except OSError as exc:
