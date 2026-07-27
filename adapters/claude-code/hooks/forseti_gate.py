@@ -296,31 +296,37 @@ def _kernel_dir(path: str) -> str:
     return cur
 
 
-def _index_ignore_snapshot(start_dir: str, prefix: str, suffix: str) -> None:
-    """Register `prefix*` in `start_dir`'s own ``.git/info/exclude``, and confirm
-    it actually keeps a `prefix`+`suffix` snapshot out of the index.
+def _index_ignore_snapshot(start_dir: str, prefix: str) -> bool:
+    """Register `prefix*` in `start_dir`'s own ``.git/info/exclude``, idempotently.
 
     `_enumerable_source` calls this *before* staging a snapshot, so a
     concurrent `git add -A`/`git status` never has a window in which the
-    snapshot exists but is not yet excluded. ``.git/info/exclude`` — not the
-    tracked `.gitignore` — is the right place: it is local, un-versioned repo
-    state, exactly like the snapshot itself, so no tracked file is touched and
-    nothing needs to be undone. `start_dir` must be the directory the snapshot
-    is actually staged in, not necessarily the Claude project root: `git
-    rev-parse` resolves upward from `start_dir` to whichever repository
-    actually contains it, which may differ from the project root's repository
-    (a submodule, a sibling checkout reached via a symlink).
+    snapshot exists but the *pattern* is not yet registered. (Registering the
+    pattern is not by itself proof of protection — see `_enumerable_source`
+    for the real-path `check-ignore` verification that catches a
+    higher-precedence tracked ``.gitignore`` overriding it.) ``.git/info/exclude``
+    — not the tracked `.gitignore` — is the right place: it is local,
+    un-versioned repo state, exactly like the snapshot itself, so no tracked
+    file is touched and nothing needs to be undone. `start_dir` must be the
+    directory the snapshot is actually staged in, not necessarily the Claude
+    project root: `git rev-parse` resolves upward from `start_dir` to
+    whichever repository actually contains it, which may differ from the
+    project root's repository (a submodule, a sibling checkout reached via a
+    symlink).
 
-    Genuinely outside a git work tree, this is a no-op: there is no index
-    there to protect against in the first place, and `git rev-parse` says so
-    by running to completion and exiting non-zero. That confirmed answer is
-    the *only* case treated as safe to skip — `git rev-parse` failing to run
-    at all (the binary missing, a timeout, some other subprocess-level error)
-    used to read identically to "not a work tree" and silently skip
-    protection even inside a real repository; it is now told apart and fails
-    closed as `UnitsUnavailable`, matching this file's convention elsewhere
-    (`_untracked_snapshot`) that an indeterminate git query must never relax
-    a guard (review feedback, issue #151).
+    Returns whether `start_dir` is inside a git work tree at all — the
+    caller needs this to know whether the follow-up `check-ignore`
+    verification even applies. Genuinely outside a work tree this returns
+    `False`: there is no index there to protect against in the first place,
+    and `git rev-parse` says so by running to completion and exiting
+    non-zero. That confirmed answer is the *only* case treated as safe to
+    skip — `git rev-parse` failing to run at all (the binary missing, a
+    timeout, some other subprocess-level error) used to read identically to
+    "not a work tree" and silently skip protection even inside a real
+    repository; it is now told apart and fails closed as `UnitsUnavailable`,
+    matching this file's convention elsewhere (`_untracked_snapshot`) that an
+    indeterminate git query must never relax a guard (review feedback, issue
+    #151).
 
     Writing the exclude entry fails the same closed way: an `OSError` —
     including one from creating a missing ``.git/info/`` (legal for a repo
@@ -334,21 +340,6 @@ def _index_ignore_snapshot(start_dir: str, prefix: str, suffix: str) -> None:
     Decoding it as text would raise `UnicodeDecodeError` — a `ValueError`, not
     an `OSError` — which would escape the `except` below uncaught and crash
     the hook process outright instead of failing closed.
-
-    Even a successfully-registered pattern is not by itself a guarantee:
-    gitignore(5) gives a repository's own tracked ``.gitignore`` files higher
-    precedence than ``$GIT_DIR/info/exclude``, so a project that re-includes
-    dotfiles (``!.*``) or whitelists ``.c`` sources (``*`` then ``!*.c``) can
-    silently override this exclude entry — measured empirically: `git
-    check-ignore -v` names the `.gitignore` rule as the decider even with the
-    exclude pattern already present, and `git add -A` then stages the
-    "excluded" snapshot. A `git check-ignore` probe against a name of the
-    same shape the real snapshot will have (`prefix` + a placeholder +
-    `suffix` — a suffix-less probe can pass a whitelist rule the real,
-    suffixed snapshot would not) confirms the exclusion is actually
-    effective; if it is not, or the probe itself cannot be run, this fails
-    closed rather than let the caller believe a snapshot is hidden when it
-    is not (review feedback, issue #151).
     """
     try:
         proc = subprocess.run(
@@ -364,7 +355,7 @@ def _index_ignore_snapshot(start_dir: str, prefix: str, suffix: str) -> None:
             f"snapshot unprotected"
         ) from exc
     if proc.returncode != 0:
-        return  # git ran and confirmed this is not a work tree
+        return False  # git ran and confirmed this is not a work tree
     exclude_rel = proc.stdout.strip()
     exclude_path = (
         exclude_rel
@@ -387,14 +378,7 @@ def _index_ignore_snapshot(start_dir: str, prefix: str, suffix: str) -> None:
             f"could not register {pattern!r} in {exclude_path} to keep the "
             f"enumeration snapshot out of the git index: {exc}"
         ) from exc
-    probe = f"{prefix}0{suffix}"
-    if _git(start_dir, "check-ignore", "-q", "--no-index", "--", probe) is None:
-        raise UnitsUnavailable(
-            f"{pattern!r} is registered in {exclude_path} but a tracked "
-            f".gitignore rule in {start_dir} appears to override it (a "
-            f"dotfile re-inclusion or a `*`/`!*{suffix}` whitelist, say) — "
-            f"refusing to stage an unprotected snapshot"
-        )
+    return True
 
 
 @contextlib.contextmanager
@@ -475,17 +459,39 @@ def _enumerable_source(
     nothing about it stops a concurrent `git add -A`, IDE, or automation job from
     staging the file while it exists on disk.
     `_index_ignore_snapshot` registers `_ENUM_SNAPSHOT_PREFIX*` in `src_dir`'s own
-    `.git/info/exclude` *before* `mkstemp` runs (below), so there is no window
-    where the snapshot sits in the tree unprotected — inside a git work tree,
-    `git status`/`git add -A` never see it, so a `finally`-block failure to
-    clean up (or this process being killed first) cannot be committed by an
-    unrelated `git add -A` in the meantime. It targets `src_dir`, not
-    `project_dir`, because that is where `mkstemp` actually stages the file: when
-    the source lives in a different repository than `project_dir` (a submodule,
-    a sibling checkout reached via a symlink), `project_dir`'s exclude file is
-    the wrong one to write. An explicit, forced `git add -f <path>` is the one
-    thing left that can still stage it, the same residual `_verifiable_source`
-    documents at the verify boundary (issue #150).
+    `.git/info/exclude` *before* `mkstemp` runs (below), so the pattern is always
+    in place — inside a git work tree, `git status`/`git add -A` never see a
+    matching name, so a `finally`-block failure to clean up (or this process
+    being killed first) cannot be committed by an unrelated `git add -A` in
+    the meantime. It targets `src_dir`, not `project_dir`, because that is
+    where `mkstemp` actually stages the file: when the source lives in a
+    different repository than `project_dir` (a submodule, a sibling checkout
+    reached via a symlink), `project_dir`'s exclude file is the wrong one to
+    write.
+
+    Registering the pattern is not by itself proof it protects anything:
+    gitignore(5) gives a repository's own tracked ``.gitignore`` files higher
+    precedence than ``$GIT_DIR/info/exclude``, so a project that re-includes
+    dotfiles (``!.*``), whitelists ``.c`` sources (``*`` then ``!*.c``), or
+    even specifically targets `mkstemp`'s own generated shape (an 8-``?``
+    glob negation) can silently override this exclude entry — measured
+    empirically: `git check-ignore -v` names the
+    `.gitignore` rule as the decider even with the exclude pattern already
+    present, and `git add -A` then stages the "excluded" snapshot. Guessing at
+    `mkstemp`'s random-name shape to build a synthetic probe was tried and
+    rejected: the length is a private, undocumented `tempfile` implementation
+    detail, and a probe of the wrong shape can itself be fooled by a rule
+    targeting the real shape. So the check below runs against the *real*
+    snapshot path immediately after `mkstemp` creates it — no guessing — and
+    unlinks it and fails closed as `UnitsUnavailable` if `git check-ignore`
+    cannot confirm it is actually excluded (review feedback, issue #151). That
+    leaves a narrow, already-accepted residual: an explicit, forced
+    `git add -f <path>` is the one thing left that can still stage it (the
+    same residual `_verifiable_source` documents at the verify boundary,
+    issue #150), and a concurrent `git add -A` racing the few instructions
+    between `mkstemp` and this check completing — negligible next to the
+    whole-enumeration-timeout window that existed before any of this staging
+    existed.
     """
     if content is None:
         yield str(file_path)
@@ -493,7 +499,7 @@ def _enumerable_source(
     spelled = os.path.join(project_dir, os.fspath(file_path))
     src_dir = _kernel_dir(os.path.dirname(spelled))
     suffix = Path(os.fspath(file_path)).suffix
-    _index_ignore_snapshot(src_dir, _ENUM_SNAPSHOT_PREFIX, suffix)
+    is_work_tree = _index_ignore_snapshot(src_dir, _ENUM_SNAPSHOT_PREFIX)
     # Every `OSError` the staging can raise — an unwritable directory, `ENOSPC`,
     # `EDQUOT`, a failed cleanup — has to land as `UnitsUnavailable`, the one
     # exception `verify_and_record` turns into a blocking `error`. Left bare it
@@ -514,6 +520,26 @@ def _enumerable_source(
             f"could not stage a snapshot of {file_path} for enumeration (check "
             f"free space and write access to {src_dir}): {exc}"
         ) from exc
+    if (
+        is_work_tree
+        and _git(src_dir, "check-ignore", "-q", "--no-index", "--", path) is None
+    ):
+        # `_index_ignore_snapshot` only proves the pattern is registered, not
+        # that it protects anything: a higher-precedence tracked `.gitignore`
+        # can override `.git/info/exclude` (a dotfile negation, a whitelist,
+        # or one shaped to match `mkstemp`'s own random suffix). Checking the
+        # *real* path — not a guessed shape — is the only way to know for
+        # certain, so this can only run once `mkstemp` has actually produced
+        # it. Never a work tree at all, `check-ignore` has nothing to confirm,
+        # so this stays gated on `is_work_tree`.
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise UnitsUnavailable(
+            f"{path} is registered in {src_dir}'s .git/info/exclude but a "
+            f"tracked .gitignore rule appears to override it — refusing to "
+            f"leave an unprotected snapshot staged"
+        )
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(content)

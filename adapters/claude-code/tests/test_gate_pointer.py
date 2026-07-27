@@ -810,12 +810,43 @@ def test_gitignore_whitelist_defeats_exclude_blocks_with_units_unavailable(
     # `!*.c`) silently overrides the registered exclude pattern, so a
     # concurrent `git add -A` can still stage the "excluded" snapshot
     # (measured empirically with `git check-ignore -v` naming the
-    # `.gitignore` rule as the decider; review feedback, issue #151). A
-    # suffix-less probe would miss this: `*`/`!*.c` only re-includes `.c`
-    # files, so the check has to use the real snapshot's suffix shape to
-    # catch it.
+    # `.gitignore` rule as the decider; review feedback, issue #151). The
+    # check has to run against the real, `mkstemp`-generated snapshot path —
+    # a synthetic probe of the wrong shape could pass a whitelist rule the
+    # real snapshot would not (see the sibling test below).
     _git_init(tmp_path)
     (tmp_path / ".gitignore").write_text("*\n!*.c\n")
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    with pytest.raises(gate.UnitsUnavailable, match="gitignore"):
+        gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+    leftover = [
+        p.name
+        for p in tmp_path.iterdir()
+        if p.name.startswith(gate._ENUM_SNAPSHOT_PREFIX)
+    ]
+    assert leftover == []
+
+
+def test_gitignore_negation_targeting_mkstemps_shape_blocks_with_units_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A negation naming `tempfile.mkstemp`'s own generated shape (its random
+    # suffix is 8 characters — a private, undocumented `tempfile`
+    # implementation detail, confirmed by reading `_RandomNameSequence`, not
+    # assumed) defeats a synthetic probe of the wrong length while still
+    # matching every real snapshot `mkstemp` will ever produce (measured:
+    # `git check-ignore -v` picks the `.gitignore` rule for an 8-character
+    # name but not a 1-character one). Checking the real post-`mkstemp` path
+    # instead of guessing a shape closes this regardless of what that length
+    # happens to be (review feedback, issue #151).
+    _git_init(tmp_path)
+    (tmp_path / ".gitignore").write_text("!/.forseti-units-????????.c\n")
     monkeypatch.setattr(
         gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
     )
