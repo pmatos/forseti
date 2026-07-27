@@ -184,6 +184,57 @@ def test_content_hash_missing_file_is_none(tmp_path: Path) -> None:
     assert gate.content_hash(tmp_path / "nope.c") is None
 
 
+# --- unit_id identity key (issue #152) --------------------------------------
+
+
+def test_unit_id_resolves_dotdot_through_a_symlink(tmp_path: Path) -> None:
+    # `link -> external/pkg`: the kernel walk `unit_id` now does resolves
+    # `link/..` to `external`, the link *target*'s parent — not to `proj`, which
+    # is what a lexical `os.path.relpath` collapses it to. Colliding on `proj`
+    # would alias this key onto a real `proj/x.c`, even though the kernel (and so
+    # the gate's read/hash/verify) opens a different file entirely.
+    proj = tmp_path / "proj"
+    external = tmp_path / "external" / "pkg"
+    external.mkdir(parents=True)
+    proj.mkdir()
+    (proj / "x.c").write_text("own\n")
+    (tmp_path / "external" / "x.c").write_text("ext\n")
+    (proj / "link").symlink_to(external)
+
+    aliased = gate.unit_id(str(proj), str(proj / "link" / ".." / "x.c"))
+    plain = gate.unit_id(str(proj), str(proj / "x.c"))
+
+    assert aliased == "../external/x.c"
+    assert aliased != plain  # the bug: both used to key as "x.c"
+    assert plain == "x.c"  # no `..` in the path: unchanged, no migration needed
+
+
+def test_stale_sources_does_not_collapse_aliased_real_files(tmp_path: Path) -> None:
+    # "Why it matters" in issue #152: `proj/x.c` and `link/../x.c` (through a
+    # symlinked component) are two REAL files. Seed `scanned` as if `proj/x.c`
+    # had just been verified, then check the aliased path — which really is
+    # `external/x.c`, holding the *same* bytes by construction — is still
+    # reported stale rather than silently read as already-fresh off the other
+    # file's stamp (the fail-open half of the bug: a collision would let unverified
+    # content slip past the gate).
+    proj = tmp_path / "proj"
+    external = tmp_path / "external" / "pkg"
+    external.mkdir(parents=True)
+    proj.mkdir()
+    content = "int f(void){return 0;}\n"
+    (proj / "x.c").write_text(content)
+    (tmp_path / "external" / "x.c").write_text(content)
+    (proj / "link").symlink_to(external)
+    aliased = str(proj / "link" / ".." / "x.c")
+
+    state = gate.load_state(str(proj))
+    state["scanned"][gate.unit_id(str(proj), str(proj / "x.c"))] = gate.content_hash(
+        str(proj / "x.c")
+    )
+
+    assert gate.stale_sources(str(proj), state, [aliased]) == [aliased]
+
+
 # --- git discovery ----------------------------------------------------------
 
 
@@ -378,7 +429,7 @@ def _enumerate_one_unit(monkeypatch: pytest.MonkeyPatch, name: str = "f") -> Non
 def _kill_during_verify(monkeypatch: pytest.MonkeyPatch, calls: list[str]) -> None:
     """Make every `verify_function` call die as if the hook were killed."""
 
-    def _boom(file_path, function, *, project_dir, k=gate.DEFAULT_K):
+    def _boom(file_path, function, *, project_dir, k=gate.DEFAULT_K, verify_path=None):
         calls.append(function)
         raise _Killed(function)
 
@@ -415,8 +466,8 @@ def test_completed_verify_clears_the_retry_marker(
     monkeypatch.setattr(
         gate,
         "verify_function",
-        lambda fp, fn, *, project_dir, k=gate.DEFAULT_K: gate.UnitVerdict(
-            "done.c::f", "done.c", "f", "verified", k
+        lambda fp, fn, *, project_dir, k=gate.DEFAULT_K, verify_path=None: (
+            gate.UnitVerdict("done.c::f", "done.c", "f", "verified", k)
         ),
     )
 
@@ -440,8 +491,10 @@ def test_final_unknown_does_not_force_staleness(
     monkeypatch.setattr(
         gate,
         "verify_function",
-        lambda fp, fn, *, project_dir, k=gate.DEFAULT_K: gate.UnitVerdict(
-            "hard.c::f", "hard.c", "f", "unknown", k, detail="timeout after 110s"
+        lambda fp, fn, *, project_dir, k=gate.DEFAULT_K, verify_path=None: (
+            gate.UnitVerdict(
+                "hard.c::f", "hard.c", "f", "unknown", k, detail="timeout after 110s"
+            )
         ),
     )
 
@@ -515,8 +568,8 @@ def test_post_bash_retries_a_killed_verify(
     monkeypatch.setattr(
         gate,
         "verify_function",
-        lambda fp, fn, *, project_dir, k=gate.DEFAULT_K: gate.UnitVerdict(
-            "oob.c::f", "oob.c", "f", "verified", k
+        lambda fp, fn, *, project_dir, k=gate.DEFAULT_K, verify_path=None: (
+            gate.UnitVerdict("oob.c::f", "oob.c", "f", "verified", k)
         ),
     )
     assert _run(post_bash.main, tmp_path, monkeypatch) == 0  # re-verified, not skipped
@@ -606,7 +659,9 @@ def test_cleanup_preserves_a_newer_runs_pending_marker(
     _enumerate_one_unit(monkeypatch)
     newer: dict[str, str] = {}
 
-    def _verify_while_a_newer_run_starts(fp, fn, *, project_dir, k=gate.DEFAULT_K):
+    def _verify_while_a_newer_run_starts(
+        fp, fn, *, project_dir, k=gate.DEFAULT_K, verify_path=None
+    ):
         newer["digest"] = _concurrent_run_starts(
             tmp_path, src, "int f(void){return 1;}\n"
         )
@@ -635,7 +690,9 @@ def test_cleanup_preserves_a_concurrent_retry_of_the_same_content(
     digest = gate.content_hash(str(src))
     _enumerate_one_unit(monkeypatch)
 
-    def _verify_while_same_content_retries(fp, fn, *, project_dir, k=gate.DEFAULT_K):
+    def _verify_while_same_content_retries(
+        fp, fn, *, project_dir, k=gate.DEFAULT_K, verify_path=None
+    ):
         _concurrent_run_starts(tmp_path, src, src.read_text())  # identical bytes
         return gate.UnitVerdict("same.c::f", "same.c", "f", "verified", k)
 
@@ -665,7 +722,7 @@ def test_cleanup_survives_a_concurrent_error_charging_its_marker(
     _enumerate_one_unit(monkeypatch)
 
     def _verify_while_a_concurrent_scan_errors(
-        fp, fn, *, project_dir, k=gate.DEFAULT_K
+        fp, fn, *, project_dir, k=gate.DEFAULT_K, verify_path=None
     ):
         def _unavailable(file_path, *, project_dir, content=None):
             raise gate.UnitsUnavailable("forseti CLI could not be launched")
@@ -992,7 +1049,7 @@ def test_unreadable_file_leaves_the_pending_marker_alone(tmp_path: Path) -> None
 def _verified_verdict(rel: str, function: str = "f"):
     """Stand-in `verify_function` whose verdict lands (the retry that finishes)."""
 
-    def _verify(fp, fn, *, project_dir, k=gate.DEFAULT_K):
+    def _verify(fp, fn, *, project_dir, k=gate.DEFAULT_K, verify_path=None):
         return gate.UnitVerdict(f"{rel}::{fn}", rel, fn, "verified", k)
 
     return _verify

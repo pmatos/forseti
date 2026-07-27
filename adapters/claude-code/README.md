@@ -128,7 +128,11 @@ does the Stop-gate let the turn end. See
 to **`.forseti/events.jsonl`** — one JSON object per line:
 
 - `edit` — a `Write`/`Edit`/`MultiEdit`, or a `Bash` out-of-band write, fired: the tool, the file, the functions found.
-- `verify` — one ESBMC call: the unit, `verdict`, `k`, `duration_s`, and the **exact `argv`**.
+- `verify` — one ESBMC call: the unit, `verdict`, `k`, `duration_s`, and the
+  **`argv`** esbmc ran — with its source token naming the real file on disk,
+  even though the gate actually verifies an immutable snapshot beside it
+  (issue #150): the trace and any counterexample have to name something
+  Claude can still read and fix.
 - `gate` — the PostToolUse decision: `pass`, or `block` (how many cex were fed back).
 - `stop` — the Stop-gate decision: `block`, loud `residual`, or `allow`.
 
@@ -219,23 +223,44 @@ turns a verdict into an error.
   same-directory snapshot needs a random name to avoid colliding with a
   concurrent enumeration of the same file and so cannot occupy any of those
   names.
-- **The verify step runs on the real path, so its own freshness is guarded, not
-  guaranteed.** A verdict has to describe the translation unit that actually
-  ships, and verifying the enumeration snapshot instead is not a drop-in
-  substitute: every counterexample and the trace's `argv` would name a temp
-  file that no longer exists once it is cleaned up, and the CLI would have to
-  keep it alive for the whole (much longer) verify call rather than the brief
-  parse-tree-only enumeration (issue #150). Instead the file is re-hashed once after the
-  verify loop and the run fails closed on drift: it withdraws its `scanned`
-  stamp and records a blocking ERROR rather than let a verdict stand for content
-  no longer on disk. That catches a rewrite that lands and **stays** during the
-  verifies. It does **not** catch a transient `A → B → A` — a verdict computed
-  against `B` stays attached to `A`'s stamp, since the final bytes compare
-  equal. So the guarantee is precisely: if `scanned` records digest `H`, the
-  units were enumerated from content hashing to `H` and the file hashed to `H`
-  both then and after the loop — *not* that every verdict was computed against
-  `H`. Taking that stamp is itself ownership-scoped: the re-hash happens under
-  the same lock that writes it, so concurrent hooks cannot interleave between the
+- **The verify step also runs on an immutable snapshot, not the real path
+  (issue #150).** Every verdict is computed against content hashing to the
+  digest `scanned` records, full stop — a transient `A → B → A` during the
+  verify can no longer attach `B`'s verdict to `A`'s stamp, since the snapshot's
+  bytes never move. The snapshot is staged as a **sibling of the source, in its
+  own real directory** — the same design the enumeration snapshot above uses,
+  for the same reason: no mirror root to fall off, so a quoted `#include`
+  resolves exactly as the in-place parse would, with no `-I` approximation to
+  get wrong. The trade is a narrower residual in its place: a translation unit
+  that `#include`s **itself by its own literal name** still reaches the live
+  file for that nested read, since a private snapshot cannot occupy the
+  original's name (it needs a random one to avoid colliding with a concurrent
+  verify of the same file). That random name would otherwise leak into
+  `__FILE__`/`__BASE_FILE__` too — code that branches on its own presumed name
+  (`strcmp(__FILE__, "expected.c")`, say) would take a different path than the
+  real file does — so the snapshot's first line is a `#line 1 "<real path>"`
+  directive, fixing the presumed name back to the original without touching
+  where its bytes sit; verified against a live `esbmc` run. The snapshot's name
+  is excluded from the gate's own discovery — never subject to
+  `FORSETI_GATE_INCLUDE`/`_EXCLUDE` — for as long as git can show it is
+  untracked, so one a killed hook could not clean up is never itself offered
+  back as a source to verify; a *tracked* file that happens to share the
+  snapshot's basename prefix is still discovered and gated normally. Staging it
+  at all is skipped when every definition in the file takes a pointer/array
+  parameter (`NEEDS_CONTRACT`, no ESBMC call ever reached): a directory that
+  could not host a snapshot must not gate an edit that would never have needed
+  one. Every path the CLI's own response names — the trace's
+  `argv` and any counterexample — is rewritten from the snapshot back to the
+  real file before it is recorded, so the loop trace and any fix Claude is asked
+  to make still point at a file that exists on disk. The file is still
+  re-hashed once after the verify loop, but that check now exists only for
+  *promptness*, not correctness: a rewrite that lands and **stays** (A → B)
+  after the snapshot was taken is nobody's fault, and the out-of-band scan would
+  eventually re-gate `B` on its own — but there is no such scan outside a git
+  work tree, and even inside one it only runs on the next hook, so the run
+  withdraws its `scanned` stamp and records a blocking ERROR rather than wait.
+  Taking that stamp is itself ownership-scoped: the re-hash happens under the
+  same lock that writes it, so concurrent hooks cannot interleave between the
   two, and a run whose bytes have already been superseded by another run's stamp
   defers to it silently instead of reclaiming the entry or blocking on a file
   that run legitimately verified.

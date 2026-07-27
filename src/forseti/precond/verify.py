@@ -21,7 +21,7 @@ memory check): the former escalates the ladder, only the latter is a VIOLATED.
 from __future__ import annotations
 
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -68,6 +68,7 @@ class Assessment(Enum):
     """The honestly-labelled outcome of a memory-precondition verification."""
 
     ASSUMED_VERIFIED = "assumed_verified"  # VERIFIED under an undischarged precond
+    DISCHARGED_VERIFIED = "discharged_verified"  # ... and every caller checked (S3)
     VIOLATED = "violated"  # a real memory counterexample under the precond
     VACUOUS = "vacuous"  # the call site was unreachable — not a pass
     UNKNOWN = "unknown"  # ladder exhausted / non-vacuity inconclusive
@@ -143,7 +144,7 @@ def _is_under_unwound(result: Violated) -> bool:
     return "unwinding assertion" in result.raw_counterexample
 
 
-def _escalating_port(raw: VerifyPort) -> VerifyPort:
+def escalating_port(raw: VerifyPort) -> VerifyPort:
     """Wrap `raw` so an under-unwound FAILED becomes an escalate-the-ladder UNKNOWN."""
 
     def port(source: Path, *, unwind: int) -> EsbmcResult:
@@ -155,15 +156,23 @@ def _escalating_port(raw: VerifyPort) -> VerifyPort:
     return port
 
 
-def _default_raw_verify(*, timeout_s: float, esbmc_bin: str) -> VerifyPort:
-    """The real sidecar verify: assertions on + force-malloc-success."""
+def sidecar_verify_port(
+    *, timeout_s: float, esbmc_bin: str, extra_flags: Sequence[str] = ()
+) -> VerifyPort:
+    """The real sidecar verify: assertions on + force-malloc-success.
+
+    `extra_flags` are appended to that fixed pair; the discharge driver
+    (RFC-0003 S3) uses it to add a ``-I`` for the source's own directory, since
+    the sidecar there includes a *generated copy* of the translation unit whose
+    relative ``#include``\\ s must still resolve.
+    """
 
     def raw(source: Path, *, unwind: int) -> EsbmcResult:
         return verify(
             source,
             unwind=unwind,
             timeout_s=timeout_s,
-            extra_flags=_FORCE_MALLOC,
+            extra_flags=(*_FORCE_MALLOC, *extra_flags),
             esbmc_bin=esbmc_bin,
             no_unwinding_assertions=False,
         )
@@ -171,7 +180,7 @@ def _default_raw_verify(*, timeout_s: float, esbmc_bin: str) -> VerifyPort:
     return raw
 
 
-def _ladder(max_len: int, cap: int) -> tuple[int, ...]:
+def precondition_ladder(max_len: int, cap: int) -> tuple[int, ...]:
     """`max_len + 1` doubling up to `cap` — strictly increasing, `cap` included."""
     rungs = [max_len + 1]
     while rungs[-1] < cap:
@@ -196,7 +205,7 @@ class PreconditionUnavailable(Exception):
         self.plan = plan
 
 
-def _plan_for(
+def plan_for(
     source: Path, function: str, lister: Callable[[Path], list[Unit]]
 ) -> UnitPlan:
     """Resolve `source::function` to a materialisable plan, or raise.
@@ -235,6 +244,7 @@ def _plan_for(
 # branch on — an assumed-but-vacuous or unsynthesisable unit is never a silent 0.
 ASSESSMENT_EXIT_CODES: dict[Assessment, int] = {
     Assessment.ASSUMED_VERIFIED: 0,
+    Assessment.DISCHARGED_VERIFIED: 0,
     Assessment.VIOLATED: 1,
     Assessment.UNKNOWN: 2,
     Assessment.ERROR: 3,
@@ -266,13 +276,15 @@ def verify_precondition(
     (the sidecar ``#include``\\ s the source by absolute path, so it can live
     anywhere).
     """
-    lister = list_units_fn or (lambda src: list_units(src, esbmc_bin=esbmc_bin))
+    lister = list_units_fn or (
+        lambda src: list_units(src, esbmc_bin=esbmc_bin, timeout_s=timeout_s)
+    )
     try:
-        plan = _plan_for(source, function, lister)
+        plan = plan_for(source, function, lister)
     except PreconditionUnavailable as exc:
         return PreconditionResult(function, exc.assessment, exc.detail, plan=exc.plan)
 
-    raw = raw_verify or _default_raw_verify(timeout_s=timeout_s, esbmc_bin=esbmc_bin)
+    raw = raw_verify or sidecar_verify_port(timeout_s=timeout_s, esbmc_bin=esbmc_bin)
     if work_dir is not None:
         return _run(source, function, plan, max_len, ladder_cap, raw, work_dir)
     with tempfile.TemporaryDirectory(prefix="forseti-precond-") as tmp:
@@ -295,7 +307,7 @@ def synthesize(
     exit code, never a silent empty emit.
     """
     lister = list_units_fn or (lambda src: list_units(src, esbmc_bin=esbmc_bin))
-    plan = _plan_for(source, function, lister)
+    plan = plan_for(source, function, lister)
     return render_sidecar(plan, str(source.resolve()), max_len=max_len)
 
 
@@ -312,8 +324,8 @@ def _run(
     primary = work_dir / f"{function}__precond.c"
     primary.write_text(render_sidecar(plan, include, max_len=max_len))
 
-    ladder = _ladder(max_len, ladder_cap)
-    port = _escalating_port(raw)
+    ladder = precondition_ladder(max_len, ladder_cap)
+    port = escalating_port(raw)
     settled = None
     for attempt in verify_ladder(primary, verify=port, ladder=ladder):
         settled = attempt
