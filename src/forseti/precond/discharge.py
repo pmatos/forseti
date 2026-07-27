@@ -75,11 +75,16 @@ past — it fails inside whatever caller's run reached it. What that costs is
 *blame*: one failing run cannot say which entry broke it. So a callee that can
 re-enter itself (`_self_reachable`, direct or through a cycle) is verified against
 its own harness too, which satisfies the obligation at the outer entry by
-construction; if that settles the re-entry as safe, a failure elsewhere is the
-caller's and is named, and if it does not, the caller's failure is
-``UNATTRIBUTED`` and the recursion is what the report names. A re-entry never
-*anchors* a chain, so a callee whose only in-TU call site is its own recursion
-still exports its obligation.
+construction — but that harness, like every other caller's, explores recursion
+only from the translation unit's own initial ambient state (RFC-0003 S2
+materialises parameters, never globals), so even a clean pass cannot settle
+whether a re-entry a *different* caller drives from state it changed itself (a
+flag set before the call, deciding whether the callee recurses at all) is safe.
+There is no entry state the self-check can be shown to share with any given
+caller's, so an obligation failure at a re-entrant callee is always
+``UNATTRIBUTED`` and the recursion is what the report names — never a caller. A
+re-entry never *anchors* a chain, so a callee whose only in-TU call site is its
+own recursion still exports its obligation.
 
 **What a discharge is relative to.** Each caller's own parameters are materialised
 by *its* S2 assumption, so one run proves ``caller precondition => callee
@@ -573,27 +578,29 @@ def _attributed(
     """`checks` with obligation failures a re-entry can explain taken off callers.
 
     The obligation is asserted at the callee's entry, so one failing run cannot
-    say *which* entry broke it — this caller's, or a re-entry reached from it. When
-    the callee's own harness settles that the re-entry keeps the obligation, a
-    failure elsewhere is the caller's and is named. When it does not, blaming the
-    caller would accuse code that passed a perfectly valid pointer, so the failure
-    becomes ``UNATTRIBUTED``: the upgrade is withheld and the recursion is what
-    the report names.
+    say *which* entry broke it — this caller's, or a re-entry reached from it. The
+    callee's own self-harness cannot settle that question for a *given* caller: it
+    materialises only its own parameters and, like every other caller's harness,
+    leaves the translation unit's ambient state at its own initial value (RFC-0003
+    S2), so even a clean pass explores recursion only from that one state — never
+    from state a caller changed before calling in (issue #166's motivating case: a
+    flag `g()` sets that decides whether the callee recurses at all). With no entry
+    state the self-check can be shown to share with any given caller's, blaming
+    that caller would risk accusing code that passed a perfectly valid pointer, so
+    an obligation failure at a re-entrant callee is always ``UNATTRIBUTED``: the
+    upgrade is withheld and the recursion is what the report names.
     """
     if not reentrant:
-        return checks
-    settled = any(
-        c.caller == function and c.outcome is CallerOutcome.DISCHARGED for c in checks
-    )
-    if settled:
         return checks
     return tuple(
         replace(
             check,
             outcome=CallerOutcome.UNATTRIBUTED,
             detail=f"{function}() can re-enter itself and the obligation is checked "
-            "at every entry, so this failure is as likely the re-entry's as this "
-            "caller's, and is not attributable to it",
+            "at every entry from whatever ambient state the caller left the "
+            "translation unit in, which the callee's own self-check explores only "
+            "from this translation unit's initial state, so this failure cannot be "
+            "attributed to this caller",
         )
         if check.caller != function
         and check.outcome is CallerOutcome.OBLIGATION_VIOLATED

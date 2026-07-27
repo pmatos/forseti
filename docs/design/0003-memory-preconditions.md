@@ -268,13 +268,16 @@ contract has one property the modular check would not have had: the assert fires
 a re-entry that breaks the precondition cannot slip past — it fails inside whatever caller's run
 reached it. What it costs is **blame**, since one failing run cannot say which entry broke it. So a
 callee that can re-enter itself (directly or round a cycle, over `Unit.calls`) is verified against its
-own harness too; that harness satisfies the obligation at the outer entry by construction, so a
-failure there is the re-entry's. If it settles clean, an obligation failure elsewhere *is* that
-caller's and is named as before; if it does not, the caller's failure is `UNATTRIBUTED` and the
-recursion is named instead — accusing a caller that handed over exactly the object it was given is
-the same phantom-blame this stage exists to avoid. A re-entry never *anchors* a chain: something
-outside the recursion has to enter the callee first, so a callee whose only in-TU call site is its own
-recursion still exports its obligation.
+own harness too; that harness satisfies the obligation at the outer entry by construction, but — like
+every other caller's harness — explores recursion only from the translation unit's own initial ambient
+state (S2 materialises parameters, never globals). Even a clean pass therefore cannot settle whether a
+re-entry a *different* caller drives from state it changed itself (a flag set before the call, deciding
+whether the callee recurses at all) is safe: there is no entry state the self-check can be shown to
+share with any given caller's. An obligation failure at a re-entrant callee is therefore always
+`UNATTRIBUTED` and the recursion is named instead, never a caller — accusing a caller that handed over
+exactly the object it was given is the same phantom-blame this stage exists to avoid. A re-entry never
+*anchors* a chain: something outside the recursion has to enter the callee first, so a callee whose
+only in-TU call site is its own recursion still exports its obligation.
 
 **And a translation unit is only the whole world for a `static` callee.** An externally visible one
 can be named — and handed anything — by any other TU of the linked program, and this command sees
