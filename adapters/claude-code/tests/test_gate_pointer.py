@@ -25,6 +25,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import forseti_gate as gate
 import pytest
@@ -745,12 +746,60 @@ def test_unregisterable_git_exclude_blocks_with_units_unavailable(
     # OSError it cannot route around (unlike a merely-missing directory, which
     # `os.makedirs` now creates — see
     # `test_missing_git_info_directory_is_created_before_writing_exclude`).
+    # `_index_ignore_snapshot` runs its own `rev-parse` directly (not through
+    # `_git`) so it can tell a confirmed non-work-tree apart from a failed
+    # probe, so the fake `rev-parse` answer has to be spliced in at the
+    # `subprocess.run` level instead of by monkeypatching `_git`.
     (tmp_path / "blocker").write_text("not a directory\n")
-    monkeypatch.setattr(gate, "_git", lambda start_dir, *args: "blocker/exclude")
+    real_run = subprocess.run
+
+    def _fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if "rev-parse" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="blocker/exclude\n", stderr=""
+            )
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(gate.subprocess, "run", _fake_run)
     src = tmp_path / "x.c"
     src.write_text("int f(void) { return 0; }\n")
     with pytest.raises(gate.UnitsUnavailable, match="exclude"):
         gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+
+def test_git_probe_failure_inside_a_work_tree_blocks_with_units_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A confirmed non-work-tree (`rev-parse` runs and exits non-zero) is the
+    # only case safe to no-op. `rev-parse` failing to *run at all* inside a
+    # real work tree (the git binary missing, a timeout, some other
+    # subprocess-level error) used to read identically and silently skip
+    # registering the exclude, staging the snapshot unprotected (review
+    # feedback, issue #151).
+    _git_init(tmp_path)
+    real_run = subprocess.run
+
+    def _fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if "rev-parse" in argv:
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=30)
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(gate.subprocess, "run", _fake_run)
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    with pytest.raises(gate.UnitsUnavailable, match="work tree"):
+        gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+    leftover = [
+        p.name
+        for p in tmp_path.iterdir()
+        if p.name.startswith(gate._ENUM_SNAPSHOT_PREFIX)
+    ]
+    assert leftover == []
 
 
 def test_snapshot_cleanup_failure_after_success_blocks(

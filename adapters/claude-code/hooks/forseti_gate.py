@@ -310,13 +310,22 @@ def _index_ignore_snapshot(start_dir: str, prefix: str) -> None:
     actually contains it, which may differ from the project root's repository
     (a submodule, a sibling checkout reached via a symlink).
 
-    A no-op outside a git work tree (`_git` returns ``None``): there is no
-    index there to protect against in the first place. Everywhere else, an
-    `OSError` — including one from creating a missing ``.git/info/`` (legal
-    for a repo made with an empty template, or by non-git tooling) — writing
-    the exclude file fails the same way every other one in this module does —
-    closed, as `UnitsUnavailable` — rather than silently proceeding to stage
-    the snapshot unprotected.
+    Genuinely outside a git work tree, this is a no-op: there is no index
+    there to protect against in the first place, and `git rev-parse` says so
+    by running to completion and exiting non-zero. That confirmed answer is
+    the *only* case treated as safe to skip — `git rev-parse` failing to run
+    at all (the binary missing, a timeout, some other subprocess-level error)
+    used to read identically to "not a work tree" and silently skip
+    protection even inside a real repository; it is now told apart and fails
+    closed as `UnitsUnavailable`, matching this file's convention elsewhere
+    (`_untracked_snapshot`) that an indeterminate git query must never relax
+    a guard (review feedback, issue #151).
+
+    Writing the exclude entry fails the same closed way: an `OSError` —
+    including one from creating a missing ``.git/info/`` (legal for a repo
+    made with an empty template, or by non-git tooling) — raises
+    `UnitsUnavailable` rather than silently proceeding to stage the snapshot
+    unprotected.
 
     Read and written as bytes, never decoded: git treats exclude patterns as
     raw bytes, and a non-UTF-8 byte sequence already in the file (e.g. a
@@ -325,10 +334,22 @@ def _index_ignore_snapshot(start_dir: str, prefix: str) -> None:
     an `OSError` — which would escape the `except` below uncaught and crash
     the hook process outright instead of failing closed.
     """
-    exclude_rel = _git(start_dir, "rev-parse", "--git-path", "info/exclude")
-    if exclude_rel is None:
-        return
-    exclude_rel = exclude_rel.strip()
+    try:
+        proc = subprocess.run(
+            ["git", "-C", start_dir, "rev-parse", "--git-path", "info/exclude"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError) as exc:
+        raise UnitsUnavailable(
+            f"could not determine whether {start_dir} is a git work tree "
+            f"(git rev-parse failed to run: {exc}); refusing to stage the "
+            f"snapshot unprotected"
+        ) from exc
+    if proc.returncode != 0:
+        return  # git ran and confirmed this is not a work tree
+    exclude_rel = proc.stdout.strip()
     exclude_path = (
         exclude_rel
         if os.path.isabs(exclude_rel)
