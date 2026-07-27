@@ -305,6 +305,40 @@ def test_discover_respells_through_a_symlinked_project_root(tmp_path: Path) -> N
     assert gate.unit_id(str(link), found[0]) == os.path.join("sub", "x.c")
 
 
+def test_discover_preserves_a_symlinked_source_alias(tmp_path: Path) -> None:
+    # review feedback, issue #161: an untracked `alias.c -> target.c`, both inside
+    # the project. Resolving the whole path (rather than just its directory) would
+    # silently substitute `target.c` for the Git-reported `alias.c`, so a
+    # Bash-created alias could be skipped whenever `target.c`'s hash was already
+    # `scanned` even though parsing through the alias can use a different lexical
+    # include directory.
+    _git_init(tmp_path)
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "target.c").write_text("int f(void){return 0;}\n")
+    _git_commit_all(tmp_path)
+    (tmp_path / "sub" / "alias.c").symlink_to("target.c")  # untracked, in-project
+
+    found = gate.discover_changed_c_sources(str(tmp_path))
+
+    alias_path = str(tmp_path / "sub" / "alias.c")
+    target_path = str(tmp_path / "sub" / "target.c")
+    assert found == [alias_path]  # the Git-reported path, not the resolved target
+    assert gate.unit_id(str(tmp_path), alias_path) == os.path.join("sub", "alias.c")
+    assert gate.unit_id(str(tmp_path), alias_path) != gate.unit_id(
+        str(tmp_path), target_path
+    )
+
+    # The fail-open half of the bug: had discovery returned `target_path` instead
+    # (the old behavior), its hash already matches a `scanned` target.c, so
+    # `stale_sources` would read the alias as already-verified off the target's
+    # stamp and silently drop it rather than gate it.
+    state = gate.load_state(str(tmp_path))
+    state["scanned"][gate.unit_id(str(tmp_path), target_path)] = gate.content_hash(
+        target_path
+    )
+    assert gate.stale_sources(str(tmp_path), state, found) == found
+
+
 # --- committed-since-baseline discovery (issue #99 review) ------------------
 
 
