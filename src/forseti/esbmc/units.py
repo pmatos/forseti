@@ -614,13 +614,17 @@ def _enclosing_function_file(stack: list[_AstNode]) -> str:
     Distinct from the current file at the node on top of `stack`: a body
     statement expanded from a macro *defined in a header* carries that header's
     location, even though the function enclosing it was declared in `source`
-    (issue #167). Empty when no `FunctionDecl` encloses the node, which
-    `_is_target` already reads as never a match.
+    (issue #167). A ``GCCAsmStmt`` is always a statement inside a function
+    body — file-scope ``asm(...)`` is a distinct ``FileScopeAsmDecl`` node
+    (verified with a live `esbmc --parse-tree-only` run) — so the no-match
+    fallback below is unreachable for this module's only caller; `next`'s
+    default keeps that dead arm out of branch coverage instead of asserting a
+    return type that isn't `str`.
     """
-    for node in reversed(stack[:-1]):
-        if node.kind == "FunctionDecl":
-            return node.file
-    return ""
+    return next(
+        (node.file for node in reversed(stack[:-1]) if node.kind == "FunctionDecl"),
+        "",
+    )
 
 
 def parse_address_escapes(ast_text: str, symbol: str) -> tuple[str, ...]:
