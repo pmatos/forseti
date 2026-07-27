@@ -1,3 +1,10 @@
+## [1.7.2](https://github.com/pmatos/forseti/compare/v1.7.1...v1.7.2) (2026-07-27)
+
+
+### Bug Fixes
+
+* **units:** anchor array-shape recovery to the definition clang selected ([#156](https://github.com/pmatos/forseti/issues/156)) ([634b663](https://github.com/pmatos/forseti/commit/634b663d726c7d28d2dec909416731bcabd85bed))
+
 ## [1.7.1](https://github.com/pmatos/forseti/compare/v1.7.0...v1.7.1) (2026-07-27)
 
 
