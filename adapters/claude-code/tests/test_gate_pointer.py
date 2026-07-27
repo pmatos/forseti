@@ -802,6 +802,45 @@ def test_git_probe_failure_inside_a_work_tree_blocks_with_units_unavailable(
     assert leftover == []
 
 
+def test_rev_parse_error_other_than_confirmed_non_worktree_blocks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A non-zero `rev-parse` exit is not by itself proof of "no work tree
+    # anywhere in the ancestry" — a malformed nested `.git` gitfile makes
+    # `rev-parse` fail the same way (`fatal: invalid gitfile format`, exit
+    # 128) as a genuine non-repo directory, but an *ancestor* repository's own
+    # `git add -A` still stages this directory's contents normally (measured;
+    # review feedback, issue #151, thread PRRT_kwDOS8LAxM6T9gjE). Only git's
+    # own affirmative "not a git repository (or any ...)" diagnostic is safe
+    # to treat as a no-op; anything else must fail closed.
+    _git_init(tmp_path)
+    real_run = subprocess.run
+
+    def _fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if "rev-parse" in argv:
+            return subprocess.CompletedProcess(
+                argv, 128, stdout="", stderr="fatal: invalid gitfile format\n"
+            )
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(gate.subprocess, "run", _fake_run)
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    with pytest.raises(gate.UnitsUnavailable, match="work tree"):
+        gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+    leftover = [
+        p.name
+        for p in tmp_path.iterdir()
+        if p.name.startswith(gate._ENUM_SNAPSHOT_PREFIX)
+    ]
+    assert leftover == []
+
+
 def test_gitignore_whitelist_defeats_exclude_blocks_with_units_unavailable(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -317,16 +317,28 @@ def _index_ignore_snapshot(start_dir: str, prefix: str) -> bool:
     Returns whether `start_dir` is inside a git work tree at all — the
     caller needs this to know whether the follow-up `check-ignore`
     verification even applies. Genuinely outside a work tree this returns
-    `False`: there is no index there to protect against in the first place,
-    and `git rev-parse` says so by running to completion and exiting
-    non-zero. That confirmed answer is the *only* case treated as safe to
-    skip — `git rev-parse` failing to run at all (the binary missing, a
-    timeout, some other subprocess-level error) used to read identically to
-    "not a work tree" and silently skip protection even inside a real
-    repository; it is now told apart and fails closed as `UnitsUnavailable`,
+    `False`, but a non-zero exit alone does not mean that: `git rev-parse`
+    exits the same 128 for a real repository-level error inside a directory
+    an *ancestor* repository still tracks normally — a malformed nested
+    ``.git`` gitfile (``fatal: invalid gitfile format``), a stale linked
+    worktree (``fatal: not a git repository: (null)``), a bad ``GIT_DIR``
+    (``fatal: not a git repository: '<path>'``) — and the parent's own
+    `git add -A` still stages this directory's contents in every one of
+    those cases (measured, not assumed). Only git's own affirmative "no
+    repository anywhere in the ancestry" diagnostic is trusted: both phrasings
+    it uses (``not a git repository (or any parent up to mount point`` /
+    ``...(or any of the parent directories)``) share the ``not a git
+    repository (or any`` anchor, which the three false-positive messages
+    above do not — checked with `LC_ALL=C` forced so a translated git on a
+    non-C locale can't silently defeat the match (verified empirically:
+    `LC_ALL=C` still reports the English message even under an explicit
+    non-C `LANGUAGE`). Every other non-zero exit — an unrecognized message,
+    the anchor absent — raises `UnitsUnavailable` instead of assuming safety,
     matching this file's convention elsewhere (`_untracked_snapshot`) that an
-    indeterminate git query must never relax a guard (review feedback, issue
-    #151).
+    indeterminate git query must never relax a guard. `git rev-parse` failing
+    to run at all (the binary missing, a timeout, some other subprocess-level
+    error) is the same kind of indeterminate answer and fails closed the same
+    way (review feedback, issue #151).
 
     Writing the exclude entry fails the same closed way: an `OSError` —
     including one from creating a missing ``.git/info/`` (legal for a repo
@@ -347,6 +359,7 @@ def _index_ignore_snapshot(start_dir: str, prefix: str) -> bool:
             capture_output=True,
             text=True,
             timeout=30,
+            env={**os.environ, "LC_ALL": "C"},
         )
     except (FileNotFoundError, OSError, subprocess.SubprocessError) as exc:
         raise UnitsUnavailable(
@@ -355,7 +368,13 @@ def _index_ignore_snapshot(start_dir: str, prefix: str) -> bool:
             f"snapshot unprotected"
         ) from exc
     if proc.returncode != 0:
-        return False  # git ran and confirmed this is not a work tree
+        if "not a git repository (or any" in proc.stderr:
+            return False  # git affirmatively confirmed this is not a work tree
+        raise UnitsUnavailable(
+            f"could not determine whether {start_dir} is a git work tree "
+            f"(git rev-parse failed: {proc.stderr.strip()}); refusing to "
+            f"stage the snapshot unprotected"
+        )
     exclude_rel = proc.stdout.strip()
     exclude_path = (
         exclude_rel
