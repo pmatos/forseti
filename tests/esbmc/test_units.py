@@ -15,6 +15,7 @@ from forseti.esbmc.units import (
     ListUnitsError,
     Param,
     Unit,
+    _line_breakpoints,
     annotate_array_extents,
     find_definition_brace,
     list_units,
@@ -87,6 +88,61 @@ def test_parse_units_param_types_are_canonical() -> None:
     assert reg.params == (Param("cb", "void (*)(void)"),)
     hash_ = next(u for u in parse_units(_AST, _TARGET) if u.name == "hash")
     assert [p.type for p in hash_.params] == ["const uint8_t *", "unsigned long"]
+
+
+def test_parse_units_captures_definition_line() -> None:
+    # `def_line` anchors `annotate_array_extents`'s declarator search (issue #145);
+    # each of these is read off the FunctionDecl's own AST location in `_AST`.
+    units = {u.name: u for u in parse_units(_AST, _TARGET)}
+    assert units["scal"].def_line == 3  # <line:3:1, col:29>
+    assert units["hash"].def_line == 4  # <line:4:1, col:77>
+    assert units["reg"].def_line == 6  # <line:6:1, col:27>
+
+
+# PR #156 follow-up: when a `FunctionDecl`'s return type is a macro defined
+# earlier in the file, clang's range *starts* at the macro's spelling location —
+# here line 1 — not the function's own line. This is a real `esbmc
+# --parse-tree-only` dump (captured against `#define API void` / `API f(int *p)
+# { *p = 1; }` on line 5), trimmed to the one FunctionDecl.
+_MACRO_RETURN_TYPE_AST = """\
+TranslationUnitDecl 0x1000 <<invalid sloc>> <invalid sloc>
+`-FunctionDecl 0x2000 </tmp/macro.c:1:13, line:5:25> col:5 f 'void (int *)'
+  |-ParmVarDecl 0x2001 <col:7, col:12> col:12 used p 'int *'
+  `-CompoundStmt 0x2002 <col:15, col:25>
+"""
+
+
+def test_parse_units_macro_return_type_uses_identifier_line_not_range_start() -> None:
+    # The range start (`1:13`) is the macro definition's line; `def_line` must be
+    # the function identifier's own line (5), which the AST separately states as
+    # its abbreviated point location (`col:5`, inheriting from the range end
+    # `line:5:25`). Anchoring on the range start instead would land `def_line` on
+    # the macro's line, letting an inactive alternative definition sitting between
+    # the macro and the real one donate its array extent (issue #145 follow-up).
+    unit = next(iter(parse_units(_MACRO_RETURN_TYPE_AST, "/tmp/macro.c")))
+    assert unit.def_line == 5
+
+
+# PR #156 follow-up: clang echoes the input path verbatim, spaces included, when
+# the source lives in a directory whose name has one. This is a real `esbmc
+# --parse-tree-only` dump (captured against `/tmp/path space/test.c`), trimmed to
+# the one FunctionDecl.
+_WHITESPACE_PATH_AST = """\
+TranslationUnitDecl 0x1000 <<invalid sloc>> <invalid sloc>
+`-FunctionDecl 0x117363d0 </tmp/path space/test.c:1:1, col:26> col:6 f 'void (int *)'
+  |-ParmVarDecl 0x11736308 <col:8, col:13> col:13 used p 'int *'
+  `-CompoundStmt 0x11736510 <col:16, col:26>
+"""
+
+
+def test_parse_units_path_with_whitespace() -> None:
+    # A token pattern that requires a whitespace-free path leaves this location
+    # chain unmatched entirely, so `def_line` would silently retain whatever line
+    # preceded it instead of this node's own — and, with an earlier inactive
+    # same-named definition, that stale anchor can select the wrong one's array
+    # extent (PR #156 follow-up to issue #145).
+    unit = next(iter(parse_units(_WHITESPACE_PATH_AST, "/tmp/path space/test.c")))
+    assert unit.def_line == 1
 
 
 def test_parse_units_empty_on_declarations_only() -> None:
@@ -243,6 +299,407 @@ def test_annotate_array_extents_unknown_function_unchanged() -> None:
     assert annotate_array_extents([unit], "void other(int x){}")[0] == unit
 
 
+# Issue #145: textual order alone cannot tell an inactive `#if 0`/`#ifdef` body
+# apart from the definition clang actually compiled — the first one is not
+# necessarily the right one, and (for a literal extent) the wrong one is the more
+# dangerous direction: an over-sized object can mask a real out-of-bounds.
+_IF0_LITERAL_SOURCE = (
+    "#if 0\nvoid f(int p[20]) { }\n#endif\nvoid f(int *p) { *p = 1; }\n"
+)
+_IF0_MACRO_SOURCE = "#if 0\nvoid f(int p[N]) { }\n#endif\nvoid f(int *p) { *p = 1; }\n"
+
+
+def test_annotate_array_extents_anchors_past_inactive_if0_body() -> None:
+    # `def_line=4` is what `parse_units` would report for the active `f` (clang
+    # never sees the `#if 0` body at all) — anchoring to it must skip the inactive
+    # literal-extent body, not read `p` as a fixed array of 20.
+    unit = Unit("f", (Param("p", "int *"),), def_line=4)
+    out = annotate_array_extents([unit], _IF0_LITERAL_SOURCE)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
+def test_annotate_array_extents_without_def_line_uses_first_textual_match() -> None:
+    # Documents the pre-#145 hazard the anchor fixes: absent a `def_line` hint,
+    # the first definition-shaped occurrence wins even when it is the inactive
+    # `#if 0` body — misreading a plain `int *p` as a fixed array of 20.
+    unit = Unit("f", (Param("p", "int *"),))
+    out = annotate_array_extents([unit], _IF0_LITERAL_SOURCE)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (20, False)
+
+
+def test_annotate_array_extents_anchors_past_inactive_macro_extent() -> None:
+    # Same anchor, with the inactive body's extent stated as a macro instead of a
+    # literal — the #137 unresolved-extent signal must not leak from it either.
+    unit = Unit("f", (Param("p", "int *"),), def_line=4)
+    out = annotate_array_extents([unit], _IF0_MACRO_SOURCE)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
+def test_annotate_array_extents_preserves_def_line() -> None:
+    # The returned Unit keeps its def_line, so a second annotation pass (or an
+    # equality check against a hand-built Unit) is not silently reset to None.
+    unit = Unit("f", (Param("p", "int *"),), def_line=4)
+    out = annotate_array_extents([unit], _IF0_LITERAL_SOURCE)[0]
+    assert out.def_line == 4
+
+
+# Issue #145 follow-up: a `#line` directive resets clang's *presumed* line counter
+# for everything after it, so an active definition's presumed line (`def_line`,
+# what clang reports) can land well before its physical line — here 1, not the
+# physical 5. Comparing `def_line` against a raw physical candidate line would
+# silently re-anchor to the inactive `#if 0` body, sitting at physical line 2.
+# Parametrized over both directive spellings clang honors: ISO C's `#line N` and
+# GNU's linemarker `# N` (no `line` keyword).
+@pytest.mark.parametrize("directive", ["#line 1", "# 1"])
+def test_annotate_array_extents_anchors_across_a_line_directive(directive: str) -> None:
+    source = (
+        f"#if 0\nvoid f(int p[20]) {{ }}\n#endif\n{directive}\n"
+        "void f(int *p) { *p = 1; }\n"
+    )
+    unit = Unit("f", (Param("p", "int *"),), def_line=1)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
+# PR #156 follow-up: a naive textual scan would see two legal `#line 11`
+# directives — one ahead of an inactive `#if 0` body, one ahead of the active
+# definition — and translate both candidates to presumed line 11, tying with
+# `def_line` (11, what clang reports for the active definition) equidistant from
+# both. `_line_breakpoints` avoids the tie outright by excluding a `#line` inside
+# a literal `#if 0`: only the second directive ever becomes a breakpoint, so the
+# inactive candidate's presumed line falls back to its own (much more distant)
+# physical line instead of colliding with the active one's.
+def test_annotate_array_extents_ignores_a_line_directive_inside_a_dead_if0_body() -> (
+    None
+):
+    source = (
+        "#if 0\n#line 11\nvoid f(int p[20]) { }\n#endif\n"
+        "#line 11\nvoid f(int *p) { *p = 1; }\n"
+    )
+    unit = Unit("f", (Param("p", "int *"),), def_line=11)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
+def test_annotate_array_extents_ignores_a_dead_if0_line_directive_mirrored() -> None:
+    # The mirror of the case above — the active definition physically *first*,
+    # the inactive `#if 0` body (with its own colliding `#line 11`) second. A
+    # naive tiebreak that always prefers the physically later occurrence would
+    # get this arrangement backwards; the dead-region exclusion above avoids the
+    # tie in both directions, so no such preference is needed at all.
+    source = (
+        "#line 11\nvoid f(int *p) { *p = 1; }\n"
+        "#if 0\n#line 11\nvoid f(int p[20]) { }\n#endif\n"
+    )
+    unit = Unit("f", (Param("p", "int *"),), def_line=11)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
+def test_annotate_array_extents_ignores_a_line_directive_inside_a_dead_elif0_body() -> (
+    None
+):
+    # PR #156 follow-up: the inactive array-shaped definition sits behind an
+    # `#elif 0`, not the `#if 0` itself. Treating every `#elif` as an
+    # unconditional `#else` would reactivate this still-dead branch and let its
+    # `#line 11` collide with the one guarding the active definition above.
+    source = (
+        "#line 11\nvoid f(int *p) { *p = 1; }\n"
+        "#if 0\n#elif 0\n#line 11\nvoid f(int p[20]) { }\n#endif\n"
+    )
+    unit = Unit("f", (Param("p", "int *"),), def_line=11)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
+def test_annotate_array_extents_ignores_a_line_directive_inside_a_dead_if1_body() -> (
+    None
+):
+    # PR #156 follow-up: the inactive array-shaped definition sits behind an
+    # `#else` paired with a literal `#if 1` — cpp always takes the `#if 1` arm,
+    # so the `#else`'s own `#line 11` never reaches the compiler either. Before
+    # this fix, `#if 1` was read as opaque and its `#else` was always assumed
+    # live, so this `#line 11` collided with the active definition's and the
+    # physical-line tiebreak picked the (physically later) inactive candidate.
+    source = (
+        "#if 1\n#line 11\nvoid f(int *p) { return; }\n"
+        "#else\n#line 11\nvoid f(int p[20]) { return; }\n#endif\n"
+    )
+    unit = Unit("f", (Param("p", "int *"),), def_line=11)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
+def test_line_breakpoints_excludes_a_directive_inside_a_dead_if0_body() -> None:
+    source = "#if 0\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(5, 9)]
+
+
+def test_line_breakpoints_else_reactivates_a_dead_if0_branch() -> None:
+    # `#else` after a literal `#if 0` is exactly the branch cpp *does* compile —
+    # a `#line` inside it is reachable and must count, even though it sits inside
+    # the same `#if 0`/`#endif` pair whose primary branch is dead.
+    source = "#if 0\n#line 5\nx\n#else\n#line 9\ny\n#endif\n"
+    assert _line_breakpoints(source) == [(5, 9)]
+
+
+def test_line_breakpoints_ignores_an_unbalanced_endif() -> None:
+    # A stray `#endif` with no matching `#if` must not raise — this scan reads
+    # arbitrary real-world source, not a validated preprocessor input.
+    source = "#endif\n#line 5\nx\n"
+    assert _line_breakpoints(source) == [(2, 5)]
+
+
+def test_line_breakpoints_does_not_treat_a_prefix_zero_as_known_false() -> None:
+    # PR #156 follow-up: `#if 0 || FEATURE` merely *starts* with `0` — its full
+    # condition is not the literal zero, so cpp might genuinely take this branch
+    # and its `#line` must still count, not be silently dropped.
+    source = "#if 0 || FEATURE\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(2, 5), (5, 9)]
+
+
+def test_line_breakpoints_elif_zero_stays_dead() -> None:
+    # PR #156 follow-up: treating every `#elif` as an unconditional `#else`
+    # would reactivate this still-dead `#elif 0` branch (its own condition is
+    # false too) and let its `#line` collide with a real one elsewhere. Only the
+    # unconditional `#else` that follows is guaranteed live.
+    source = "#if 0\n#line 5\nx\n#elif 0\n#line 9\ny\n#else\n#line 11\nz\n#endif\n"
+    assert _line_breakpoints(source) == [(8, 11)]
+
+
+def test_line_breakpoints_excludes_a_directive_inside_a_dead_if1_else_body() -> None:
+    # PR #156 follow-up: `#if 1` is a literal-true condition, so cpp always
+    # takes it and never reaches the paired `#else` — a `#line` there must not
+    # count, even though an `#else` is unconditionally live after an *opaque*
+    # `#if` (contrast `test_line_breakpoints_else_reactivates_a_dead_if0_branch`).
+    source = "#if 1\n#line 5\nx\n#else\n#line 9\ny\n#endif\n"
+    assert _line_breakpoints(source) == [(2, 5)]
+
+
+def test_line_breakpoints_elif_one_is_live_when_no_earlier_arm_won() -> None:
+    # PR #156 follow-up: a literal `#elif 1` is live exactly when nothing
+    # earlier in the chain was already known-taken — the opaque `#if FOO`
+    # hasn't proven anything either way, so this arm is (optimistically)
+    # assumed live, the same bias as an opaque `#if`/`#elif` on its own.
+    source = "#if FOO\n#elif 1\n#line 5\nx\n#endif\n"
+    assert _line_breakpoints(source) == [(3, 5)]
+
+
+def test_line_breakpoints_elif_one_is_dead_after_an_earlier_if_one() -> None:
+    # Mirror: once a literal `#if 1` has already won the chain, a later
+    # `#elif 1` can never be reached, however true its own condition reads.
+    source = "#if 1\n#elif 1\n#line 5\nx\n#endif\n"
+    assert _line_breakpoints(source) == []
+
+
+def test_line_breakpoints_ignores_an_unbalanced_elif_zero() -> None:
+    # A stray `#elif 0` with no matching `#if` must not raise, mirroring
+    # `test_line_breakpoints_ignores_an_unbalanced_endif` for `#endif`.
+    source = "#elif 0\n#line 5\nx\n"
+    assert _line_breakpoints(source) == [(2, 5)]
+
+
+def test_line_breakpoints_ignores_an_unbalanced_elif_one() -> None:
+    source = "#elif 1\n#line 5\nx\n"
+    assert _line_breakpoints(source) == [(2, 5)]
+
+
+def test_line_breakpoints_ignores_an_unbalanced_else() -> None:
+    source = "#else\n#line 5\nx\n"
+    assert _line_breakpoints(source) == [(2, 5)]
+
+
+def test_line_breakpoints_ignores_a_line_directive_spliced_from_a_macro() -> None:
+    # PR #156 follow-up: a physical line that only *looks* like `#line 1`
+    # because it is spliced onto the previous line's backslash continuation
+    # (here, a multi-line `#define`'s replacement text) is not a directive to
+    # cpp at all — line splicing (translation phase 2) merges it into the
+    # `#define` before cpp ever looks for a leading `#`.
+    source = "#define UNUSED tokens \\\n#line 1\nx\n"
+    assert _line_breakpoints(source) == []
+
+
+def test_line_breakpoints_ignores_a_conditional_directive_spliced_from_a_macro() -> (
+    None
+):
+    # The splicing hazard applies to every directive regex, not just
+    # `#line` itself: an unfiltered, spliced-in `#if 0` would open a
+    # permanently-dead frame (no matching `#endif` exists in the real source
+    # to close it) and silently drop every later breakpoint in the file.
+    source = "#define X \\\n#if 0\n#line 5\nx\n"
+    assert _line_breakpoints(source) == [(3, 5)]
+
+
+def test_annotate_array_extents_ignores_a_line_directive_spliced_from_a_macro() -> None:
+    # End-to-end: the inactive array-shaped `f` sits behind a real `#if 0`,
+    # and the active pointer `f` follows a `#define`/`#line`-lookalike pair.
+    # Without splicing awareness, the phantom `#line 1` would make the active
+    # definition's translated presumed line collide with (or fall closer to)
+    # the inactive one's, than the definition clang actually reports (6).
+    source = (
+        "#if 0\nvoid f(int p[20]) { }\n#endif\n"
+        "#define UNUSED tokens \\\n#line 1\nvoid f(int *p) { *p = 1; }\n"
+    )
+    unit = Unit("f", (Param("p", "int *"),), def_line=6)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
+def test_line_breakpoints_joins_a_spliced_if_condition() -> None:
+    # PR #156 follow-up: `#if \` + newline + `0` is one logical `#if 0` to cpp
+    # (line splicing runs before the preprocessor ever evaluates a condition),
+    # but capturing only the first physical line's text would see just a
+    # trailing backslash and misclassify the branch as opaque/live, retaining
+    # the `#line` inside what is actually a dead branch.
+    source = "#if \\\n0\n#line 5\nx\n#endif\n"
+    assert _line_breakpoints(source) == []
+
+
+def test_line_breakpoints_joins_a_spliced_elif_condition() -> None:
+    # Mirror of the `#if` case: `#elif \` + newline + `0` is one logical
+    # `#elif 0` to cpp — still dead regardless of the opaque `#if X` before it
+    # — so a `#line` inside it must not count.
+    source = "#if X\n#elif \\\n0\n#line 5\nx\n#endif\n"
+    assert _line_breakpoints(source) == []
+
+
+def test_line_breakpoints_joins_a_spliced_line_directive_digit() -> None:
+    # PR #156 follow-up: `#line \` + newline + `11` is one logical `#line 11`
+    # to cpp (line splicing runs before cpp ever reads the directive), but
+    # capturing only the first physical line's digits would see none at all
+    # and silently drop the breakpoint — not a safe failure: with no
+    # breakpoint recorded, both an active and an inactive same-named
+    # candidate translate to their own physical line, and the nearest-before
+    # tiebreak can then pick whichever sits physically closer to `def_line`,
+    # regardless of which one cpp actually compiled.
+    source = "#line \\\n11\nx\n"
+    assert _line_breakpoints(source) == [(1, 11)]
+
+
+def test_annotate_array_extents_ignores_a_line_directive_spliced_from_a_line() -> None:
+    # End-to-end, confirmed against esbmc's own parse tree: `#line \` +
+    # newline + `11` reports `f`'s definition at presumed line 12. An
+    # inactive array-shaped `f` sits behind a real `#if 0` right after it; if
+    # the spliced `#line`'s breakpoint is dropped, both candidates fall back
+    # to their physical lines (3 and 5) and the nearest-before tiebreak picks
+    # the closer, inactive one (5) over the active pointer definition (3),
+    # copying its extent onto the compiled pointer parameter.
+    source = (
+        "#line \\\n11\nvoid f(int *p) { *p = 1; }\n"
+        "#if 0\nvoid f(int p[20]) { }\n#endif\n"
+    )
+    unit = Unit("f", (Param("p", "int *"),), def_line=12)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
+def test_annotate_array_extents_ignores_a_line_directive_in_a_spliced_if_zero() -> None:
+    # End-to-end: without joining the spliced condition, `#if \` + newline +
+    # `0` reads as opaque/live, so the `#line 11` guarding the inactive
+    # array-shaped `f` stays a real breakpoint and can collide with the active
+    # definition's own presumed line.
+    source = (
+        "#if \\\n0\n#line 11\nvoid f(int p[20]) { }\n#endif\n"
+        "#line 11\nvoid f(int *p) { *p = 1; }\n"
+    )
+    unit = Unit("f", (Param("p", "int *"),), def_line=11)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
+def test_annotate_array_extents_breaks_a_genuine_presumed_tie_by_physical_line() -> (
+    None
+):
+    # A tie unrelated to `#if 0`/`#ifdef` entirely — two `#line 5` directives
+    # outside any conditional, each immediately ahead of a definition-shaped `f`.
+    # Nothing here is preprocessor-dead, so both directives are real breakpoints
+    # and both candidates translate to presumed line 5, genuinely equidistant
+    # from `def_line`. This is what the physical-line tiebreak (`-c[0]`) exists
+    # for: `min`'s stability would otherwise keep the textually-first (here,
+    # wrong) candidate.
+    source = "#line 5\nvoid f(int p[20]) { }\n#line 5\nvoid f(int *p) { *p = 1; }\n"
+    unit = Unit("f", (Param("p", "int *"),), def_line=5)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
+def test_blank_comment_preserves_line_numbers_across_a_multiline_comment() -> None:
+    # `_param_list_text` compares byte-offset-derived line numbers in the
+    # comment-stripped text against `Unit.def_line`, which clang reports against
+    # the *original* source. A multi-line block comment collapsed to a single
+    # space (as a naive `re.sub(_COMMENT_RE, " ", ...)` would) shifts every line
+    # after it, breaking that comparison — `mask_comments` must instead keep the
+    # comment's newlines so line numbers stay aligned with the original source.
+    source = "int a;\n/* line one\nline two\nline three */\nint b;\n"
+    stripped = mask_comments(source)
+    assert stripped.count("\n") == source.count("\n")
+    b_line_original = next(
+        i for i, line in enumerate(source.splitlines(), 1) if "int b;" in line
+    )
+    b_line_stripped = next(
+        i for i, line in enumerate(stripped.splitlines(), 1) if "int b;" in line
+    )
+    assert b_line_stripped == b_line_original == 5
+
+
+def test_annotate_array_extents_anchors_correctly_across_a_multiline_comment() -> None:
+    # A realistic case combining both mechanisms: a multi-line doc comment sits
+    # between the inactive `#if 0` body and the active definition, so a correct
+    # anchor depends on `mask_comments` keeping the active definition's line
+    # number aligned with the `def_line` clang reports against the real source.
+    source = (
+        "#if 0\n"
+        "void f(int p[20]) { }\n"
+        "#endif\n"
+        "/* Documents f.\n"
+        " * See also: nothing.\n"
+        " */\n"
+        "void f(int *p) { *p = 1; }\n"
+    )
+    def_line = next(
+        i for i, line in enumerate(source.splitlines(), 1) if "int *p" in line
+    )
+    assert def_line == 7
+    unit = Unit("f", (Param("p", "int *"),), def_line=def_line)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
+def test_blank_comment_absorbs_a_backslash_continued_line_comment() -> None:
+    # PR #156 follow-up: cpp splices a `\`-terminated line onto the next before
+    # it ever recognizes a `//` comment (translation phase 2 runs before phase
+    # 3), so a directive-looking line right after such a splice is part of the
+    # comment, not a directive. `_COMMENT_RE` must absorb the continuation so
+    # the directive-looking text is blanked away with it, not left exposed.
+    source = "int a;\n// comment \\\n#line 1\nint b;\n"
+    stripped = mask_comments(source)
+    assert stripped.count("\n") == source.count("\n")
+    assert "#line" not in stripped
+    b_line_original = next(
+        i for i, line in enumerate(source.splitlines(), 1) if "int b;" in line
+    )
+    b_line_stripped = next(
+        i for i, line in enumerate(stripped.splitlines(), 1) if "int b;" in line
+    )
+    assert b_line_stripped == b_line_original == 4
+
+
+def test_annotate_array_extents_ignores_a_line_directive_spliced_from_a_comment() -> (
+    None
+):
+    # End-to-end: the earlier continuation fix (1dc377c) only scanned the
+    # already-blanked text, where a backslash inside a `//` comment was already
+    # erased along with the comment — invisible to that continuation check. The
+    # phantom `#line 1` must instead never survive comment-blanking at all.
+    source = (
+        "#if 0\nvoid f(int p[20]) { }\n#endif\n"
+        "// c \\\n#line 1\nvoid f(int *p) { *p = 1; }\n"
+    )
+    unit = Unit("f", (Param("p", "int *"),), def_line=6)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
 _HAVE_ESBMC = shutil.which("esbmc") is not None
 
 
@@ -296,6 +753,117 @@ def test_list_units_marks_macro_extent_unresolved(tmp_path: Path) -> None:
         "tag": (16, False),
         "raw": (None, False),
     }
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_anchors_extent_to_active_if0_definition(tmp_path: Path) -> None:
+    # End-to-end (issue #145): an inactive `#if 0` body must not donate its array
+    # extent to the definition clang actually compiled. The over-sized hazard this
+    # closes is the dangerous direction — it can mask a real out-of-bounds by
+    # backing a plain `int *p` with a too-large object (VIOLATED -> VERIFIED).
+    src = tmp_path / "sig.c"
+    src.write_text("#if 0\nvoid f(int p[20]) { }\n#endif\nvoid f(int *p) { *p = 1; }\n")
+    f = next(u for u in list_units(src) if u.name == "f")
+    assert f.params[0].array_extent is None
+    assert f.params[0].array_extent_unresolved is False
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_anchors_extent_to_ifdef_selected_definition(tmp_path: Path) -> None:
+    # Same anchor, for the other conditional-compilation shape the issue calls
+    # out: an `#ifdef`-selected alternative definition. Whichever branch clang
+    # actually compiles is the one the extent must come from.
+    src = tmp_path / "sig.c"
+    src.write_text(
+        "#ifdef WIDGET\n"
+        "void f(int p[20]) { (void)p; }\n"
+        "#else\n"
+        "void f(int *p) { *p = 1; }\n"
+        "#endif\n"
+    )
+    f_default = next(u for u in list_units(src) if u.name == "f")
+    assert f_default.params[0].array_extent is None
+    assert f_default.params[0].array_extent_unresolved is False
+
+    f_widget = next(
+        u for u in list_units(src, extra_flags=("-DWIDGET",)) if u.name == "f"
+    )
+    assert f_widget.params[0].array_extent == 20
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_anchors_extent_across_a_line_directive(tmp_path: Path) -> None:
+    # End-to-end (issue #145 follow-up): a `#line` directive makes clang report the
+    # active definition's presumed line (1) well before its physical line (5) —
+    # earlier, even, than the inactive `#if 0` body's physical line (2). Comparing
+    # `def_line` straight against physical candidate lines would pick the inactive
+    # body and copy its extent onto the active `int *p`.
+    src = tmp_path / "sig.c"
+    src.write_text(
+        "#if 0\nvoid f(int p[20]) { }\n#endif\n#line 1\nvoid f(int *p) { *p = 1; }\n"
+    )
+    f = next(u for u in list_units(src) if u.name == "f")
+    assert f.params[0].array_extent is None
+    assert f.params[0].array_extent_unresolved is False
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_anchors_extent_past_a_macro_return_type(tmp_path: Path) -> None:
+    # End-to-end (PR #156 follow-up): with a macro'd return type, clang's
+    # `FunctionDecl` range starts at the macro's *definition* line, not the
+    # function's own line. Anchoring `def_line` on the range start would land it
+    # on the `#define` line, ahead of the inactive `#if 0` body sitting between
+    # the macro and the active definition — donating the inactive body's extent.
+    src = tmp_path / "sig.c"
+    src.write_text(
+        "#define API void\n"
+        "#if 0\n"
+        "API f(int p[20]) { }\n"
+        "#endif\n"
+        "API f(int *p) { *p = 1; }\n"
+    )
+    f = next(u for u in list_units(src) if u.name == "f")
+    assert f.params[0].array_extent is None
+    assert f.params[0].array_extent_unresolved is False
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_ignores_a_line_directive_inside_a_dead_if0_body(
+    tmp_path: Path,
+) -> None:
+    # End-to-end (PR #156 follow-up): two `#line 11` directives, one ahead of an
+    # inactive `#if 0` body and one ahead of the active definition, would
+    # translate both candidates to presumed line 11 if both counted — the same
+    # value clang reports for the active definition's `def_line`, an unbreakable
+    # tie. `_line_breakpoints` excludes the one inside the dead `#if 0`, so the
+    # inactive candidate never collides with the active one in the first place.
+    src = tmp_path / "sig.c"
+    src.write_text(
+        "#if 0\n#line 11\nvoid f(int p[20]) { }\n#endif\n"
+        "#line 11\nvoid f(int *p) { *p = 1; }\n"
+    )
+    f = next(u for u in list_units(src) if u.name == "f")
+    assert f.params[0].array_extent is None
+    assert f.params[0].array_extent_unresolved is False
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_anchors_extent_with_whitespace_in_the_path(
+    tmp_path: Path,
+) -> None:
+    # End-to-end (PR #156 follow-up): clang echoes the input path verbatim,
+    # spaces included, when the source lives in a directory whose name has one.
+    # A token pattern that requires a whitespace-free path would leave `def_line`
+    # unset, letting the inactive `#if 0` body's array extent donate to the
+    # active `int *p` — the exact over-sized-object hazard issue #145 exists to
+    # close.
+    src_dir = tmp_path / "path space"
+    src_dir.mkdir()
+    src = src_dir / "sig.c"
+    src.write_text("#if 0\nvoid f(int p[20]) { }\n#endif\nvoid f(int *p) { *p = 1; }\n")
+    f = next(u for u in list_units(src) if u.name == "f")
+    assert f.params[0].array_extent is None
+    assert f.params[0].array_extent_unresolved is False
 
 
 # The brittleness class from issue #131: every shape a regex over the source text
