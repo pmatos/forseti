@@ -340,7 +340,7 @@ def test_a_caller_that_changes_ambient_state_is_not_blamed_for_the_re_entry(
     outcomes = {c.caller: c.outcome for c in result.callers}
     assert outcomes["step"] is CallerOutcome.DISCHARGED
     assert outcomes["trigger"] is CallerOutcome.UNATTRIBUTED
-    assert "passes" not in result.label
+    assert "VIOLATED at the call site" not in result.label
 
 
 _BLOCK_SCOPE_DECL_CALLER = """\

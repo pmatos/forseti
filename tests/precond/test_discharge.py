@@ -453,7 +453,7 @@ def test_a_discharged_self_check_still_leaves_a_caller_failure_unattributed(
     outcomes = {c.caller: c.outcome for c in result.callers}
     assert outcomes["sum_bytes"] is CallerOutcome.DISCHARGED
     assert outcomes["frame_checksum"] is CallerOutcome.UNATTRIBUTED
-    assert "passes" not in result.detail  # never accused of a bad pointer
+    assert "VIOLATED at the call site" not in result.label
 
 
 def test_an_indirect_cycle_counts_as_a_re_entry(tmp_path: Path) -> None:
