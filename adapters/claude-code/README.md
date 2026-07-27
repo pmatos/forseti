@@ -195,39 +195,41 @@ turns a verdict into an error.
   verdict rather than silently skipped. A file that only parses with the
   project's include paths needs `FORSETI_BUILD_FLAGS` set — an unresolvable
   `#include` is such a failure. What gets parsed is an **immutable snapshot** of
-  the exact bytes the gate hashed, written to a private temp directory (issue
-  #141), so a rewrite concurrent with the parse cannot make the gate enumerate
-  one version of the file while stamping another. That temp tree is made to
-  stand in for the source's own neighbourhood, with no extra flag: every entry
-  beside the source is symlinked next to the snapshot, and the directory chain
-  from the project root down is reproduced level by level, each mirroring its own
-  entries — so `#include "sibling.h"` *and* `#include "../common.h"` resolve to
-  the same headers an in-place parse would pick. A symlinked directory component
-  is reproduced as a **symlink**, and the chain then continues from its target:
-  the kernel resolves such a component before it applies `..`, so a climb past
-  one leaves the spelled chain, and a real directory there would silently select
-  a different header. (Naming the directory with
+  the exact bytes the gate hashed (issue #141), so a rewrite concurrent with the
+  parse cannot make the gate enumerate one version of the file while stamping
+  another. The snapshot is staged as a **sibling of the source, in its own real
+  directory** (issue #151) — not a copy mirrored elsewhere — so it needs no
+  reproduction of the source's neighbourhood at all: every real sibling, and
+  everything a `..` chain can reach, resolves exactly as an in-place parse
+  would, because the snapshot *is* in that directory. (Naming the directory with
   `-I` instead would be wrong: `-I` also joins the *angle-bracket* search and
   lands after any `-iquote`, so `#include <config.h>` next to a generated
   `config.h` would pick the wrong one, flip an `#if`, and hide a unit from the
-  gate.) A quoted include that climbs *above* the project root is the one shape
-  the mirror does not reproduce: it misses there, and clang then falls through to
-  the `-I` search with the *spelled* path — a blocking ERROR when no such flag is
-  set, and otherwise whatever `<-I dir>/../above.h` finds, which need not be the
-  header an in-place parse picks. `FORSETI_BUILD_FLAGS="-I."` is the spelling
-  that reproduces the in-place answer (the CLI runs with `cwd` = project dir).
-  This is unchanged from mirroring the siblings alone; the padded depth only
-  removes the worse variant, where the miss landed in `/tmp` itself. A symlink
-  pointing *out* of the project has the same limit one level down — the mirror
-  claims no ancestry above the link's target, exactly as it claims none above the
-  project root — so a climb past that target misses too, and blocks.
+  gate — same-directory staging needs no flag at all.) A snapshot's name is
+  excluded from the gate's own discovery — never subject to
+  `FORSETI_GATE_INCLUDE`/`_EXCLUDE` — for as long as git can show it is
+  untracked, so one a killed hook could not clean up is never itself offered
+  back as a source; a *tracked* file that happens to share the snapshot's
+  basename prefix is still discovered and gated normally. Inside a git work
+  tree the snapshot's name is also registered in `.git/info/exclude` before it
+  is staged, so a concurrent `git add -A`/`git status` never sees it either —
+  only an explicit, forced `git add -f <path>` can still index it. The trade for
+  dropping the earlier mirrored design (which had a project-root boundary a
+  quoted include could climb past, silently landing on a different translation
+  unit) is a narrower residual: a translation unit that `#include`s the source
+  under any name that resolves to its own inode — its literal filename, a
+  same-directory symlink, or
+  a hard link — still reaches the live file for that nested read, since a
+  same-directory snapshot needs a random name to avoid colliding with a
+  concurrent enumeration of the same file and so cannot occupy any of those
+  names.
 - **The verify step also runs on an immutable snapshot, not the real path
   (issue #150).** Every verdict is computed against content hashing to the
   digest `scanned` records, full stop — a transient `A → B → A` during the
   verify can no longer attach `B`'s verdict to `A`'s stamp, since the snapshot's
   bytes never move. The snapshot is staged as a **sibling of the source, in its
-  own real directory** (not the mirrored-elsewhere tree the enumeration snapshot
-  above uses): that has no mirror root to fall off, so a quoted `#include`
+  own real directory** — the same design the enumeration snapshot above uses,
+  for the same reason: no mirror root to fall off, so a quoted `#include`
   resolves exactly as the in-place parse would, with no `-I` approximation to
   get wrong. The trade is a narrower residual in its place: a translation unit
   that `#include`s **itself by its own literal name** still reaches the live

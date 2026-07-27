@@ -16,7 +16,6 @@ broken launcher elsewhere is shadowed)::
 from __future__ import annotations
 
 import contextlib
-import errno
 import hashlib
 import json
 import os
@@ -26,6 +25,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import forseti_gate as gate
 import pytest
@@ -67,19 +67,13 @@ def _fake_forseti_cmd(
 
 
 def _argv_capturing_forseti_cmd(tmp_path: Path, dest: Path) -> list[str]:
-    """A fake CLI recording its argv and the source's *neighbourhood* to `dest`.
+    """A fake CLI recording its argv and the source's *directory* to `dest`.
 
     `siblings` maps each entry beside the file it was handed to that entry's
-    real path — which is how a test checks that a snapshot's temp directory
-    stands in for the source's own directory (`_enumerable_source` mirrors it
-    with symlinks, so quoted `#include`s resolve exactly as they would in place).
-    `ancestors` is the same walking upwards *lexically*, one record per level
-    from the source's directory to ``/``: what a `..` in an `#include` would find
-    if the caller normalized the path itself. `kernel_ancestors` is the walk the
-    kernel actually performs — it resolves each component first, so a symlinked
-    one sends the chain somewhere the lexical walk never goes. `islink`/`real`
-    say which of the two a given level belongs to. A level that cannot be listed
-    records ``None`` rather than aborting the capture.
+    real path — how a test checks that the snapshot sits in the source's own
+    real directory (`_enumerable_source`'s same-directory staging), so quoted
+    `#include`s resolve exactly as they would in place. A directory that cannot
+    be listed records ``None`` rather than aborting the capture.
     """
     script = tmp_path / "argv_forseti.py"
     script.write_text(
@@ -91,21 +85,9 @@ def _argv_capturing_forseti_cmd(tmp_path: Path, dest: Path) -> list[str]:
         "    except OSError:\n"
         "        return None\n"
         "src = sys.argv[2]\n"
-        "d = os.path.dirname(src)\n"
-        "sib = ents(d)\n"
-        "anc = []\n"
-        "while d and d != os.sep:\n"
-        "    anc.append({'path': d, 'islink': os.path.islink(d),"
-        " 'real': os.path.realpath(d), 'entries': ents(d)})\n"
-        "    d = os.path.dirname(d)\n"
-        "k = os.path.realpath(os.path.dirname(src))\n"
-        "ker = []\n"
-        "while k and k != os.sep:\n"
-        "    ker.append({'path': k, 'entries': ents(k)})\n"
-        "    k = os.path.dirname(k)\n"
+        "sib = ents(os.path.dirname(src))\n"
         f"open({str(dest)!r}, 'w').write("
-        "json.dumps({'argv': sys.argv[1:], 'siblings': sib, 'ancestors': anc,"
-        " 'kernel_ancestors': ker}))\n"
+        "json.dumps({'argv': sys.argv[1:], 'siblings': sib}))\n"
         "sys.stdout.write('{\"units\": []}')\n"
     )
     return [sys.executable, str(script)]
@@ -148,6 +130,10 @@ def _echoing_forseti_cmd(
     ]
     script.write_text("\n".join(body) + "\n")
     return [sys.executable, str(script)]
+
+
+def _git_init(path: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
 
 
 def _content_keyed_verify_forseti_cmd(
@@ -451,9 +437,9 @@ def test_snapshot_directory_stands_in_for_the_sources_own(
     tmp_path: Path, monkeypatch
 ) -> None:
     # clang resolves a quoted `#include "sibling.h"` against the directory of the
-    # file it is reading, so the snapshot has to sit in an equivalent directory:
-    # every entry beside the source is mirrored into the temp dir. Crucially this
-    # needs NO `-I` — see the next test for why a flag is not a substitute.
+    # file it is reading, so the snapshot has to sit in that same directory — a
+    # real sibling of the source, not a copy elsewhere. Crucially this needs NO
+    # `-I` — see the next test for why a flag is not a substitute.
     dest = tmp_path / "argv.json"
     monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
     monkeypatch.setattr(
@@ -472,21 +458,81 @@ def test_snapshot_directory_stands_in_for_the_sources_own(
 
     captured = json.loads(dest.read_text())
     enumerated = Path(captured["argv"][1])
-    assert enumerated != src and enumerated.name == "x.c"  # a recognisable name
-    # The sibling header and the subdirectory both resolve to the real ones...
+    # A distinct, recognisable name in the source's own real directory — never
+    # the source's own path, and never occupying it.
+    assert enumerated != src
+    assert os.path.samefile(enumerated.parent, sub)
+    assert enumerated.name.startswith(gate._ENUM_SNAPSHOT_PREFIX)
+    # The sibling header, the subdirectory, and the source itself are all real —
+    # nothing mirrored, because the snapshot sits right beside them.
     assert captured["siblings"]["helper.h"] == str((sub / "helper.h").resolve())
     assert captured["siblings"]["nested"] == str((sub / "nested").resolve())
-    # ...and the source's own name is the snapshot, not a link back to the file.
-    assert captured["siblings"]["x.c"] != str(src.resolve())
+    assert captured["siblings"]["x.c"] == str(src.resolve())
     assert "--" not in captured["argv"]  # no include flag invented
-    assert not enumerated.exists()  # the temp mirror is cleaned up
+    assert not enumerated.exists()  # the snapshot is cleaned up
+
+
+def test_snapshot_preserves_the_source_extension_including_case(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # `is_c_source`/`extract_function_defs` lowercase the suffix to decide whether
+    # to enumerate at all, but clang itself does not: an uppercase `.C` source is
+    # C++, not C. A hard-coded `.c` snapshot would silently reinterpret it as C —
+    # e.g. dropping a function guarded by `#ifdef __cplusplus` that the real file
+    # has — so the snapshot's suffix has to match the source's own, case included.
+    dest = tmp_path / "argv.json"
+    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
+    )
+    src = tmp_path / "x.C"
+    src.write_text("int f(void) { return 0; }\n")
+
+    gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+    captured = json.loads(dest.read_text())
+    enumerated = Path(captured["argv"][1])
+    assert enumerated.suffix == ".C"
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_uppercase_c_source_snapshot_matches_in_place_enumeration(
+    tmp_path: Path,
+) -> None:
+    # Measured, not assumed: clang (via `forseti list-units`) parses a `.C`
+    # source as C++, so `__cplusplus` is defined there and undefined for a `.c`
+    # one. A hard-coded `.c` snapshot suffix would enumerate `only_in_cxx` out of
+    # existence — reporting an empty-looking unit list that then gets stamped as
+    # scanned, silently skipping a function the in-place (and later verify) parse
+    # both see.
+    src = tmp_path / "x.C"
+    src.write_text(
+        "int f(void) { return 0; }\n"
+        "#ifdef __cplusplus\n"
+        "int only_in_cxx(void) { return 1; }\n"
+        "#endif\n"
+    )
+
+    in_place = gate.extract_functions(str(src), project_dir=str(tmp_path))
+    snapshotted = [
+        d.name
+        for d in gate.extract_function_defs(
+            str(src), project_dir=str(tmp_path), content=src.read_bytes()
+        )
+    ]
+
+    assert in_place == ["f", "only_in_cxx"]
+    assert snapshotted == in_place
 
 
 def test_snapshot_does_not_disturb_angle_include_or_iquote_precedence(
     tmp_path: Path, monkeypatch
 ) -> None:
-    # Why the directory is mirrored rather than named with `-I`: `-I` also joins
-    # the *angle-bracket* search, and lands after any `-iquote` from
+    # Why the snapshot is staged in the source's own directory rather than named
+    # with `-I`: `-I` also joins the *angle-bracket* search, and lands after any
+    # `-iquote` from
     # FORSETI_BUILD_FLAGS instead of taking the source directory's first-place
     # precedence. With `#include <config.h>` next to a generated `config.h` —
     # the standard shape — either one selects a different header than the
@@ -513,14 +559,14 @@ def test_snapshot_does_not_disturb_angle_include_or_iquote_precedence(
     ]
 
 
-def test_snapshot_mirrors_the_lexical_directory_not_the_symlink_target(
+def test_snapshot_stages_beside_the_lexical_directory_not_the_symlink_target(
     tmp_path: Path, monkeypatch
 ) -> None:
     # clang searches the directory of the path it was *given*, so for a symlinked
-    # source that is the link's directory, not the target's. Mirroring the
-    # resolved one would drop a header beside the link and silently prefer a
-    # same-named header beside the target — enumerating units the in-place parse
-    # never sees.
+    # source that is the link's directory, not the target's. Staging beside the
+    # resolved target instead would drop a header beside the link and silently
+    # prefer a same-named header beside the target — enumerating units the
+    # in-place parse never sees.
     dest = tmp_path / "argv.json"
     monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
     monkeypatch.setattr(
@@ -531,7 +577,7 @@ def test_snapshot_mirrors_the_lexical_directory_not_the_symlink_target(
     real = tmp_path / "real"
     real.mkdir()
     (real / "x.c").write_text("int f(void) { return 0; }\n")
-    (real / "config.h").write_text("#define WHICH 2\n")  # must NOT be mirrored
+    (real / "config.h").write_text("#define WHICH 2\n")  # must NOT be picked
     link_dir = tmp_path / "linked"
     link_dir.mkdir()
     (link_dir / "config.h").write_text("#define WHICH 1\n")  # this one must be
@@ -545,12 +591,12 @@ def test_snapshot_mirrors_the_lexical_directory_not_the_symlink_target(
     assert siblings["config.h"] == str((link_dir / "config.h").resolve())
 
 
-def test_snapshot_mirrors_the_dir_resolved_against_project_dir(
+def test_snapshot_stages_beside_the_dir_resolved_against_project_dir(
     tmp_path: Path, monkeypatch
 ) -> None:
     # The CLI subprocess runs with cwd=project_dir, so a relative `file_path` is
     # relative to *that*, not to the hook process's cwd. A bare `os.path.abspath`
-    # would mirror whatever directory the hook happened to start in.
+    # would stage beside whatever directory the hook happened to start in.
     dest = tmp_path / "argv.json"
     monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
     monkeypatch.setattr(
@@ -567,154 +613,6 @@ def test_snapshot_mirrors_the_dir_resolved_against_project_dir(
 
     siblings = json.loads(dest.read_text())["siblings"]
     assert siblings["helper.h"] == str((sub / "helper.h").resolve())
-
-
-def test_snapshot_mirrors_the_ancestry_up_to_the_project_dir(
-    tmp_path: Path, monkeypatch
-) -> None:
-    # `#include "../common.h"` — the ordinary shape for a `src/foo.c` — resolves
-    # against the *parent* of the source's directory. Mirroring only the siblings
-    # left it unresolvable, so `list-units` failed on a translation unit that
-    # parses perfectly in place and the gate recorded a blocking `error`. The
-    # chain from the project dir down is mirrored too: each level carries its own
-    # entries, minus the one the chain continues through.
-    dest = tmp_path / "argv.json"
-    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
-    monkeypatch.setattr(
-        gate,
-        "resolve_forseti_cmd",
-        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
-    )
-    proj = tmp_path / "proj"
-    (proj / "src").mkdir(parents=True)
-    (proj / "common.h").write_text("#define COMMON 1\n")
-    (proj / "include").mkdir()
-    src = proj / "src" / "x.c"
-    src.write_text("int f(void) { return 0; }\n")
-
-    gate.extract_function_defs(str(src), project_dir=str(proj), content=b"f\n")
-
-    captured = json.loads(dest.read_text())
-    staged = Path(captured["argv"][1])
-    src_level, proj_level = captured["ancestors"][0], captured["ancestors"][1]
-    assert proj_level["entries"]["common.h"] == str((proj / "common.h").resolve())
-    assert proj_level["entries"]["include"] == str((proj / "include").resolve())
-    # `src` on the chain is the mirror the snapshot sits in, NOT a link back to
-    # the real directory — a link there would put the real `x.c` beside it.
-    assert proj_level["entries"]["src"] == str(staged.parent.resolve())
-    # Every step is a real directory, so `..` walks the mirror whether the caller
-    # normalizes `foo/../bar` lexically or leaves it to the kernel.
-    assert not src_level["islink"] and not proj_level["islink"]
-
-
-def test_snapshot_reproduces_a_symlinked_directory_component(
-    tmp_path: Path, monkeypatch
-) -> None:
-    # A `..` climbing past a *symlinked* component does not climb the spelled
-    # chain: the kernel resolves the component first, so `link/src/../..` lands
-    # beside the link's target. clang hands the concatenated path straight to
-    # `open`, so that is the resolution the in-place parse gets. Reproducing the
-    # component as a real directory would send the climb up the spelled chain
-    # instead and silently select a different header — a different translation
-    # unit, which enumeration then prunes and stamps against.
-    dest = tmp_path / "argv.json"
-    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
-    monkeypatch.setattr(
-        gate,
-        "resolve_forseti_cmd",
-        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
-    )
-    proj = tmp_path / "proj"
-    pkg = proj / "vendor" / "pkg"
-    (pkg / "src").mkdir(parents=True)
-    (pkg / "common.h").write_text("#define COMMON 1\n")
-    (proj / "vendor" / "selector.h").write_text("#define WHICH 1\n")  # the real pick
-    (proj / "selector.h").write_text("#define WHICH 2\n")  # the spelled-chain decoy
-    (proj / "link").symlink_to(pkg)
-    src = proj / "link" / "src" / "x.c"
-    src.write_text("int f(void) { return 0; }\n")
-
-    gate.extract_function_defs(str(src), project_dir=str(proj), content=b"f\n")
-
-    captured = json.loads(dest.read_text())
-    src_level, link_level, proj_level = captured["ancestors"][:3]
-    kernel = captured["kernel_ancestors"]
-    # The component is a link in the mirror too, so the kernel walk leaves the
-    # spelled chain exactly where it does in place...
-    assert link_level["islink"]
-    assert os.path.dirname(src_level["real"]) == link_level["real"]
-    assert os.path.dirname(link_level["real"]) != proj_level["real"]
-    # ...landing on the target's own parent, where `../../selector.h` finds the
-    # header the in-place parse finds — not the project's decoy.
-    assert kernel[2]["entries"]["selector.h"] == str(
-        (proj / "vendor" / "selector.h").resolve()
-    )
-    # The target's entries are mirrored, so a one-level `#include "../common.h"`
-    # keeps resolving (it already did — mirroring scandirs through the link).
-    assert kernel[1]["entries"]["common.h"] == str((pkg / "common.h").resolve())
-    # And the spelled chain survives as spelled, for a caller that normalizes
-    # `foo/../bar` itself: lexically two levels up is still the project dir.
-    assert proj_level["entries"]["selector.h"] == str((proj / "selector.h").resolve())
-
-
-def test_snapshot_reproduces_the_sources_absolute_depth(
-    tmp_path: Path, monkeypatch
-) -> None:
-    # An `#include` that climbs past the mirror root has to land somewhere
-    # private and empty. Staging at the temp root itself would make `../x.h`
-    # resolve into `/tmp` — world-writable, so anyone's same-named header would
-    # be included and the gate would enumerate a *different* translation unit.
-    # That is worse than the blocking `error` an unresolved include produces, so
-    # the source's absolute path is reproduced under the temp root and the levels
-    # above the mirror root are left empty.
-    dest = tmp_path / "argv.json"
-    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
-    monkeypatch.setattr(
-        gate,
-        "resolve_forseti_cmd",
-        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
-    )
-    proj = tmp_path / "proj"
-    (proj / "src").mkdir(parents=True)
-    src = proj / "src" / "x.c"
-    src.write_text("int f(void) { return 0; }\n")
-
-    gate.extract_function_defs(str(src), project_dir=str(proj), content=b"f\n")
-
-    captured = json.loads(dest.read_text())
-    staged = captured["argv"][1]
-    assert staged.endswith(str(src)) and staged != str(src)  # padded, not flattened
-    above_root = captured["ancestors"][2]  # one level above the mirrored project
-    assert list(above_root["entries"]) == ["proj"]  # nothing real to climb into
-
-
-def test_snapshot_ancestry_stops_at_the_mirror_root(
-    tmp_path: Path, monkeypatch
-) -> None:
-    # A source outside the project has no ancestry the gate can claim, and
-    # walking to `/` would mean a `scandir` of `$HOME` on every edit (thousands
-    # of entries, and an unreadable one becomes a blocking `error`). Mirroring
-    # stops at the source's own directory: siblings yes, parent's entries no.
-    dest = tmp_path / "argv.json"
-    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
-    monkeypatch.setattr(
-        gate,
-        "resolve_forseti_cmd",
-        lambda: _argv_capturing_forseti_cmd(tmp_path, dest),
-    )
-    proj = tmp_path / "proj"
-    proj.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (outside / "helper.h").write_text("#define HELP 1\n")
-    src = outside / "x.c"
-    src.write_text("int f(void) { return 0; }\n")
-
-    gate.extract_function_defs(str(src), project_dir=str(proj), content=b"f\n")
-
-    captured = json.loads(dest.read_text())
-    assert captured["siblings"]["helper.h"] == str((outside / "helper.h").resolve())
-    assert list(captured["ancestors"][1]["entries"]) == ["outside"]  # not mirrored
 
 
 def test_in_place_enumeration_uses_no_snapshot(tmp_path: Path, monkeypatch) -> None:
@@ -736,18 +634,20 @@ def test_in_place_enumeration_uses_no_snapshot(tmp_path: Path, monkeypatch) -> N
 
 
 def _unstageable_snapshot(monkeypatch, message: str = "No space left") -> None:
-    """Make staging the snapshot fail with a bare `OSError`: ENOSPC, bad TMPDIR, ..."""
+    """Make staging the snapshot fail with a bare `OSError`: ENOSPC, an unwritable
+    directory, ...
+    """
 
     def _boom(*args: object, **kwargs: object) -> None:
         raise OSError(message)
 
-    monkeypatch.setattr(gate.tempfile, "TemporaryDirectory", _boom)
+    monkeypatch.setattr(gate.tempfile, "mkstemp", _boom)
 
 
 def test_unstageable_snapshot_raises_units_unavailable(
     tmp_path: Path, monkeypatch
 ) -> None:
-    # An unwritable/missing TMPDIR, ENOSPC or EDQUOT must surface as the one
+    # An unwritable source directory, ENOSPC or EDQUOT must surface as the one
     # exception the gate knows how to block on. A bare OSError escapes to the
     # hook, which installs no handler — the process would die with a traceback
     # and exit 1 rather than the blocking exit 2.
@@ -779,6 +679,481 @@ def test_unstageable_snapshot_blocks_and_does_not_stamp(
     assert "x.c" not in after["scanned"]
     assert after["scanned"]["sentinel.c"] == "deadbeef"
     assert gate.blocking_units(after)
+
+
+def test_snapshot_is_excluded_from_the_git_index_before_it_exists(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A concurrent `git add -A` — an IDE, another automation job, a user's own
+    # habit — can land at any point while the snapshot sits on disk for the
+    # whole enumeration. Running `git add -A` from *inside* the fake CLI is the
+    # moment the snapshot is guaranteed to exist, so it is the sharpest test of
+    # whether `_index_ignore_snapshot`'s registration (which has to happen
+    # before `mkstemp`, not after) actually keeps git from seeing it.
+    _git_init(tmp_path)
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            before_read=(
+                "import subprocess as sp; sp.run(['git', 'add', '-A'], check=True)"
+            ),
+        ),
+    )
+
+    gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+    staged = subprocess.run(
+        ["git", "-C", str(tmp_path), "diff", "--cached", "--name-only"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert gate._ENUM_SNAPSHOT_PREFIX not in staged
+    assert "x.c" in staged  # the real edit is still staged normally
+
+
+def test_snapshot_exclusion_is_a_noop_outside_a_git_work_tree(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # No git index exists outside a work tree, so registering the exclude
+    # pattern must not become a hard dependency of enumeration succeeding —
+    # `tmp_path` here is deliberately never `git init`ed.
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+
+    defs = gate.extract_function_defs(
+        str(src), project_dir=str(tmp_path), content=b"f\n"
+    )
+
+    assert [d.name for d in defs] == ["f"]
+
+
+def test_unregisterable_git_exclude_blocks_with_units_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Every OSError this staging path can raise has to land as UnitsUnavailable
+    # (fail closed) — including one from registering the exclude pattern
+    # itself, or the snapshot would end up staged unprotected rather than not
+    # staged at all. A regular file standing where a directory component of
+    # the resolved exclude path needs to be makes `os.makedirs` fail with an
+    # OSError it cannot route around (unlike a merely-missing directory, which
+    # `os.makedirs` now creates — see
+    # `test_missing_git_info_directory_is_created_before_writing_exclude`).
+    # `_index_ignore_snapshot` runs its own `rev-parse` directly (not through
+    # `_git`) so it can tell a confirmed non-work-tree apart from a failed
+    # probe, so the fake `rev-parse` answer has to be spliced in at the
+    # `subprocess.run` level instead of by monkeypatching `_git`.
+    (tmp_path / "blocker").write_text("not a directory\n")
+    real_run = subprocess.run
+
+    def _fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if "rev-parse" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="blocker/exclude\n", stderr=""
+            )
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(gate.subprocess, "run", _fake_run)
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    with pytest.raises(gate.UnitsUnavailable, match="exclude"):
+        gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+
+def test_git_probe_failure_inside_a_work_tree_blocks_with_units_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A confirmed non-work-tree (`rev-parse` runs and exits non-zero) is the
+    # only case safe to no-op. `rev-parse` failing to *run at all* inside a
+    # real work tree (the git binary missing, a timeout, some other
+    # subprocess-level error) used to read identically and silently skip
+    # registering the exclude, staging the snapshot unprotected (review
+    # feedback, issue #151).
+    _git_init(tmp_path)
+    real_run = subprocess.run
+
+    def _fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if "rev-parse" in argv:
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=30)
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(gate.subprocess, "run", _fake_run)
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    with pytest.raises(gate.UnitsUnavailable, match="work tree"):
+        gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+    leftover = [
+        p.name
+        for p in tmp_path.iterdir()
+        if p.name.startswith(gate._ENUM_SNAPSHOT_PREFIX)
+    ]
+    assert leftover == []
+
+
+def test_rev_parse_error_other_than_confirmed_non_worktree_blocks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A non-zero `rev-parse` exit is not by itself proof of "no work tree
+    # anywhere in the ancestry" — a malformed nested `.git` gitfile makes
+    # `rev-parse` fail the same way (`fatal: invalid gitfile format`, exit
+    # 128) as a genuine non-repo directory, but an *ancestor* repository's own
+    # `git add -A` still stages this directory's contents normally (measured;
+    # review feedback, issue #151, thread PRRT_kwDOS8LAxM6T9gjE). Only git's
+    # own affirmative "not a git repository (or any ...)" diagnostic is safe
+    # to treat as a no-op; anything else must fail closed.
+    _git_init(tmp_path)
+    real_run = subprocess.run
+
+    def _fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if "rev-parse" in argv:
+            return subprocess.CompletedProcess(
+                argv, 128, stdout="", stderr="fatal: invalid gitfile format\n"
+            )
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(gate.subprocess, "run", _fake_run)
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    with pytest.raises(gate.UnitsUnavailable, match="work tree"):
+        gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+    leftover = [
+        p.name
+        for p in tmp_path.iterdir()
+        if p.name.startswith(gate._ENUM_SNAPSHOT_PREFIX)
+    ]
+    assert leftover == []
+
+
+def test_git_ceiling_directories_does_not_defeat_the_exclude(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # `GIT_CEILING_DIRECTORIES` only stops git's *upward* repository discovery
+    # at a listed boundary — it does not mean no repository exists past it.
+    # Verified empirically: probing a subdirectory with the ceiling set at its
+    # own repo root produces the exact same "not a git repository (or any of
+    # the parent directories)" diagnostic as a genuine non-repo directory,
+    # while `git add -A` run from the repo root still stages a file placed in
+    # that subdirectory normally (review feedback, issue #151, thread
+    # PRRT_kwDOS8LAxM6T-adc). Both the initial rev-parse probe and the
+    # follow-up check-ignore verification have to ignore this env var, or the
+    # snapshot ends up staged with no exclude entry protecting it at all.
+    _git_init(tmp_path)
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    src = sub / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            before_read=(
+                "import subprocess as sp; sp.run(['git', 'add', '-A'], check=True)"
+            ),
+        ),
+    )
+
+    defs = gate.extract_function_defs(
+        str(src), project_dir=str(tmp_path), content=b"f\n"
+    )
+
+    assert [d.name for d in defs] == ["f"]
+    staged = subprocess.run(
+        ["git", "-C", str(tmp_path), "diff", "--cached", "--name-only"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert gate._ENUM_SNAPSHOT_PREFIX not in staged
+    assert "sub/x.c" in staged  # the real edit is still staged normally
+
+
+def test_gitignore_whitelist_defeats_exclude_blocks_with_units_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # gitignore(5) gives a tracked `.gitignore` higher precedence than
+    # `$GIT_DIR/info/exclude` — a whitelist-style `.gitignore` (`*` then
+    # `!*.c`) silently overrides the registered exclude pattern, so a
+    # concurrent `git add -A` can still stage the "excluded" snapshot
+    # (measured empirically with `git check-ignore -v` naming the
+    # `.gitignore` rule as the decider; review feedback, issue #151). The
+    # check has to run against the real, `mkstemp`-generated snapshot path —
+    # a synthetic probe of the wrong shape could pass a whitelist rule the
+    # real snapshot would not (see the sibling test below).
+    _git_init(tmp_path)
+    (tmp_path / ".gitignore").write_text("*\n!*.c\n")
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    with pytest.raises(gate.UnitsUnavailable, match="gitignore"):
+        gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+    leftover = [
+        p.name
+        for p in tmp_path.iterdir()
+        if p.name.startswith(gate._ENUM_SNAPSHOT_PREFIX)
+    ]
+    assert leftover == []
+
+
+def test_gitignore_negation_targeting_mkstemps_shape_blocks_with_units_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A negation naming `tempfile.mkstemp`'s own generated shape (its random
+    # suffix is 8 characters — a private, undocumented `tempfile`
+    # implementation detail, confirmed by reading `_RandomNameSequence`, not
+    # assumed) defeats a synthetic probe of the wrong length while still
+    # matching every real snapshot `mkstemp` will ever produce (measured:
+    # `git check-ignore -v` picks the `.gitignore` rule for an 8-character
+    # name but not a 1-character one). Checking the real post-`mkstemp` path
+    # instead of guessing a shape closes this regardless of what that length
+    # happens to be (review feedback, issue #151).
+    _git_init(tmp_path)
+    (tmp_path / ".gitignore").write_text("!/.forseti-units-????????.c\n")
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    with pytest.raises(gate.UnitsUnavailable, match="gitignore"):
+        gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+    leftover = [
+        p.name
+        for p in tmp_path.iterdir()
+        if p.name.startswith(gate._ENUM_SNAPSHOT_PREFIX)
+    ]
+    assert leftover == []
+
+
+def test_snapshot_cleanup_failure_after_success_blocks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The happy path: enumeration itself succeeds, but the final `os.unlink`
+    # fails (a lost-write-permission race, an NFS hiccup). That must not be
+    # suppressed into a silent success — it would leave a complete source
+    # snapshot in the worktree indefinitely while reporting the enumeration as
+    # fine.
+    real_unlink = os.unlink
+
+    def _boom(path: str, *, dir_fd: int | None = None) -> None:
+        if os.path.basename(path).startswith(gate._ENUM_SNAPSHOT_PREFIX):
+            raise OSError("permission denied")
+        real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(gate.os, "unlink", _boom)
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    with pytest.raises(gate.UnitsUnavailable, match="remove"):
+        gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+
+def test_snapshot_cleanup_failure_does_not_mask_a_pending_enumeration_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # When the CLI call itself already failed, a *secondary* cleanup failure
+    # must not replace that primary, more actionable exception — cleanup is
+    # still attempted (best-effort) but its error is suppressed here, mirroring
+    # the write-failure path just above.
+    real_unlink = os.unlink
+
+    def _boom(path: str, *, dir_fd: int | None = None) -> None:
+        if os.path.basename(path).startswith(gate._ENUM_SNAPSHOT_PREFIX):
+            raise OSError("permission denied")
+        real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(gate.os, "unlink", _boom)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _fake_forseti_cmd(
+            tmp_path, stderr="boom-original-failure", exit_code=1
+        ),
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    with pytest.raises(gate.UnitsUnavailable, match="boom-original-failure"):
+        gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+
+def test_snapshot_is_removed_when_the_write_is_interrupted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A KeyboardInterrupt (or any other non-OSError) raised while writing the
+    # snapshot's content used to escape both the write's `except OSError` and
+    # the yield's `except BaseException` (which wraps only the yield, not the
+    # write step above it) — leaking the file `mkstemp` already created on
+    # disk indefinitely.
+    class _InterruptingHandle:
+        def __enter__(self) -> _InterruptingHandle:
+            return self
+
+        def __exit__(self, *exc_info: object) -> None:
+            return None
+
+        def write(self, data: bytes) -> int:
+            raise KeyboardInterrupt
+
+    def _fdopen(fd: int, mode: str) -> _InterruptingHandle:
+        os.close(fd)
+        return _InterruptingHandle()
+
+    monkeypatch.setattr(gate.os, "fdopen", _fdopen)
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    with (
+        pytest.raises(KeyboardInterrupt),
+        gate._enumerable_source(
+            str(src), b"int f(void) { return 0; }\n", project_dir=str(tmp_path)
+        ),
+    ):
+        pass
+
+    leftover = [
+        p.name
+        for p in tmp_path.iterdir()
+        if p.name.startswith(gate._ENUM_SNAPSHOT_PREFIX)
+    ]
+    assert leftover == []
+
+
+def test_exclude_is_registered_against_the_source_repo_not_the_project_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A source living in a *different* repository than `project_dir` (a
+    # submodule, a sibling checkout reached via a symlink) must have the
+    # exclude pattern registered in *its own* `.git/info/exclude` — the one a
+    # `git add -A` run from inside that repo actually consults — not the
+    # project root's, which `mkstemp` never stages anything into (issue #151
+    # follow-up).
+    _git_init(tmp_path)
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    _git_init(nested)
+    src = nested / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+
+    gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+    pattern = f"{gate._ENUM_SNAPSHOT_PREFIX}*"
+    nested_exclude = (nested / ".git" / "info" / "exclude").read_text()
+    assert pattern in nested_exclude.splitlines()
+    # `git init` always seeds a commented-out `.git/info/exclude` (confirmed
+    # empirically), so this is a real assertion, not a vacuous one.
+    root_exclude = (tmp_path / ".git" / "info" / "exclude").read_text()
+    assert pattern not in root_exclude.splitlines()
+
+
+def test_exclude_is_registered_in_the_repo_root_for_a_nested_source(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The common shape: one repo at `project_dir`, source one level down (e.g.
+    # `src/x.c`). `git rev-parse --git-path info/exclude` run from a
+    # subdirectory returns a path *relative to that subdirectory*
+    # (``../.git/info/exclude``, confirmed empirically) rather than an
+    # absolute one — this pins that `os.path.join`/`os.makedirs` resolve it to
+    # the same repo root's exclude file the project-root case already covers,
+    # not a nonexistent `src/../.git/info/exclude` tree of its own.
+    _git_init(tmp_path)
+    sub = tmp_path / "src"
+    sub.mkdir()
+    src = sub / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+
+    gate.extract_function_defs(str(src), project_dir=str(tmp_path), content=b"f\n")
+
+    pattern = f"{gate._ENUM_SNAPSHOT_PREFIX}*"
+    root_exclude = (tmp_path / ".git" / "info" / "exclude").read_text()
+    assert pattern in root_exclude.splitlines()
+    assert not (sub / ".git").exists()
+
+
+def test_preexisting_non_utf8_exclude_content_does_not_crash(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # `.git/info/exclude` is git's own file, read as raw bytes by git itself —
+    # a non-UTF-8 byte sequence already in it (e.g. a pattern written under a
+    # non-UTF-8 locale) is legal. Decoding it as text would raise
+    # `UnicodeDecodeError`, a `ValueError` that escapes the surrounding
+    # `except OSError` uncaught and crashes the hook process instead of
+    # failing closed.
+    _git_init(tmp_path)
+    exclude_path = tmp_path / ".git" / "info" / "exclude"
+    exclude_path.write_bytes(b"\xff\xfe not valid utf-8\n")
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    defs = gate.extract_function_defs(
+        str(src), project_dir=str(tmp_path), content=b"f\n"
+    )
+
+    assert [d.name for d in defs] == ["f"]
+    updated = exclude_path.read_bytes()
+    assert b"\xff\xfe not valid utf-8\n" in updated
+    assert f"{gate._ENUM_SNAPSHOT_PREFIX}*".encode() in updated
+
+
+def test_missing_git_info_directory_is_created_before_writing_exclude(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # `git rev-parse --git-path info/exclude` only computes a path — it does
+    # not create `.git/info/`, which is legitimately absent for a repo made
+    # with an empty template or by non-git tooling. That must not turn into a
+    # hard, total gate outage on ordinary (if uncommon) repo state.
+    _git_init(tmp_path)
+    info_dir = tmp_path / ".git" / "info"
+    shutil.rmtree(info_dir, ignore_errors=True)
+    assert not info_dir.exists()
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+
+    defs = gate.extract_function_defs(
+        str(src), project_dir=str(tmp_path), content=b"f\n"
+    )
+
+    assert [d.name for d in defs] == ["f"]
+    exclude = (info_dir / "exclude").read_text()
+    assert f"{gate._ENUM_SNAPSHOT_PREFIX}*" in exclude.splitlines()
 
 
 def test_transient_rewrite_during_enumeration_is_enumerated_faithfully(
@@ -1389,10 +1764,20 @@ def test_verifiable_source_without_bom_is_unaffected(tmp_path: Path) -> None:
 
 
 def _unstageable_verify_snapshot(monkeypatch, message: str = "No space left") -> None:
-    """Make staging the *verify* snapshot fail with a bare `OSError`."""
+    """Make staging the *verify* snapshot fail with a bare `OSError`.
 
-    def _boom(*args: object, **kwargs: object) -> None:
-        raise OSError(message)
+    Discriminates on `mkstemp`'s `prefix` kwarg: `verify_and_record` stages the
+    *enumeration* snapshot first (`_ENUM_SNAPSHOT_PREFIX`, via
+    `extract_function_defs`), and that staging must still succeed through the
+    real `tempfile.mkstemp` — only the later, verify-boundary call
+    (`_VERIFY_SNAPSHOT_PREFIX`) is the one these tests mean to fail.
+    """
+    real_mkstemp = gate.tempfile.mkstemp
+
+    def _boom(*args: object, **kwargs: object):
+        if kwargs.get("prefix") == gate._VERIFY_SNAPSHOT_PREFIX:
+            raise OSError(message)
+        return real_mkstemp(*args, **kwargs)
 
     monkeypatch.setattr(gate.tempfile, "mkstemp", _boom)
 
@@ -2095,23 +2480,22 @@ def test_relative_include_resolves_through_the_snapshot(
 
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
-def test_include_above_the_mirror_root_is_a_known_residual(
+def test_include_above_the_project_root_is_no_longer_a_residual(
     tmp_path: Path, monkeypatch
 ) -> None:
-    # Characterization, not an endorsement. Mirroring stops at the project dir,
-    # so `#include "../common.h"` from a file *at* the root misses in the mirror
-    # — and clang then falls through to the `-I` search with the spelled path,
-    # which here resolves `sub/../common.h` to the project's own header instead
-    # of the one above it. Different `VARIANT`, so the `#if` hides a function the
-    # in-place parse enumerates: a wrong translation unit, not a block. Pinned so
-    # a future fix flips this test rather than quietly widening the guarantee.
-    # It is not a regression — the siblings-only staging did exactly this; what
-    # the padded depth removes is the worse variant where the miss landed in
-    # `/tmp` itself, where any user's `common.h` would have won.
+    # This used to be a characterization test, not an endorsement: the mirrored
+    # design that preceded `_enumerable_source`'s same-directory staging (issue
+    # #151) stopped at the project dir, so `#include "../common.h"` from a file
+    # *at* the root missed the mirror and fell through to the `-I` search with
+    # the spelled path — landing on the project's own header instead of the one
+    # above it, silently enumerating the wrong translation unit. A
+    # same-directory snapshot has no mirror root to fall off: `../common.h`
+    # resolves relative to its own real directory, exactly like the in-place
+    # file, because it *is* in that directory.
     (tmp_path / "common.h").write_text("#define VARIANT 2\n")  # the in-place pick
     proj = tmp_path / "proj"
     (proj / "sub").mkdir(parents=True)
-    (proj / "common.h").write_text("#define VARIANT 1\n")  # what the `-I` finds
+    (proj / "common.h").write_text("#define VARIANT 1\n")  # the old `-I` miss
     src = proj / "x.c"
     src.write_text(
         '#include "../common.h"\n'
@@ -2128,7 +2512,7 @@ def test_include_above_the_mirror_root_is_a_known_residual(
     )
 
     assert sorted(d.name for d in in_place) == ["f", "only_above"]
-    assert sorted(d.name for d in snapshotted) == ["f"]  # the residual
+    assert sorted(d.name for d in snapshotted) == ["f", "only_above"]
 
 
 def _symlinked_component_tree(proj: Path, pkg: Path) -> Path:
@@ -2182,41 +2566,49 @@ def test_symlinked_component_enumerates_like_the_in_place_parse(tmp_path: Path) 
 
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
-def test_symlink_out_of_the_project_blocks_rather_than_switching_headers(
-    tmp_path: Path,
-) -> None:
-    # Characterization. When the link leaves the project the mirror can claim no
-    # ancestry above its target — the same rule that stops the walk at the
-    # project dir, and for the same reason (a `scandir` of `$HOME` on every
-    # edit). So a climb past the target lands on empty padding and the parse
-    # fails: a blocking `error`, which is the honest answer for a translation
-    # unit the gate cannot reproduce. What it must never be again is the silent
-    # one — enumerating `spelled_won`, a unit the in-place parse does not have.
+def test_symlink_out_of_the_project_no_longer_blocks(tmp_path: Path) -> None:
+    # The mirrored design this replaced (issue #151) could claim no ancestry
+    # above a link's target once it left the project — the same rule that
+    # stopped the walk at the project dir, and for the same reason (a `scandir`
+    # of `$HOME` on every edit). A climb past the target landed on empty padding
+    # and the parse failed with a blocking `error`. Same-directory staging has no
+    # project boundary to enforce in the first place: the snapshot sits beside
+    # the real `x.c`, wherever that is, so the same translation unit enumerates
+    # whether the source lives inside the project or, as here, entirely outside
+    # it through a symlink.
     proj = tmp_path / "proj"
     proj.mkdir()
     src = _symlinked_component_tree(proj, tmp_path / "external" / "pkg")
 
-    assert gate.extract_functions("link/src/x.c", project_dir=str(proj)) == [
-        "target_won"
-    ]
-    with pytest.raises(gate.UnitsUnavailable):
-        gate.extract_function_defs(
+    in_place = gate.extract_functions("link/src/x.c", project_dir=str(proj))
+    snapshotted = [
+        d.name
+        for d in gate.extract_function_defs(
             "link/src/x.c", project_dir=str(proj), content=src.read_bytes()
         )
+    ]
+
+    assert in_place == ["target_won"]
+    assert snapshotted == in_place
 
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
 @pytest.mark.parametrize("alias", ["symlink", "hardlink"])
-def test_a_source_alias_leads_back_into_the_snapshot(
+def test_a_source_alias_leads_back_into_the_live_file_is_a_known_residual(
     tmp_path: Path, alias: str
 ) -> None:
-    # A sibling that is the source under *another name* is a door out of the
-    # immutable copy. Linked to the real file, a translation unit that includes
-    # itself through that name reads whatever is on disk now — and its `#define`s
-    # then decide which units the *snapshot* enumerates. That is issue #141's own
-    # race one include deep: units enumerated from a transient B, pruned and
-    # stamped against the restored A. Both names for one inode must lead to the
-    # snapshot.
+    # Characterization, not an endorsement — widened by the same-directory
+    # staging issue #151 introduced. The old mirrored design redirected any
+    # sibling sharing the source's inode to the snapshot, so a symlink or
+    # hard-link alias beside the source still led back to the immutable copy.
+    # A same-directory snapshot has a random name (`tempfile.mkstemp`, so a
+    # concurrent enumeration of the same file cannot collide with it), so it
+    # cannot occupy any of the source's other names either — every real
+    # sibling, alias included, still resolves to the real, live file. Pinned
+    # alongside `test_self_include_by_own_name_is_a_known_residual` (the
+    # narrowest case, needing no alias at all) and
+    # `test_a_nested_source_alias_is_a_known_residual` (one directory deeper),
+    # which this change does not affect either way.
     proj = tmp_path / "proj"
     proj.mkdir()
     src = proj / "x.c"
@@ -2247,20 +2639,52 @@ def test_a_source_alias_leads_back_into_the_snapshot(
         )
     ]
 
-    assert names == ["from_the_snapshot"]
+    assert names == ["from_the_live_file"]  # the residual: not the snapshot's branch
 
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
-def test_a_resolved_path_under_a_symlinked_project_keeps_its_ancestry(
+def test_self_include_by_own_name_is_a_known_residual(tmp_path: Path) -> None:
+    # The narrowest case of the alias residual above — no alias or symlink
+    # needed, since the source is already a sibling of its own literal name and
+    # the snapshot (a random `tempfile.mkstemp` name) can never occupy it.
+    src = tmp_path / "x.c"
+    src.write_text(
+        "#ifdef SELF\n"
+        "#define PICK 1\n"
+        "#else\n"
+        "#define SELF\n"
+        '#include "x.c"\n'
+        "#if PICK\n"
+        "int from_the_snapshot(int x) { return x; }\n"
+        "#else\n"
+        "int from_the_live_file(int x) { return x; }\n"
+        "#endif\n"
+        "#endif\n"
+    )
+    snapshotted = src.read_bytes()
+    src.write_bytes(snapshotted.replace(b"#define PICK 1", b"#define PICK 0"))
+
+    names = [
+        d.name
+        for d in gate.extract_function_defs(
+            "x.c", project_dir=str(tmp_path), content=snapshotted
+        )
+    ]
+
+    assert names == ["from_the_live_file"]  # the residual: not the snapshot's branch
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_a_resolved_path_under_a_symlinked_project_still_matches_in_place(
     tmp_path: Path,
 ) -> None:
     # The project dir and the source path need not be spelled the same way: with
     # `link -> real`, a hook may be handed `<link>/sub/x.c` while out-of-band
     # discovery builds its paths on the git root, which `git rev-parse` reports
-    # *resolved*. A lexical containment test calls the second one external, and a
-    # file "outside" the project gets no ancestry mirrored — so an ordinary
-    # `#include "../common.h"` stops resolving, which is a blocking `error` on a
-    # file that parses fine in place.
+    # *resolved*. Same-directory staging has no project-dir containment test to
+    # get wrong here — the snapshot goes beside whatever real directory `x.c`'s
+    # own (possibly-resolved) path names, regardless of how `project_dir` itself
+    # was spelled.
     real = tmp_path / "real"
     (real / "sub").mkdir(parents=True)
     (real / "common.h").write_text("#define COMMON 1\n")
@@ -2284,12 +2708,9 @@ def test_a_resolved_path_under_a_symlinked_project_keeps_its_ancestry(
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
 def test_a_component_walked_twice_is_not_a_loop(tmp_path: Path) -> None:
     # `self -> .` is a real idiom, and `self/self/x.c` is a perfectly ordinary path
-    # the kernel resolves in two hops. The loop guard keyed on the spelled link
-    # alone called that a cycle and turned an innocuous layout into a blocking
-    # `error` on every edit. Keyed on the walk *state*, the second visit has a
-    # shorter `rest` and is allowed — and the plan is deduped, since staging the
-    # same component twice would raise `FileExistsError` and block by another
-    # route.
+    # the kernel resolves in two hops — no `..` involved, so `_kernel_dir` leaves
+    # it spelled and `tempfile.mkstemp` stages it via a real filesystem write,
+    # which the kernel resolves the same way it resolves the source's own path.
     proj = tmp_path / "proj"
     proj.mkdir()
     (proj / "self").symlink_to(".")
@@ -2311,48 +2732,48 @@ def test_a_component_walked_twice_is_not_a_loop(tmp_path: Path) -> None:
     assert snapshotted == in_place
 
 
-@pytest.mark.parametrize(
-    ("name", "points_to"),
-    [
-        ("mutual", "b"),  # a -> b, b -> a: `realpath` hands the link back unchanged
-        ("expanding", "a/x"),  # a -> a/x: ...and here, one component LONGER each time
-    ],
-)
-def test_a_symlink_cycle_blocks_instead_of_spinning(
-    tmp_path: Path, name: str, points_to: str
-) -> None:
-    # The guard the fix above must not remove — and the reason it is a budget and
-    # not a seen-set. `realpath` never reports ELOOP; it gives up and returns
-    # something unresolved. For `a -> a/x` that something *grows*, so no (link,
-    # rest) state ever recurs and a repeat-detector would spin forever inside a
-    # hook. The kernel's own `MAXSYMLINKS` bounds it: past that, the source could
-    # not have been read either, so blocking is the honest answer.
+def test_an_expanding_symlink_cycle_blocks_instead_of_spinning(tmp_path: Path) -> None:
+    # There is no custom cycle guard left to test directly — same-directory
+    # staging has no chain to walk, so nothing in `_enumerable_source` can spin.
+    # What still has to hold is that a `..` in the *given* path through a cyclic
+    # symlink component (`a -> a/x`, one component LONGER every hop, so no
+    # repeat-detector would ever recur) fails closed rather than hanging: `_kernel_dir`
+    # calls `os.path.realpath`, which never reports ELOOP itself and instead gives
+    # up and returns something unresolved, but `tempfile.mkstemp`'s own `open`
+    # against that path *does* hit the kernel's `MAXSYMLINKS` bound (measured) —
+    # surfacing as the one `OSError` this function already converts to a blocking
+    # `UnitsUnavailable`, never a hang.
     proj = tmp_path / "proj"
     proj.mkdir()
-    (proj / "a").symlink_to(proj / points_to)
-    if name == "mutual":
-        (proj / "b").symlink_to(proj / "a")
+    (proj / "a").symlink_to(proj / "a" / "x")
 
-    with pytest.raises(OSError) as excinfo:
-        gate._mirror_plan(str(proj / "a"), str(proj))
-    assert excinfo.value.errno == errno.ELOOP
+    with (
+        pytest.raises(gate.UnitsUnavailable),
+        gate._enumerable_source(
+            "a/../x.c", b"int f(void) { return 0; }\n", project_dir=str(proj)
+        ),
+    ):
+        pass
 
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
 def test_a_nested_source_alias_is_a_known_residual(tmp_path: Path) -> None:
     # Characterization, not an endorsement, and the boundary of the guarantee the
-    # test above establishes. A directory is mirrored by linking it *whole*, so an
-    # alias one level down (`sub/alias.c -> ../x.c`) is never compared with the
-    # source and leads back to the live file — as does an absolute include of the
-    # source, which no mirrored neighbourhood can intercept at all. Immutability is
-    # the top-level file's; a self-include reaching around it lands back in the
-    # A -> B -> A residual the verify loop already carries.
+    # tests above establish. Same-directory staging only touches the source's own
+    # directory — it neither creates nor redirects anything a level down, so an
+    # alias below a subdirectory (`sub/alias.c -> ../x.c`) still resolves through
+    # the real filesystem straight back to the live file, as does an absolute
+    # include of the source (clang opens the spelled path, which no staging can
+    # intercept). Immutability is the top-level file's; a self-include reaching
+    # around it lands back in the A -> B -> A residual the verify loop already
+    # carries.
     #
-    # Closing it by mirroring subdirectories entry-by-entry would `scandir` and
-    # `stat` the source's whole subtree on every edit — disproportionate to a
-    # translation unit that includes itself through a nested alias. The real fix
-    # is the one the verify loop needs too: enumeration of content the parser
-    # cannot reach around (Core CLI, content on stdin, explicit include root).
+    # Closing it would mean rewriting the source's whole subtree to redirect any
+    # alias back to the snapshot — `scandir` and `stat` on every edit,
+    # disproportionate to a translation unit that includes itself through a
+    # nested alias, and no cleaner in Core: ESBMC 8.3.0 has no stdin convention
+    # (measured — `esbmc - --parse-tree-only` fails outright), so there is no
+    # "hand it content directly" escape from staging a real file somewhere.
     proj = tmp_path / "proj"
     (proj / "sub").mkdir(parents=True)
     src = proj / "x.c"
@@ -2384,15 +2805,20 @@ def test_a_nested_source_alias_is_a_known_residual(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
-def test_self_include_by_own_name_is_a_known_residual(tmp_path: Path) -> None:
+def test_self_include_by_own_name_is_a_known_residual_at_the_verify_boundary(
+    tmp_path: Path,
+) -> None:
     # Characterization, not an endorsement — the residual `_verifiable_source`'s
-    # docstring names (issue #150). `_enumerable_source`'s mirrored snapshot
-    # occupies the source's own spelled name, so a self-include resolves to
-    # itself; the *verify* snapshot instead sits beside the source under a
-    # random name (`_VERIFY_SNAPSHOT_PREFIX` + a `mkstemp` suffix), so it cannot
-    # protect a `#include` of the source's own literal filename — no alias or
-    # symlink needed here, unlike the nested-alias sibling above, because the
-    # real file simply *is* a sibling of the same name.
+    # docstring names (issue #150), and the verify-boundary sibling of
+    # `test_self_include_by_own_name_is_a_known_residual` above. Both snapshots
+    # sit beside the source under a random name (`mkstemp` with
+    # `_ENUM_SNAPSHOT_PREFIX`/`_VERIFY_SNAPSHOT_PREFIX` respectively), so neither
+    # can protect a `#include` of the source's own literal filename — no alias
+    # or symlink needed here, unlike the nested-alias sibling further above,
+    # because the real file simply *is* a sibling of the same name. Pinned
+    # separately at each boundary since the mechanisms differ
+    # (`_enumerable_source`/`extract_function_defs` vs.
+    # `_verifiable_source`/`verify_function`).
     src = tmp_path / "x.c"
     src.write_text(
         "#ifdef SELF\n"

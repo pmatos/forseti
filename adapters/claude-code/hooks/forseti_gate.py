@@ -16,7 +16,6 @@ this gate.
 from __future__ import annotations
 
 import contextlib
-import errno
 import fcntl
 import fnmatch
 import hashlib
@@ -115,11 +114,6 @@ MAX_STOP_ATTEMPTS = 3
 # via MAX_STOP_ATTEMPTS.
 MAX_PENDING_VERIFY_ATTEMPTS = 3
 
-# Symlinked directory components the snapshot's mirror plan will follow before it
-# calls the chain a loop — Linux's own `MAXSYMLINKS` for one path resolution. A
-# source reached through more than this could not have been `open`ed either.
-_MAX_SYMLINK_HOPS = 40
-
 # How many times `verify_and_record` re-reads a file whose mtime moved between
 # the two `fstat`s bracketing its read — see the comment at that read for why a
 # lone re-read-through-the-same-fd does not by itself guarantee `raw` and
@@ -166,6 +160,16 @@ _NEEDS_CONTRACT_DETAIL = (
     "pointer/array parameter(s); function-level safety is unreliable without a "
     "memory precondition/harness — not gated (see issue #122)"
 )
+
+# The enumeration snapshot's filename prefix (issue #151). `_untracked_snapshot`
+# rejects a path whose basename starts with it *and* that git cannot show as
+# tracked — ahead of `FORSETI_GATE_EXCLUDE`/`FORSETI_GATE_INCLUDE` (a project can
+# replace, not extend, that env var), a snapshot a killed hook could not clean up
+# must never be offered back to `verify_and_record` as a source in its own right.
+# `.` leads so `is_c_source`'s suffix check (`.c`/`.C` — see `_enumerable_source`)
+# still lets it through the discovery scans as a dotfile, which is exactly what
+# that exclusion exists to catch.
+_ENUM_SNAPSHOT_PREFIX = ".forseti-units-"
 
 # The verify snapshot's filename prefix (issue #150). `_untracked_verify_snapshot`
 # rejects a path whose basename starts with it *and* that git cannot show as
@@ -267,12 +271,17 @@ def _kernel_dir(path: str) -> str:
     resolves ``link`` before it climbs, landing on the parent of the link's
     *target*. Since the gate reads and verifies through that same kernel walk, a
     snapshot staged at the collapsed path would stand in for a different file's
-    neighbourhood — or a different file altogether.
+    neighbourhood — or a different file altogether. `tempfile.mkstemp` cannot be
+    trusted to do this on its own: it normalizes its `dir` argument with
+    `os.path.abspath` before opening anything, so handing it a raw
+    ``proj/link/..`` reproduces exactly the lexical mistake this function exists
+    to avoid (measured, not assumed — see `_enumerable_source`).
 
     Only ``..`` forces a resolution. A symlinked component *not* followed by one
-    stays spelled, so `_mirror_plan` still sees it and reproduces it as a symlink
-    — which is what keeps the two ways of resolving a ``..`` inside an ``#include``
-    agreeing (see there). Paths without ``..`` come back untouched.
+    stays spelled and is returned unresolved: staging directly at that spelled
+    path is itself a real filesystem write, and the kernel resolves it exactly
+    as it would resolve the real file's own `open()` — nothing left for this
+    function to do. Paths without ``..`` come back untouched.
     """
     cur = os.sep if os.path.isabs(path) else os.getcwd()
     for part in path.split(os.sep):
@@ -287,308 +296,351 @@ def _kernel_dir(path: str) -> str:
     return cur
 
 
-def _contains(root: str, path: str) -> bool:
-    """Is `path` `root` itself or lexically below it?"""
-    prefix = root if root.endswith(os.sep) else root + os.sep
-    return path == root or path.startswith(prefix)
+def _git_probe_env() -> dict[str, str]:
+    """Environment for a git call whose job is "does a work tree exist here at
+    all", not "respect the caller's ambient discovery constraints".
 
-
-def _mirror_root(src_dir: str, project_dir: str) -> str:
-    """The highest ancestor of `src_dir` whose entries the snapshot mirrors.
-
-    `project_dir` when it contains `src_dir` — the gate's whole universe is the
-    project, and mirroring stops there rather than walking to ``/``, which would
-    mean a `scandir` of `$HOME` (thousands of entries, and an unreadable one turns
-    into a blocking `error`) for every edit. Otherwise the source's own directory:
-    a file outside the project has no ancestry the gate can claim.
-
-    Containment is tried against the project dir as spelled *and* as resolved,
-    because the two spellings do not have to agree: with `proj -> /data/proj`, a
-    hook may be handed `<cwd>/proj/src/x.c` while out-of-band discovery builds its
-    paths on the git root, which `git rev-parse` reports resolved. Lexically, one
-    of those is not under the other — and calling a file physically inside the
-    project "outside" costs it its whole ancestry, so an ordinary
-    ``#include "../common.h"`` stops resolving and enumeration blocks (or, with an
-    `-I` to fall through to, quietly reads a different header). Whichever test
-    matches returns a prefix of `src_dir`, so the source keeps its own spelling.
+    `GIT_CEILING_DIRECTORIES` stops git's *upward* repository discovery at a
+    listed boundary — it does not mean no repository exists past it, and an
+    ancestor repository's own `git add -A`, invoked directly from its own
+    directory (which never needs discovery from `start_dir` at all), still
+    stages `start_dir`'s contents normally: verified empirically that probing
+    a subdirectory with the ceiling set at its parent repo produces the exact
+    same `fatal: not a git repository (or any of the parent directories)`
+    diagnostic as a genuine no-repository-anywhere answer, while `git add -A`
+    run from the parent still stages a file placed in that subdirectory
+    (review feedback, issue #151). Removing the variable here — rather than
+    leaving each caller to inherit whatever the ambient environment
+    happens to impose — makes the probe answer the only question that
+    matters for deciding whether to protect a snapshot. `LC_ALL=C` keeps the
+    stderr substring match immune to a translated git.
     """
-    root = os.path.abspath(project_dir)
-    if _contains(root, src_dir):
-        return root
-    real_root = os.path.realpath(project_dir)
-    return real_root if _contains(real_root, src_dir) else src_dir
+    env = dict(os.environ)
+    env.pop("GIT_CEILING_DIRECTORIES", None)
+    env["LC_ALL"] = "C"
+    return env
 
 
-def _staged(tmp: str, path: str) -> str:
-    """`path`'s place inside the snapshot tree: the same depth, rooted at `tmp`."""
-    return os.path.join(tmp, os.path.relpath(path, os.sep))
+def _index_ignore_snapshot(start_dir: str, prefix: str) -> bool:
+    """Register `prefix*` in `start_dir`'s own ``.git/info/exclude``, idempotently.
 
+    `_enumerable_source` calls this *before* staging a snapshot, so a
+    concurrent `git add -A`/`git status` never has a window in which the
+    snapshot exists but the *pattern* is not yet registered. (Registering the
+    pattern is not by itself proof of protection — see `_enumerable_source`
+    for the real-path `check-ignore` verification that catches a
+    higher-precedence tracked ``.gitignore`` overriding it.) ``.git/info/exclude``
+    — not the tracked `.gitignore` — is the right place: it is local,
+    un-versioned repo state, exactly like the snapshot itself, so no tracked
+    file is touched and nothing needs to be undone. `start_dir` must be the
+    directory the snapshot is actually staged in, not necessarily the Claude
+    project root: `git rev-parse` resolves upward from `start_dir` to
+    whichever repository actually contains it, which may differ from the
+    project root's repository (a submodule, a sibling checkout reached via a
+    symlink).
 
-def _file_id(path: str) -> tuple[int, int] | None:
-    """``(st_dev, st_ino)`` for `path`, links followed; ``None`` if it cannot stat."""
+    Returns whether `start_dir` is inside a git work tree at all — the
+    caller needs this to know whether the follow-up `check-ignore`
+    verification even applies. Genuinely outside a work tree this returns
+    `False`, but a non-zero exit alone does not mean that: `git rev-parse`
+    exits the same 128 for a real repository-level error inside a directory
+    an *ancestor* repository still tracks normally — a malformed nested
+    ``.git`` gitfile (``fatal: invalid gitfile format``), a stale linked
+    worktree (``fatal: not a git repository: (null)``), a bad ``GIT_DIR``
+    (``fatal: not a git repository: '<path>'``) — and the parent's own
+    `git add -A` still stages this directory's contents in every one of
+    those cases (measured, not assumed). A fourth non-genuine case is
+    environmental rather than repository-level: `GIT_CEILING_DIRECTORIES` set
+    in the ambient environment can stop `git rev-parse` from discovering an
+    ancestor repository that is still very much there and still tracks
+    `start_dir` normally — `_git_probe_env` strips it (alongside forcing
+    `LC_ALL=C`) so this probe answers "does a repository genuinely exist
+    anywhere in the ancestry", not "what does the caller's ambient discovery
+    boundary happen to allow". Only git's own affirmative "no repository
+    anywhere in the ancestry" diagnostic is trusted: both phrasings it uses
+    (``not a git repository (or any parent up to mount point`` /
+    ``...(or any of the parent directories)``) share the ``not a git
+    repository (or any`` anchor, which the four false-positive cases above do
+    not. Every other non-zero exit — an unrecognized message,
+    the anchor absent — raises `UnitsUnavailable` instead of assuming safety,
+    matching this file's convention elsewhere (`_untracked_snapshot`) that an
+    indeterminate git query must never relax a guard. `git rev-parse` failing
+    to run at all (the binary missing, a timeout, some other subprocess-level
+    error) is the same kind of indeterminate answer and fails closed the same
+    way (review feedback, issue #151).
+
+    Writing the exclude entry fails the same closed way: an `OSError` —
+    including one from creating a missing ``.git/info/`` (legal for a repo
+    made with an empty template, or by non-git tooling) — raises
+    `UnitsUnavailable` rather than silently proceeding to stage the snapshot
+    unprotected.
+
+    Read and written as bytes, never decoded: git treats exclude patterns as
+    raw bytes, and a non-UTF-8 byte sequence already in the file (e.g. a
+    non-ASCII path pattern written under a non-UTF-8 locale) is legal there.
+    Decoding it as text would raise `UnicodeDecodeError` — a `ValueError`, not
+    an `OSError` — which would escape the `except` below uncaught and crash
+    the hook process outright instead of failing closed.
+    """
     try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    return st.st_dev, st.st_ino
-
-
-def _mirror_entries(
-    real_dir: str,
-    into: str,
-    *,
-    source_id: tuple[int, int] | None = None,
-    snapshot: str | None = None,
-) -> None:
-    """Symlink every entry of `real_dir` into `into` that is not already there.
-
-    Whatever the caller has already put in `into` is the mirrored tree itself —
-    a level of the chain down to the snapshot, a reproduced symlink component, or
-    the snapshot file — and must never be overwritten by a link back to the real
-    entry of the same name. `lexists`, so a *dangling* link already staged counts
-    too. A directory is linked whole, so ``#include "sub/h.h"`` resolves through
-    it.
-
-    An entry that is **another name for the source** — a sibling
-    ``alias.c -> x.c``, or a hard link — is linked to `snapshot` instead. Left
-    pointing at the real file it would be a door back out of the immutable copy:
-    a translation unit that includes itself under that name reads whatever is on
-    disk *now*, and its ``#define``s then decide which units the snapshot
-    enumerates (issue #141's own race, one include deep). Compared by
-    ``(st_dev, st_ino)`` so a hard link counts, and an entry that cannot be
-    stat'd is still linked to the real path — one extra `stat` per entry beside
-    the `lexists` already spent.
-    """
-    with os.scandir(real_dir) as entries:
-        for entry in entries:
-            dest = os.path.join(into, entry.name)
-            if os.path.lexists(dest):
-                continue
-            checkable = snapshot is not None and source_id is not None
-            if checkable and _file_id(entry.path) == source_id:
-                os.symlink(str(snapshot), dest)  # another name for the source
-            else:
-                os.symlink(entry.path, dest)
-
-
-def _mirror_plan(
-    src_dir: str, project_dir: str
-) -> tuple[list[str], list[tuple[str, str]]]:
-    """How to reproduce `src_dir`'s ancestry: real directories, symlink components.
-
-    Returns the directories to recreate as *real* directories (each mirroring its
-    own entries) and the ``(spelled link, its target)`` pairs to recreate as
-    *symlinks*, so that both ways of resolving a ``..`` agree with the in-place
-    parse:
-
-    * **The kernel walks it.** ``..`` from a directory reached through a symlink
-      is the parent of the link's *target*, not of the link — clang concatenates
-      the including file's directory with the spelled path and hands the result
-      to ``open``, so this is the resolution that actually happens (measured, not
-      assumed). Reproducing a symlinked component as a real directory would make
-      ``..`` climb the spelled chain instead, silently selecting a different
-      header — which flips ``#if`` branches, so enumeration reports units the
-      verify never sees, prunes the rest, and stamps the file.
-    * **The caller normalizes it lexically.** The spelled chain is reproduced
-      *as spelled*, so ``foo/../bar`` collapsed before the open lands on the
-      mirror of the same directory it lands on in place.
-
-    The walk stops at the first symlinked component, hops to its target, and
-    resumes from that target's own `_mirror_root` — so a link into the project
-    keeps the full ancestry, and a link out of it mirrors the target directory
-    (entries yes, parent no) exactly as a source outside the project does.
-    """
-    real_dirs: list[str] = []
-    links: list[tuple[str, str]] = []
-    hops = 0
-    base = _mirror_root(src_dir, project_dir)
-    steps = [] if src_dir == base else os.path.relpath(src_dir, base).split(os.sep)
-    while True:
-        if base not in real_dirs:
-            real_dirs.append(base)
-        cur, hop = base, None
-        for i, step in enumerate(steps):
-            nxt = os.path.join(cur, step)
-            if os.path.islink(nxt):
-                hop = (nxt, steps[i + 1 :])
-                break
-            cur = nxt
-            if cur not in real_dirs:
-                real_dirs.append(cur)
-        if hop is None:
-            return real_dirs, links
-        link, rest = hop
-        # A cyclic component would loop here forever, and `os.path.realpath` will
-        # not say so: it gives up and hands back a path that is *not* resolved —
-        # `a -> a` unchanged, `a -> a/x` one component longer every time. The
-        # second shape is why this is a **budget**, not a seen-set: with the target
-        # growing, no (link, rest) state ever recurs, so a repeat-detector spins.
-        #
-        # The budget is the kernel's own: `MAXSYMLINKS` traversals for one path
-        # resolution. Anything past it could not have been `open`ed either — this
-        # walk only runs for a source already read — so blocking is the honest
-        # answer, and it leaves room for the legitimate repeat this must not
-        # reject (`self -> .` walked as `self/self/x.c` visits one component
-        # twice, and the kernel counts that the same way).
-        hops += 1
-        if hops > _MAX_SYMLINK_HOPS:
-            raise OSError(errno.ELOOP, "symlinked directory component loops", link)
-        target = os.path.realpath(link)
-        # Deduped: the same component can legitimately be reached twice (the
-        # `self -> .` walk again), and staging one plan entry twice would raise
-        # `FileExistsError` at `os.symlink` — a blocking `error` by another route.
-        if (link, target) not in links:
-            links.append((link, target))
-        # Against the *resolved* project dir: `target` is fully resolved, so that
-        # is the apples-to-apples comparison, and a link that lands back inside a
-        # project which is itself reached through a symlink keeps its full
-        # ancestry rather than being treated as foreign.
-        base = _mirror_root(target, os.path.realpath(project_dir))
-        below = [] if target == base else os.path.relpath(target, base).split(os.sep)
-        # `target` is fully resolved, so nothing in `below` can be a symlink; only
-        # the not-yet-walked `rest` can hop again.
-        steps = below + rest
+        proc = subprocess.run(
+            ["git", "-C", start_dir, "rev-parse", "--git-path", "info/exclude"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_git_probe_env(),
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError) as exc:
+        raise UnitsUnavailable(
+            f"could not determine whether {start_dir} is a git work tree "
+            f"(git rev-parse failed to run: {exc}); refusing to stage the "
+            f"snapshot unprotected"
+        ) from exc
+    if proc.returncode != 0:
+        if "not a git repository (or any" in proc.stderr:
+            return False  # git affirmatively confirmed this is not a work tree
+        raise UnitsUnavailable(
+            f"could not determine whether {start_dir} is a git work tree "
+            f"(git rev-parse failed: {proc.stderr.strip()}); refusing to "
+            f"stage the snapshot unprotected"
+        )
+    exclude_rel = proc.stdout.strip()
+    exclude_path = (
+        exclude_rel
+        if os.path.isabs(exclude_rel)
+        else os.path.join(start_dir, exclude_rel)
+    )
+    pattern = f"{prefix}*"
+    pattern_bytes = pattern.encode("utf-8")
+    try:
+        os.makedirs(os.path.dirname(exclude_path), exist_ok=True)
+        with open(exclude_path, "a+b") as handle:
+            handle.seek(0)
+            existing = handle.read()
+            if pattern_bytes not in existing.splitlines():
+                if existing and not existing.endswith(b"\n"):
+                    handle.write(b"\n")
+                handle.write(pattern_bytes + b"\n")
+    except OSError as exc:
+        raise UnitsUnavailable(
+            f"could not register {pattern!r} in {exclude_path} to keep the "
+            f"enumeration snapshot out of the git index: {exc}"
+        ) from exc
+    return True
 
 
 @contextlib.contextmanager
 def _enumerable_source(
     file_path: str | os.PathLike[str], content: bytes | None, *, project_dir: str
 ) -> Iterator[str]:
-    """Yield the path to enumerate for `file_path` — itself, or an immutable copy.
+    """Yield the path to enumerate for `file_path` — itself, or an immutable sibling.
 
     With `content` ``None`` the file is enumerated where it lies. Given `content`,
-    those exact bytes are written to a snapshot in a private temp directory and
-    *that* is what gets parsed — so the enumeration is of the caller's bytes by
-    construction, not of whatever the file happens to hold when the CLI re-reads
-    it (issue #141). Write the bytes; never `shutil.copy` or re-read `file_path`,
-    or the race walks straight back in.
+    those exact bytes are written to a snapshot and *that* is what gets parsed —
+    so the enumeration is of the caller's bytes by construction, not of whatever
+    the file happens to hold when the CLI re-reads it (issue #141). Write the
+    bytes; never `shutil.copy` or re-read `file_path`, or the race walks straight
+    back in.
 
-    The temp tree is then made to **stand in for the source's own
-    neighbourhood**, because clang resolves a quoted ``#include`` against the
-    directory of the file it is reading — so the snapshot has to *be* in an
-    equivalent directory, including for headers reached through it, which clang
-    opens by their linked path and whose own quoted includes therefore resolve
-    the same way. Two things make it equivalent:
+    Staged as a **sibling of `file_path`, in its own real directory** — not a
+    tree mirrored elsewhere, which is what this replaced (issue #151). clang
+    resolves a quoted ``#include`` against the directory of the file it is
+    reading, and a same-directory snapshot *is* that directory: every real
+    sibling, and everything a ``..`` chain can reach, resolves exactly as the
+    in-place parse would — nothing to reproduce, and no boundary to fall off.
+    The mirrored design this replaces had to stop somewhere short of the
+    filesystem root (walking to it would mean a `scandir` of ``$HOME`` on every
+    edit) and so left a residual: a quoted include climbing above that boundary
+    missed the mirror and fell through to the ``-I`` search with the *spelled*
+    path, silently landing on a different translation unit. Nothing needs
+    mirroring now, so that boundary — and every helper that built and walked the
+    synthetic tree it required — is gone with it. The old
+    ``test_include_above_the_mirror_root_is_a_known_residual`` pinned the miss;
+    ``test_include_above_the_project_root_is_no_longer_a_residual`` is its
+    replacement, since there is no boundary left to climb past.
 
-    * **Siblings.** Every other entry of the source's directory is symlinked
-      beside the snapshot, so ``#include "sibling.h"`` resolves to the real one —
-      except a sibling that *is* the source under another name, which leads back
-      to the snapshot (`_mirror_entries`).
+    The trade is a narrower residual in its place: this snapshot cannot occupy
+    `file_path`'s own name (`tempfile.mkstemp` gives it a random one, so two
+    concurrent enumerations of the same file cannot collide with each other
+    either), so a translation unit that ``#include``s the source under any name
+    that resolves to its own inode — its literal filename, a same-directory
+    symlink, or a hard link — still reaches the live file for that nested read,
+    not the frozen snapshot. Pinned by
+    ``test_a_source_alias_leads_back_into_the_live_file_is_a_known_residual``
+    and, one level deeper and unaffected by this change either way (a nested
+    alias below a subdirectory was never protected here),
+    ``test_a_nested_source_alias_is_a_known_residual``.
 
-    Immutability is the *top-level* file's, and two ways of naming the source
-    still reach the live one: an **absolute** include (clang opens the spelled
-    path, which no mirrored neighbourhood can stand in for) and an alias *below*
-    a mirrored directory (``sub/alias.c -> ../x.c``, since a directory is linked
-    whole). A translation unit that includes itself that way, during a transient
-    A -> B -> A, can enumerate B — the same residual the verify loop already
-    carries, and the same fix: enumeration of content the parser cannot reach
-    around, which means a Core CLI taking content on stdin with an explicit
-    include root, not a deeper mirror. Mirroring subdirectories entry-by-entry
-    instead would `scandir` and `stat` the source's whole subtree on every edit.
-    Pinned by ``test_a_nested_source_alias_is_a_known_residual``.
-    * **Ancestry.** The chain from `_mirror_root` down to the source's directory
-      is reproduced level by level, each mirroring its own entries bar the names
-      the chain itself already occupies, so ``#include "../common.h"`` — the
-      ordinary shape for a ``src/foo.c`` — resolves too. A real directory where
-      the source has a real directory and a *symlink* where it has a symlink
-      (`_mirror_plan`): ``..`` is then the same directory the in-place parse
-      reaches whether the caller normalizes ``foo/../bar`` lexically or lets the
-      kernel walk it.
+    The source's own path is derived **as spelled** — joined onto `project_dir`
+    (the subprocess's cwd) but never `resolve()`d — and the snapshot is staged
+    beside it. clang searches the directory of the path it was *given*, so for a
+    symlinked source file resolving would mirror the link target's directory
+    instead: a header beside the link would go missing, and a same-named header
+    beside the target would be silently preferred.
 
-    The tree also reproduces the source's **absolute depth** (``/a/b/x.c`` stages
-    at ``<tmp>/a/b/x.c``), with the levels above the mirror root real but empty.
-    A ``..`` chain that climbs past the root then lands on an empty private
-    directory instead of on ``/tmp``, where a same-named file — anyone's, the
-    directory is world-writable — would silently be included.
+    One part of it is not spelled: a ``..`` in the given path is resolved the
+    way the kernel walks it (`_kernel_dir`), never left to
+    `tempfile.mkstemp`'s own lexical `os.path.abspath` normalization — see there
+    for why the difference is real, not academic. The kernel is what picked the
+    file whose bytes were hashed and what will pick it again for the verify, so
+    collapsing ``proj/link/../x.c`` lexically to ``proj/x.c`` would stage the
+    snapshot beside the *project's* headers instead of the link target's — a
+    different translation unit, which is the failure this staging exists to
+    prevent. A symlinked component not followed by a ``..`` stays spelled, since
+    staging directly at that spelled path is itself a real filesystem write and
+    the kernel resolves it correctly without any help from this function.
 
-    Above the mirror root, resolution is **not** reproduced, and the miss is not
-    the end of it: clang falls through to the ``-I`` search with the *spelled*
-    path, so ``#include "../above.h"`` from a file at the project root ends at
-    whatever ``<-I dir>/../above.h`` finds — a blocking `error` when there is no
-    such flag, and otherwise a header the in-place parse need not have picked.
-    ``-I.`` is the spelling that reproduces it (the CLI runs with
-    ``cwd=project_dir``). Unchanged from the siblings-only staging this replaces;
-    what the padding removes is the far worse variant where the miss landed in
-    ``/tmp`` itself. Pinned by
-    ``test_include_above_the_mirror_root_is_a_known_residual``.
+    An explicit include root piped to ``forseti list-units`` on stdin — no
+    staging at all — looks like a cleaner fix than either design and was
+    considered (issue #151). It is not buildable against ESBMC 8.3.0: there is
+    no stdin convention (``esbmc - --parse-tree-only`` fails with "failed to
+    figure out type of file -", measured, not assumed) and no flag that
+    separates a quoted include's search base from the file's own location
+    (``-iquote`` is rejected; only ``-I``/``--idirafter`` are exposed). A real
+    file beside the source is the only way left to make ESBMC resolve
+    ``#include``s from the place the source actually lives.
 
-    An ``-I <source dir>`` looks like a cheaper substitute for all this and is not
-    one: ``-I`` also joins the **angle-bracket** search, and it appends *after*
-    any ``-iquote`` from `FORSETI_BUILD_FLAGS` instead of taking the source
-    directory's first-place precedence. Either one silently selects a different
-    header than the in-place parse would — ``#include <config.h>`` next to a
-    generated ``config.h`` is the standard shape — which flips ``#if`` branches,
-    so enumeration reports units the verify never sees, prunes the rest, and
-    stamps the file. (ESBMC 8.3.0 offers no quoted-only include flag: it rejects
-    clang's ``-iquote``, exposing only ``-I``/``--idirafter``.) Mirroring needs no
-    flag at all and leaves every search path exactly as it was.
+    The name carries `_ENUM_SNAPSHOT_PREFIX` so `_untracked_snapshot` excludes it
+    from the gate's own discovery for as long as it is untracked — see there for
+    why a *tracked* file sharing the prefix must not be exempted the same way.
+    That guard only keeps the snapshot out of the *gate's own* scans, though;
+    nothing about it stops a concurrent `git add -A`, IDE, or automation job from
+    staging the file while it exists on disk.
+    `_index_ignore_snapshot` registers `_ENUM_SNAPSHOT_PREFIX*` in `src_dir`'s own
+    `.git/info/exclude` *before* `mkstemp` runs (below), so the pattern is always
+    in place — inside a git work tree, `git status`/`git add -A` never see a
+    matching name, so a `finally`-block failure to clean up (or this process
+    being killed first) cannot be committed by an unrelated `git add -A` in
+    the meantime. It targets `src_dir`, not `project_dir`, because that is
+    where `mkstemp` actually stages the file: when the source lives in a
+    different repository than `project_dir` (a submodule, a sibling checkout
+    reached via a symlink), `project_dir`'s exclude file is the wrong one to
+    write.
 
-    The source's own path is derived **as spelled** — absolutized against
-    `project_dir` (the subprocess's cwd) but never `resolve()`d — and the
-    snapshot is staged there. clang searches the directory of the path it was
-    *given*, so for a symlinked source file resolving would mirror the link
-    target's directory instead: a header beside the link would go missing, and a
-    same-named header beside the target would be silently preferred.
-
-    One part of it is not spelled: a ``..`` in the given path is resolved the way
-    the kernel walks it (`_kernel_dir`). The kernel is what picked the file whose
-    bytes were hashed and what will pick it again for the verify, so collapsing
-    ``proj/link/../x.c`` lexically to ``proj/x.c`` would surround content read
-    from the link target's parent with the *project's* headers — a different
-    translation unit, which is the failure this staging exists to prevent.
-    Symlinked directory components not followed by a ``..`` stay spelled and are
-    reproduced as symlinks; see `_mirror_plan`.
+    Registering the pattern is not by itself proof it protects anything:
+    gitignore(5) gives a repository's own tracked ``.gitignore`` files higher
+    precedence than ``$GIT_DIR/info/exclude``, so a project that re-includes
+    dotfiles (``!.*``), whitelists ``.c`` sources (``*`` then ``!*.c``), or
+    even specifically targets `mkstemp`'s own generated shape (an 8-``?``
+    glob negation) can silently override this exclude entry — measured
+    empirically: `git check-ignore -v` names the
+    `.gitignore` rule as the decider even with the exclude pattern already
+    present, and `git add -A` then stages the "excluded" snapshot. Guessing at
+    `mkstemp`'s random-name shape to build a synthetic probe was tried and
+    rejected: the length is a private, undocumented `tempfile` implementation
+    detail, and a probe of the wrong shape can itself be fooled by a rule
+    targeting the real shape. So the check below runs against the *real*
+    snapshot path immediately after `mkstemp` creates it — no guessing — and
+    unlinks it and fails closed as `UnitsUnavailable` if `git check-ignore`
+    cannot confirm it is actually excluded (review feedback, issue #151). That
+    leaves a narrow, already-accepted residual: an explicit, forced
+    `git add -f <path>` is the one thing left that can still stage it (the
+    same residual `_verifiable_source` documents at the verify boundary,
+    issue #150), and a concurrent `git add -A` racing the few instructions
+    between `mkstemp` and this check completing — negligible next to the
+    whole-enumeration-timeout window that existed before any of this staging
+    existed.
     """
     if content is None:
         yield str(file_path)
         return
     spelled = os.path.join(project_dir, os.fspath(file_path))
-    src_dir, name = _kernel_dir(os.path.dirname(spelled)), os.path.basename(spelled)
-    target = os.path.join(src_dir, name)
-    # Every `OSError` the staging can raise — an unwritable/missing `TMPDIR`,
-    # `ENOSPC`, `EDQUOT`, an unreadable directory anywhere on the mirrored chain,
-    # a failed cleanup — has to land as `UnitsUnavailable`, the one exception
-    # `verify_and_record` turns into a blocking `error`. Left bare it escapes to
-    # the hook, which installs no handler: the process dies with a traceback and
-    # exit 1 (not the blocking exit 2) before any verdict or `scanned` stamp is
-    # written, so the edit passes with the file unverified. Outside a git work
-    # tree nothing backstops that — the same reason the post-verify drift check
-    # blocks rather than deferring to the out-of-band scan. Mirrors how
-    # `_list_units` already converts `OSError` from the spawn.
+    src_dir = _kernel_dir(os.path.dirname(spelled))
+    suffix = Path(os.fspath(file_path)).suffix
+    is_work_tree = _index_ignore_snapshot(src_dir, _ENUM_SNAPSHOT_PREFIX)
+    # Every `OSError` the staging can raise — an unwritable directory, `ENOSPC`,
+    # `EDQUOT`, a failed cleanup — has to land as `UnitsUnavailable`, the one
+    # exception `verify_and_record` turns into a blocking `error`. Left bare it
+    # escapes to the hook, which installs no handler: the process dies with a
+    # traceback and exit 1 (not the blocking exit 2) before any verdict or
+    # `scanned` stamp is written, so the edit passes with the file unverified.
+    # Outside a git work tree nothing backstops that — the same reason the
+    # post-verify drift check blocks rather than deferring to the out-of-band
+    # scan. Mirrors how `_list_units` already converts `OSError` from the spawn.
     try:
-        with tempfile.TemporaryDirectory(prefix="forseti-units-") as tmp:
-            real_dirs, links = _mirror_plan(src_dir, project_dir)
-            # Order is load-bearing. The whole skeleton — every level of the
-            # chain, every reproduced symlink component, and the snapshot itself
-            # — has to exist before any level mirrors its entries, because
-            # `_mirror_entries` yields to whatever is already staged. Mirror the
-            # source's directory first and its own name would become a link back
-            # to the real file, which `write_bytes` would then follow and
-            # *truncate the user's source*.
-            for real in real_dirs:
-                os.makedirs(_staged(tmp, real), exist_ok=True)
-            for link, link_target in links:
-                os.symlink(_staged(tmp, link_target), _staged(tmp, link))
-            snapshot = Path(_staged(tmp, target))
-            snapshot.write_bytes(content)
-            # Taken before the mirroring, off the real file: any entry that turns
-            # out to be this same inode is another name for the source and must
-            # lead to the snapshot, not back out to the live file.
-            source_id = _file_id(target)
-            for real in real_dirs:
-                _mirror_entries(
-                    real,
-                    _staged(tmp, real),
-                    source_id=source_id,
-                    snapshot=str(snapshot),
-                )
-            yield str(snapshot)
+        fd, path = tempfile.mkstemp(
+            prefix=_ENUM_SNAPSHOT_PREFIX,
+            suffix=suffix,
+            dir=src_dir,
+        )
     except OSError as exc:
         raise UnitsUnavailable(
-            f"could not stage a snapshot of {name} for enumeration (check "
-            f"TMPDIR, free space, and read access to {src_dir} and the "
-            f"directories `_mirror_plan` reproduces for it): {exc}"
+            f"could not stage a snapshot of {file_path} for enumeration (check "
+            f"free space and write access to {src_dir}): {exc}"
         ) from exc
+    if (
+        is_work_tree
+        and _git(
+            src_dir,
+            "check-ignore",
+            "-q",
+            "--no-index",
+            "--",
+            path,
+            env=_git_probe_env(),
+        )
+        is None
+    ):
+        # `_index_ignore_snapshot` only proves the pattern is registered, not
+        # that it protects anything: a higher-precedence tracked `.gitignore`
+        # can override `.git/info/exclude` (a dotfile negation, a whitelist,
+        # or one shaped to match `mkstemp`'s own random suffix). Checking the
+        # *real* path — not a guessed shape — is the only way to know for
+        # certain, so this can only run once `mkstemp` has actually produced
+        # it. Never a work tree at all, `check-ignore` has nothing to confirm,
+        # so this stays gated on `is_work_tree`.
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise UnitsUnavailable(
+            f"{path} is registered in {src_dir}'s .git/info/exclude but a "
+            f"tracked .gitignore rule appears to override it — refusing to "
+            f"leave an unprotected snapshot staged"
+        )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise UnitsUnavailable(
+            f"could not stage a snapshot of {file_path} for enumeration (check "
+            f"free space and write access to {src_dir}): {exc}"
+        ) from exc
+    except BaseException:
+        # A KeyboardInterrupt/SystemExit (or any other non-OSError) during the
+        # write must not leak the snapshot `mkstemp` already created — the
+        # `except OSError` above only ever covered write failures reported as
+        # an OSError, and the yield's own `except BaseException` below wraps
+        # only the yield, not this write. Same best-effort cleanup, and a bare
+        # re-raise so an interrupt isn't relabeled as a blocking
+        # `UnitsUnavailable`.
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
+    try:
+        yield path
+    except BaseException:
+        # A real failure is already in flight (from the caller's use of `path`,
+        # e.g. `_list_units` raising `UnitsUnavailable`) — a cleanup error here
+        # would replace it with a less useful one, so it's suppressed the same
+        # way the write-failure path above suppresses it, and best-effort
+        # cleanup is attempted anyway.
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
+    else:
+        # The happy path: nothing else is failing, so a cleanup error must not
+        # be swallowed — that's exactly what would leave a complete source
+        # snapshot sitting in the tree indefinitely while enumeration reports
+        # success.
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            raise UnitsUnavailable(
+                f"enumerated {file_path} but could not remove the snapshot left "
+                f"at {path} (check write access to {src_dir}): {exc}"
+            ) from exc
 
 
 def extract_function_defs(
@@ -647,7 +699,7 @@ def _list_units(source: str, *, project_dir: str) -> list[FuncDef]:
     # `error` on every edited file rather than a listing. Only the build flags go
     # here: `SAFETY_FLAGS` is for the verify, and a property flag on a
     # `--parse-tree-only` run is at best inert. Nothing is added for a snapshot —
-    # `_enumerable_source` mirrors the source's directory precisely so the search
+    # `_enumerable_source` stages it beside the source itself, so the search
     # paths stay identical to the in-place parse.
     build_flags = _build_flags()
     if build_flags:
@@ -767,8 +819,9 @@ def _included(rel: str) -> bool:
     Exclude wins over include. When `FORSETI_GATE_EXCLUDE` is unset the built-in
     `_DEFAULT_EXCLUDE_GLOBS` apply; setting it replaces (not extends) them.
 
-    Purely name-based — it does not know about the verify snapshot's basename
-    prefix (`_VERIFY_SNAPSHOT_PREFIX`). That exclusion lives one layer up, in
+    Purely name-based — it does not know about the enumeration or verify
+    snapshot's basename prefix (`_ENUM_SNAPSHOT_PREFIX`/`_VERIFY_SNAPSHOT_PREFIX`).
+    That exclusion lives one layer up, in
     `_in_scope_c_abspath`, because it must not apply to a *tracked* file that
     happens to share the prefix — see there for why.
     """
@@ -816,13 +869,18 @@ def _staged_paths_from_porcelain(out: str) -> list[str]:
     return [path for status, path in _iter_porcelain_z(out) if status[0] not in " ?"]
 
 
-def _git(project_dir: str, *args: str) -> str | None:
+def _git(project_dir: str, *args: str, env: dict[str, str] | None = None) -> str | None:
     """Run a git subcommand in `project_dir`; its stdout, or ``None`` on failure.
 
     ``None`` covers git being absent, `project_dir` not being a work tree, or a
     non-zero exit — the caller treats all three as "out-of-band discovery is
     unavailable" (distinct from a clean tree), so it can report the degraded scope
     loudly instead of silently skipping.
+
+    `env` defaults to inheriting the ambient environment unmodified, same as
+    before this parameter existed. Pass `_git_probe_env()` for a call whose
+    job is confirming whether a work tree genuinely exists — see that
+    function for why the ambient environment isn't trusted there.
     """
     try:
         proc = subprocess.run(
@@ -830,6 +888,7 @@ def _git(project_dir: str, *args: str) -> str | None:
             capture_output=True,
             text=True,
             timeout=30,
+            env=env,
         )
     except (FileNotFoundError, OSError, subprocess.SubprocessError):
         return None
@@ -920,6 +979,41 @@ def git_committed_files_since(project_dir: str, baseline_head: str | None) -> li
     return [p for p in out.split("\0") if p]
 
 
+def _untracked_snapshot(root: str, rel: str) -> bool:
+    """True only when repo-root-relative `rel` is a *provably untracked* leftover
+    matching the enumeration snapshot's basename prefix (`_ENUM_SNAPSHOT_PREFIX`).
+
+    A snapshot `_enumerable_source` could not clean up (a kill) must never be
+    handed back to `verify_and_record` as a source in its own right — that is
+    this check's job. But a repository can also already *track* a legitimate
+    source whose name happens to share the prefix; excluding by name alone would
+    silently drop a real, changed file from every scan (a Bash edit to it would
+    ship unverified, since the direct Write/Edit hook never sees a Bash write).
+    So the exemption only fires when git can affirmatively say the path is not in
+    its index — never when the question can't be asked. A missing/unreachable git,
+    a timeout, or `root` not being a work tree all read `_git` as ``None``; treated
+    as "provably untracked" that would fail *open* (exempt, i.e. silently drop, a
+    file that might well be a real tracked source) in the one predicate whose job
+    this round is to stop exactly that silent bypass — so ``None`` never exempts.
+
+    ``:(literal)`` keeps `rel` from being read as a glob/pathspec-magic pattern —
+    a tracked file literally named ``.forseti-units-[a].c`` would otherwise be
+    matched as a character class instead of itself and could read as untracked.
+
+    The residual this leaves, deliberately: a *new*, not-yet-tracked legitimate
+    source that happens to share the prefix is still silently exempt until it is
+    `git add`ed. Narrowing further (e.g. also requiring `mkstemp`'s random-suffix
+    shape) is a second, overlapping guard for the same gap trackedness already
+    closes for the common case (a killed hook's snapshot is never staged, per
+    `_index_ignore_snapshot`) — not worth it for how exotic a deliberately
+    prefix-named untracked source is.
+    """
+    if not os.path.basename(rel).startswith(_ENUM_SNAPSHOT_PREFIX):
+        return False
+    listed = _git(root, "ls-files", "-z", "--", f":(literal){rel}")
+    return listed is not None and not listed.strip()
+
+
 def _untracked_verify_snapshot(root: str, rel: str) -> bool:
     """True only when repo-root-relative `rel` is a *provably untracked* leftover
     matching the verify snapshot's basename prefix (`_VERIFY_SNAPSHOT_PREFIX`).
@@ -975,7 +1069,7 @@ def _in_scope_c_abspath(
             return None  # changed outside this project subtree — out of scope
     except ValueError:
         return None  # different drive/root — cannot be under proj
-    if _untracked_verify_snapshot(root, rel):
+    if _untracked_snapshot(root, rel) or _untracked_verify_snapshot(root, rel):
         return None
     if not _included(os.path.relpath(abspath, project_dir)):
         return None
