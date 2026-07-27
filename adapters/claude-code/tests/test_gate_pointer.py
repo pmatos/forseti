@@ -21,13 +21,27 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import forseti_gate as gate
 import pytest
 
 _HAVE_ESBMC = shutil.which("esbmc") is not None and shutil.which("forseti") is not None
+
+
+def _git_init(path: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "t"], check=True)
+
+
+def _git_commit_all(path: Path) -> None:
+    subprocess.run(["git", "-C", str(path), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-qm", "baseline"], check=True)
 
 
 # --- fake `forseti list-units` CLI (no esbmc needed) -----------------------
@@ -131,6 +145,45 @@ def _echoing_forseti_cmd(
         "    fn = sys.argv[sys.argv.index('--function') + 1]",
         f"    print(json.dumps({{'verdict': {verdict!r}, 'unwind': 1, "
         "'counterexample': 'cex ' + fn}))",
+    ]
+    script.write_text("\n".join(body) + "\n")
+    return [sys.executable, str(script)]
+
+
+def _content_keyed_verify_forseti_cmd(
+    tmp_path: Path, *, during_verify: str = "", original: str = "alpha\n"
+) -> list[str]:
+    """A fake CLI whose `verify` branch reads the *exact path it is handed* and
+    keys its verdict to that content: `verified` for content ending with
+    `original`, `violated` for anything else.
+
+    Unlike `_echoing_forseti_cmd`'s `verify` branch, which answers a canned
+    verdict without ever reading its own source argument, this one can actually
+    tell a snapshot from the live path apart — which is the whole point: seeing
+    `violated` here means the live (and briefly-rewritten) source was read
+    instead of an immutable snapshot of `original`. A suffix check, not exact
+    equality: the real snapshot (`_verifiable_source`) carries a leading
+    `#line 1 "..."` directive ahead of `original`'s own bytes (issue #150's
+    `__FILE__`/`__BASE_FILE__` fix), which the suffix check tolerates without
+    caring about its exact spelling. `list-units` reports a single unit named
+    after `original`'s first word, unconditionally — issue #141's enumeration
+    race is already closed and not what this helper probes. `during_verify`
+    runs before the read, so it can race a rewrite of some *other* path (the
+    real source) against the read of whatever path `verify` actually receives.
+    """
+    fn = original.split()[0]
+    script = tmp_path / "content_keyed_forseti.py"
+    body = [
+        "import json, sys",
+        "if sys.argv[1] == 'list-units':",
+        f"    print(json.dumps({{'units': [{{'function': {fn!r}, "
+        "'takes_pointer': False}]}))",
+        "else:",
+        *(f"    {line}" for line in during_verify.splitlines()),
+        "    content = open(sys.argv[2]).read()",
+        f"    verdict = 'verified' if content.endswith({original!r}) else 'violated'",
+        "    print(json.dumps({'verdict': verdict, 'unwind': 1, "
+        "'counterexample': 'cex'}))",
     ]
     script.write_text("\n".join(body) + "\n")
     return [sys.executable, str(script)]
@@ -943,14 +996,17 @@ def test_enumerate_drift_block_defers_to_a_stamp_taken_after_the_check(
 def test_persistent_rewrite_during_verify_withdraws_the_stamp_and_blocks(
     tmp_path: Path, monkeypatch
 ) -> None:
-    # The verifies read the *real* path — a verdict must describe the translation
-    # unit that ships — so a rewrite landing there can attach a `verified` verdict
-    # to bytes the gate never stamped. Re-hashing once after the loop fails closed
-    # on a rewrite that lands and *stays*: the up-front stamp is withdrawn, so the
-    # out-of-band scan re-gates the file, and a blocking `error` covers the case
-    # where there is no such scan (outside a git work tree). A transient
-    # A -> B -> A during a verify is the acknowledged residual (see below) — the
-    # final bytes compare equal, so nothing here can see it.
+    # This fake CLI answers a canned verdict without reading its own source
+    # argument, so it stands in for *any* run whose reported verdict has moved
+    # on from what `verify_and_record` actually staged (the verify itself now
+    # reads an immutable snapshot — issue #150 — so this is no longer the only
+    # way a stale `verified` could arrive, just the simplest one to construct).
+    # A rewrite that lands and *stays* has to be caught some other way: the
+    # up-front stamp is withdrawn on the post-loop re-hash, so the out-of-band
+    # scan re-gates the file, and a blocking `error` covers the case where there
+    # is no such scan (outside a git work tree). The *transient* A -> B -> A
+    # case this guard cannot see is no longer a residual — see
+    # `test_transient_rewrite_during_verify_is_closed_by_the_snapshot`.
     src = tmp_path / "x.c"
     src.write_text("alpha\n")
     _seed_scanned(tmp_path)
@@ -1021,19 +1077,18 @@ def test_rewrite_during_verify_releases_the_claim_when_deferring(
     }
 
 
-def test_transient_rewrite_during_verify_is_a_known_residual(
+def test_transient_rewrite_during_verify_is_closed_by_the_snapshot(
     tmp_path: Path, monkeypatch
 ) -> None:
-    # Characterization, not an endorsement. A transient A -> B -> A *during a
-    # verify* leaves B's verdict attached to A's stamp: the post-loop re-hash can
-    # only compare final bytes, and they are equal. Closing it would mean
-    # verifying immutable content, which changes *what* is verified — the
-    # snapshot reproduces include resolution only up to its mirror root, so an
-    # include reaching above that would turn a verifiable file into a blocking
-    # `error` — and would put a since-deleted temp path in every counterexample
-    # and in the trace's
-    # `argv`. Pinned here so the limit is explicit in the suite, and so a future
-    # fix flips this test rather than quietly widening the guarantee.
+    # Issue #150. A transient A -> B -> A *during a verify* used to leave B's
+    # verdict attached to A's stamp: the post-loop re-hash can only compare
+    # final bytes, and they compare equal. Now the verify reads an immutable
+    # snapshot of A's exact bytes, taken before the fake CLI ever runs, so the
+    # rewrite below — which only touches the *real* `src`, never the snapshot —
+    # has nothing to leak into the recorded verdict. `_content_keyed_verify_forseti_cmd`
+    # is what gives this test teeth: it reads whatever path it is actually
+    # handed, so a `violated` verdict here would mean the live path was read
+    # after all.
     src = tmp_path / "x.c"
     original = "alpha\n"
     src.write_text(original)
@@ -1041,12 +1096,12 @@ def test_transient_rewrite_during_verify_is_a_known_residual(
     monkeypatch.setattr(
         gate,
         "resolve_forseti_cmd",
-        lambda: _echoing_forseti_cmd(
+        lambda: _content_keyed_verify_forseti_cmd(
             tmp_path,
-            verdict="verified",
+            original=original,
             during_verify=(
-                f"open({str(src)!r}, 'w').write('beta\\n')\n"  # what got verified
-                f"open({str(src)!r}, 'w').write({original!r})"  # ...then restored
+                f"open({str(src)!r}, 'w').write('beta\\n')\n"  # transient...
+                f"open({str(src)!r}, 'w').write({original!r})"  # ...restored
             ),
         ),
     )
@@ -1055,7 +1110,7 @@ def test_transient_rewrite_during_verify_is_a_known_residual(
     assert [v.verdict for v in verdicts] == ["verified"]
     after = gate.load_state(str(tmp_path))
     assert after["scanned"]["x.c"] == hashlib.sha256(original.encode()).hexdigest()
-    assert gate.blocking_units(after) == []  # the residual: A passes on B's verdict
+    assert gate.blocking_units(after) == []
 
 
 def test_rewrite_during_verify_defers_to_a_concurrent_runs_stamp(
@@ -1221,6 +1276,633 @@ def test_drift_block_still_lands_when_no_stamp_vouches_for_the_file(
     # ...and it can be cleared: the file hashes to neither stamp, so the next scan
     # re-offers it and the reconcile drops the `?`.
     assert gate.stale_sources(str(tmp_path), after, [str(src)]) == [str(src)]
+
+
+# --- verify snapshot mechanics (issue #150) ---------------------------------
+
+
+def test_verifiable_source_prepends_line_directive(tmp_path: Path) -> None:
+    # `#line 1 "<file_path>"` is what keeps `__FILE__`/`__BASE_FILE__` (and
+    # every reported counterexample line) pointing at the real file instead of
+    # the snapshot's own random name — see `_verifiable_source`'s docstring and
+    # review feedback on PR #159 (issue #150).
+    src = tmp_path / "sub" / "x.c"
+    src.parent.mkdir()
+    content = b"int f(void) { return 0; }\n"
+    src.write_bytes(content)
+    mtime_ns = os.stat(src).st_mtime_ns
+
+    with gate._verifiable_source(
+        str(src), content, project_dir=str(tmp_path), mtime_ns=mtime_ns
+    ) as vp:
+        written = Path(vp).read_bytes()
+
+    assert written == f'#line 1 "{src}"\n'.encode() + content
+
+
+def test_line_directive_escapes_quotes_and_backslashes() -> None:
+    assert gate._line_directive('a"b\\c.c') == b'#line 1 "a\\"b\\\\c.c"\n'
+
+
+def test_line_directive_escapes_newlines_and_carriage_returns() -> None:
+    # A `#line` directive must occupy one logical line, so a literal `\n`/`\r`
+    # in `path` — legal in a POSIX filename, and not filtered by anything
+    # upstream (`is_c_source` only checks the suffix) — would otherwise end the
+    # string literal early and corrupt the directive. Review feedback on PR
+    # #159, issue #150.
+    assert gate._line_directive("a\nb\rc.c") == b'#line 1 "a\\nb\\rc.c"\n'
+
+
+def test_verifiable_source_preserves_uppercase_c_suffix(tmp_path: Path) -> None:
+    # `is_c_source`/`extract_function_defs` both lowercase the suffix before
+    # comparing, so an uppercase `.C` file reaches `_verifiable_source` too.
+    # Forcing a fixed `.c` snapshot would hand `esbmc`'s own frontend a
+    # different language signal than the real file's own name does — measured
+    # directly against a live `esbmc`, identical bytes named `.C` parse as C++
+    # (accepting `class Foo { ... };`) and diverge at runtime from the same
+    # bytes named `.c` (`sizeof('a') == sizeof(int)` is true in C, false in
+    # C++) — letting the verdict describe a translation unit the compiler
+    # would not actually build from the real file. Review feedback on PR #159,
+    # issue #150.
+    src = tmp_path / "x.C"
+    content = b"int f(void) { return 0; }\n"
+    src.write_bytes(content)
+    mtime_ns = os.stat(src).st_mtime_ns
+
+    with gate._verifiable_source(
+        str(src), content, project_dir=str(tmp_path), mtime_ns=mtime_ns
+    ) as vp:
+        assert vp.endswith(".C")
+
+
+def test_verifiable_source_preserves_mtime_for_timestamp_macro(tmp_path: Path) -> None:
+    # `#line` fixes the *presumed name* `__FILE__`/`__BASE_FILE__` read, but
+    # measured directly against clang, `__TIMESTAMP__` follows the snapshot's
+    # own physical mtime regardless — a fresh `mkstemp` always reads "now"
+    # unless corrected. `mtime_ns` threads the original's mtime through so the
+    # snapshot's matches it exactly. Review feedback on PR #159, issue #150.
+    src = tmp_path / "x.c"
+    content = b"int f(void) { return 0; }\n"
+    src.write_bytes(content)
+    old_ns = 1_577_836_800_000_000_000  # 2020-01-01T00:00:00Z, well before "now"
+    os.utime(src, ns=(old_ns, old_ns))
+
+    with gate._verifiable_source(
+        str(src), content, project_dir=str(tmp_path), mtime_ns=old_ns
+    ) as vp:
+        assert os.stat(vp).st_mtime_ns == old_ns
+
+
+def test_verifiable_source_keeps_leading_bom_at_byte_zero(tmp_path: Path) -> None:
+    # Writing the directive first would push a leading UTF-8 BOM into the
+    # middle of the file, fusing it onto the first real token. Verified
+    # empirically against clang: `int` becomes an unrecognized `﻿int` and
+    # the file fails to parse. The BOM must stay at byte zero, ahead of the
+    # directive. Review feedback on PR #159, issue #150.
+    src = tmp_path / "x.c"
+    body = b"int f(void) { return 0; }\n"
+    content = gate._UTF8_BOM + body
+    src.write_bytes(content)
+    mtime_ns = os.stat(src).st_mtime_ns
+
+    with gate._verifiable_source(
+        str(src), content, project_dir=str(tmp_path), mtime_ns=mtime_ns
+    ) as vp:
+        written = Path(vp).read_bytes()
+
+    assert written == gate._UTF8_BOM + f'#line 1 "{src}"\n'.encode() + body
+
+
+def test_verifiable_source_without_bom_is_unaffected(tmp_path: Path) -> None:
+    src = tmp_path / "x.c"
+    content = b"int f(void) { return 0; }\n"
+    src.write_bytes(content)
+    mtime_ns = os.stat(src).st_mtime_ns
+
+    with gate._verifiable_source(
+        str(src), content, project_dir=str(tmp_path), mtime_ns=mtime_ns
+    ) as vp:
+        written = Path(vp).read_bytes()
+
+    assert not written.startswith(gate._UTF8_BOM)
+    assert written == f'#line 1 "{src}"\n'.encode() + content
+
+
+def _unstageable_verify_snapshot(monkeypatch, message: str = "No space left") -> None:
+    """Make staging the *verify* snapshot fail with a bare `OSError`."""
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise OSError(message)
+
+    monkeypatch.setattr(gate.tempfile, "mkstemp", _boom)
+
+
+def test_unstageable_verify_snapshot_raises_units_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # An unwritable directory, ENOSPC or EDQUOT must surface as the one
+    # exception the gate knows how to block on, exactly like the enumeration
+    # side's own staging failure.
+    _unstageable_verify_snapshot(monkeypatch)
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    with (
+        pytest.raises(gate.UnitsUnavailable, match="snapshot"),
+        gate._verifiable_source(
+            str(src),
+            b"...",
+            project_dir=str(tmp_path),
+            mtime_ns=os.stat(src).st_mtime_ns,
+        ),
+    ):
+        pass
+
+
+def test_unstageable_verify_snapshot_defers_quietly_and_charges_a_retry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Unlike the enumeration-side staging failure, this one lands AFTER the
+    # stamp and the pending `unknown` units are already recorded (enumeration
+    # succeeded first) — exactly the already-stamped case `unless_superseded`
+    # exists for. Recording an unconditional `error` on top would strand an
+    # unclearable `x.c::?` on a file whose stamp nothing will ever re-check.
+    # It defers quietly instead: the pending `unknown` unit stays blocking, and
+    # the file's unfinished-verify marker is charged exactly *one* attempt —
+    # the marker already counted this attempt the moment it was created, a few
+    # lines above the snapshot staging that then failed, so `_blocking_error`
+    # must not add a second charge on top of it. (An earlier version of this
+    # test pinned that double-charge bug as `attempts == 2`; review feedback
+    # on PR #159, issue #150.)
+    src = tmp_path / "x.c"
+    src.write_text("f\n")
+    digest = hashlib.sha256(src.read_bytes()).hexdigest()
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+    _unstageable_verify_snapshot(monkeypatch)
+
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert verdicts == []  # superseded by our own just-written stamp — quiet
+    after = gate.load_state(str(tmp_path))
+    assert after["scanned"]["x.c"] == digest  # never withdrawn
+    assert after["units"]["x.c::f"]["verdict"] == "unknown"  # still blocking
+    assert after["pending"]["x.c"]["attempts"] == 1  # exactly one attempt charged
+    assert gate.blocking_units(after)
+    assert gate.stale_sources(str(tmp_path), after, [str(src)]) == [str(src)]
+
+
+def test_unstageable_verify_snapshot_takes_three_failures_to_exhaust_retries(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # MAX_PENDING_VERIFY_ATTEMPTS == 3, so it must take three *separate*
+    # staging failures — not two — before the file drops out of
+    # `stale_sources`'s retry set. The double-charge bug spent 2 of the 3
+    # attempts on a single failure, so the boundary landed one failure early;
+    # this pins the corrected count (review feedback on PR #159, issue #150).
+    src = tmp_path / "x.c"
+    src.write_text("f\n")
+    monkeypatch.setattr(
+        gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
+    )
+    _unstageable_verify_snapshot(monkeypatch)
+
+    for expected_attempts in (1, 2, 3):
+        gate.verify_and_record(str(src), project_dir=str(tmp_path))
+        state = gate.load_state(str(tmp_path))
+        assert state["pending"]["x.c"]["attempts"] == expected_attempts
+        still_retryable = expected_attempts < gate.MAX_PENDING_VERIFY_ATTEMPTS
+        assert (
+            bool(gate.stale_sources(str(tmp_path), state, [str(src)]))
+            == still_retryable
+        )
+
+
+def test_verify_and_record_retries_when_mtime_races_the_read(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # `read()` and `fstat()` are two separate syscalls even through the same fd,
+    # so a rewrite landing strictly between them (or straddling the read) can
+    # pair stable content with a foreign mtime — content-only drift checks
+    # elsewhere in `verify_and_record` never see this, since they compare
+    # bytes, never mtime. Bracketing the read with an `fstat()` on each side and
+    # retrying until they agree is the fix; this drives that path by making the
+    # first bracket (the top-of-function read) disagree once before stabilizing.
+    # The second bracket (the pre-verify re-pair under `gate_lock`, closing the
+    # narrower window `extract_function_defs`'s subprocess call leaves open)
+    # then reads real, already-stable `fstat` values on its very first
+    # iteration. Review feedback on PR #159, issue #150.
+    src = tmp_path / "x.c"
+    original = "alpha\n"
+    src.write_text(original)
+    target_ino = os.stat(src).st_ino
+    real_fstat = os.fstat
+    calls = {"n": 0}
+
+    def flaky_fstat(fd: int) -> object:
+        real = real_fstat(fd)
+        if real.st_ino != target_ino:
+            return real
+        calls["n"] += 1
+        if calls["n"] <= 2:  # only the first bracket disagrees
+            return SimpleNamespace(st_mtime_ns=real.st_mtime_ns + calls["n"])
+        return real
+
+    monkeypatch.setattr(gate.os, "fstat", flaky_fstat)
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _content_keyed_verify_forseti_cmd(tmp_path, original=original),
+    )
+
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert [v.verdict for v in verdicts] == ["verified"]
+    # 4 calls to stabilize the first bracket (one retry) + 2 for the second
+    # bracket's single, already-stable iteration.
+    assert calls["n"] == 6
+    after = gate.load_state(str(tmp_path))
+    assert after["scanned"]["x.c"] == hashlib.sha256(original.encode()).hexdigest()
+
+
+def test_verify_and_record_fails_closed_when_mtime_never_stabilizes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A file some other process keeps rewriting on every single attempt must
+    # not spin forever, and must not proceed with an unpaired (content, mtime)
+    # either: it fails closed as a blocking `error`, the same family as an
+    # unreadable file, bounded by `_MTIME_STABLE_ATTEMPTS`. Review feedback on
+    # PR #159, issue #150.
+    src = tmp_path / "x.c"
+    src.write_text("alpha\n")
+    target_ino = os.stat(src).st_ino
+    real_fstat = os.fstat
+    calls = {"n": 0}
+
+    def always_moving_fstat(fd: int) -> object:
+        real = real_fstat(fd)
+        if real.st_ino != target_ino:
+            return real
+        calls["n"] += 1
+        return SimpleNamespace(st_mtime_ns=real.st_mtime_ns + calls["n"])
+
+    monkeypatch.setattr(gate.os, "fstat", always_moving_fstat)
+    _seed_scanned(tmp_path)
+
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert [v.verdict for v in verdicts] == ["error"]
+    assert calls["n"] == 2 * gate._MTIME_STABLE_ATTEMPTS  # bounded, not infinite
+    after = gate.load_state(str(tmp_path))
+    assert "x.c" not in after["scanned"]  # never stamped as scanned
+
+
+def test_mtime_never_stabilizing_defers_to_a_concurrent_runs_stamp(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Unlike an unreadable file (which also fails `content_hash`, so
+    # `stale_sources` skips it entirely), a file whose mtime never stabilizes
+    # is perfectly readable — it hashes the same as any other content-fresh
+    # file. So if a concurrent run has already stamped `scanned` with exactly
+    # what's on disk now, that run owns the file: blocking anyway would strand
+    # an unclearable `x.c::?`, since the file would hash equal to the
+    # surviving stamp and `stale_sources` would read it as fresh forever.
+    src = tmp_path / "x.c"
+    content = "alpha\n"
+    src.write_text(content)
+    target_ino = os.stat(src).st_ino
+    real_fstat = os.fstat
+    calls = {"n": 0}
+
+    def always_moving_fstat(fd: int) -> object:
+        real = real_fstat(fd)
+        if real.st_ino != target_ino:
+            return real
+        calls["n"] += 1
+        return SimpleNamespace(st_mtime_ns=real.st_mtime_ns + calls["n"])
+
+    monkeypatch.setattr(gate.os, "fstat", always_moving_fstat)
+    state = gate.load_state(str(tmp_path))
+    state.setdefault("scanned", {})["x.c"] = hashlib.sha256(
+        content.encode()
+    ).hexdigest()
+    gate.save_state(str(tmp_path), state)
+
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert verdicts == []  # deferred quietly, not a stray `?`
+    assert calls["n"] == 2 * gate._MTIME_STABLE_ATTEMPTS  # still bounded
+    after = gate.load_state(str(tmp_path))
+    assert "x.c::?" not in after.get("units", {})
+    assert after["scanned"]["x.c"] == hashlib.sha256(content.encode()).hexdigest()
+
+
+def test_verify_and_record_stages_the_mtime_seen_at_verify_time_not_before_enumeration(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The reviewer's exact scenario: the source is touched with identical bytes
+    # *after* the top-of-function bracket pairs `raw`/`mtime_ns` but *during* the
+    # `extract_function_defs` subprocess call — a window a content-only check can
+    # never see. `after_read` runs inside that subprocess, right after it reads
+    # the source, so it lands precisely there. The snapshot must be staged with
+    # the mtime observed at verify time, not the one captured before enumeration
+    # started. Review feedback on PR #159, issue #150.
+    src = tmp_path / "x.c"
+    src.write_text("f\n")
+    touched_ns = os.stat(src).st_mtime_ns + 5_000_000_000  # unambiguously distinct
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(
+            tmp_path,
+            after_read=(
+                f"import os; os.utime({str(src)!r}, ns=({touched_ns}, {touched_ns}))"
+            ),
+            verdict="verified",
+        ),
+    )
+    captured: dict[str, int] = {}
+    real_verifiable_source = gate._verifiable_source
+
+    @contextlib.contextmanager
+    def capturing_verifiable_source(file_path, content, *, project_dir, mtime_ns):
+        captured["mtime_ns"] = mtime_ns
+        with real_verifiable_source(
+            file_path, content, project_dir=project_dir, mtime_ns=mtime_ns
+        ) as path:
+            yield path
+
+    monkeypatch.setattr(gate, "_verifiable_source", capturing_verifiable_source)
+
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert [v.verdict for v in verdicts] == ["verified"]
+    assert captured["mtime_ns"] == touched_ns
+
+
+def test_pointer_only_file_never_stages_a_verify_snapshot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Every def in this file takes a pointer, so `verify_function` is never
+    # reached for it — staging a snapshot nothing downstream would use must not
+    # block the edit, or leave a retry claim behind, even when staging itself is
+    # impossible (an unwritable directory, ENOSPC, ...). Review feedback on PR
+    # #159 (issue #150) named both harms — "leaves a pending retry claim and
+    # repeatedly gates the session" — so both are checked here. Forcing
+    # `mkstemp` to always raise proves the snapshot path is genuinely skipped,
+    # not just tolerant of failure — if `_verifiable_source` were entered at
+    # all here, this would surface as a blocking `error` with `pending["buf.c"]`
+    # left behind, not NEEDS_CONTRACT with no pending claim.
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _fake_forseti_cmd(tmp_path, stdout=_units_payload(("f", True))),
+    )
+    _unstageable_verify_snapshot(monkeypatch)
+    src = tmp_path / "buf.c"
+    src.write_text("int f(int *p) { return *p; }\n")
+
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert len(verdicts) == 1
+    assert verdicts[0].verdict == gate.NEEDS_CONTRACT
+    state = gate.load_state(str(tmp_path))
+    assert gate.blocking_units(state) == []
+    assert len(gate.needs_contract_units(state)) == 1
+    assert "buf.c" not in state["pending"]  # no retry claim left behind either
+
+
+def _capturing_verify_forseti_cmd(tmp_path: Path, dest: Path) -> list[str]:
+    """A fake CLI: `list-units` reports one `f`; `verify` records the exact
+    source path it was handed to `dest`, then echoes that same path back in
+    `argv` and embeds it in the counterexample — the shape real ESBMC/`forseti
+    verify` actually emits (measured against a live run), so a test can check
+    the gate rewrites every one of those back to the real file.
+    """
+    script = tmp_path / "capture_verify.py"
+    body = [
+        "import json, sys",
+        "if sys.argv[1] == 'list-units':",
+        "    print(json.dumps({'units': [{'function': 'f', 'takes_pointer': False}]}))",
+        "else:",
+        "    src = sys.argv[2]",
+        f"    open({str(dest)!r}, 'w').write(json.dumps({{'source': src}}))",
+        "    print(json.dumps({'verdict': 'violated', 'unwind': 1, "
+        "'argv': ['esbmc', src, '--function', 'f'], "
+        "'counterexample': 'State 1 file ' + src + ' line 2'}))",
+    ]
+    script.write_text("\n".join(body) + "\n")
+    return [sys.executable, str(script)]
+
+
+def test_verify_snapshot_path_is_rewritten_to_the_real_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The CLI is invoked on the immutable snapshot, not `src` — but every path
+    # it echoes back (`argv`, the counterexample) must name the real file, or
+    # the loop trace and any fix Claude is asked to make would point at a temp
+    # file that no longer exists once the snapshot is cleaned up.
+    src = tmp_path / "x.c"
+    src.write_text("int f(void) { return 0; }\n")
+    dest = tmp_path / "captured.json"
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _capturing_verify_forseti_cmd(tmp_path, dest),
+    )
+
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert len(verdicts) == 1
+    v = verdicts[0]
+    captured_source = json.loads(dest.read_text())["source"]
+    assert captured_source != str(src)  # the CLI really did see a different path
+    assert v.argv is not None
+    assert str(src) in v.argv
+    assert captured_source not in v.argv
+    assert v.counterexample is not None
+    assert str(src) in v.counterexample
+    assert captured_source not in v.counterexample
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_verify_snapshot_preserves_file_and_base_file_macro_identity(
+    tmp_path: Path,
+) -> None:
+    # A translation unit that branches on its own presumed name — `__FILE__`
+    # (standard) or `__BASE_FILE__` (a GCC/clang extension) — must verify
+    # identically whether the gate reads it in place or through the transient-
+    # rewrite snapshot (`_verifiable_source`); otherwise the snapshot silently
+    # verifies a different program than the one on disk. Without the `#line`
+    # directive this reaches the null-deref branch instead (empirically
+    # confirmed against a live esbmc): the snapshot's own random name never
+    # equals `src`'s. Review feedback on PR #159, issue #150.
+    src = tmp_path / "named.c"
+    src.write_text(
+        "#include <string.h>\n"
+        "int check_name(void) {\n"
+        f'    if (strcmp(__FILE__, "{src}") == 0 &&\n'
+        f'        strcmp(__BASE_FILE__, "{src}") == 0) {{\n'
+        "        return 0;\n"
+        "    }\n"
+        "    int *p = 0;\n"
+        "    return *p;\n"
+        "}\n"
+    )
+
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert len(verdicts) == 1
+    assert verdicts[0].verdict == "verified"
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_verify_snapshot_preserves_timestamp_macro(tmp_path: Path) -> None:
+    # `__TIMESTAMP__` (a GCC/clang extension, `ctime`-formatted) is a second
+    # identity leak the `#line` directive above does nothing for: measured
+    # directly against clang, it follows the snapshot's own *physical* mtime,
+    # not the presumed name — so without correcting it, a branch on it
+    # diverges the instant `mkstemp` gives the snapshot a "now" mtime.
+    # Review feedback on PR #159, issue #150.
+    src = tmp_path / "timestamped.c"
+    old = 1_577_836_800  # 2020-01-01T00:00:00Z, well before "now"
+    stamp = time.ctime(old)
+    src.write_text(
+        "#include <string.h>\n"
+        "int check_timestamp(void) {\n"
+        f'    if (strcmp(__TIMESTAMP__, "{stamp}") == 0) {{\n'
+        "        return 0;\n"
+        "    }\n"
+        "    int *p = 0;\n"
+        "    return *p;\n"
+        "}\n"
+    )
+    os.utime(src, (old, old))  # after the write above, which bumps mtime itself
+
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert len(verdicts) == 1
+    assert verdicts[0].verdict == "verified"
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_verify_snapshot_of_bom_prefixed_source_still_verifies(tmp_path: Path) -> None:
+    # A BOM-prefixed `.c` compiles fine in place; through the snapshot, writing
+    # the `#line` directive ahead of a BOM that isn't at byte zero fuses the
+    # BOM onto the directive's own first token, so the translation unit fails
+    # to parse — a genuine bug would come back `error` (an unparseable
+    # snapshot) instead of `violated` (the real verdict). Review feedback on
+    # PR #159, issue #150.
+    src = tmp_path / "bom.c"
+    src.write_bytes(
+        gate._UTF8_BOM + b"int f(void) {\n    int *p = 0;\n    return *p;\n}\n"
+    )
+
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert len(verdicts) == 1
+    assert verdicts[0].verdict == "violated"
+
+
+def test_verify_snapshot_is_removed_after_verify_and_record(
+    tmp_path: Path, monkeypatch
+) -> None:
+    src = tmp_path / "x.c"
+    src.write_text("f\n")
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _echoing_forseti_cmd(tmp_path, verdict="verified"),
+    )
+    gate.verify_and_record(str(src), project_dir=str(tmp_path))
+    leftovers = [
+        p.name
+        for p in tmp_path.iterdir()
+        if p.name.startswith(gate._VERIFY_SNAPSHOT_PREFIX)
+    ]
+    assert leftovers == []
+
+
+def test_in_scope_c_abspath_rejects_an_untracked_verify_snapshot(
+    tmp_path: Path,
+) -> None:
+    # The shared funnel `discover_changed_c_sources`/`divergent_blob_sources`/
+    # `baseline_blob_hashes` all go through: a leftover snapshot a killed hook
+    # could not clean up must never come back as a source in its own right.
+    _git_init(tmp_path)
+    rel = f"{gate._VERIFY_SNAPSHOT_PREFIX}xyz.c"
+    (tmp_path / rel).write_text("int f(void) { return 0; }\n")
+    root = str(tmp_path)
+    proj_real = os.path.realpath(str(tmp_path))
+    assert gate._in_scope_c_abspath(str(tmp_path), root, proj_real, rel) is None
+
+
+def test_untracked_verify_snapshot_exemption_survives_an_include_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The exemption for an untracked snapshot has to come before `_included`'s
+    # globs, or a project's own FORSETI_GATE_EXCLUDE (which *replaces* the
+    # defaults, never extends them) plus a narrowing FORSETI_GATE_INCLUDE could
+    # un-exclude it.
+    _git_init(tmp_path)
+    rel = f"{gate._VERIFY_SNAPSHOT_PREFIX}xyz.c"
+    (tmp_path / rel).write_text("int f(void) { return 0; }\n")
+    monkeypatch.setenv("FORSETI_GATE_EXCLUDE", "nothing_matches_this")
+    monkeypatch.setenv("FORSETI_GATE_INCLUDE", rel)
+    root = str(tmp_path)
+    proj_real = os.path.realpath(str(tmp_path))
+    assert gate._in_scope_c_abspath(str(tmp_path), root, proj_real, rel) is None
+
+
+def test_in_scope_c_abspath_still_gates_a_tracked_file_sharing_the_prefix(
+    tmp_path: Path,
+) -> None:
+    # The residual the untracked-only exemption narrows: excluding by basename
+    # prefix alone also dropped a *tracked* file that happens to share it from
+    # every scan, so a Bash edit to it (invisible to the direct Write/Edit hook)
+    # could ship unverified. Only a provably untracked match is exempt now.
+    _git_init(tmp_path)
+    rel = f"{gate._VERIFY_SNAPSHOT_PREFIX}core.c"
+    (tmp_path / rel).write_text("int f(void) { return 0; }\n")
+    _git_commit_all(tmp_path)
+    root = str(tmp_path)
+    proj_real = os.path.realpath(str(tmp_path))
+    assert gate._in_scope_c_abspath(str(tmp_path), root, proj_real, rel) == str(
+        tmp_path / rel
+    )
+
+
+def test_in_scope_c_abspath_gates_when_trackedness_cannot_be_determined(
+    tmp_path: Path,
+) -> None:
+    # `_git` reads as `None` for "git absent/timed out/not a work tree", not just
+    # for "untracked" — collapsing those would fail *open* in the one predicate
+    # whose job is to stop a silent bypass, so an unanswerable query must never
+    # exempt a file, only gate it like anything else.
+    rel = f"{gate._VERIFY_SNAPSHOT_PREFIX}xyz.c"
+    (tmp_path / rel).write_text("int f(void) { return 0; }\n")
+    root = str(tmp_path)  # deliberately never `git init`ed
+    proj_real = os.path.realpath(str(tmp_path))
+    assert gate._in_scope_c_abspath(str(tmp_path), root, proj_real, rel) == str(
+        tmp_path / rel
+    )
+
+
+def test_discover_changed_c_sources_gates_a_bash_edit_to_a_tracked_snapshot_lookalike(
+    tmp_path: Path,
+) -> None:
+    # The reviewer's exact scenario end to end: a repo already tracks a
+    # legitimate source named like the snapshot prefix; an out-of-band (Bash)
+    # edit to it must still be discovered, not silently dropped by name alone.
+    _git_init(tmp_path)
+    rel = f"{gate._VERIFY_SNAPSHOT_PREFIX}core.c"
+    (tmp_path / rel).write_text("int f(void) { return 0; }\n")
+    _git_commit_all(tmp_path)
+    (tmp_path / rel).write_text("int f(void) { return 1; }\n")  # the Bash edit
+
+    found = gate.discover_changed_c_sources(str(tmp_path))
+
+    assert found == [str(tmp_path / rel)]
 
 
 def test_units_absent_payload_records_blocking_error(
@@ -1702,6 +2384,61 @@ def test_a_nested_source_alias_is_a_known_residual(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_self_include_by_own_name_is_a_known_residual(tmp_path: Path) -> None:
+    # Characterization, not an endorsement — the residual `_verifiable_source`'s
+    # docstring names (issue #150). `_enumerable_source`'s mirrored snapshot
+    # occupies the source's own spelled name, so a self-include resolves to
+    # itself; the *verify* snapshot instead sits beside the source under a
+    # random name (`_VERIFY_SNAPSHOT_PREFIX` + a `mkstemp` suffix), so it cannot
+    # protect a `#include` of the source's own literal filename — no alias or
+    # symlink needed here, unlike the nested-alias sibling above, because the
+    # real file simply *is* a sibling of the same name.
+    src = tmp_path / "x.c"
+    src.write_text(
+        "#ifdef SELF\n"
+        "#define PICK 1\n"
+        "#else\n"
+        "#define SELF\n"
+        '#include "x.c"\n'
+        "#if PICK\n"
+        "int from_the_snapshot(int x) { return x; }\n"
+        "#else\n"
+        "int from_the_live_file(int x) { return x; }\n"
+        "#endif\n"
+        "#endif\n"
+    )
+    original = src.read_bytes()
+    # Mutate the real file the way a rewrite mid-verify would, then verify a
+    # verify-style snapshot of `original` through `verify_function` directly —
+    # standing in for what `verify_and_record` hands `forseti verify`. Not
+    # `_list_units`: its file-attribution filter (`parse_units`, matching
+    # clang's reported location against the literal CLI path) requires the
+    # snapshot's *own* path to be what clang reports — which the `#line`
+    # directive `_verifiable_source` now writes deliberately defeats (it
+    # reports `file_path` instead, the whole point of the fix), so it no
+    # longer characterizes this residual. `verify_function` looks a function
+    # up by name in the compiled translation unit, unaffected by that filter.
+    src.write_bytes(original.replace(b"#define PICK 1", b"#define PICK 0"))
+
+    with gate._verifiable_source(
+        str(src), original, project_dir=str(tmp_path), mtime_ns=os.stat(src).st_mtime_ns
+    ) as vp:
+        live = gate.verify_function(
+            str(src), "from_the_live_file", project_dir=str(tmp_path), verify_path=vp
+        )
+        snapshot = gate.verify_function(
+            str(src), "from_the_snapshot", project_dir=str(tmp_path), verify_path=vp
+        )
+
+    # The residual: the nested `#include "x.c"` reaches the live (mutated) file,
+    # not the snapshot's own frozen bytes, so only the live file's branch ends
+    # up in the translation unit `forseti verify` actually compiles.
+    assert live.verdict == "verified"
+    assert snapshot.verdict == "error"
+    assert snapshot.detail is not None and "from_the_snapshot" in snapshot.detail
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
 def test_dotdot_in_the_given_path_stages_where_the_kernel_lands(
     tmp_path: Path,
 ) -> None:
@@ -1992,3 +2729,41 @@ def test_snapshot_enumeration_matches_the_in_place_parse(
     # The generated header wins in both, so the guarded unit is present in both.
     assert in_place == ["scal", "only_with_widget"]
     assert snapshot == in_place
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
+def test_verify_snapshot_matches_the_in_place_verify(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # End to end against the real frontend, on the exact shape a snapshot
+    # mirrored *elsewhere* gets wrong
+    # (`test_include_above_the_mirror_root_is_a_known_residual`): a source at
+    # the project root with `#include "../common.h"`, where the
+    # header above the root and one inside select a different constant. A
+    # mirrored-elsewhere snapshot has no ancestry above the project root to
+    # reproduce and falls through to an `-I` guess; the same-directory verify
+    # snapshot needs no such fallback at all — `../common.h` resolves relative
+    # to its own (real) directory, exactly like the in-place file, because it
+    # *is* in that directory. This is the empirical case for picking that
+    # design over a mirrored one for the verify step (issue #150).
+    #
+    # `FORSETI_BUILD_FLAGS="-I."` is set only so the *enumeration* snapshot's
+    # mirror — which stops at the project root and has nothing above it — can
+    # resolve `../common.h` at all instead of hard-failing; happens to reproduce
+    # the in-place answer for enumeration too (`-I.` = the project dir, the
+    # subprocess cwd), but that is incidental to what this test is checking.
+    monkeypatch.setenv("FORSETI_BUILD_FLAGS", "-I.")
+    (tmp_path / "common.h").write_text("#define DIVISOR 1\n")  # the in-place pick
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "common.h").write_text("#define DIVISOR 0\n")  # a wrong `-I` fallback
+    src = proj / "x.c"
+    src.write_text('#include "../common.h"\nint f(int x) { return x / DIVISOR; }\n')
+
+    in_place = gate.verify_function("x.c", "f", project_dir=str(proj))
+    recorded = gate.verify_and_record(str(src), project_dir=str(proj))
+
+    # DIVISOR == 1 in place: no division by zero. A wrong `-I` pick (DIVISOR ==
+    # 0) would instead report VIOLATED.
+    assert in_place.verdict == "verified"
+    assert [v.verdict for v in recorded] == ["verified"]

@@ -120,6 +120,16 @@ MAX_PENDING_VERIFY_ATTEMPTS = 3
 # source reached through more than this could not have been `open`ed either.
 _MAX_SYMLINK_HOPS = 40
 
+# How many times `verify_and_record` re-reads a file whose mtime moved between
+# the two `fstat`s bracketing its read — see the comment at that read for why a
+# lone re-read-through-the-same-fd does not by itself guarantee `raw` and
+# `mtime_ns` describe the same instant. Bounded, not looped forever: a file
+# some other process keeps rewriting on every attempt fails closed as a
+# blocking `error` (or, if a concurrent run has already stamped fresher
+# content, defers quietly to it) instead of spinning here (review feedback on
+# PR #159, issue #150).
+_MTIME_STABLE_ATTEMPTS = 5
+
 C_SUFFIXES = {".c", ".h"}
 
 # Out-of-band discovery (issue #99): a C file written via the `Bash` tool
@@ -156,6 +166,17 @@ _NEEDS_CONTRACT_DETAIL = (
     "pointer/array parameter(s); function-level safety is unreliable without a "
     "memory precondition/harness — not gated (see issue #122)"
 )
+
+# The verify snapshot's filename prefix (issue #150). `_untracked_verify_snapshot`
+# rejects a path whose basename starts with it *and* that git cannot show as
+# tracked — ahead of `FORSETI_GATE_EXCLUDE`/`FORSETI_GATE_INCLUDE` (a project can
+# replace, not extend, that env var), a snapshot a killed hook could not clean up
+# must never be offered back to `verify_and_record` as a source in its own right.
+# `.` leads so `is_c_source`'s suffix check (always true here — the snapshot's
+# suffix always case-insensitively matches `file_path`'s own, see
+# `_verifiable_source`) still lets it through the discovery scans as a dotfile,
+# which is exactly what that exclusion exists to catch.
+_VERIFY_SNAPSHOT_PREFIX = ".forseti-verify-"
 
 
 @dataclass(frozen=True)
@@ -745,6 +766,11 @@ def _included(rel: str) -> bool:
 
     Exclude wins over include. When `FORSETI_GATE_EXCLUDE` is unset the built-in
     `_DEFAULT_EXCLUDE_GLOBS` apply; setting it replaces (not extends) them.
+
+    Purely name-based — it does not know about the verify snapshot's basename
+    prefix (`_VERIFY_SNAPSHOT_PREFIX`). That exclusion lives one layer up, in
+    `_in_scope_c_abspath`, because it must not apply to a *tracked* file that
+    happens to share the prefix — see there for why.
     """
     exclude = _globs(os.environ.get("FORSETI_GATE_EXCLUDE")) or _DEFAULT_EXCLUDE_GLOBS
     if _matches(rel, exclude):
@@ -894,17 +920,52 @@ def git_committed_files_since(project_dir: str, baseline_head: str | None) -> li
     return [p for p in out.split("\0") if p]
 
 
+def _untracked_verify_snapshot(root: str, rel: str) -> bool:
+    """True only when repo-root-relative `rel` is a *provably untracked* leftover
+    matching the verify snapshot's basename prefix (`_VERIFY_SNAPSHOT_PREFIX`).
+
+    A snapshot `_verifiable_source` could not clean up (a kill) must never be
+    handed back to `verify_and_record` as a source in its own right — that is
+    this check's job. But a repository can also already *track* a legitimate
+    source whose name happens to share the prefix; excluding by name alone would
+    silently drop a real, changed file from every scan (a Bash edit to it would
+    ship unverified, since the direct Write/Edit hook never sees a Bash write —
+    review feedback on PR #159, issue #150). So the exemption only fires when git
+    can affirmatively say the path is not in its index — never when the question
+    can't be asked. A missing/unreachable git, a timeout, or `root` not being a
+    work tree all read `_git` as ``None``; treating that as "provably untracked"
+    would fail *open* (exempt, i.e. silently drop, a file that might well be a
+    real tracked source) in the one predicate whose job this round is to stop
+    exactly that silent bypass — so ``None`` never exempts.
+
+    ``:(literal)`` keeps `rel` from being read as a glob/pathspec-magic pattern —
+    a tracked file literally named ``.forseti-verify-[a].c`` would otherwise be
+    matched as a character class instead of itself and could read as untracked.
+
+    The residual this leaves, deliberately: a *new*, not-yet-tracked legitimate
+    source that happens to share the prefix is still silently exempt until it is
+    `git add`ed. Narrowing further (e.g. also requiring `mkstemp`'s random-suffix
+    shape) is a second, overlapping guard for the same gap trackedness already
+    closes for the common case — not worth it for how exotic a deliberately
+    prefix-named untracked source is.
+    """
+    if not os.path.basename(rel).startswith(_VERIFY_SNAPSHOT_PREFIX):
+        return False
+    listed = _git(root, "ls-files", "-z", "--", f":(literal){rel}")
+    return listed is not None and not listed.strip()
+
+
 def _in_scope_c_abspath(
     project_dir: str, root: str, proj_real: str, rel: str
 ) -> str | None:
     """Absolute path for repo-root-relative `rel` if it is an in-scope, included C
     source under `project_dir`, else ``None``.
 
-    Applies the C-suffix, project-subtree, and include/exclude-glob filters shared by
-    the worktree scan (`discover_changed_c_sources`) and the staged/committed-blob
-    scan (`divergent_blob_sources`). Deliberately does **not** check file existence —
-    a staged or committed blob can outlive its worktree file (a `git add`-then-`rm`),
-    and the blob scan must still gate it.
+    Applies the C-suffix, project-subtree, untracked-snapshot, and include/exclude-
+    glob filters shared by the worktree scan (`discover_changed_c_sources`) and the
+    staged/committed-blob scan (`divergent_blob_sources`). Deliberately does **not**
+    check file existence — a staged or committed blob can outlive its worktree file
+    (a `git add`-then-`rm`), and the blob scan must still gate it.
     """
     abspath = os.path.join(root, rel)
     if not is_c_source(abspath):
@@ -914,6 +975,8 @@ def _in_scope_c_abspath(
             return None  # changed outside this project subtree — out of scope
     except ValueError:
         return None  # different drive/root — cannot be under proj
+    if _untracked_verify_snapshot(root, rel):
+        return None
     if not _included(os.path.relpath(abspath, project_dir)):
         return None
     return abspath
@@ -1250,12 +1313,201 @@ def baseline_scanned(project_dir: str) -> int | None:
     return len(baseline)
 
 
+def _line_directive(path: str) -> bytes:
+    r"""A `#line 1 "path"` directive, escaped as a single C string literal.
+
+    Backslashes, double quotes, and newlines are the characters that would
+    otherwise end the literal early or corrupt it (a Windows-style path, a
+    `"` in a filename, or a `\n`/`\r`, all of which are legal in a POSIX
+    path); everything else passes through unescaped, same as a C string
+    literal allows.
+    """
+    escaped = (
+        path.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
+    return f'#line 1 "{escaped}"\n'.encode()
+
+
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+
+@contextlib.contextmanager
+def _verifiable_source(
+    file_path: str | os.PathLike[str],
+    content: bytes,
+    *,
+    project_dir: str,
+    mtime_ns: int,
+) -> Iterator[str]:
+    """Yield the path to verify `file_path`'s content against: an immutable sibling.
+
+    One boundary over from `_enumerable_source` (issue #150): the *verify* step
+    reads the real path today, guarded only by a re-hash after the loop
+    (`verify_and_record`) — which a transient A -> B -> A rewrite slips past,
+    because the bytes it verified and the bytes it finds afterward compare
+    equal. Writing `content` to a private snapshot and verifying THAT instead
+    means every verdict is computed against content hashing to the digest this
+    run stamped, full stop — there is no "afterward" for the verify itself to
+    race.
+
+    Staged as a **sibling of `file_path`, in its own real directory** — not a
+    mirrored copy elsewhere, which is what `_enumerable_source` uses for
+    enumeration. That choice is deliberate, not laziness: mirroring stops at the
+    project root (`_mirror_root`), so a source *at* the root with
+    `#include "../above.h"` misses the mirror and falls through to the `-I`
+    search with the spelled path — silently a different translation unit, not a
+    block (measured: `test_include_above_the_mirror_root_is_a_known_residual`).
+    Tolerable for an enumeration; not for the verify the whole gate rests on. A
+    same-directory snapshot has no mirror root to fall off: it *is* the
+    includer's own directory, real siblings included, so a quoted `#include`
+    resolves exactly as the in-place parse would — nothing to approximate.
+
+    The trade is the mirror's own residual for a narrower one: this snapshot
+    cannot occupy `file_path`'s own name (`tempfile.mkstemp` gives it a random
+    one), so a translation unit that `#include`s **itself by its own literal
+    name** reaches the live file during the verify, not the snapshot — the
+    self-alias class `_enumerable_source` closes by having the snapshot occupy
+    the source's exact spelled path. Pinned by
+    `test_self_include_by_own_name_is_a_known_residual`. Narrower because it
+    needs an unusual C construct (a `.c` including itself by name) rather than
+    an ordinary `#include "../common.h"` from a project-root source.
+
+    The random name is also a problem the moment a translation unit reads its
+    own identity back: `__FILE__` (standard) and `__BASE_FILE__` (a GCC/clang
+    extension) are the *presumed* source name, and without correction that
+    presumed name would be the snapshot's random one — not `file_path` — so
+    code that branches on it (`strcmp(__FILE__, "expected.c")`, an `#include`
+    built from `__BASE_FILE__`, …) would take a different path than the real
+    file does, silently verifying a different program. A leading `#line 1
+    "file_path"` directive fixes the *presumed* name back to `file_path`
+    without touching the physical bytes `content` holds or where they sit:
+    verified empirically against a live `esbmc` — a `strcmp(__FILE__, ...)`
+    branch (and the same for `__BASE_FILE__`) taken by the real file is taken
+    identically by the snapshot once the directive is prepended, and every
+    reported counterexample line number still lines up with `file_path`'s own
+    (`#line 1` re-bases the immediately following line to 1, matching
+    `content`'s own first line).
+
+    This directive must stay verify-only, never grow onto `_enumerable_source`'s
+    snapshot: `forseti list-units` (`parse_units`) attributes a `FunctionDecl` to
+    the source by a normalized match against the literal CLI path it was given,
+    and a `#line`-carrying file reports every location as the directive's target
+    instead — so every function would fail that match and `list-units` would
+    report a clean, function-free file, which `_list_units` (correctly, for a
+    file that genuinely has none) treats as a legitimate pass. `verify_function`
+    has no such filter — it looks a function up by name in the whole compiled
+    unit — which is exactly why this directive is safe here and would not be
+    there.
+
+    `__TIMESTAMP__` (a GCC/clang extension expanding to the source's last
+    modification time, `ctime`-formatted) is the same class of problem one
+    layer down from `__FILE__`, and — unlike `__FILE__` — the `#line` directive
+    does *nothing* for it: measured directly against clang, `__TIMESTAMP__`
+    follows the snapshot's own physical mtime regardless of what the directive
+    presumes the name to be. Left alone, a freshly-`mkstemp`'d snapshot always
+    reads "now", diverging from `file_path`'s real mtime on every verify.
+    `mtime_ns` is required, not optional, and is applied to the snapshot with
+    `os.utime` right after writing it, so `__TIMESTAMP__` expands to the same
+    value in place or through the snapshot — a caller cannot silently opt back
+    into the "now" mtime by omitting it (review feedback on PR #159, issue
+    #150).
+
+    A leading UTF-8 BOM is written at byte zero, ahead of the directive,
+    instead of being pushed into the middle of the file: clang only recognizes
+    a BOM there, and one sitting in front of the directive is read as part of
+    the directive's own first token, corrupting it. Verified empirically:
+    without this, a valid BOM-prefixed `.c` fails to compile through the
+    snapshot with the BOM fused onto whatever follows (e.g. `int` becomes an
+    unrecognized `﻿int`) even though the same file compiles fine in place
+    (review feedback on PR #159, issue #150).
+
+    The snapshot keeps `file_path`'s own suffix, case included, rather than a
+    fixed `.c`: `is_c_source`/`extract_function_defs` both lowercase before
+    comparing, so an uppercase `.C` reaches here too, and the two spellings are
+    not interchangeable to `esbmc`'s own frontend — the one `forseti verify`
+    actually runs, not just GCC's documented convention. Verified empirically:
+    the same bytes parse as C++ through a `.C` name (`class Foo { ... };`
+    parses; the identical `.c` name fails with "use of undeclared identifier")
+    and diverge at runtime too (`sizeof('a') == sizeof(int)` — true in C,
+    false in C++ — flips `esbmc`'s verdict on an otherwise identical file
+    depending only on which suffix it was run with). Forcing `.c` would verify
+    a `.C` file as C while the real translation unit — the one that ships —
+    is C++, letting a safety branch that depends on the difference diverge
+    from the recorded verdict. It would also part ways with
+    `_enumerable_source`, which already stages the enumeration snapshot under
+    the source's real basename, suffix and all (review feedback on PR #159,
+    issue #150).
+
+    The name carries `_VERIFY_SNAPSHOT_PREFIX` so `_untracked_verify_snapshot`
+    excludes it from the gate's own discovery for as long as it is untracked —
+    see there for why a *tracked* file sharing the prefix must not be exempted
+    the same way. `git status` still lists it until the `finally` below runs
+    (or, if this process is killed first, until something else removes it) —
+    the cost of writing into the user's tree at all, and cheaper than the race
+    this exists to close.
+    """
+    spelled = os.path.join(project_dir, os.fspath(file_path))
+    src_dir = os.path.dirname(spelled) or "."
+    directive = _line_directive(os.fspath(file_path))
+    bom, body = (
+        (content[: len(_UTF8_BOM)], content[len(_UTF8_BOM) :])
+        if content.startswith(_UTF8_BOM)
+        else (b"", content)
+    )
+    try:
+        fd, path = tempfile.mkstemp(
+            prefix=_VERIFY_SNAPSHOT_PREFIX,
+            suffix=Path(os.fspath(file_path)).suffix,
+            dir=src_dir,
+        )
+    except OSError as exc:
+        raise UnitsUnavailable(
+            f"could not stage a verify snapshot beside {file_path} (check free "
+            f"space and write access to {src_dir}): {exc}"
+        ) from exc
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(bom)
+            handle.write(directive)
+            handle.write(body)
+        os.utime(path, ns=(mtime_ns, mtime_ns))
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise UnitsUnavailable(
+            f"could not stage a verify snapshot beside {file_path} (check free "
+            f"space and write access to {src_dir}): {exc}"
+        ) from exc
+    try:
+        yield path
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
 def verify_function(
-    file_path: str, function: str, *, project_dir: str, k: int = DEFAULT_K
+    file_path: str,
+    function: str,
+    *,
+    project_dir: str,
+    k: int = DEFAULT_K,
+    verify_path: str | None = None,
 ) -> UnitVerdict:
-    """Run ``forseti verify`` on one function and map its JSON payload to a verdict."""
+    """Run ``forseti verify`` on one function and map its JSON payload to a verdict.
+
+    `verify_path`, when given, is what actually gets handed to the CLI as the
+    source to parse — an immutable snapshot standing in for `file_path`
+    (`verify_and_record`'s `_verifiable_source`) so the verdict cannot describe a
+    transient rewrite. `file_path` still names the unit everywhere else: `rel`,
+    `uid`, and — rewritten back in below — every path in the CLI's own response.
+    Omitting it verifies `file_path` directly, unchanged from before.
+    """
     rel = unit_id(project_dir, file_path)
     uid = f"{rel}::{function}"
+    source = file_path if verify_path is None else verify_path
     try:
         # Same build flags the enumeration parsed with, so the verify sees the
         # same translation unit the unit list was taken from. Unparseable config
@@ -1268,7 +1520,7 @@ def verify_function(
     argv = [
         *resolve_forseti_cmd(),
         "verify",
-        file_path,
+        source,
         "--function",
         function,
         "--unwind",
@@ -1323,14 +1575,29 @@ def verify_function(
 
     verdict = str(payload.get("verdict", "error"))
     raw_argv = payload.get("argv")
+    counterexample = payload.get("counterexample")
+    detail = payload.get("reason") or payload.get("message")
+    if verify_path is not None:
+        # ESBMC embeds the source path it was given verbatim — in `argv` (just
+        # echoed back) and in each counterexample/diagnostic line ("file <path>
+        # line ...") — measured empirically against a live `esbmc`/`forseti
+        # verify`, not assumed. Substituting the snapshot back to the real path
+        # is what keeps the loop trace, and any counterexample the agent is
+        # asked to fix, pointing at a file that still exists on disk.
+        if isinstance(raw_argv, list):
+            raw_argv = [file_path if tok == verify_path else tok for tok in raw_argv]
+        if isinstance(counterexample, str):
+            counterexample = counterexample.replace(verify_path, file_path)
+        if isinstance(detail, str):
+            detail = detail.replace(verify_path, file_path)
     return UnitVerdict(
         uid,
         rel,
         function,
         verdict,
         int(payload.get("unwind", k)),
-        counterexample=payload.get("counterexample"),
-        detail=payload.get("reason") or payload.get("message"),
+        counterexample=counterexample,
+        detail=detail,
         argv=tuple(raw_argv) if isinstance(raw_argv, list) else None,
         duration_s=payload.get("duration_s"),
     )
@@ -1544,7 +1811,11 @@ def verify_and_record(
     rel = unit_id(project_dir, file_path)
 
     def _blocking_error(
-        detail: str, *, digest: str | None = None, unless_superseded: bool = False
+        detail: str,
+        *,
+        digest: str | None = None,
+        unless_superseded: bool = False,
+        charge: bool = True,
     ) -> list[UnitVerdict]:
         """Record a blocking `error` verdict for the whole file and return it.
 
@@ -1580,35 +1851,55 @@ def verify_and_record(
         that block must land.
 
         An unfinished-verify marker for `digest` is *spent one attempt*, never
-        deleted (PR #148 review). Deleting is what the ownership rule forbids: this
-        path can never own the marker — an error caller either returns before the
-        block that creates one or (the post-verify drift caller) has already
-        released its own claim, and `pending` holds a single claim per file — so the
-        marker it would drop always belongs to another run, whose pre-recorded `unknown`
-        units would then sit content-fresh (that run stamped `scanned` with these
-        same bytes) with nothing left to retry, the exact hole issue #140 closes.
-        Bumping keeps that retry claim alive while still making progress: leaving the
-        counter untouched would let a persistently-erroring file re-verify on every
-        scan forever — each error resets `stop_attempts` — instead of going quiet at
-        `MAX_PENDING_VERIFY_ATTEMPTS` and blocking its way to the loud residual. The
-        bump goes through `_pending_attempts`, so a corrupt counter normalizes to 1
-        rather than freezing, and stops at the cap so a marker no scan will retry
-        again cannot count up forever. `hash`/`pid` are left as the creating run
-        wrote them: this run owns nothing and will never clear the marker — and
-        because those two fields alone are `_pending_owner`'s identity, the charge
-        leaves the creating run still able to clear it.
+        deleted (PR #148 review). Deleting is not this call's decision to make,
+        whoever created the marker: this charge always means "verdicts for
+        `digest` could not be produced this round", so the retry claim has to
+        survive for a future scan regardless. `charge` exists because owning the
+        marker changes what "this round" means: the enumeration failure above is
+        the only caller that leaves `charge` at its default `True` — it fires
+        before this run could have created a marker of its own, so any entry it
+        finds under `rel` for `digest` belongs to a *prior* run (a kill, or an
+        earlier persistent failure), and bumping it is this run's one and only
+        contribution to that budget. The verify-snapshot staging failure below
+        passes `charge=False` instead: by the time it fires, this run already
+        owns the marker under `rel` — created earlier in this same call, with
+        its `attempts` set to count this very attempt (the reconcile block's
+        "counting the start") — so charging again here would spend the attempt
+        this run is *currently making* a second time, exhausting
+        `MAX_PENDING_VERIFY_ATTEMPTS` in two real failures instead of three
+        (review feedback on PR #159, issue #150). In every case `pending` holds
+        a single claim per file, so bumping in place — never deleting — is what
+        keeps a killed or persistently-failing run's pre-recorded `unknown`
+        units retryable: deleting here would leave them content-fresh (this
+        run's own stamp still vouches for `digest`) with nothing left to retry,
+        the exact hole issue #140 closes. Bumping keeps that retry claim alive
+        while still making progress: leaving the counter untouched would let a
+        persistently-erroring file re-verify on every scan forever — each error
+        resets `stop_attempts` — instead of going quiet at
+        `MAX_PENDING_VERIFY_ATTEMPTS` and blocking its way to the loud residual.
+        The bump goes through `_pending_attempts`, so a corrupt counter
+        normalizes to 1 rather than freezing, and stops at the cap so a marker
+        no scan will retry again cannot count up forever. `hash`/`pid` are left
+        exactly as written: this call never clears the marker either way, and
+        because those two fields alone are `_pending_owner`'s identity, the
+        charge (or the deliberate lack of one) leaves whoever's claim it is
+        still able to clear it later.
 
         Only a marker recording exactly `digest` is charged: a concurrent run of
         *other* content is verifying bytes this error says nothing about.
 
-        Three callers pass no `digest` and so touch nothing. The read failure never
+        Four callers pass no `digest` and so touch nothing. The read failure never
         learned which bytes it was scanning, so it cannot name the claim to charge —
         and such a file also fails `content_hash`, so `stale_sources` skips it
-        entirely and no frozen counter can spin. The other two are the drift checks,
+        entirely and no frozen counter can spin. Two more are the drift checks,
         around the enumeration and around the verify loop, and they share a reason:
         each fires precisely *because* the file no longer hashes to `digest`, so
         charging that content's retry budget would spend a claim on bytes this run is
-        no longer speaking for. The counter is bumped by the next run that scans
+        no longer speaking for. The fourth is the mtime-pairing retry giving up
+        above `verify_and_record`'s own read: it fires *before* this run has created
+        a `pending` marker of its own, so any entry already under `rel` belongs to a
+        prior run, not this one's to charge — passing no `digest` just makes
+        `charge` inert either way. The counter is bumped by the next run that scans
         whatever the file now holds.
         """
         verdict = UnitVerdict(f"{rel}::?", rel, "?", "error", k, detail=detail)
@@ -1626,7 +1917,7 @@ def verify_and_record(
             if not superseded:
                 record(state, verdict)
                 state["stop_attempts"] = 0
-            if attempts is not None:
+            if charge and attempts is not None:
                 pending[rel]["attempts"] = min(
                     attempts + 1, MAX_PENDING_VERIFY_ATTEMPTS
                 )
@@ -1634,7 +1925,46 @@ def verify_and_record(
         return [] if superseded else [verdict]
 
     try:
-        raw = Path(file_path).read_bytes()
+        # Read and stat through the same fd, not `Path.read_bytes()` followed by a
+        # separate `os.stat`: `mtime_ns` below has to describe the exact bytes in
+        # `raw`. Same fd is not enough by itself, though — `read()` and `fstat()`
+        # are still two separate syscalls, so an in-place rewrite by another
+        # process can land between them, or straddle the read itself, without
+        # `raw` reflecting the write that moved the mtime. A transient A -> B -> A
+        # can then leave `raw` holding A while `mtime_ns` reports B's timestamp —
+        # a mismatched pair the content-only checks further down (which compare
+        # bytes, never mtime) would never catch, so a `__TIMESTAMP__` branch could
+        # be verified against a moment `raw` was never at. Bracketing the read
+        # with an `fstat()` on each side and retrying unless they agree rules
+        # that out — and, unlike the `stat`-based verify guard the issue
+        # rejects for being coarse-filesystem-dependent, this bracket isn't:
+        # an mtime delta too small for the filesystem to represent is also too
+        # small for `__TIMESTAMP__` to show, since that macro reads the same
+        # clock. Content itself stays hash-guarded further down regardless
+        # (review feedback on PR #159, issue #150).
+        for _ in range(_MTIME_STABLE_ATTEMPTS):
+            with open(file_path, "rb") as handle:
+                before_ns = os.fstat(handle.fileno()).st_mtime_ns
+                raw = handle.read()
+                mtime_ns = os.fstat(handle.fileno()).st_mtime_ns
+            if mtime_ns == before_ns:
+                break
+        else:
+            # Unlike the `OSError` below, this file is perfectly readable — it
+            # will hash the same as any other content-fresh file — so a stamp
+            # already vouching for what is on disk now means some other run
+            # owns it, and this failure must defer quietly rather than strand
+            # an unclearable `rel::?` on a file `stale_sources` would
+            # otherwise read as fresh. No `digest` passed either: this fires
+            # before this run has created a `pending` marker of its own, so
+            # any entry already under `rel` belongs to a prior run, not this
+            # one's to charge — `charge` is inert either way with `digest`
+            # left `None` (see `_blocking_error`'s docstring).
+            return _blocking_error(
+                f"{file_path} kept changing while being read; could not pair "
+                "its bytes with a stable mtime",
+                unless_superseded=True,
+            )
     except OSError as exc:
         return _blocking_error(str(exc))
 
@@ -1682,10 +2012,55 @@ def verify_and_record(
     # has superseded ours, and the reconcile below would then prune and pre-record
     # against content nobody has on disk.
     marker: dict[str, object] = {}  # only ever read on the path that fills it
+    mtime_unstable = False
     with gate_lock(project_dir):
         state = load_state(project_dir)
-        on_disk = content_hash(file_path)
-        if on_disk == digest:
+        # Re-pair content and mtime right here under the lock, not by reusing the
+        # far-earlier top-of-function read: `extract_function_defs` above shells out
+        # to `forseti list-units`, real wall-clock time in which a touch/rewrite-
+        # with-identical-bytes can move the file's mtime without moving `on_disk`
+        # off `digest` — invisible to a content-only check, so the earlier
+        # `mtime_ns` could describe a moment already behind the one this run is
+        # about to stamp as fresh. Bracketed exactly like the top-of-function read
+        # (`fstat` on each side, retried until they agree), so a stable
+        # `fresh_mtime_ns` is trustworthy paired with whatever `on_disk` reads as.
+        # This has to happen *inside* the same lock that stamps `scanned` — same
+        # reason the plain content re-check already did (see the comment above this
+        # block): reading it first and checking after acquiring the lock would let a
+        # concurrent run's rewrite-and-stamp land in between, so a stale `on_disk`
+        # here would go on to reclaim an entry a concurrent run had already made
+        # correct (review feedback on PR #159, issue #150).
+        on_disk: str | None = None
+        fresh_mtime_ns = mtime_ns
+        for _ in range(_MTIME_STABLE_ATTEMPTS):
+            try:
+                with open(file_path, "rb") as handle:
+                    before_ns = os.fstat(handle.fileno()).st_mtime_ns
+                    on_disk = hashlib.sha256(handle.read()).hexdigest()
+                    fresh_mtime_ns = os.fstat(handle.fileno()).st_mtime_ns
+            except OSError:
+                on_disk = None
+                break
+            if fresh_mtime_ns == before_ns:
+                break
+        else:
+            # Readable on every attempt, just never stable — distinct from
+            # "unreadable" and from "content changed" (both handled below via
+            # `on_disk`), so this gets the top bracket's own message and
+            # treatment instead of being folded into "someone else's content is
+            # on disk". Deferred until the lock releases: `_blocking_error`
+            # takes the same lock itself.
+            mtime_unstable = True
+
+        if not mtime_unstable and on_disk == digest:
+            # `on_disk == digest` means this re-read's bytes are the same bytes
+            # `raw` holds (both hash to `digest`), so `fresh_mtime_ns` — paired
+            # with THIS read, under this same lock — describes those bytes at
+            # least as well as (and more recently than) the `mtime_ns` captured
+            # before `extract_function_defs` ran. Staging still uses `raw` itself
+            # (identical content, already what was enumerated) with this
+            # refreshed timestamp.
+            mtime_ns = fresh_mtime_ns
             # Reconcile + record every current function BEFORE the slow verifies:
             # drop functions the file no longer defines, reset the Stop-gate's
             # patience, and pre-record each — a pointer/array-taking unit as its
@@ -1729,6 +2104,13 @@ def verify_and_record(
                     )
             save_state(project_dir, state)
 
+    if mtime_unstable:
+        return _blocking_error(
+            f"{file_path} kept changing while being read; could not pair "
+            "its bytes with a stable mtime",
+            unless_superseded=True,
+        )
+
     if on_disk != digest:
         # Someone else's content is on disk. If a stamp already vouches for
         # exactly that content, a concurrent run owns this file: it enumerated
@@ -1750,52 +2132,92 @@ def verify_and_record(
         )
 
     verdicts: list[UnitVerdict] = []
-    for d in defs:
-        if d.takes_pointer:
-            # Signature-based, a priori: skip the (meaningless) function-level
-            # verify — no ESBMC call — and report NEEDS_CONTRACT. Classifying by
-            # signature, never by matching "dereference failure" in a cex, keeps a
-            # genuine out-of-bounds bug (same string) from being suppressed.
-            verdicts.append(_needs_contract_verdict(rel, d.name, k))
-            continue
-        verdict = verify_function(file_path, d.name, project_dir=project_dir, k=k)
-        verdicts.append(verdict)
-        with gate_lock(project_dir):  # overwrite the pending entry
-            state = load_state(project_dir)
-            # Ownership-scoped, exactly like the stamp withdrawal below: a
-            # concurrent hook that has re-stamped `scanned` for this file owns
-            # its units too — it re-enumerated and pre-recorded them. This run's
-            # verdict describes content that hook has already superseded, so
-            # writing it could replace that run's fresh `violated` with a stale
-            # `verified`, after which the file hashes fresh and nothing blocks.
-            # Dropping it is safe in the other direction: the owner pre-records
-            # every unit as pending `unknown`, so an un-overwritten unit still
-            # blocks. (The stale verdict stays in the returned list — the
-            # PostToolUse message — but the Stop-gate reads state, not this.)
-            if state.get("scanned", {}).get(rel) == digest:
-                record(state, verdict)
-                save_state(project_dir, state)
+    # Staging costs a write into the user's tree (`_verifiable_source`), so pay it
+    # only when some `d` will actually reach `verify_function` below — never for a
+    # file whose definitions are all pointer/array-taking (classified NEEDS_CONTRACT
+    # a priori, no ESBMC call) or that defines no functions at all. Skipping it then
+    # means a directory ESBMC could never even be asked to read from (unwritable, out
+    # of space) still lets a pointer-only edit through non-blocking, instead of
+    # gating and retrying for a snapshot nothing downstream would have used.
+    verify_ctx: contextlib.AbstractContextManager[str] = (
+        _verifiable_source(file_path, raw, project_dir=project_dir, mtime_ns=mtime_ns)
+        if any(not d.takes_pointer for d in defs)
+        else contextlib.nullcontext(file_path)
+    )
+    try:
+        with verify_ctx as verify_path:
+            for d in defs:
+                if d.takes_pointer:
+                    # Signature-based, a priori: skip the (meaningless)
+                    # function-level verify — no ESBMC call — and report
+                    # NEEDS_CONTRACT. Classifying by signature, never by
+                    # matching "dereference failure" in a cex, keeps a genuine
+                    # out-of-bounds bug (same string) from being suppressed.
+                    verdicts.append(_needs_contract_verdict(rel, d.name, k))
+                    continue
+                verdict = verify_function(
+                    file_path,
+                    d.name,
+                    project_dir=project_dir,
+                    k=k,
+                    verify_path=verify_path,
+                )
+                verdicts.append(verdict)
+                with gate_lock(project_dir):  # overwrite the pending entry
+                    state = load_state(project_dir)
+                    # Ownership-scoped, exactly like the stamp withdrawal below: a
+                    # concurrent hook that has re-stamped `scanned` for this file owns
+                    # its units too — it re-enumerated and pre-recorded them. This run's
+                    # verdict describes content that hook has already superseded, so
+                    # writing it could replace that run's fresh `violated` with a stale
+                    # `verified`, after which the file hashes fresh and nothing blocks.
+                    # Dropping it is safe in the other direction: the owner pre-records
+                    # every unit as pending `unknown`, so an un-overwritten unit still
+                    # blocks. (The stale verdict stays in the returned list — the
+                    # PostToolUse message — but the Stop-gate reads state, not this.)
+                    if state.get("scanned", {}).get(rel) == digest:
+                        record(state, verdict)
+                        save_state(project_dir, state)
+    except UnitsUnavailable as exc:
+        # Could not stage the verify snapshot (ENOSPC, an unwritable directory,
+        # a killed TMPDIR). The stamp and every function's pending `unknown`
+        # were already written above (`on_disk == digest`), so this is exactly
+        # the already-stamped case `unless_superseded` exists for: recording an
+        # unconditional `error` here would strand an unclearable `rel::?` on a
+        # file whose stamp nothing will ever re-check. Deferring quietly still
+        # leaves every unit blocking as pending `unknown` — retried up to
+        # `MAX_PENDING_VERIFY_ATTEMPTS` rather than forgotten. `charge=False`:
+        # the marker this run owns was already bumped to count this very
+        # attempt when it was created above ("counting the start"), so
+        # charging again here would spend it twice — one staging failure would
+        # cost two of the three attempts (review feedback on PR #159, issue
+        # #150).
+        return _blocking_error(
+            str(exc)[:800], digest=digest, unless_superseded=True, charge=False
+        )
 
-    # The verifies read the *real* path, not the snapshot: a verdict has to
-    # describe the translation unit that actually ships, and the snapshot's
-    # mirrored neighbourhood reproduces in-place include resolution only up to
-    # its root — an include reaching above that fails to resolve, which is a
-    # tolerable blocking `error` for an enumeration and an intolerable one for
-    # the verify the whole gate rests on. Plus every counterexample and the
-    # trace's `argv` would name a temp file that no longer exists. So this
-    # boundary is guarded, not eliminated: re-hash once after the
-    # loop and fail closed on drift. Un-stamping is what makes the out-of-band
-    # scan re-gate the file, and the `error` blocks when there is no scan to fall
-    # back on (outside a git work tree); both clear on the next edit's reconcile.
+    # Issue #150: the verify above reads `verify_path` — an immutable snapshot of
+    # `raw`, never the live path — so every verdict just recorded is computed
+    # against content hashing to `digest`, full stop. A transient A -> B -> A
+    # during the verify can no longer taint it: the snapshot's bytes never move.
+    # (One narrow residual survives: a translation unit that `#include`s *itself
+    # by its own literal name* still reaches the live file for that nested read,
+    # since the snapshot cannot occupy that name — see `_verifiable_source` and
+    # `test_self_include_by_own_name_is_a_known_residual`.)
     #
-    # What this catches: a rewrite that lands and *stays* (A → B) during the
-    # verifies. What it does NOT catch — the acknowledged residual — is a
-    # transient A → B → A: a verdict computed against B stays attached to A's
-    # stamp, because the final bytes compare equal. Detecting that needs
-    # verification of immutable content, which costs more than it buys (above).
-    # So the invariant is precisely: if `scanned[rel]` is H, the units were
-    # enumerated from content hashing to H and the file hashed to H both then and
-    # after the loop — NOT that every verdict was computed against H.
+    # What the re-hash below is for now is different: keeping `scanned` fresh
+    # *promptly*, not protecting the verdict. A rewrite that lands and *stays*
+    # (A → B) after this run took its snapshot is nobody's fault, and the
+    # out-of-band scan would eventually re-gate B on its own (`stale_sources`
+    # compares live content-hash to `scanned` on every scan) — but there is no
+    # such scan outside a git work tree, and even inside one it only runs on the
+    # next hook. Withdrawing the stamp here — still ownership-scoped, still
+    # deferring to a concurrent run that has already re-stamped fresher content —
+    # makes that staleness visible immediately instead of silently passing until
+    # someone thinks to re-scan. So the invariant is precisely: if `scanned[rel]`
+    # is H, every verdict recorded alongside it was computed against content
+    # hashing to H (modulo the self-include residual above), and the file itself
+    # still hashed to H at least once, right after the verifies finished.
     withdrawn = False
     drifted = content_hash(file_path) != digest
     if drifted:
