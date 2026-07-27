@@ -1,3 +1,10 @@
+## [1.7.3](https://github.com/pmatos/forseti/compare/v1.7.2...v1.7.3) (2026-07-27)
+
+
+### Bug Fixes
+
+* **claude-adapter:** stage the enumeration snapshot beside the source, not mirrored elsewhere ([#151](https://github.com/pmatos/forseti/issues/151)) ([#160](https://github.com/pmatos/forseti/issues/160)) ([72db093](https://github.com/pmatos/forseti/commit/72db0939563093eb4b54aeb3ef616b850bf2d6bf))
+
 ## [1.7.2](https://github.com/pmatos/forseti/compare/v1.7.1...v1.7.2) (2026-07-27)
 
 
