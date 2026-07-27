@@ -139,19 +139,70 @@ _QUALIFIER_ONLY_RE = re.compile(
 _STATIC_MIN_RE = re.compile(r"\bstatic\b")
 
 # A `#line N` (ISO C) or GNU linemarker `# N "file" flags...` directive, in its
-# literal-digit-sequence form (a macro-valued `#line` is not handled — vanishingly
-# rare outside raw preprocessor output, which this module never sees). Matches
-# right after `#`, so `#define`/`#if`/... (which start with a non-digit, non-
-# "line" word) never do. The captured digit run also tolerates an embedded
-# backslash-continuation (PR #156 follow-up to issue #145: cpp splices `#line
-# \` + newline + `11` into one logical `#line 11` before ever reading it, so a
-# breakpoint recorded here must be too — the same splicing hazard `_IF_RE`/
-# `_ELIF_RE` already guard against for a conditional's own text). The
-# continuation is stripped from the captured group — via `_CONTINUATION_RE` —
-# before the digits are read as an `int`, in `_line_breakpoints`.
+# literal-digit-sequence form. Matches right after `#`, so `#define`/`#if`/...
+# (which start with a non-digit, non-"line" word) never do. The captured digit
+# run also tolerates an embedded backslash-continuation (PR #156 follow-up to
+# issue #145: cpp splices `#line \` + newline + `11` into one logical `#line
+# 11` before ever reading it, so a breakpoint recorded here must be too — the
+# same splicing hazard `_IF_RE`/`_ELIF_RE` already guard against for a
+# conditional's own text). The continuation is stripped from the captured
+# group — via `_CONTINUATION_RE` — before the digits are read as an `int`, in
+# `_line_breakpoints`.
 _LINE_DIRECTIVE_RE = re.compile(
     r"^[ \t]*#[ \t]*(?:line[ \t]+)?((?:\\\r?\n)*\d(?:\\\r?\n|\d)*)\b", re.MULTILINE
 )
+
+# A macro-valued `#line NAME` (issue #165 follow-up to #156/#157): GNU's
+# linemarker form is always digits (never a macro), so only the ISO `line`
+# spelling is matched here — the `\d` case above already owns the digit form,
+# and requiring the first non-continuation character to be a letter/underscore
+# keeps the two regexes mutually exclusive at the same start position. The
+# named macro is resolved against `_line_breakpoints`' own tiny macro-value
+# table (see `_DEFINE_RE`), which only ever tracks a plain integer literal — a
+# `#line` naming anything else (an unknown identifier, a function-like macro,
+# one bound to a non-literal expression) stays unresolved, the same graceful
+# no-breakpoint fallback this scan already uses for every condition it cannot
+# evaluate.
+_LINE_DIRECTIVE_MACRO_RE = re.compile(
+    r"^[ \t]*#[ \t]*line[ \t]+((?:\\\r?\n)*[A-Za-z_]\w*)\b", re.MULTILINE
+)
+
+# `#define NAME <rest of line>` and `#undef NAME`, tracked only so a
+# macro-valued `#line NAME` (`_LINE_DIRECTIVE_MACRO_RE`) can be resolved —
+# this is deliberately not a general macro table. `_DEFINE_RE`'s second group
+# is the *entire* remainder of the line, exactly like `_IF_RE`'s condition
+# group: `_line_breakpoints` strips its continuation and whitespace, then
+# accepts it only if what is left is a bare unsigned-integer literal (see
+# `_INT_LITERAL_RE`) — a function-like macro's `(params) body`, an empty
+# replacement (`#define DEBUG`), or any non-literal expression all fail that
+# check and simply drop any existing binding for the name, exactly as an
+# explicit `#undef` would. A binding is *never* established while a
+# `#define`/`#undef` cannot itself be proven live or dead (`_line_breakpoints`'
+# own `stack` is non-empty) — only ever unbound: this scan does not have the
+# macro state to know which of an `#ifdef`'s two arms cpp actually takes, so
+# recording whichever arm happened to run last would risk resolving `#line
+# NAME` to a value cpp itself would never produce, the same failure mode
+# `_IF_RE`'s own comment names as the reason `#ifdef`/non-literal `#if` stay
+# opaque. A `#define`/`#undef` inside a branch already proven dead (a literal
+# `#if 0`) is excluded exactly like a `#line` there — cpp never reaches it
+# either, so it must not disturb an existing trustworthy binding. This is
+# still only as trustworthy as the scan's usual blind spot: it reads one
+# file's own text, so a `#define`/`#undef` of the same name arriving via an
+# `#include` between this file's own binding and its `#line NAME` is invisible
+# and can leave a stale value in the table — no worse than every other gap
+# this module already has for `#include`d macro state, but worth naming here
+# since this is the first place that state can produce a wrong *value*
+# instead of just a missed opaque condition.
+_DEFINE_RE = re.compile(
+    r"^[ \t]*#[ \t]*define[ \t]+(\w+)((?:\\\r?\n|[^\n])*)$", re.MULTILINE
+)
+_UNDEF_RE = re.compile(r"^[ \t]*#[ \t]*undef[ \t]+(\w+)\b", re.MULTILINE)
+
+# A bare unsigned-integer literal, nothing else — what `_DEFINE_RE`'s captured
+# replacement text must reduce to (after continuation-stripping and
+# whitespace-trimming) for `_line_breakpoints` to trust it as a `#line`-usable
+# value. `fullmatch` so a stray trailing character can never slip through.
+_INT_LITERAL_RE = re.compile(r"[0-9]+")
 
 # A literal `#if 0`/`#elif 0` or `#if 1`/`#elif 1` (the complete condition is
 # exactly the digit `0` or `1`, nothing else) are the only conditionals this
@@ -170,7 +221,15 @@ _LINE_DIRECTIVE_RE = re.compile(
 # follow-up to issue #145: cpp splices a condition written as `#if \` +
 # newline + `0` into one logical `#if 0` before ever evaluating it, so
 # `_cond_events` strips any spliced newline out of the captured text — via
-# `_CONTINUATION_RE` — before comparing it to the literal `"0"`/`"1"`).
+# `_CONTINUATION_RE` — before comparing it to the literal `"0"`/`"1"`). A
+# condition wrapped in balanced parens spanning its *entire* text — `(0)`,
+# `((1))` — is peeled down to the bare digit first, via
+# `_strip_literal_parens` (issue #165 follow-up to #156: cpp always evaluates
+# `#if (0)` as false, so leaving the parens in place and missing the exact
+# `"0"`/`"1"` match would wrongly leave it opaque). A paren pair that does not
+# span the whole condition — `(0 || FEATURE)`, `(0) || FEATURE` — is left
+# alone by that same whole-span check and still falls through to opaque,
+# exactly like the unparenthesized `0 || FEATURE` case above.
 #
 # `#ifdef`/`#ifndef` and any other `#if`/`#elif <expr>` stay opaque — their
 # condition needs macro state this scan does not have — so they are tracked
@@ -215,6 +274,38 @@ _ENDIF_RE = re.compile(r"^[ \t]*#[ \t]*endif\b", re.MULTILINE)
 # (universal newlines), since `annotate_array_extents` is also callable
 # directly on arbitrary text.
 _CONTINUATION_RE = re.compile(r"\\\r?\n")
+
+
+def _strip_literal_parens(text: str) -> str:
+    """`text` with any balanced parens spanning its *entire* length peeled off,
+    recursively — `"(0)"` and `"((1))"` both reduce to their bare digit.
+
+    A pair is only peeled when its own open paren's matching close is the
+    text's last character: `"(0 || FEATURE)"` reduces once (to `"0 ||
+    FEATURE"`, then stops, since that no longer starts with `(`), but
+    `"(0) || FEATURE"` is never touched at all — its leading `(` closes at
+    index 2, well before the end, so the pair wraps only a subexpression, not
+    the whole condition. Both are deliberately left as the non-literal text
+    they are — `_cond_events` still calls this before its exact `"0"`/`"1"`
+    lookup, so anything this leaves unpeeled falls through to opaque exactly
+    like an unparenthesized compound condition already does.
+    """
+    text = text.strip()
+    while text.startswith("(") and text.endswith(")"):
+        depth = 0
+        wraps_whole = False
+        for i, ch in enumerate(text):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    wraps_whole = i == len(text) - 1
+                    break
+        if not wraps_whole:
+            break
+        text = text[1:-1].strip()
+    return text
 
 
 @dataclass(frozen=True)
@@ -898,6 +989,14 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
     inline (see `_IF_RE`/`_ELIF_RE`/`_LINE_DIRECTIVE_RE`) and stripped via
     `_CONTINUATION_RE` before the captured text is read, not handled by this
     exclusion.
+
+    A ``#line`` naming a macro (``#line NAME``) resolves against a tiny
+    ``#define``/``#undef``-tracking table this scan builds as it walks
+    forward (issue #165 follow-up to #156/#157) — see `_DEFINE_RE`'s comment
+    for exactly which bindings are trusted. A literal ``#if (0)``/``#elif
+    (0)``/... — parens spanning the whole condition, however deeply nested —
+    is normalized to the bare digit before the ``"0"``/``"1"`` comparison (see
+    `_strip_literal_parens`), the same issue's second follow-up.
     """
     continuation_starts = {
         m.end() for m in _CONTINUATION_RE.finditer(source_no_comments)
@@ -919,7 +1018,8 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
             (
                 m.start(),
                 kinds_by_literal.get(
-                    _CONTINUATION_RE.sub("", m.group(1)).strip(), opaque_kind
+                    _strip_literal_parens(_CONTINUATION_RE.sub("", m.group(1))),
+                    opaque_kind,
                 ),
                 None,
             )
@@ -933,7 +1033,10 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
         + _cond_events(_ELIF_RE, {"0": "elif0", "1": "elif1"}, "elifop")
         + _events(_ELSE_RE, "else")
         + _events(_ENDIF_RE, "endif")
-        + _events(_LINE_DIRECTIVE_RE, "line", keep_match=True),
+        + _events(_LINE_DIRECTIVE_RE, "line", keep_match=True)
+        + _events(_LINE_DIRECTIVE_MACRO_RE, "line_macro", keep_match=True)
+        + _events(_DEFINE_RE, "define", keep_match=True)
+        + _events(_UNDEF_RE, "undef", keep_match=True),
         key=lambda event: event[0],
     )
     # One `(dead, decided)` pair per open conditional. `dead` is whether the
@@ -942,8 +1045,13 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
     # can never reach any later `#elif`/`#else` in the chain, however live
     # that arm looks in isolation (PR #156 follow-up to issue #145).
     stack: list[tuple[bool, bool]] = []
+    # `#line NAME`'s tiny macro-value table (issue #165 follow-up to #156),
+    # populated by `#define`/emptied by `#undef` as the scan walks forward —
+    # see `_DEFINE_RE`.
+    macros: dict[str, int] = {}
     breakpoints: list[tuple[int, int]] = []
     for pos, kind, match in events:
+        dead = any(is_dead for is_dead, _ in stack)
         if kind == "if0":
             stack.append((True, False))
         elif kind == "if1":
@@ -969,7 +1077,34 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
         elif kind == "endif":
             if stack:
                 stack.pop()
-        elif match is not None and not any(dead for dead, _ in stack):
+        elif kind == "define":
+            if match is not None and not dead:
+                name = match.group(1)
+                if stack:
+                    # Some enclosing branch is not provably dead but also not
+                    # provably the chain's only reachable arm — this scan
+                    # cannot tell whether cpp ever executes this `#define`, so
+                    # it must not *establish* a binding, only drop a
+                    # previously-trustworthy one for the same name (same
+                    # fail-closed stance `_IF_RE`'s own comment gives for
+                    # `#ifdef`).
+                    macros.pop(name, None)
+                else:
+                    value_text = _CONTINUATION_RE.sub("", match.group(2)).strip()
+                    if _INT_LITERAL_RE.fullmatch(value_text):
+                        macros[name] = int(value_text)
+                    else:
+                        macros.pop(name, None)
+        elif kind == "undef":
+            if match is not None and not dead:
+                macros.pop(match.group(1), None)
+        elif kind == "line_macro":
+            if match is not None and not dead:
+                name = _CONTINUATION_RE.sub("", match.group(1))
+                if name in macros:
+                    physical = source_no_comments.count("\n", 0, pos) + 1
+                    breakpoints.append((physical, macros[name]))
+        elif match is not None and not dead:
             physical = source_no_comments.count("\n", 0, pos) + 1
             presumed = int(_CONTINUATION_RE.sub("", match.group(1)))
             breakpoints.append((physical, presumed))
