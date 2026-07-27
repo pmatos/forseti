@@ -74,12 +74,29 @@ produces a ``DeclRefExpr`` — so unlike a function pointer, this path leaves no
 reference of *any* kind for `parse_address_escapes` to find either. Worse, the
 string itself is never printed by clang's own AST dump (checked against both
 esbmc's pinned clang and a current upstream one), so no scan run over this
-format can tell which symbol, if any, a given inline-asm block invokes.
-`parse_asm_statements` therefore withholds unconditionally: every such block
-found in `source` opens the caller set for whatever function is under
-discharge, since none can be ruled out. That is wider than strictly necessary
-whenever the block does something unrelated (a memory barrier, a syscall), but
-narrower is not an option this AST format supports.
+format can tell which symbol, if any, a given ``GCCAsmStmt`` invokes.
+`parse_asm_statements` therefore withholds unconditionally, swept over the
+*whole* translation unit rather than just `source` — a block inside a
+function defined in an included header is exactly as invisible to the caller
+enumeration as one in `source` itself, so scoping to `source` would silently
+drop that path rather than merely miss it (issue #167). That is wider than
+strictly necessary whenever the block does something unrelated (a memory
+barrier, a syscall), and it means a translation unit that pulls in a header
+with unrelated inline asm can never reach ``DISCHARGED_VERIFIED`` at all — but
+narrower is not an option this AST format supports for a ``GCCAsmStmt``
+(verified against ``sys/io.h``: its port-I/O wrappers convert and verify
+cleanly, so a TU that includes it really does pay this cost, not just at
+``--parse-tree-only`` time). A file-scope ``asm(...)`` is the one shape this
+format *can* narrow: clang prints its text in full, so `parse_asm_statements`
+opens the set only when `function`'s name actually appears in it — though with
+esbmc 8.3.0 that narrowing never actually runs against a real TU:
+``FileScopeAsmDecl`` fails goto conversion outright, for *any* function in the
+TU, regardless of which one is under discharge, so S2 itself returns
+``ERROR`` before this stage is reached
+(`test_file_scope_asm_fails_esbmc_conversion_before_discharge_runs` pins that
+against a live run). The narrowing is still correct and still tested — at the
+parser level and with an injected `asm_statements_fn` — for the day a fork
+adds support.
 
 **A recursive callee is a call site of itself.** Asserting at the entry rather than
 transplanting a contract has one property a modular check would not: the assert
@@ -326,7 +343,7 @@ def discharge_precondition(
     address_escapes_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
     aliases_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
     implicit_invocations_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
-    asm_statements_fn: Callable[[Path], tuple[str, ...]] | None = None,
+    asm_statements_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
 ) -> DischargeResult:
     """Verify `source::function` against its precondition, then discharge it.
 
@@ -337,7 +354,9 @@ def discharge_precondition(
     `implicit_invocations_fn` and `asm_statements_fn` inject the esbmc calls for
     tests; production adds a ``-I`` for the source's own directory so the
     generated copy's relative ``#include``\\ s still resolve. `asm_statements_fn`
-    takes no `symbol` — see `parse_asm_statements` for why one cannot narrow it.
+    still gets `function` — a ``GCCAsmStmt`` can never be narrowed by it (see
+    `parse_asm_statements`), but a ``FileScopeAsmDecl`` can, so it is threaded
+    through like every other listing here.
     """
     lister = _memoized(
         list_units_fn
@@ -388,7 +407,9 @@ def discharge_precondition(
         )
     )
     asm_statements = asm_statements_fn or (
-        lambda src: list_asm_statements(src, esbmc_bin=esbmc_bin, timeout_s=timeout_s)
+        lambda src, sym: list_asm_statements(
+            src, sym, esbmc_bin=esbmc_bin, timeout_s=timeout_s
+        )
     )
     args = (
         source,
@@ -419,7 +440,7 @@ def _discharge(
     address_escapes_fn: Callable[[Path, str], tuple[str, ...]],
     aliases_fn: Callable[[Path, str], tuple[str, ...]],
     implicit_invocations_fn: Callable[[Path, str], tuple[str, ...]],
-    asm_statements_fn: Callable[[Path], tuple[str, ...]],
+    asm_statements_fn: Callable[[Path, str], tuple[str, ...]],
     max_len: int,
     ladder_cap: int,
     raw: VerifyPort,
@@ -491,7 +512,7 @@ def _discharge(
         escaped = address_escapes_fn(source, function)
         aliased = aliases_fn(source, function)
         implicit = implicit_invocations_fn(source, function)
-        asm_sites = asm_statements_fn(source)
+        asm_sites = asm_statements_fn(source, function)
     except ListUnitsError as exc:
         return DischargeResult(function, Assessment.ERROR, str(exc), unit_result)
     unenumerable = (
@@ -539,8 +560,7 @@ def _discharge(
             CallerCheck(
                 site,
                 CallerOutcome.UNRESOLVED,
-                "contains a GNU inline-assembly statement whose text clang's own "
-                "AST dump never prints, so it cannot be shown not to reach "
+                "contains or is named by GNU inline assembly that may invoke "
                 f"{function}() by a path that leaves no `DeclRefExpr` for this "
                 "enumeration to ever see",
             )

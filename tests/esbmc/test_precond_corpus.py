@@ -605,7 +605,110 @@ def test_an_inline_asm_call_opens_the_caller_set(tmp_path: Path) -> None:
     outcomes = {c.caller: c.outcome for c in result.callers}
     assert outcomes["frame_checksum"] is CallerOutcome.DISCHARGED
     assert outcomes["via_asm"] is CallerOutcome.UNRESOLVED
-    assert "GNU inline-assembly statement" in result.label
+    assert "GNU inline assembly" in result.label
+
+
+_HEADER_ASM_CALLER = """\
+static inline uint32_t header_asm_client(const uint8_t *p) {
+    uint32_t result;
+    asm("call sum_bytes" : "=a"(result) : "D"(p));
+    return result;
+}
+"""
+
+_TU_WITH_HEADER_ASM_CALLER = """\
+#include <stddef.h>
+#include <stdint.h>
+
+static uint32_t sum_bytes(const uint8_t *buf, size_t len) {
+    uint32_t acc = 0;
+    for (size_t i = 0; i < len; i++) acc += buf[i];
+    return acc;
+}
+
+#include "header_asm.h"
+
+uint32_t frame_checksum(const uint8_t *frame, size_t len) {
+    return sum_bytes(frame, len);
+}
+"""
+
+
+def test_asm_in_a_header_defined_function_withholds_the_upgrade(
+    tmp_path: Path,
+) -> None:
+    # PR #176 review (issue #167 follow-up): `header_asm_client`'s
+    # `asm("call sum_bytes")` sits in an *included header*, not the file under
+    # test. An earlier version of this fix scoped the asm scan to the file
+    # under test — the same reasoning `list_units` uses to narrow to enumerable
+    # units — but a `GCCAsmStmt` is invisible to the call graph regardless of
+    # which file its enclosing function is declared in, so that scoping
+    # silently dropped this call path instead of merely missing it. Upgrading
+    # on the strength of `frame_checksum` alone would let this header's
+    # unchecked asm call ride to DISCHARGED_VERIFIED.
+    (tmp_path / "header_asm.h").write_text(_HEADER_ASM_CALLER)
+    src = tmp_path / "tu.c"
+    src.write_text(_TU_WITH_HEADER_ASM_CALLER)
+    result = discharge_precondition(src, function="sum_bytes", max_len=MAX_LEN)
+    assert result.assessment is Assessment.ASSUMED_VERIFIED, result.label
+    outcomes = {c.caller: c.outcome for c in result.callers}
+    assert outcomes["frame_checksum"] is CallerOutcome.DISCHARGED
+    assert outcomes["header_asm_client"] is CallerOutcome.UNRESOLVED
+    assert "GNU inline assembly" in result.label
+
+
+_FILE_SCOPE_ASM_CALLER = """\
+#include <stddef.h>
+#include <stdint.h>
+
+static uint32_t sum_bytes(const uint8_t *buf, size_t len) {
+    uint32_t acc = 0;
+    for (size_t i = 0; i < len; i++) acc += buf[i];
+    return acc;
+}
+
+uint32_t frame_checksum(const uint8_t *frame, size_t len) {
+    return sum_bytes(frame, len);
+}
+
+asm(
+    "wrapper:\\n"
+    "    call sum_bytes\\n"
+    "    ret\\n"
+);
+"""
+
+
+def test_file_scope_asm_fails_esbmc_conversion_before_discharge_runs(
+    tmp_path: Path,
+) -> None:
+    # PR #176 review (issue #167 follow-up) raised the same soundness concern
+    # for a file-scope `asm(...)` that opened this issue for a `GCCAsmStmt`: a
+    # hand-written assembly function can call `sum_bytes` while leaving no
+    # `DeclRefExpr` for the ordinary caller enumeration to see. Unlike a
+    # `GCCAsmStmt`, clang prints a `FileScopeAsmDecl`'s text in full — verified
+    # empirically under `--parse-tree-only` — so `parse_asm_statements` narrows
+    # it by name instead of opening the set unconditionally; that logic is
+    # covered directly (fake-injected) in tests/precond/test_discharge.py and
+    # at the parser level in tests/esbmc/test_units.py.
+    #
+    # This corpus test pins something else: esbmc 8.3.0's *conversion* pass
+    # (not `--parse-tree-only`, which only dumps the tree) cannot build a goto
+    # program for any translation unit that contains a `FileScopeAsmDecl`
+    # anywhere, regardless of which function is targeted — verified directly
+    # with `esbmc fsasm.c --function frame_checksum`. So S2 itself fails with
+    # ERROR before discharge's asm-narrowing logic is ever reached, which
+    # closes today's version of the exact soundness gap the review raised by a
+    # side door (ERROR, never a false DISCHARGED_VERIFIED) — but that is an
+    # artifact of the pinned fork (ADR-0004), not a design guarantee. If a
+    # future fork starts converting `FileScopeAsmDecl`, this assertion breaks
+    # and the narrowing logic needs re-verifying against the real pipeline,
+    # not just the fake-injected and parser-level tests.
+    src = tmp_path / "file_scope_asm.c"
+    src.write_text(_FILE_SCOPE_ASM_CALLER)
+    result = discharge_precondition(src, function="sum_bytes", max_len=MAX_LEN)
+    assert result.assessment is Assessment.ERROR, result.label
+    assert "FileScopeAsm" in result.label
 
 
 _FILE_IDENTITY_TEMPLATE = """\

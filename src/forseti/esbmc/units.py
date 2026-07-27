@@ -379,20 +379,13 @@ def _error_line(text: str) -> str:
 
 @dataclass
 class _AstNode:
-    """One node of the walked AST, with its position among its parent's children.
-
-    `file` is the presumed file at this node's own line — the same value `_walk`
-    yields alongside it, just pinned to the node rather than to the moment of
-    traversal. Read by `_enclosing_function_file` off a `FunctionDecl` higher up
-    the stack.
-    """
+    """One node of the walked AST, with its position among its parent's children."""
 
     depth: int
     kind: str
     rest: str
     index: int
     children: int = 0
-    file: str = ""
 
 
 @dataclass
@@ -438,7 +431,7 @@ def _walk(ast_text: str) -> Iterator[tuple[list[_AstNode], str, str, str, int]]:
         if stack:
             index = stack[-1].children
             stack[-1].children += 1
-        stack.append(_AstNode(depth, kind, rest, index, file=current_file))
+        stack.append(_AstNode(depth, kind, rest, index))
         yield stack, kind, rest, current_file, current_line
 
 
@@ -608,25 +601,6 @@ def _enclosing_name(stack: list[_AstNode]) -> str:
     return _FILE_SCOPE
 
 
-def _enclosing_function_file(stack: list[_AstNode]) -> str:
-    """The file the nearest enclosing ``FunctionDecl`` was itself declared in.
-
-    Distinct from the current file at the node on top of `stack`: a body
-    statement expanded from a macro *defined in a header* carries that header's
-    location, even though the function enclosing it was declared in `source`
-    (issue #167). A ``GCCAsmStmt`` is always a statement inside a function
-    body — file-scope ``asm(...)`` is a distinct ``FileScopeAsmDecl`` node
-    (verified with a live `esbmc --parse-tree-only` run) — so the no-match
-    fallback below is unreachable for this module's only caller; `next`'s
-    default keeps that dead arm out of branch coverage instead of asserting a
-    return type that isn't `str`.
-    """
-    return next(
-        (node.file for node in reversed(stack[:-1]) if node.kind == "FunctionDecl"),
-        "",
-    )
-
-
 def parse_address_escapes(ast_text: str, symbol: str) -> tuple[str, ...]:
     """Sites naming `symbol` **outside a direct call**, by enclosing declaration.
 
@@ -762,8 +736,8 @@ def parse_symbol_aliases(ast_text: str, symbol: str) -> tuple[str, ...]:
     return tuple(aliases)
 
 
-def parse_asm_statements(ast_text: str, source: str | Path) -> tuple[str, ...]:
-    """Declarations in `source` that contain a GNU inline-assembly statement.
+def parse_asm_statements(ast_text: str, symbol: str) -> tuple[str, ...]:
+    """Sites in the translation unit that GNU inline assembly might route to `symbol`.
 
     A `GCCAsmStmt` can invoke any symbol in the translation unit by name
     (``asm("call f")``), with no ``DeclRefExpr`` and hence no `Unit.calls` edge
@@ -773,50 +747,58 @@ def parse_asm_statements(ast_text: str, source: str | Path) -> tuple[str, ...]:
     clang, a `GCCAsmStmt` node's only children are its operand expressions
     (``result``, ``x`` for ``asm("..." : "=a"(result) : "D"(x))``); the asm
     string itself is never printed. There is therefore no substring to compare
-    against a `symbol` the way `parse_symbol_aliases`' targets or
-    `parse_implicit_invocations`' attributes can be, so every block found is
-    reported, unconditionally, naming the declaration that encloses it — the
-    only reading that does not silently drop a call path this scan cannot see
-    at all.
+    against `symbol`, so every block found is reported unconditionally, naming
+    the declaration that encloses it — the only reading that does not silently
+    drop a call path this scan cannot see at all.
 
-    Scoped to `source` like `parse_units`, not swept over the whole dump like
-    `parse_address_escapes`: low-level headers genuinely contain inline asm for
-    unrelated reasons (``sys/io.h``'s port-I/O wrappers, measured at 18
-    `GCCAsmStmt` nodes for a single header), and treating every one of those as
-    an open caller set for every function in every translation unit that merely
-    includes such a header would not make discharge conservative, it would
-    disable it. The residual is the same one `parse_external_callers` already
-    documents for a `static inline` header definition: asm inside a function
-    *defined* in a header goes unseen here, whether it is a system header like
-    ``sys/io.h`` or the source's own project header pulled in by a local
-    ``#include "..."``.
+    Swept over the *whole* translation unit, like `parse_address_escapes`,
+    `parse_symbol_aliases` and `parse_implicit_invocations` — not narrowed to
+    one file the way `parse_units` is. A function *defined in an included
+    header* can contain ``asm("call f")`` exactly as one defined in the file
+    under test can, and the block leaves no reference of any kind for anything
+    else in this module to catch by name instead (issue #167 follow-up); a
+    scan that only looked at the file under test would silently drop that
+    call path, which is unsound, not merely incomplete. The cost is real: a
+    translation unit that happens to pull in a header with unrelated inline
+    asm (``sys/io.h``'s port-I/O wrappers, measured at 18 `GCCAsmStmt` nodes
+    for that one header alone) now permanently withholds discharge for every
+    function in it — the honest price of a format that never prints what a
+    `GCCAsmStmt` actually invokes.
 
-    The scoping check is therefore on the *enclosing function's* declared file
-    (`_enclosing_function_file`), not the `GCCAsmStmt` node's own location: a
-    call written through a macro (``#define CALL_F() asm("call f")``) defined in
-    a header gets that header's location on the statement itself, even when the
-    macro is invoked from an ordinary function defined in `source` — the
-    statement's own file would wrongly read as the header's and drop the site
-    (issue #167). `_enclosing_function_file` still traces back to `_loc_file`,
-    which reads a node's range *start* rather than its `point` — so a
-    return-type macro from a header shifts a `FunctionDecl`'s own presumed file
-    the same way it shifts `Unit.def_line`'s file (`_loc_file`'s docstring): a
-    function's own start-based file already reads as the header's, `parse_units`
-    already drops it as a unit entirely (measured), and an asm site inside it
-    stays unseen here for that same, pre-existing reason.
+    A file-scope ``asm(...)`` (``FileScopeAsmDecl``) is narrower: unlike
+    `GCCAsmStmt`, clang prints its full text as a ``StringLiteral`` child
+    (verified with a live `esbmc --parse-tree-only` run — the text is not
+    truncated even across the embedded newlines a multi-line block like
+    ``asm("wrapper:\\n\\tcall f\\n\\tret")`` prints escaped, not literal, nor at
+    an embedded ``\\"`` — though that one *would* truncate the match, since
+    `_TARGET_NAME_RE` stops at the first quote it sees). A block that only
+    renames or declares a symbol unrelated to `symbol` does not have to cost a
+    withheld discharge, so this reports one only when `symbol` appears in it as
+    a whole word — the reading a hand-written assembly function that itself
+    calls ``f`` would need. It sits outside any function, so `_enclosing_name`
+    reports it as `_FILE_SCOPE`.
 
-    A file-scope ``asm(...)`` (``FileScopeAsmDecl``) is a different node kind
-    that *does* print its string and sits outside any function to begin with —
-    it defines or renames a symbol rather than calling one from within a body,
-    so it is not a caller-set concern this module tracks.
+    This narrowing is real code with real unit and fake-injected coverage, but
+    it does not yet run against an actual translation unit: esbmc 8.3.0's
+    frontend cannot *convert* a ``FileScopeAsmDecl`` at all (only dump it under
+    ``--parse-tree-only``), so any TU containing one fails S2 verification
+    outright before `parse_asm_statements` is ever called for real — see
+    `discharge_precondition`'s module docstring and
+    `test_file_scope_asm_fails_esbmc_conversion_before_discharge_runs`.
     """
-    source_norm = os.path.normpath(str(source))
+    target = re.compile(r"\b" + re.escape(symbol) + r"\b")
     sites: dict[str, None] = {}
-    for stack, kind, _rest, _file, _line in _walk(ast_text):
-        if kind == "GCCAsmStmt" and _is_target(
-            _enclosing_function_file(stack), source_norm
-        ):
+    for stack, kind, rest, _file, _line in _walk(ast_text):
+        if kind == "GCCAsmStmt":
             sites[_enclosing_name(stack)] = None
+        elif (
+            kind == "StringLiteral"
+            and len(stack) > 1
+            and stack[-2].kind == "FileScopeAsmDecl"
+        ):
+            text = _TARGET_NAME_RE.search(rest)
+            if text and target.search(text.group(1)):
+                sites[_enclosing_name(stack)] = None
     return tuple(sites)
 
 
@@ -1293,19 +1275,20 @@ def list_implicit_invocations(
 
 def list_asm_statements(
     source: Path,
+    symbol: str,
     *,
     esbmc_bin: str = "esbmc",
     timeout_s: float = 30.0,
     extra_flags: Sequence[str] = (),
 ) -> tuple[str, ...]:
-    """Declarations in `source` that contain a GNU inline-assembly statement.
+    """Sites in `source`'s translation unit that GNU asm might route to `symbol`.
 
-    The fifth way the caller enumeration can be incomplete, and unlike the other
-    four, one no `symbol` can narrow — see `parse_asm_statements`. Raises
-    `ListUnitsError` on the same conditions as `list_units`.
+    The fifth way the caller enumeration can be incomplete — see
+    `parse_asm_statements`. Raises `ListUnitsError` on the same conditions as
+    `list_units`.
     """
     ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
-    return parse_asm_statements(ast_text, source)
+    return parse_asm_statements(ast_text, symbol)
 
 
 def list_units(

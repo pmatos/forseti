@@ -1505,14 +1505,14 @@ def test_parse_address_escapes_keeps_a_reference_it_cannot_name() -> None:
 # expressions (`result`, `x` below, for `asm("..." : "=a"(result) : "D"(x))`) —
 # the assembly *string* itself, which could spell `call helper`, is never
 # printed. `bare_asm` is the operand-free shape (a bare `asm("nop")`, a leaf
-# node with no children at all). `FileScopeAsmDecl` is a different node kind
-# that *does* print its string (`StringLiteral` child) and sits outside any
-# function — not a call site, so it must never be mistaken for one. And
-# `header_asm` lives in `/tmp/other.h`, not `_TARGET`, standing in for a header
-# like `sys/io.h` whose port-I/O wrappers use inline asm for reasons unrelated
-# to `_TARGET`'s own callers (measured at 18 `GCCAsmStmt` nodes for that one
-# header) — the scan must stay scoped to `_TARGET` or every function in every
-# TU that merely includes such a header would become permanently unresolved.
+# node with no children at all). `header_asm` lives in `/tmp/other.h`, standing
+# in for a function defined in an included header — it must be reported too:
+# an included header's `asm("call f")` is exactly as invisible to the call
+# graph as one in the file under test, so scoping this scan to one file would
+# silently drop that path (issue #167 follow-up). `FileScopeAsmDecl` is a
+# different node kind that *does* print its string, so its `my_symbol` never
+# matches a lookup for `helper` below — the negative half of narrowing it by
+# name (see `_FILE_SCOPE_ASM_AST` for the positive half).
 _ASM_AST = """\
 TranslationUnitDecl 0x7000 <<invalid sloc>> <invalid sloc>
 |-FunctionDecl 0x7001 </tmp/foo.c:1:1, col:38> col:6 used helper 'int (int)'
@@ -1542,54 +1542,47 @@ TranslationUnitDecl 0x7000 <<invalid sloc>> <invalid sloc>
 
 
 def test_parse_asm_statements_reports_every_enclosing_declaration() -> None:
-    # Neither reports which symbol, if any, is invoked — the whole reason both
-    # `caller`'s operand-bearing asm and `bare_asm`'s bare one must be reported
-    # unconditionally, since there is no substring anywhere in this dump to
-    # narrow either down to a specific callee.
-    assert parse_asm_statements(_ASM_AST, _TARGET) == ("caller", "bare_asm")
+    # Neither `caller`'s operand-bearing asm nor `bare_asm`'s bare one names
+    # which symbol, if any, is invoked, so both are reported unconditionally —
+    # and so is `header_asm`, defined in a different file entirely: a
+    # `GCCAsmStmt` is swept over the whole translation unit, not just the file
+    # under test (issue #167 follow-up).
+    assert parse_asm_statements(_ASM_AST, "helper") == (
+        "caller",
+        "bare_asm",
+        "header_asm",
+    )
 
 
-def test_parse_asm_statements_ignores_a_different_translation_unit_file() -> None:
-    # `header_asm`'s asm sits in `/tmp/other.h`, a stand-in for a header whose
-    # inline asm has nothing to do with `_TARGET`'s own callers.
-    sites = parse_asm_statements(_ASM_AST, _TARGET)
-    assert "header_asm" not in sites
+def test_parse_asm_statements_ignores_file_scope_asm_naming_a_different_symbol() -> (
+    None
+):
+    # `FileScopeAsmDecl` prints its string in full, unlike `GCCAsmStmt`, so it
+    # can be narrowed by name: `.global my_symbol` never mentions `helper`, so
+    # it must not surface as a third, unrelated site.
+    assert "<file scope>" not in parse_asm_statements(_ASM_AST, "helper")
 
 
-def test_parse_asm_statements_ignores_file_scope_asm() -> None:
-    # `FileScopeAsmDecl` prints a string and sits outside any function — it
-    # defines/renames a symbol rather than calling one from within a body, so
-    # it must never surface as a caller-set concern: the full result is exactly
-    # `caller`/`bare_asm`, with no third site (named or `<file scope>`) for it.
-    assert parse_asm_statements(_ASM_AST, _TARGET) == ("caller", "bare_asm")
-
-
-# Verified empirically (issue #167 follow-up) with a live
-# `esbmc --parse-tree-only` run over `#define CALL_F() asm("call f")` in a
-# header, invoked from an ordinary function in the source file: clang assigns
-# the `GCCAsmStmt` its *spelling* location — the macro definition, in the
-# header — not the location of the call site that expanded it. `macro_caller`
-# stands in for that shape: its own `FunctionDecl` is in `_TARGET`, but its
-# `GCCAsmStmt` reads `/tmp/macro.h`. `header_fn` is the mirror image, pinning
-# the fix's direction: its `FunctionDecl` is in `/tmp/other.h` but its
-# `GCCAsmStmt` reads `_TARGET` — scoping by the statement's own location would
-# wrongly include it, and scoping by *both* locations (an OR) would too.
-_MACRO_ASM_AST = """\
-TranslationUnitDecl 0x8000 <<invalid sloc>> <invalid sloc>
-|-FunctionDecl 0x8010 </tmp/foo.c:3:1, line:6:1> line:3:5 macro_caller 'void (void)'
-| `-CompoundStmt 0x8011 <col:19, line:6:1>
-|   `-GCCAsmStmt 0x8012 </tmp/macro.h:1:18, col:30>
-`-FunctionDecl 0x8020 </tmp/other.h:1:1, col:38> col:6 header_fn 'void (void)'
-  `-CompoundStmt 0x8021 <col:20, col:38>
-    `-GCCAsmStmt 0x8022 </tmp/foo.c:8:5, col:19>
+# Verified with a live `esbmc --parse-tree-only` run (issue #167 follow-up):
+# unlike `GCCAsmStmt`, a `FileScopeAsmDecl`'s `StringLiteral` child prints its
+# text in full, embedded newlines included (escaped, not literal) — so a
+# hand-written assembly function such as the reviewer's
+# ``asm("wrapper:\n    call helper\n    ret\n")`` can be matched by name.
+_FILE_SCOPE_ASM_AST = """\
+TranslationUnitDecl 0x9000 <<invalid sloc>> <invalid sloc>
+`-FileScopeAsmDecl 0x9010 <line:1:1, line:4:1> line:1:1
+  `-StringLiteral 0x9011 <line:1:5> 'char[24]' lvalue "wrapper:\\n call helper\\n"
 """
 
 
-def test_parse_asm_statements_scopes_by_enclosing_function_file() -> None:
-    # `macro_caller` is defined in `_TARGET` and must be reported even though
-    # its `GCCAsmStmt`'s own spelling location is the header the macro came
-    # from. `header_fn` is defined in a header and must stay excluded even
-    # though its `GCCAsmStmt`'s location happens to read `_TARGET` — that
-    # rules out scoping by the statement's own location (drops `macro_caller`)
-    # and scoping by either location (wrongly keeps `header_fn`).
-    assert parse_asm_statements(_MACRO_ASM_AST, _TARGET) == ("macro_caller",)
+def test_parse_asm_statements_matches_a_file_scope_asm_by_name() -> None:
+    assert parse_asm_statements(_FILE_SCOPE_ASM_AST, "helper") == ("<file scope>",)
+
+
+def test_parse_asm_statements_file_scope_match_is_whole_word() -> None:
+    # The fixture's text names `helper`, not `help` or `helpers` — a strict
+    # substring and a strict superstring of it. Neither may match: a whole-word
+    # boundary is what tells a real callee from one that merely contains or is
+    # contained in its name.
+    assert parse_asm_statements(_FILE_SCOPE_ASM_AST, "help") == ()
+    assert parse_asm_statements(_FILE_SCOPE_ASM_AST, "helpers") == ()
