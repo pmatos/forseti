@@ -1736,12 +1736,17 @@ def test_verifiable_source_preserves_mtime_for_timestamp_macro(tmp_path: Path) -
 def test_snapshot_mtime_drift_after_staging_is_a_known_residual(tmp_path: Path) -> None:
     # Characterization, not an endorsement — the mtime-fidelity sibling of
     # `test_self_include_by_own_name_is_a_known_residual`. This pins the
-    # mechanism the residual rides on: the snapshot's mtime is frozen at
-    # whatever `mtime_ns` reads at *stage* time, and nothing re-checks that
-    # pairing afterward. The decision not to chase this — closing it would
-    # require holding `gate_lock` across the whole verify subprocess call,
-    # serializing concurrent verifications — lives in the drift-check comment
-    # in `verify_and_record`, not here. A source touched with identical bytes
+    # *mechanism* the residual rides on: `_verifiable_source` freezes the
+    # snapshot's mtime at whatever `mtime_ns` reads at stage time and nothing
+    # re-checks that pairing afterward. It never calls `verify_and_record`, so
+    # it says nothing about that function's `drifted` check by itself —
+    # `test_scanned_stamp_survives_a_live_mtime_only_drift_during_verify`
+    # below is what drives `verify_and_record` and pins the residual itself.
+    # The decision not to chase this — including why holding `gate_lock`
+    # longer would not help, since it only serializes this gate's own state
+    # read/modify/write among hook processes, never an editor's or backup's
+    # touch on the source — lives in the drift-check comment in
+    # `verify_and_record`, not here. A source touched with identical bytes
     # (editor, backup, unrelated tooling) anywhere between staging and the
     # drift check's re-hash moves the live file's mtime without moving its
     # content hash — invisible to a content-only check — so a `__TIMESTAMP__`
@@ -1767,6 +1772,50 @@ def test_snapshot_mtime_drift_after_staging_is_a_known_residual(tmp_path: Path) 
         assert src.read_bytes() == content  # content never drifted...
         assert os.stat(vp).st_mtime_ns == old_ns  # ...but the snapshot is stale
         assert os.stat(src).st_mtime_ns != os.stat(vp).st_mtime_ns
+
+
+def test_scanned_stamp_survives_a_live_mtime_only_drift_during_verify(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Issue #164: this is what actually pins the residual described in
+    # `verify_and_record`'s drift-check comment — the sibling test above only
+    # drives `_verifiable_source` directly and never reaches `verify_and_record`
+    # or its `drifted` check. Unlike
+    # `test_transient_rewrite_during_verify_is_closed_by_the_snapshot`'s
+    # A -> B -> A content rewrite, this one never touches a single byte — only
+    # the live file's mtime moves, during the verify — so the post-verify
+    # `drifted` check (bytes only) reads it as untouched and stamps `scanned`
+    # anyway: exactly the gap the comment describes, not a hypothetical one.
+    src = tmp_path / "x.c"
+    original = "alpha\n"
+    src.write_text(original)
+    staged_ns = os.stat(src).st_mtime_ns
+    touched_ns = staged_ns + 1_000_000_000  # +1s, bytes never move
+    snapshot_ns_file = tmp_path / "snapshot_ns.txt"
+
+    monkeypatch.setattr(
+        gate,
+        "resolve_forseti_cmd",
+        lambda: _content_keyed_verify_forseti_cmd(
+            tmp_path,
+            original=original,
+            during_verify=(
+                "import os\n"
+                f"open({str(snapshot_ns_file)!r}, 'w').write("
+                "str(os.stat(sys.argv[2]).st_mtime_ns))\n"
+                f"os.utime({str(src)!r}, ns=({touched_ns}, {touched_ns}))"
+            ),
+        ),
+    )
+    verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
+
+    assert [v.verdict for v in verdicts] == ["verified"]
+    # The snapshot really was verified under the old timestamp...
+    assert int(snapshot_ns_file.read_text()) == staged_ns
+    after = gate.load_state(str(tmp_path))
+    digest = hashlib.sha256(original.encode()).hexdigest()
+    assert after["scanned"]["x.c"] == digest  # ...yet the stamp lands anyway...
+    assert os.stat(src).st_mtime_ns == touched_ns  # ...though the live file moved on
 
 
 def test_verifiable_source_keeps_leading_bom_at_byte_zero(tmp_path: Path) -> None:

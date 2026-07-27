@@ -2329,8 +2329,7 @@ def verify_and_record(
     # A second, narrower residual survives alongside the self-include one:
     # `drifted` below compares bytes, never mtime, so a source touched (editor,
     # backup, unrelated tooling — anything) with *identical* bytes anywhere
-    # across the interval this run does not hold `gate_lock` for — from the
-    # pre-verify refresh above through this re-hash returning — leaves
+    # between the pre-verify refresh above and this re-hash returning leaves
     # `on_disk == digest` true while the live file's mtime has moved past the
     # `mtime_ns` baked into the snapshot at staging time. A translation unit
     # branching on `__TIMESTAMP__` (see `_verifiable_source`) was therefore
@@ -2351,12 +2350,18 @@ def verify_and_record(
     # multi-second ESBMC subprocess call, so comparing live-mtime-at-return
     # against embedded-mtime-at-stage is an unbounded window — every retry
     # re-opens it, making this a liveness risk (perpetually unstamped), not a
-    # soundness gain. Closing it properly would mean holding `gate_lock`
-    # across the whole verify subprocess call, which would serialize every
-    # concurrent verification behind it — a case this gate explicitly supports
-    # today (concurrent PostToolUse hooks on the same or different paths).
+    # soundness gain. `gate_lock` cannot close this either way: it only
+    # serializes this gate's own state read/modify/write among hook
+    # processes, so holding it across the whole verify subprocess call would
+    # not stop an editor, backup, or unrelated tool from touching the live
+    # file's mtime mid-verify — none of those writers take this lock at all.
     # Accepted as a documented gap, not a bug to fix (issue #164); pinned by
-    # `test_snapshot_mtime_drift_after_staging_is_a_known_residual`.
+    # `test_scanned_stamp_survives_a_live_mtime_only_drift_during_verify`,
+    # which drives `verify_and_record` itself and shows the stamp surviving a
+    # live mtime-only touch during verify (the mechanism it rides on —
+    # `_verifiable_source` freezing the snapshot's mtime at stage time — is
+    # characterized on its own by
+    # `test_snapshot_mtime_drift_after_staging_is_a_known_residual`).
     withdrawn = False
     drifted = content_hash(file_path) != digest
     if drifted:
