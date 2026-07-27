@@ -1071,22 +1071,43 @@ def _in_scope_c_abspath(
     `unit_id(project_dir, ...)` relativizes against `project_dir` either way, so a
     `root`-spelled input and a `project_dir`-spelled input for the identical file
     produce different keys (issue #161, the other half of #152's aliasing class).
-    Rejoining `rel`'s *directory's* resolved location onto `project_dir` instead —
-    rather than resolving `project_dir` itself, which would change the persisted
-    key for every symlinked-root project, not just the ones this scan touches —
-    keeps every caller's key agreeing without widening the blast radius past this
-    scan's own output. A project whose root is not symlinked is unaffected:
-    `real_dir`'s offset from `proj_real` is then exactly `rel`'s own dirname.
 
-    Only `rel`'s directory is resolved, never its basename: `rel` itself can be a
-    symlink git reports as its own path (an untracked ``alias.c -> target.c``, both
-    inside the project). Resolving the whole path would silently substitute
-    `target.c` for the git-reported `alias.c`, so include/exclude filtering and
-    `unit_id` freshness would operate on the wrong file — a Bash-created alias
-    could be skipped entirely whenever its target's hash was already `scanned`
-    (review feedback, issue #161). Leaving the basename lexical mirrors `unit_id`
-    itself, which resolves only `os.path.dirname(file_path)` and never its
-    basename.
+    Whether `rel` is *in scope* and how it is *spelled* are answered by two
+    separate checks, deliberately not conflated. Scope is answered by resolving
+    `rel`'s directory and comparing it against `proj_real` (`project_dir`,
+    resolved): that has to follow every symlink on the way, in or out of
+    `project_dir`, since a component pointing outside the project makes a file
+    that is lexically nested under it genuinely a different, out-of-project file.
+    Spelling only ever translates the *boundary* between `root` and `project_dir`
+    — `proj_real`'s offset from `root`, both already resolved — and rejoins `rel`
+    onto `project_dir` past that boundary exactly as git spelled it, nothing
+    further resolved. Resolving `rel`'s whole directory for the *spelling* too
+    (rather than just to decide scope) over-reaches past that boundary: it
+    silently rewrites every symlinked path component under `project_dir`, not
+    just `project_dir`'s own root. A tracked directory `a/` that Bash replaces
+    with an in-project symlink `a -> b` reports `a/x.c` as changed; spelling it
+    through the resolved directory turns that into `b/x.c`, and if `b/x.c`
+    already has a matching `scanned` digest, the change reads as already-verified
+    and is silently dropped — even though the former `a/x.c` held different
+    content and the new alias has its own include context (review feedback,
+    issue #161). Keying it as `a/x.c` instead compares against whatever was last
+    verified under *that* name (nothing, the first time), so the swap is
+    correctly seen as new content. A project whose root is not itself symlinked
+    leaves the boundary offset as ``"."``, so `rel` passes through unchanged; a
+    subdirectory `project_dir` shifts the boundary by however many components
+    separate it from `root`, still without resolving anything past it. The
+    lexical offset can still land outside `project_dir` (a ``..`` prefix) even
+    when the resolved-directory check passed — a `rel` reached from outside
+    `project_dir`'s own lexical subtree that happens to alias back into it — and
+    that is rejected too, since a spelling with ``..`` in it would no longer be
+    "through `project_dir`" at all.
+
+    `rel`'s own basename is never resolved either, by the same reasoning: `rel`
+    itself can be a symlink git reports as its own path (an untracked
+    ``alias.c -> target.c``, both inside the project), and substituting
+    `target.c` for it would misfile the change the same way. Leaving it lexical
+    mirrors `unit_id` itself, which resolves only `os.path.dirname(file_path)` and
+    never its basename.
     """
     abspath = os.path.join(root, rel)
     if not is_c_source(abspath):
@@ -1095,14 +1116,12 @@ def _in_scope_c_abspath(
         real_dir = os.path.realpath(os.path.dirname(abspath))
         if os.path.commonpath([proj_real, real_dir]) != proj_real:
             return None  # changed outside this project subtree — out of scope
-        dir_offset = os.path.relpath(real_dir, proj_real)
+        boundary = os.path.relpath(proj_real, root)
+        offset = os.path.relpath(rel, boundary)
     except ValueError:
         return None  # different drive/root — cannot be under proj
-    offset = (
-        os.path.basename(rel)
-        if dir_offset == os.curdir
-        else os.path.join(dir_offset, os.path.basename(rel))
-    )
+    if offset == os.pardir or offset.startswith(os.pardir + os.sep):
+        return None  # lexically outside project_dir's own subtree
     spelled = os.path.join(project_dir, offset)
     if _untracked_snapshot(root, rel) or _untracked_verify_snapshot(root, rel):
         return None
@@ -1143,13 +1162,13 @@ def discover_changed_c_sources(
     # is verified once).
     committed = git_committed_files_since(project_dir, baseline_head)
     rels = list(dict.fromkeys([*rels, *committed]))
-    # `realpath` is used both to scope to the (possibly symlinked) project subtree
-    # and, in `_in_scope_c_abspath`, to respell the result through `project_dir`'s
-    # own route rather than `root`'s resolved one — so the `unit_id` key this
-    # produces agrees with the one a direct PostToolUse edit of the same file
-    # produces, even when `project_dir` is itself a symlinked spelling (issue #161,
-    # the other half of #152's aliasing class). Only the directory is resolved,
-    # never the file's own basename — see `_in_scope_c_abspath`.
+    # `realpath` locates `project_dir` once, resolved, so `_in_scope_c_abspath` can
+    # translate the `root`/`project_dir` boundary and respell each result through
+    # `project_dir`'s own route rather than `root`'s resolved one — so the
+    # `unit_id` key this produces agrees with the one a direct PostToolUse edit of
+    # the same file produces, even when `project_dir` is itself a symlinked
+    # spelling (issue #161, the other half of #152's aliasing class). Nothing past
+    # that boundary is resolved — see `_in_scope_c_abspath`.
     proj_real = os.path.realpath(project_dir)
     found: list[str] = []
     for rel in rels:

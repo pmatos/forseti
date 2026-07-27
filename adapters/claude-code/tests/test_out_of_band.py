@@ -339,6 +339,48 @@ def test_discover_preserves_a_symlinked_source_alias(tmp_path: Path) -> None:
     assert gate.stale_sources(str(tmp_path), state, found) == found
 
 
+def test_discover_preserves_directory_spelling_when_a_symlink_replaces_it(
+    tmp_path: Path,
+) -> None:
+    # review feedback on PR #171 (issue #161): Bash replaces a tracked directory
+    # `a/` with an in-project symlink `a -> b`. Git reports the former `a/x.c` as
+    # changed; resolving its *directory* (rather than just translating the
+    # project root's own boundary) would silently rewrite that to `b/x.c`, and if
+    # `b/x.c` already has a matching `scanned` digest the swap reads as
+    # already-verified and is dropped — even though `a/x.c` held different
+    # content before the swap and the new alias has its own include context.
+    _git_init(tmp_path)
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    (tmp_path / "a" / "x.c").write_text("int fa(void){return 0;}\n")
+    (tmp_path / "b" / "x.c").write_text("int fb(void){return 1;}\n")
+    _git_commit_all(tmp_path)
+
+    state = gate.load_state(str(tmp_path))
+    state["scanned"][os.path.join("a", "x.c")] = gate.content_hash(
+        str(tmp_path / "a" / "x.c")
+    )
+    state["scanned"][os.path.join("b", "x.c")] = gate.content_hash(
+        str(tmp_path / "b" / "x.c")
+    )
+
+    shutil.rmtree(tmp_path / "a")
+    (tmp_path / "a").symlink_to("b")  # the Bash swap: directory -> symlink
+
+    found = gate.discover_changed_c_sources(str(tmp_path))
+
+    a_path = str(tmp_path / "a" / "x.c")
+    b_path = str(tmp_path / "b" / "x.c")
+    assert found == [a_path]  # the Git-reported directory spelling, not `b/x.c`
+    assert gate.unit_id(str(tmp_path), a_path) == os.path.join("a", "x.c")
+    assert gate.unit_id(str(tmp_path), a_path) != gate.unit_id(str(tmp_path), b_path)
+
+    # The fail-open half of the bug: had discovery respelled this to `b/x.c`, its
+    # `scanned` digest already matches the current (identical, through the new
+    # symlink) content, so the swap would read as already-verified and never gate.
+    assert gate.stale_sources(str(tmp_path), state, found) == found
+
+
 # --- committed-since-baseline discovery (issue #99 review) ------------------
 
 
