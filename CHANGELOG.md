@@ -1,3 +1,10 @@
+# [1.7.0](https://github.com/pmatos/forseti/compare/v1.6.6...v1.7.0) (2026-07-27)
+
+
+### Features
+
+* **precond:** discharge an assumed precondition at every caller ([#126](https://github.com/pmatos/forseti/issues/126)) ([#155](https://github.com/pmatos/forseti/issues/155)) ([4589370](https://github.com/pmatos/forseti/commit/458937096f8f107dc3850840e6dd5a69ae08d934))
+
 ## [1.6.6](https://github.com/pmatos/forseti/compare/v1.6.5...v1.6.6) (2026-07-26)
 
 
