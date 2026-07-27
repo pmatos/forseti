@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from forseti.esbmc import (
@@ -91,6 +92,7 @@ def _add_verify_parser(
         action="store_true",
         help="emit the verdict as a JSON object (the MCP tool's payload)",
     )
+    p.set_defaults(func=_run_verify)
 
 
 def _run_verify(args: argparse.Namespace) -> int:
@@ -144,6 +146,7 @@ def _add_list_units_parser(
     # it changes *which* functions exist, so a gate that enumerates without the
     # project's defines would miss units the verify then has to check.
     add_esbmc_invocation_arguments(p, passthrough_help=_LIST_UNITS_PASSTHROUGH_HELP)
+    p.set_defaults(func=_run_list_units)
 
 
 def _run_list_units(args: argparse.Namespace) -> int:
@@ -243,6 +246,7 @@ def _add_synth_parser(
         action="store_true",
         help="emit the assessment as a JSON object",
     )
+    p.set_defaults(func=_run_synth)
 
 
 def _run_synth(args: argparse.Namespace) -> int:
@@ -339,6 +343,7 @@ def _add_propose_parser(
         action="store_true",
         help="emit the proposal as a JSON object (the MCP tool's payload)",
     )
+    p.set_defaults(func=_run_propose)
 
 
 def _render_proposal(result: ProposalResult) -> str:
@@ -381,6 +386,17 @@ def _run_propose(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_mcp_parser(
+    sub: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    p = sub.add_parser(
+        "mcp",
+        help="start the Core MCP server on stdio (needs the 'mcp' extra)",
+        description="Expose Forseti Core's tools (currently `verify`) over MCP/stdio.",
+    )
+    p.set_defaults(func=_run_mcp)
+
+
 def _run_mcp(_args: argparse.Namespace) -> int:
     try:
         from .mcp_server import serve
@@ -401,31 +417,23 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Forseti Core: write -> verify -> counterexample -> fix.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+    # Each `_add_*` helper binds its own handler via `set_defaults(func=...)`, so
+    # registering a subcommand *is* wiring its dispatch — there is no parallel
+    # name->function table for a new subcommand to fall out of sync with.
     _add_verify_parser(sub)
     _add_list_units_parser(sub)
     _add_synth_parser(sub)
     _add_propose_parser(sub)
-    sub.add_parser(
-        "mcp",
-        help="start the Core MCP server on stdio (needs the 'mcp' extra)",
-        description="Expose Forseti Core's tools (currently `verify`) over MCP/stdio.",
-    )
+    _add_mcp_parser(sub)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    if args.command == "verify":
-        return _run_verify(args)
-    if args.command == "list-units":
-        return _run_list_units(args)
-    if args.command == "synth":
-        return _run_synth(args)
-    if args.command == "propose":
-        return _run_propose(args)
-    if args.command == "mcp":
-        return _run_mcp(args)
-    raise AssertionError(f"unhandled command: {args.command}")  # pragma: no cover
+    # `required=True` guarantees a subcommand (and thus a bound `func`) was
+    # parsed, or argparse exits before we get here.
+    handler: Callable[[argparse.Namespace], int] = args.func
+    return handler(args)
 
 
 if __name__ == "__main__":
