@@ -68,6 +68,36 @@ same reason — a call written through it references only that name — so
 ``__asm__`` label alike. Following an indirect call to its
 targets is L1/S4 work.
 
+**A GNU ``asm("call f")`` is invisible to the call graph in a stronger sense
+still.** It names its target only inside the assembly string, which never
+produces a ``DeclRefExpr`` — so unlike a function pointer, this path leaves no
+reference of *any* kind for `parse_address_escapes` to find either. Worse, the
+string itself is never printed by clang's own AST dump (checked against both
+esbmc's pinned clang and a current upstream one), so no scan run over this
+format can tell which symbol, if any, a given ``GCCAsmStmt`` invokes.
+`parse_asm_statements` therefore withholds unconditionally, swept over the
+*whole* translation unit rather than just `source` — a block inside a
+function defined in an included header is exactly as invisible to the caller
+enumeration as one in `source` itself, so scoping to `source` would silently
+drop that path rather than merely miss it (issue #167). That is wider than
+strictly necessary whenever the block does something unrelated (a memory
+barrier, a syscall), and it means a translation unit that pulls in a header
+with unrelated inline asm can never reach ``DISCHARGED_VERIFIED`` at all — but
+narrower is not an option this AST format supports for a ``GCCAsmStmt``
+(verified against ``sys/io.h``: its port-I/O wrappers convert and verify
+cleanly, so a TU that includes it really does pay this cost, not just at
+``--parse-tree-only`` time). A file-scope ``asm(...)`` is the one shape this
+format *can* narrow: clang prints its text in full, so `parse_asm_statements`
+opens the set only when `function`'s name actually appears in it — though with
+esbmc 8.3.0 that narrowing never actually runs against a real TU:
+``FileScopeAsmDecl`` fails goto conversion outright, for *any* function in the
+TU, regardless of which one is under discharge, so S2 itself returns
+``ERROR`` before this stage is reached
+(`test_file_scope_asm_fails_esbmc_conversion_before_discharge_runs` pins that
+against a live run). The narrowing is still correct and still tested — at the
+parser level and with an injected `asm_statements_fn` — for the day a fork
+adds support.
+
 **A recursive callee is a call site of itself.** Asserting at the entry rather than
 transplanting a contract has one property a modular check would not: the assert
 fires at *every* entry, so a re-entry that breaks the precondition cannot slip
@@ -143,6 +173,7 @@ from forseti.esbmc import (
     Verified,
     Violated,
     list_address_escapes,
+    list_asm_statements,
     list_external_callers,
     list_implicit_invocations,
     list_symbol_aliases,
@@ -317,16 +348,20 @@ def discharge_precondition(
     address_escapes_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
     aliases_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
     implicit_invocations_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
+    asm_statements_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
 ) -> DischargeResult:
     """Verify `source::function` against its precondition, then discharge it.
 
     Runs S2 first and *only ever upgrades* its verdict: anything other than
     ``ASSUMED_VERIFIED`` (a real violation, ``NEEDS_CONTRACT``, an error) passes
     through untouched, because there is no assumption to discharge. `raw_verify`,
-    `list_units_fn`, `external_callers_fn`, `address_escapes_fn`, `aliases_fn` and
-    `implicit_invocations_fn` inject the esbmc calls for tests; production adds a
-    ``-I`` for the source's own directory so the generated copy's relative
-    ``#include``\\ s still resolve.
+    `list_units_fn`, `external_callers_fn`, `address_escapes_fn`, `aliases_fn`,
+    `implicit_invocations_fn` and `asm_statements_fn` inject the esbmc calls for
+    tests; production adds a ``-I`` for the source's own directory so the
+    generated copy's relative ``#include``\\ s still resolve. `asm_statements_fn`
+    still gets `function` — a ``GCCAsmStmt`` can never be narrowed by it (see
+    `parse_asm_statements`), but a ``FileScopeAsmDecl`` can, so it is threaded
+    through like every other listing here.
     """
     lister = _memoized(
         list_units_fn
@@ -376,6 +411,11 @@ def discharge_precondition(
             src, sym, esbmc_bin=esbmc_bin, timeout_s=timeout_s
         )
     )
+    asm_statements = asm_statements_fn or (
+        lambda src, sym: list_asm_statements(
+            src, sym, esbmc_bin=esbmc_bin, timeout_s=timeout_s
+        )
+    )
     args = (
         source,
         function,
@@ -385,6 +425,7 @@ def discharge_precondition(
         escapes,
         aliases,
         implicit_invocations,
+        asm_statements,
         max_len,
         ladder_cap,
         raw,
@@ -404,6 +445,7 @@ def _discharge(
     address_escapes_fn: Callable[[Path, str], tuple[str, ...]],
     aliases_fn: Callable[[Path, str], tuple[str, ...]],
     implicit_invocations_fn: Callable[[Path, str], tuple[str, ...]],
+    asm_statements_fn: Callable[[Path, str], tuple[str, ...]],
     max_len: int,
     ladder_cap: int,
     raw: VerifyPort,
@@ -459,20 +501,23 @@ def _discharge(
     # named from another one, so "every caller here" is every caller; an
     # externally visible one exports the obligation to clients we never see.
     internal = any(u.internal_linkage for u in units if u.name == function)
-    # The four ways the caller set can be wider than what `units` shows, each of
+    # The five ways the caller set can be wider than what `units` shows, each of
     # which keeps "every caller in this TU" from being a claim about a set we
     # never saw: a `static inline` in an included header is part of this
     # translation unit but is not a unit `list_units` reports; an address taken
     # rather than called can be invoked from anywhere through the pointer that
     # holds it; an alias attribute gives the callee a second name whose call
-    # sites reference only that name; and a constructor/destructor attribute
-    # names no one at all — the loader invokes the callee's own declaration
-    # directly, supplying none of the arguments any explicit caller does.
+    # sites reference only that name; a constructor/destructor attribute names
+    # no one at all — the loader invokes the callee's own declaration directly,
+    # supplying none of the arguments any explicit caller does; and a GNU inline
+    # ``asm("call f")`` names its target only inside a string clang's own AST
+    # dump never prints, so no scan can tell which symbol, if any, it reaches.
     try:
         foreign = external_callers_fn(source, function)
         escaped = address_escapes_fn(source, function)
         aliased = aliases_fn(source, function)
         implicit = implicit_invocations_fn(source, function)
+        asm_sites = asm_statements_fn(source, function)
     except ListUnitsError as exc:
         return DischargeResult(function, Assessment.ERROR, str(exc), unit_result)
     unenumerable = (
@@ -515,6 +560,16 @@ def _discharge(
                 "any explicit call site in this translation unit does",
             )
             for kind in implicit
+        )
+        + tuple(
+            CallerCheck(
+                site,
+                CallerOutcome.UNRESOLVED,
+                "contains or is named by GNU inline assembly that may invoke "
+                f"{function}() by a path that leaves no `DeclRefExpr` for this "
+                "enumeration to ever see",
+            )
+            for site in asm_sites
         )
     )
     # A re-entry is never an *anchor*: something outside the recursion has to

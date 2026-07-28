@@ -123,6 +123,7 @@ def _run(
     escapes: Callable[[Path, str], tuple[str, ...]] = lambda _s, _f: (),
     aliases: Callable[[Path, str], tuple[str, ...]] = lambda _s, _f: (),
     implicit_invocations: Callable[[Path, str], tuple[str, ...]] = lambda _s, _f: (),
+    asm_statements: Callable[[Path, str], tuple[str, ...]] = lambda _s, _f: (),
     raw: Callable[..., EsbmcResult] | None = None,
 ) -> DischargeResult:
     src = tmp / "frame.c"
@@ -139,6 +140,7 @@ def _run(
         address_escapes_fn=escapes,
         aliases_fn=aliases,
         implicit_invocations_fn=implicit_invocations,
+        asm_statements_fn=asm_statements,
     )
 
 
@@ -293,6 +295,7 @@ def test_one_broken_caller_outranks_the_clean_ones(tmp_path: Path) -> None:
         address_escapes_fn=lambda _s, _f: (),
         aliases_fn=lambda _s, _f: (),
         implicit_invocations_fn=lambda _s, _f: (),
+        asm_statements_fn=lambda _s, _f: (),
     )
     assert result.assessment is Assessment.VIOLATED
     assert "payload_checksum()" in result.detail
@@ -334,6 +337,28 @@ def test_an_escape_counts_even_with_no_local_caller(tmp_path: Path) -> None:
     result = _run(tmp_path, units=(CALLEE,), escapes=lambda _s, _f: ("fp",))
     assert result.assessment is Assessment.ASSUMED_VERIFIED
     assert [c.caller for c in result.callers] == ["fp"]
+    assert "no caller" not in result.label  # one exists; it just cannot be named
+
+
+def test_an_inline_asm_statement_withholds_the_upgrade(tmp_path: Path) -> None:
+    # Issue #167: `asm("call sum_bytes")` inside `via_asm` leaves no `DeclRefExpr`
+    # at all — not even the escape-shaped reference an address-of or a cleanup
+    # attribute would print — so nothing but a dedicated, symbol-agnostic scan
+    # can say this caller set might not be complete. A clean sweep of the one
+    # caller the enumeration *can* see must not upgrade regardless.
+    result = _run(tmp_path, asm_statements=lambda _s, _f: ("via_asm",))
+    assert result.assessment is Assessment.ASSUMED_VERIFIED
+    unresolved = [c for c in result.callers if c.caller == "via_asm"]
+    assert unresolved and unresolved[0].outcome is CallerOutcome.UNRESOLVED
+    assert "GNU inline assembly" in result.label
+    # the caller that *was* checked still reports what it established
+    assert any(c.outcome is CallerOutcome.DISCHARGED for c in result.callers)
+
+
+def test_an_asm_statement_counts_even_with_no_local_caller(tmp_path: Path) -> None:
+    result = _run(tmp_path, units=(CALLEE,), asm_statements=lambda _s, _f: ("via_asm",))
+    assert result.assessment is Assessment.ASSUMED_VERIFIED
+    assert [c.caller for c in result.callers] == ["via_asm"]
     assert "no caller" not in result.label  # one exists; it just cannot be named
 
 
@@ -554,6 +579,7 @@ def test_unreadable_source_is_an_error(tmp_path: Path) -> None:
         address_escapes_fn=lambda _s, _f: (),
         aliases_fn=lambda _s, _f: (),
         implicit_invocations_fn=lambda _s, _f: (),
+        asm_statements_fn=lambda _s, _f: (),
     )
     assert result.assessment is Assessment.ERROR
     assert "could not read" in result.detail
@@ -630,7 +656,7 @@ def test_discharge_forwards_the_requested_timeout_to_every_listing_call(
 ) -> None:
     # `-t/--timeout` maps to `timeout_s`; every ESBMC parse-tree listing call this
     # driver makes on its own — not just the actual verification runs — must
-    # honour it, or a short user-requested timeout still lets up to five
+    # honour it, or a short user-requested timeout still lets up to six
     # independent 30-second defaults run before verification even begins.
     seen: dict[str, float | None] = {}
 
@@ -658,6 +684,9 @@ def test_discharge_forwards_the_requested_timeout_to_every_listing_call(
     monkeypatch.setattr(
         "forseti.precond.discharge.list_implicit_invocations", _recorder("implicit")
     )
+    monkeypatch.setattr(
+        "forseti.precond.discharge.list_asm_statements", _recorder("asm")
+    )
 
     src = tmp_path / "frame.c"
     src.write_text(SOURCE)
@@ -676,4 +705,5 @@ def test_discharge_forwards_the_requested_timeout_to_every_listing_call(
         "escapes": 1.0,
         "aliases": 1.0,
         "implicit": 1.0,
+        "asm": 1.0,
     }

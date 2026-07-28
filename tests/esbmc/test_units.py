@@ -21,6 +21,7 @@ from forseti.esbmc.units import (
     list_units,
     mask_comments,
     parse_address_escapes,
+    parse_asm_statements,
     parse_definitions,
     parse_external_callers,
     parse_implicit_invocations,
@@ -1745,3 +1746,91 @@ def test_parse_address_escapes_keeps_a_reference_it_cannot_name() -> None:
     # `<file scope>` keeps the escape (and the withheld discharge) rather than
     # dropping the one thing that says the caller set is open.
     assert parse_address_escapes(_ORPHAN_REFERENCE_AST, "leaf") == ("<file scope>",)
+
+
+# Verified empirically against both esbmc's pinned clang and a current upstream
+# clang (issue #167): a `GCCAsmStmt`'s only children are its constraint operand
+# expressions (`result`, `x` below, for `asm("..." : "=a"(result) : "D"(x))`) —
+# the assembly *string* itself, which could spell `call helper`, is never
+# printed. `bare_asm` is the operand-free shape (a bare `asm("nop")`, a leaf
+# node with no children at all). `header_asm` lives in `/tmp/other.h`, standing
+# in for a function defined in an included header — it must be reported too:
+# an included header's `asm("call f")` is exactly as invisible to the call
+# graph as one in the file under test, so scoping this scan to one file would
+# silently drop that path (issue #167 follow-up). `FileScopeAsmDecl` is a
+# different node kind that *does* print its string, so its `my_symbol` never
+# matches a lookup for `helper` below — the negative half of narrowing it by
+# name (see `_FILE_SCOPE_ASM_AST` for the positive half).
+_ASM_AST = """\
+TranslationUnitDecl 0x7000 <<invalid sloc>> <invalid sloc>
+|-FunctionDecl 0x7001 </tmp/foo.c:1:1, col:38> col:6 used helper 'int (int)'
+| |-ParmVarDecl 0x7002 <col:18, col:22> col:22 used x 'int'
+| `-CompoundStmt 0x7003 <col:25, col:38>
+|-FunctionDecl 0x7010 <line:2:1, line:6:1> line:2:5 caller 'int (int)'
+| |-ParmVarDecl 0x7011 <col:12, col:16> col:16 used x 'int'
+| `-CompoundStmt 0x7012 <col:19, line:6:1>
+|   |-DeclStmt 0x7013 <line:3:5, col:15>
+|   | `-VarDecl 0x7014 <col:5, col:9> col:9 used result 'int'
+|   |-GCCAsmStmt 0x7015 <line:4:5, col:46>
+|   | |-DeclRefExpr 0x7016 <col:30> 'int' lvalue Var 0x7014 'result' 'int'
+|   | `-ImplicitCastExpr 0x7017 <col:44> 'int' <LValueToRValue>
+|   |   `-DeclRefExpr 0x7018 <col:44> 'int' lvalue ParmVar 0x7011 'x' 'int'
+|   `-ReturnStmt 0x7019 <line:5:5, col:12>
+|     `-DeclRefExpr 0x701a <col:12> 'int' lvalue Var 0x7014 'result' 'int'
+|-FunctionDecl 0x7020 <line:8:1, line:10:1> line:8:5 bare_asm 'int (void)'
+| `-CompoundStmt 0x7021 <col:18, line:10:1>
+|   |-GCCAsmStmt 0x7022 <line:9:5, col:14>
+|   `-ReturnStmt 0x7023 <line:9:6, col:1>
+|-FileScopeAsmDecl 0x7030 <line:12:1, col:24> col:1
+| `-StringLiteral 0x7031 <col:5> 'char[18]' lvalue ".global my_symbol"
+`-FunctionDecl 0x7040 </tmp/other.h:1:1, col:38> col:6 header_asm 'void (void)'
+  `-CompoundStmt 0x7041 <col:20, col:38>
+    `-GCCAsmStmt 0x7042 <col:22, col:36>
+"""
+
+
+def test_parse_asm_statements_reports_every_enclosing_declaration() -> None:
+    # Neither `caller`'s operand-bearing asm nor `bare_asm`'s bare one names
+    # which symbol, if any, is invoked, so both are reported unconditionally —
+    # and so is `header_asm`, defined in a different file entirely: a
+    # `GCCAsmStmt` is swept over the whole translation unit, not just the file
+    # under test (issue #167 follow-up).
+    assert parse_asm_statements(_ASM_AST, "helper") == (
+        "caller",
+        "bare_asm",
+        "header_asm",
+    )
+
+
+def test_parse_asm_statements_ignores_file_scope_asm_naming_a_different_symbol() -> (
+    None
+):
+    # `FileScopeAsmDecl` prints its string in full, unlike `GCCAsmStmt`, so it
+    # can be narrowed by name: `.global my_symbol` never mentions `helper`, so
+    # it must not surface as a third, unrelated site.
+    assert "<file scope>" not in parse_asm_statements(_ASM_AST, "helper")
+
+
+# Verified with a live `esbmc --parse-tree-only` run (issue #167 follow-up):
+# unlike `GCCAsmStmt`, a `FileScopeAsmDecl`'s `StringLiteral` child prints its
+# text in full, embedded newlines included (escaped, not literal) — so a
+# hand-written assembly function such as the reviewer's
+# ``asm("wrapper:\n    call helper\n    ret\n")`` can be matched by name.
+_FILE_SCOPE_ASM_AST = """\
+TranslationUnitDecl 0x9000 <<invalid sloc>> <invalid sloc>
+`-FileScopeAsmDecl 0x9010 <line:1:1, line:4:1> line:1:1
+  `-StringLiteral 0x9011 <line:1:5> 'char[24]' lvalue "wrapper:\\n call helper\\n"
+"""
+
+
+def test_parse_asm_statements_matches_a_file_scope_asm_by_name() -> None:
+    assert parse_asm_statements(_FILE_SCOPE_ASM_AST, "helper") == ("<file scope>",)
+
+
+def test_parse_asm_statements_file_scope_match_is_whole_word() -> None:
+    # The fixture's text names `helper`, not `help` or `helpers` — a strict
+    # substring and a strict superstring of it. Neither may match: a whole-word
+    # boundary is what tells a real callee from one that merely contains or is
+    # contained in its name.
+    assert parse_asm_statements(_FILE_SCOPE_ASM_AST, "help") == ()
+    assert parse_asm_statements(_FILE_SCOPE_ASM_AST, "helpers") == ()
