@@ -216,6 +216,15 @@ _ENDIF_RE = re.compile(r"^[ \t]*#[ \t]*endif\b", re.MULTILINE)
 # directly on arbitrary text.
 _CONTINUATION_RE = re.compile(r"\\\r?\n")
 
+# A GNU suffix attribute's opening: ``__attribute__`` then its own ``(``. A
+# definition may carry one or more of these between its declarator and body —
+# ``static void f(int *p) __attribute__((noinline)) { ... }`` — which clang
+# (and so ESBMC) accepts even though gcc requires attributes *before* the
+# declarator in a definition (issue #163). Matched separately from the ``(``
+# it opens so `_skip_suffix_attributes` can balance that parenthesis on its
+# own — its argument list can itself nest parens (``__attribute__((aligned(8)))``).
+_ATTRIBUTE_RE = re.compile(r"__attribute__\s*\(")
+
 
 @dataclass(frozen=True)
 class Param:
@@ -752,17 +761,57 @@ def mask_comments(source_text: str) -> str:
     return _COMMENT_RE.sub(blank, source_text)
 
 
+def _skip_suffix_attributes(text: str, pos: int) -> int:
+    """`pos`, advanced past every literal ``__attribute__((...))`` starting there.
+
+    `pos` must already be past any whitespace. Each attribute's own
+    parentheses are balanced independently — its argument list can nest them
+    (``__attribute__((aligned(8)))``) — and whitespace after it is skipped
+    before looking for a next one, so ``f(int *p) __attribute__((noinline))
+    __attribute__((used)) {`` is skipped in full. Stops, returning `pos`
+    unchanged, at the first unbalanced attribute — the caller's own ``{``
+    check then fails on it, the same fail-closed outcome as today.
+
+    Textual and literal on purpose, like the rest of this scan: a macro that
+    expands to an attribute (``#define NOINLINE __attribute__((noinline))``,
+    then ``f(int *p) NOINLINE {``) is not recognised and cannot be by a scan
+    with no preprocessor — that definition still misses, exactly as before
+    this function existed.
+    """
+    while True:
+        match = _ATTRIBUTE_RE.match(text, pos)
+        if match is None:
+            return pos
+        depth = 0
+        j = match.end() - 1  # index of the attribute's own '('
+        while j < len(text):
+            char = text[j]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        else:
+            return pos  # unbalanced — leave position at the attribute
+        pos = j + 1
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+
+
 def _definition_signature(
     source_no_comments: str, fn_name: str
 ) -> tuple[str, int] | None:
     """`fn_name`'s definition: its parameter-list text and its ``{`` index.
 
     Scans for ``fn_name (`` and balances parentheses to the matching ``)``; the
-    occurrence whose ``)`` is followed (past whitespace) by ``{`` is the
-    definition — so a prototype (``);``) or a call site (``) ;``, ``))``) is
-    skipped. Deliberately narrow: clang already told us the canonical types and
-    which parameters are pointers, so this only has to isolate the declarator
-    text to harvest an array extent from — never to classify a type.
+    occurrence whose ``)`` is followed (past whitespace and any suffix
+    attributes) by ``{`` is the definition — so a prototype (``);``) or a call
+    site (``) ;``, ``))``) is skipped. Deliberately narrow: clang already told
+    us the canonical types and which parameters are pointers, so this only has
+    to isolate the declarator text to harvest an array extent from — never to
+    classify a type.
     """
     for match in re.finditer(rf"\b{re.escape(fn_name)}\s*\(", source_no_comments):
         depth = 0
@@ -781,6 +830,7 @@ def _definition_signature(
         k = j + 1
         while k < len(source_no_comments) and source_no_comments[k].isspace():
             k += 1
+        k = _skip_suffix_attributes(source_no_comments, k)
         if k < len(source_no_comments) and source_no_comments[k] == "{":
             return source_no_comments[match.end() : j], k
     return None
@@ -996,11 +1046,12 @@ def _param_list_text(
     """The parameter-list text of `fn_name`'s *definition*, or ``None``.
 
     Scans for ``fn_name (`` and balances parentheses to the matching ``)``; an
-    occurrence whose ``)`` is followed (past whitespace) by ``{`` is *definition-
-    shaped* — so a prototype (``);``) or a call site (``) ;``, ``))``) is skipped.
-    Deliberately narrow: clang already told us the canonical types and which
-    parameters are pointers, so this only has to isolate the declarator text to
-    harvest an array extent from — never to classify a type.
+    occurrence whose ``)`` is followed (past whitespace and any suffix
+    attributes) by ``{`` is *definition-shaped* — so a prototype (``);``) or a
+    call site (``) ;``, ``))``) is skipped. Deliberately narrow: clang already
+    told us the canonical types and which parameters are pointers, so this
+    only has to isolate the declarator text to harvest an array extent from —
+    never to classify a type.
 
     Textual order alone cannot tell two definition-shaped occurrences of the same
     name apart — e.g. an inactive ``#if 0`` body ahead of the one clang actually
@@ -1052,6 +1103,7 @@ def _param_list_text(
         k = j + 1
         while k < len(source_no_comments) and source_no_comments[k].isspace():
             k += 1
+        k = _skip_suffix_attributes(source_no_comments, k)
         if k < len(source_no_comments) and source_no_comments[k] == "{":
             line = source_no_comments.count("\n", 0, match.start()) + 1
             candidates.append((line, source_no_comments[match.end() : j]))
