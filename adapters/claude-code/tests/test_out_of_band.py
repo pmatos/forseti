@@ -275,6 +275,232 @@ def test_discover_resolves_repo_root_and_scopes_to_project_dir(tmp_path: Path) -
     assert os.path.isfile(found[0])  # path resolved correctly against the repo root
 
 
+def test_discover_respells_through_a_symlinked_project_root(tmp_path: Path) -> None:
+    # issue #161: `project_dir` reached through a symlink (`link -> real`). Confirm
+    # the actual mechanism first — `git rev-parse --show-toplevel` must report the
+    # resolved root, not `link` itself, or this divergence has a different cause
+    # than the one this fix targets.
+    real = tmp_path / "real"
+    real.mkdir()
+    _git_init(real)
+    (real / "sub").mkdir()
+    (real / "sub" / "x.c").write_text("int f(void){return 0;}\n")
+    _git_commit_all(real)
+    (real / "sub" / "x.c").write_text("int f(void){return 1;}\n")  # dirty
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    resolved_link = os.path.realpath(str(link))
+    assert resolved_link != str(link)  # sanity: link is genuinely a symlink
+
+    toplevel = gate._git(str(link), "rev-parse", "--show-toplevel")
+    assert toplevel is not None
+    assert toplevel.strip() == resolved_link  # precondition this fix relies on
+
+    # A direct PostToolUse edit spells the file through `link`, never through the
+    # resolved root; that is the key `unit_id` must agree with.
+    direct_path = str(link / "sub" / "x.c")
+    found = gate.discover_changed_c_sources(str(link))
+    assert found == [direct_path]  # not the resolved-root spelling
+    assert gate.unit_id(str(link), found[0]) == gate.unit_id(str(link), direct_path)
+    assert gate.unit_id(str(link), found[0]) == os.path.join("sub", "x.c")
+
+
+def test_discover_preserves_a_symlinked_source_alias(tmp_path: Path) -> None:
+    # review feedback, issue #161: an untracked `alias.c -> target.c`, both inside
+    # the project. Resolving the whole path (rather than just its directory) would
+    # silently substitute `target.c` for the Git-reported `alias.c`, so a
+    # Bash-created alias could be skipped whenever `target.c`'s hash was already
+    # `scanned` even though parsing through the alias can use a different lexical
+    # include directory.
+    _git_init(tmp_path)
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "target.c").write_text("int f(void){return 0;}\n")
+    _git_commit_all(tmp_path)
+    (tmp_path / "sub" / "alias.c").symlink_to("target.c")  # untracked, in-project
+
+    found = gate.discover_changed_c_sources(str(tmp_path))
+
+    alias_path = str(tmp_path / "sub" / "alias.c")
+    target_path = str(tmp_path / "sub" / "target.c")
+    assert found == [alias_path]  # the Git-reported path, not the resolved target
+    assert gate.unit_id(str(tmp_path), alias_path) == os.path.join("sub", "alias.c")
+    assert gate.unit_id(str(tmp_path), alias_path) != gate.unit_id(
+        str(tmp_path), target_path
+    )
+
+    # The fail-open half of the bug: had discovery returned `target_path` instead
+    # (the old behavior), its hash already matches a `scanned` target.c, so
+    # `stale_sources` would read the alias as already-verified off the target's
+    # stamp and silently drop it rather than gate it.
+    state = gate.load_state(str(tmp_path))
+    state["scanned"][gate.unit_id(str(tmp_path), target_path)] = gate.content_hash(
+        target_path
+    )
+    assert gate.stale_sources(str(tmp_path), state, found) == found
+
+
+def test_in_scope_c_abspath_rejects_a_leaf_symlink_whose_target_leaves_the_project(
+    tmp_path: Path,
+) -> None:
+    # review feedback on PR #171 (issue #161): the directory-only scope check
+    # (`real_dir`) passes an untracked `alias.c -> ../outside.c` straight through,
+    # since its *parent* is in-project — only the leaf's own target escapes. Left
+    # unchecked, discovery would hand back the alias and the gate would hash and
+    # verify whatever lives outside the project under the alias's key. Called
+    # directly so the assertion isn't laundered through `discover_changed_c_sources`'s
+    # `os.path.isfile` existence filter, which would drop a *dangling* symlink for
+    # an unrelated reason and never exercise this check at all.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.c").write_text("int leak(void){return 0;}\n")
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    _git_init(proj)
+    (proj / "sub").mkdir()
+    (proj / "sub" / "alias.c").symlink_to(outside / "secret.c")  # untracked, escapes
+
+    root = str(proj)
+    proj_real = os.path.realpath(str(proj))
+    rel = os.path.join("sub", "alias.c")
+    assert gate._in_scope_c_abspath(str(proj), root, proj_real, rel) is None
+
+
+def test_discover_rejects_a_leaf_symlink_whose_target_leaves_the_project(
+    tmp_path: Path,
+) -> None:
+    # Same scenario end to end through `discover_changed_c_sources`, alongside a
+    # legitimately dirty in-project source — so the assertion pins "the escaping
+    # alias is excluded" rather than "everything happens to come back empty".
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.c").write_text("int leak(void){return 0;}\n")
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    _git_init(proj)
+    (proj / "sub").mkdir()
+    (proj / "sub" / "x.c").write_text("int f(void){return 0;}\n")
+    _git_commit_all(proj)
+    (proj / "sub" / "x.c").write_text("int f(void){return 1;}\n")  # legit, dirty
+    (proj / "sub" / "alias.c").symlink_to(outside / "secret.c")  # untracked, escapes
+
+    found = gate.discover_changed_c_sources(str(proj))
+
+    assert found == [str(proj / "sub" / "x.c")]
+
+
+def test_discover_preserves_directory_spelling_when_a_symlink_replaces_it(
+    tmp_path: Path,
+) -> None:
+    # review feedback on PR #171 (issue #161): Bash replaces a tracked directory
+    # `a/` with an in-project symlink `a -> b`. Git reports the former `a/x.c` as
+    # changed; resolving its *directory* (rather than just translating the
+    # project root's own boundary) would silently rewrite that to `b/x.c`, and if
+    # `b/x.c` already has a matching `scanned` digest the swap reads as
+    # already-verified and is dropped — even though `a/x.c` held different
+    # content before the swap and the new alias has its own include context.
+    _git_init(tmp_path)
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    (tmp_path / "a" / "x.c").write_text("int fa(void){return 0;}\n")
+    (tmp_path / "b" / "x.c").write_text("int fb(void){return 1;}\n")
+    _git_commit_all(tmp_path)
+
+    state = gate.load_state(str(tmp_path))
+    state["scanned"][os.path.join("a", "x.c")] = gate.content_hash(
+        str(tmp_path / "a" / "x.c")
+    )
+    state["scanned"][os.path.join("b", "x.c")] = gate.content_hash(
+        str(tmp_path / "b" / "x.c")
+    )
+
+    shutil.rmtree(tmp_path / "a")
+    (tmp_path / "a").symlink_to("b")  # the Bash swap: directory -> symlink
+
+    found = gate.discover_changed_c_sources(str(tmp_path))
+
+    a_path = str(tmp_path / "a" / "x.c")
+    b_path = str(tmp_path / "b" / "x.c")
+    assert found == [a_path]  # the Git-reported directory spelling, not `b/x.c`
+    assert gate.unit_id(str(tmp_path), a_path) == os.path.join("a", "x.c")
+    assert gate.unit_id(str(tmp_path), a_path) != gate.unit_id(str(tmp_path), b_path)
+
+    # The fail-open half of the bug: had discovery respelled this to `b/x.c`, its
+    # `scanned` digest already matches the current (identical, through the new
+    # symlink) content, so the swap would read as already-verified and never gate.
+    assert gate.stale_sources(str(tmp_path), state, found) == found
+
+
+def test_discover_preserves_root_spelling_when_the_project_root_becomes_a_symlink(
+    tmp_path: Path,
+) -> None:
+    # review feedback on PR #171 (issue #161): `project_dir` is a tracked
+    # repository subdirectory `repo/a`, and Bash replaces `a/` itself with an
+    # in-project symlink `a -> b` where `b/` is already tracked (so git never
+    # reports `b/x.c`). `proj_real` now resolves to `repo/b`, and relpathing the
+    # deleted `a/x.c` against that resolved boundary escapes (`../a/x.c`),
+    # dropping the change — even though `project_dir/x.c` still exists through
+    # the alias with content the gate never verified, while the recorded `x.c`
+    # stamp and verdicts stand.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo)
+    (repo / "a").mkdir()
+    (repo / "b").mkdir()
+    (repo / "a" / "x.c").write_text("int fa(void){return 0;}\n")
+    (repo / "b" / "x.c").write_text("int fb(void){return 1;}\n")
+    _git_commit_all(repo)
+    proj = repo / "a"
+
+    state = gate.load_state(str(proj))
+    state["scanned"]["x.c"] = gate.content_hash(str(proj / "x.c"))  # pre-swap stamp
+
+    shutil.rmtree(proj)
+    proj.symlink_to("b")  # the Bash swap: the project root itself -> symlink
+
+    found = gate.discover_changed_c_sources(str(proj))
+
+    # Spelled through the project root's own (lexical) name — the same key a
+    # direct PostToolUse edit through the alias produces — not dropped.
+    assert found == [str(proj / "x.c")]
+    assert gate.unit_id(str(proj), found[0]) == "x.c"
+
+    # The fail-open half of the bug: with the change dropped, nothing re-verifies
+    # and the pre-swap `x.c` stamp keeps the swap reading as already-verified.
+    # Through the preserved spelling the bytes now behind that name hash against
+    # the stamp and are correctly seen as new content.
+    assert gate.stale_sources(str(proj), state, found) == found
+
+
+def test_discover_root_swap_dedupes_reports_that_spell_to_the_same_path(
+    tmp_path: Path,
+) -> None:
+    # Companion to the tracked-target swap: with an *untracked* `b/`, git reports
+    # both the deleted `a/x.c` (under the project root's lexical boundary) and
+    # the new `b/x.c` (under the resolved one) — and through the symlink both
+    # spell `project_dir/x.c`. Discovery must still surface the file exactly
+    # once, keyed `x.c`, and read it as stale against a pre-swap stamp.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo)
+    (repo / "a").mkdir()
+    (repo / "a" / "x.c").write_text("int fa(void){return 0;}\n")
+    _git_commit_all(repo)
+    (repo / "b").mkdir()
+    (repo / "b" / "x.c").write_text("int fb(void){return 1;}\n")  # untracked
+    proj = repo / "a"
+
+    state = gate.load_state(str(proj))
+    state["scanned"]["x.c"] = gate.content_hash(str(proj / "x.c"))
+
+    shutil.rmtree(proj)
+    proj.symlink_to("b")
+
+    found = gate.discover_changed_c_sources(str(proj))
+
+    assert found == [str(proj / "x.c")]  # once, not once per git report
+    assert gate.stale_sources(str(proj), state, found) == found
+
+
 # --- committed-since-baseline discovery (issue #99 review) ------------------
 
 
@@ -1127,9 +1353,10 @@ def test_pending_retry_of_stale_content_is_left_to_discovery(
 def test_sources_needing_verify_reports_a_file_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Discovery joins the git root and the pending scan joins `project_dir`, so a
-    # file both scans name arrives under two spellings — verifying it twice in one
-    # scan would double the ESBMC cost and name it twice in the Stop note.
+    # A file both scans name can still arrive under two literal spellings (here, a
+    # trailing `.` path component) even though discovery and the pending scan both
+    # join through `project_dir` now (issue #161) — verifying it twice in one scan
+    # would double the ESBMC cost and name it twice in the Stop note.
     src = tmp_path / "dup.c"
     src.write_text("int f(void){return 0;}\n")
     _enumerate_one_unit(monkeypatch)
