@@ -1088,11 +1088,18 @@ def _in_scope_c_abspath(
     Either check failing drops `rel` from this scan the same way an out-of-scope
     path always has — it is not a new, separate blocking condition, just the
     existing out-of-scope exit reached by a path the directory-only check missed.
-    Spelling only ever translates the *boundary* between `root` and `project_dir`
-    — `proj_real`'s offset from `root`, both already resolved — and rejoins `rel`
-    onto `project_dir` past that boundary exactly as git spelled it, nothing
-    further resolved. Resolving `rel`'s whole directory for the *spelling* too
-    (rather than just to decide scope) over-reaches past that boundary: it
+    Spelling only ever translates the *boundary* between `root` and
+    `project_dir` and rejoins `rel` onto `project_dir` past that boundary
+    exactly as git spelled it, nothing further resolved. The boundary has two
+    spellings — `project_dir`'s own lexical offset from `root` (`abspath`,
+    unresolved) and `proj_real`'s offset (both already resolved) — tried in
+    that order: the lexical one whenever `rel` sits under it, the resolved one
+    as the fallback for a `project_dir` whose own spelling never reaches `root`
+    at all (itself reached through a symlink, the original issue #161 case).
+    The two agree unless the project root itself moved after the session spelled
+    it — and then only the lexical one still matches how git spells `rel` (the
+    root swap below). Resolving `rel`'s whole directory for the *spelling* too
+    (rather than just to decide scope) over-reaches past either boundary: it
     silently rewrites every symlinked path component under `project_dir`, not
     just `project_dir`'s own root. A tracked directory `a/` that Bash replaces
     with an in-project symlink `a -> b` reports `a/x.c` as changed; spelling it
@@ -1102,15 +1109,29 @@ def _in_scope_c_abspath(
     content and the new alias has its own include context (review feedback,
     issue #161). Keying it as `a/x.c` instead compares against whatever was last
     verified under *that* name (nothing, the first time), so the swap is
-    correctly seen as new content. A project whose root is not itself symlinked
-    leaves the boundary offset as ``"."``, so `rel` passes through unchanged; a
-    subdirectory `project_dir` shifts the boundary by however many components
-    separate it from `root`, still without resolving anything past it. The
-    lexical offset can still land outside `project_dir` (a ``..`` prefix) even
-    when the resolved-directory check passed — a `rel` reached from outside
-    `project_dir`'s own lexical subtree that happens to alias back into it — and
-    that is rejected too, since a spelling with ``..`` in it would no longer be
-    "through `project_dir`" at all.
+    correctly seen as new content.
+
+    The same blind spot exists one level up when what Bash swaps is the project
+    *root itself*: a subdirectory `project_dir` `repo/a` replaced by an
+    in-project symlink `a -> b` (with `b/` already tracked, so git never reports
+    `b/x.c`) leaves `proj_real` pointing at `repo/b`, and `rel` — `a/x.c`,
+    reported deleted — relpaths clean out of the resolved boundary
+    (``../a/x.c``). Dropping it silently loses the change even though
+    `project_dir/x.c` still exists through the alias, holding content the gate
+    never verified while the recorded `x.c` stamp and verdicts stand (review
+    feedback, issue #161). The lexical boundary is still `a` — git's own
+    spelling of the report — so `a/x.c` rejoins as `project_dir/x.c`, keys the
+    same `x.c` a direct PostToolUse edit through the alias produces, and hashes
+    what is really there now against what was last verified under that name. A
+    project whose root is not itself symlinked leaves both boundaries equal
+    (``.`` for a root checkout), so `rel` passes through unchanged; a
+    subdirectory `project_dir` shifts both by however many components separate
+    it from `root`, still without resolving anything past them. The offset can
+    still land outside `project_dir` (a ``..`` prefix) even when the resolved
+    checks passed — a `rel` reached from outside `project_dir`'s own lexical
+    subtree that happens to alias back into it — and that is rejected too,
+    since a spelling with ``..`` in it would no longer be "through
+    `project_dir`" at all.
 
     `rel`'s own basename is never resolved for the *returned spelling*, by the
     same reasoning: `rel` itself can be a symlink git reports as its own path (an
@@ -1131,8 +1152,20 @@ def _in_scope_c_abspath(
         real_leaf = os.path.realpath(abspath)
         if os.path.commonpath([proj_real, real_leaf]) != proj_real:
             return None  # leaf symlink's own target escapes the project
-        boundary = os.path.relpath(proj_real, root)
-        offset = os.path.relpath(rel, boundary)
+        # Two boundary spellings (see docstring): prefer `project_dir`'s own
+        # lexical offset from `root` whenever `rel` sits under it — that is the
+        # spelling git reports against; fall back to the resolved boundary for a
+        # `project_dir` whose spelling never reaches `root` (itself symlinked).
+        lex_boundary = os.path.relpath(os.path.abspath(project_dir), root)
+        offset = None
+        if lex_boundary != os.pardir and not lex_boundary.startswith(
+            os.pardir + os.sep
+        ):
+            lexical = os.path.relpath(rel, lex_boundary)
+            if lexical != os.pardir and not lexical.startswith(os.pardir + os.sep):
+                offset = lexical
+        if offset is None:
+            offset = os.path.relpath(rel, os.path.relpath(proj_real, root))
     except ValueError:
         return None  # different drive/root — cannot be under proj
     if offset == os.pardir or offset.startswith(os.pardir + os.sep):
@@ -1197,7 +1230,10 @@ def discover_changed_c_sources(
         # file is gated instead by `divergent_blob_sources`.
         if abspath is not None and os.path.isfile(abspath):
             found.append(abspath)
-    return found
+    # Two reports can spell to the same path: a root swap (`a/` -> symlink to
+    # untracked `b/`) reports the deleted `a/x.c` and the new `b/x.c`, and both
+    # rejoin as `project_dir/x.c`. Dedup, order preserved.
+    return list(dict.fromkeys(found))
 
 
 def _pending_attempts(entry: object, digest: str) -> int | None:

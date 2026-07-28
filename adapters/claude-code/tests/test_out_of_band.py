@@ -430,6 +430,77 @@ def test_discover_preserves_directory_spelling_when_a_symlink_replaces_it(
     assert gate.stale_sources(str(tmp_path), state, found) == found
 
 
+def test_discover_preserves_root_spelling_when_the_project_root_becomes_a_symlink(
+    tmp_path: Path,
+) -> None:
+    # review feedback on PR #171 (issue #161): `project_dir` is a tracked
+    # repository subdirectory `repo/a`, and Bash replaces `a/` itself with an
+    # in-project symlink `a -> b` where `b/` is already tracked (so git never
+    # reports `b/x.c`). `proj_real` now resolves to `repo/b`, and relpathing the
+    # deleted `a/x.c` against that resolved boundary escapes (`../a/x.c`),
+    # dropping the change — even though `project_dir/x.c` still exists through
+    # the alias with content the gate never verified, while the recorded `x.c`
+    # stamp and verdicts stand.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo)
+    (repo / "a").mkdir()
+    (repo / "b").mkdir()
+    (repo / "a" / "x.c").write_text("int fa(void){return 0;}\n")
+    (repo / "b" / "x.c").write_text("int fb(void){return 1;}\n")
+    _git_commit_all(repo)
+    proj = repo / "a"
+
+    state = gate.load_state(str(proj))
+    state["scanned"]["x.c"] = gate.content_hash(str(proj / "x.c"))  # pre-swap stamp
+
+    shutil.rmtree(proj)
+    proj.symlink_to("b")  # the Bash swap: the project root itself -> symlink
+
+    found = gate.discover_changed_c_sources(str(proj))
+
+    # Spelled through the project root's own (lexical) name — the same key a
+    # direct PostToolUse edit through the alias produces — not dropped.
+    assert found == [str(proj / "x.c")]
+    assert gate.unit_id(str(proj), found[0]) == "x.c"
+
+    # The fail-open half of the bug: with the change dropped, nothing re-verifies
+    # and the pre-swap `x.c` stamp keeps the swap reading as already-verified.
+    # Through the preserved spelling the bytes now behind that name hash against
+    # the stamp and are correctly seen as new content.
+    assert gate.stale_sources(str(proj), state, found) == found
+
+
+def test_discover_root_swap_dedupes_reports_that_spell_to_the_same_path(
+    tmp_path: Path,
+) -> None:
+    # Companion to the tracked-target swap: with an *untracked* `b/`, git reports
+    # both the deleted `a/x.c` (under the project root's lexical boundary) and
+    # the new `b/x.c` (under the resolved one) — and through the symlink both
+    # spell `project_dir/x.c`. Discovery must still surface the file exactly
+    # once, keyed `x.c`, and read it as stale against a pre-swap stamp.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo)
+    (repo / "a").mkdir()
+    (repo / "a" / "x.c").write_text("int fa(void){return 0;}\n")
+    _git_commit_all(repo)
+    (repo / "b").mkdir()
+    (repo / "b" / "x.c").write_text("int fb(void){return 1;}\n")  # untracked
+    proj = repo / "a"
+
+    state = gate.load_state(str(proj))
+    state["scanned"]["x.c"] = gate.content_hash(str(proj / "x.c"))
+
+    shutil.rmtree(proj)
+    proj.symlink_to("b")
+
+    found = gate.discover_changed_c_sources(str(proj))
+
+    assert found == [str(proj / "x.c")]  # once, not once per git report
+    assert gate.stale_sources(str(proj), state, found) == found
+
+
 # --- committed-since-baseline discovery (issue #99 review) ------------------
 
 
