@@ -1,3 +1,11 @@
+## [1.7.4](https://github.com/pmatos/forseti/compare/v1.7.3...v1.7.4) (2026-07-28)
+
+
+### Bug Fixes
+
+* **claude-adapter:** respell out-of-band discovery through project_dir, not the resolved git root ([#161](https://github.com/pmatos/forseti/issues/161)) ([#171](https://github.com/pmatos/forseti/issues/171)) ([0de5460](https://github.com/pmatos/forseti/commit/0de54607c84b03b8240572c7fffe87e156c45fff))
+* **units:** skip GNU suffix attributes when locating a definition's body ([#172](https://github.com/pmatos/forseti/issues/172)) ([199b51a](https://github.com/pmatos/forseti/commit/199b51a6d188e38e85dfde144ad93776d1804d03))
+
 ## [1.7.3](https://github.com/pmatos/forseti/compare/v1.7.2...v1.7.3) (2026-07-27)
 
 
