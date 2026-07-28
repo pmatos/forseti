@@ -702,6 +702,14 @@ def test_line_breakpoints_ignores_a_macro_defined_inside_a_dead_if0_body() -> No
     assert _line_breakpoints(source) == [(5, 11)]
 
 
+def test_line_breakpoints_ignores_an_undef_inside_a_dead_if0_body() -> None:
+    # The unbinding half of the dead-branch exclusion above: cpp never
+    # processes this `#undef`, so the trustworthy top-level binding of `L`
+    # must survive it unchanged.
+    source = "#define L 11\n#if 0\n#undef L\n#endif\n#line L\nx\n"
+    assert _line_breakpoints(source) == [(5, 11)]
+
+
 def test_line_breakpoints_does_not_guess_a_macro_defined_in_an_ifdef_branch() -> None:
     # Neither arm's `#define` can be proven live or dead by this scan — cpp's
     # real `L` depends on whether `FOO` is defined, which needs macro state
@@ -786,6 +794,24 @@ def test_line_breakpoints_does_not_treat_a_paren_wrapped_subexpr_as_false() -> N
     # trailing `|| FEATURE` means the outer text does not even end in `)`, so
     # this must stay opaque exactly like `test_..._paren_wrapped_prefix_zero`.
     source = "#if (0) || FEATURE\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(2, 5), (5, 9)]
+
+
+def test_line_breakpoints_does_not_treat_a_trailing_paren_group_as_wrapping() -> None:
+    # `(0)+(1)` both starts and ends in parens, but the leading pair closes at
+    # index 2 — it wraps a subexpression, not the whole condition — so nothing
+    # is peeled and the compound stays opaque (cpp would even evaluate this
+    # one to a literal `1`, which this scan deliberately does not attempt).
+    source = "#if (0)+(1)\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(2, 5), (5, 9)]
+
+
+def test_line_breakpoints_leaves_unbalanced_parens_opaque() -> None:
+    # Mid-edit source can hold a condition whose parens never balance (more
+    # opens than closes): the whole-span scan must exhaust its paren walk
+    # without ever finding a match and leave the text alone — opaque, like
+    # any other condition this scan cannot evaluate.
+    source = "#if (0 || (1)\n#line 5\nx\n#endif\n#line 9\ny\n"
     assert _line_breakpoints(source) == [(2, 5), (5, 9)]
 
 
