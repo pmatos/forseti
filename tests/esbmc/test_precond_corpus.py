@@ -295,6 +295,54 @@ def test_a_re_entry_that_breaks_the_obligation_names_the_recursion(
     assert "clean()" not in result.label
 
 
+_FLAG_GATED_RECURSIVE_LEAF = """\
+#include <stddef.h>
+#include <stdint.h>
+
+static int g_flag = 0;
+
+/* Recurses only once `g_flag` is set — from the translation unit's own
+ * initial state (`g_flag == 0`) this branch is dead code, so a self-check
+ * that never touches ambient state can never see what an anchored caller who
+ * flips the flag before calling in actually drives `step` into. Advancing 2
+ * bytes while `len` only drops by 1 breaks the L0 pair on the next entry,
+ * without either call ever dereferencing anything itself (issue #166). */
+static uint32_t step(const uint8_t *buf, size_t len) {
+    if (g_flag && len > 1) {
+        return step(buf + 2, len - 1);
+    }
+    return 0;
+}
+
+uint32_t trigger(void) {
+    uint8_t block[2] = {1, 2};
+    g_flag = 1;
+    return step(block, 2);
+}
+"""
+
+
+def test_a_caller_that_changes_ambient_state_is_not_blamed_for_the_re_entry(
+    tmp_path: Path,
+) -> None:
+    # `trigger` hands `step` exactly the 2-byte object its signature declares —
+    # a valid caller at its own call site. It is also what makes `step` recurse
+    # at all, by setting `g_flag` first; the callee's own self-check never
+    # touches ambient state, so it explores `step` only from the translation
+    # unit's initial state (`g_flag == 0`, the recursion is dead code there) and
+    # cannot settle whether the re-entry `trigger` actually reaches is safe.
+    # Blaming `trigger` would accuse it of a failure that is the recursion's,
+    # not its own pointer's.
+    src = tmp_path / "flag_gated.c"
+    src.write_text(_FLAG_GATED_RECURSIVE_LEAF)
+    result = discharge_precondition(src, function="step", max_len=MAX_LEN)
+    assert result.assessment is Assessment.ASSUMED_VERIFIED, result.label
+    outcomes = {c.caller: c.outcome for c in result.callers}
+    assert outcomes["step"] is CallerOutcome.DISCHARGED
+    assert outcomes["trigger"] is CallerOutcome.UNATTRIBUTED
+    assert "VIOLATED at the call site" not in result.label
+
+
 _BLOCK_SCOPE_DECL_CALLER = """\
 #include <stddef.h>
 #include <stdint.h>

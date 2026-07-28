@@ -435,19 +435,25 @@ def test_a_re_entry_failure_is_not_blamed_on_the_caller(tmp_path: Path) -> None:
     assert "frame_checksum()" not in result.detail
 
 
-def test_a_clean_re_entry_still_blames_a_bad_caller(tmp_path: Path) -> None:
-    # The mirror case: the callee's own harness discharges, so the re-entry keeps
-    # the obligation and an obligation failure elsewhere *is* that caller's.
+def test_a_discharged_self_check_still_leaves_a_caller_failure_unattributed(
+    tmp_path: Path,
+) -> None:
+    # A DISCHARGED self-check only explores recursion from the translation
+    # unit's own initial ambient state (S2 materialises parameters, never
+    # globals), so it can never be shown to cover the entry state a *different*
+    # caller drove the recursion from (issue #166: a flag `frame_checksum` could
+    # set before calling in). Blaming `frame_checksum` would risk accusing code
+    # that passed a perfectly valid pointer.
     result = _run(
         tmp_path,
         units=(RECURSIVE_CALLEE, CALLER),
         raw=_per_harness("frame_checksum"),
     )
-    assert result.assessment is Assessment.VIOLATED
+    assert result.assessment is Assessment.ASSUMED_VERIFIED
     outcomes = {c.caller: c.outcome for c in result.callers}
     assert outcomes["sum_bytes"] is CallerOutcome.DISCHARGED
-    assert outcomes["frame_checksum"] is CallerOutcome.OBLIGATION_VIOLATED
-    assert "frame_checksum()" in result.detail
+    assert outcomes["frame_checksum"] is CallerOutcome.UNATTRIBUTED
+    assert "VIOLATED at the call site" not in result.label
 
 
 def test_an_indirect_cycle_counts_as_a_re_entry(tmp_path: Path) -> None:
