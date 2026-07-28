@@ -1,3 +1,12 @@
+## [1.7.5](https://github.com/pmatos/forseti/compare/v1.7.4...v1.7.5) (2026-07-28)
+
+
+### Bug Fixes
+
+* **discharge:** open the caller set when GNU inline asm can invoke the callee ([#176](https://github.com/pmatos/forseti/issues/176)) ([974cfcb](https://github.com/pmatos/forseti/commit/974cfcb37b026ec867da254ac0014776111358f4))
+* **precond:** keep recursion obligation failures unattributed across entry states ([#175](https://github.com/pmatos/forseti/issues/175)) ([69fb594](https://github.com/pmatos/forseti/commit/69fb59401fc69e6976b18bb5df61fc51520bfec9))
+* **units:** resolve macro-valued #line and parenthesized-literal #if (0) ([#174](https://github.com/pmatos/forseti/issues/174)) ([15df340](https://github.com/pmatos/forseti/commit/15df340e34a65a37e2d43eb83508a6489326ef99)), closes [#line](https://github.com/pmatos/forseti/issues/line) [#if](https://github.com/pmatos/forseti/issues/if)
+
 ## [1.7.4](https://github.com/pmatos/forseti/compare/v1.7.3...v1.7.4) (2026-07-28)
 
 
