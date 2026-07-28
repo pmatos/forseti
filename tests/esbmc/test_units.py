@@ -631,6 +631,211 @@ def test_annotate_array_extents_breaks_a_genuine_presumed_tie_by_physical_line()
     assert (out.array_extent, out.array_extent_unresolved) == (None, False)
 
 
+# Issue #165 follow-up to #156/#157, fix 1: a `#line` whose argument is a macro
+# name, not a literal digit sequence.
+
+
+def test_line_breakpoints_resolves_a_macro_valued_line_directive() -> None:
+    source = "#define L 11\n#line L\nx\n"
+    assert _line_breakpoints(source) == [(2, 11)]
+
+
+def test_line_breakpoints_leaves_an_unresolvable_macro_line_directive_unresolved() -> (
+    None
+):
+    # No `#define` for `UNKNOWN` anywhere — this scan cannot know its value,
+    # so (like every other condition it cannot evaluate) it must not guess.
+    source = "#line UNKNOWN\nx\n"
+    assert _line_breakpoints(source) == []
+
+
+def test_line_breakpoints_ignores_a_function_like_macro_in_a_line_directive() -> None:
+    # `L` here is function-like — `#line L` cannot expand it (no argument
+    # list follows), so it must stay unresolved rather than reuse some
+    # unrelated non-integer replacement text.
+    source = "#define L(x) (x)\n#line L\nx\n"
+    assert _line_breakpoints(source) == []
+
+
+def test_line_breakpoints_ignores_an_empty_macro_in_a_line_directive() -> None:
+    # `#define L` with no replacement text at all (a common feature-flag
+    # idiom) is not an integer literal either.
+    source = "#define L\n#line L\nx\n"
+    assert _line_breakpoints(source) == []
+
+
+def test_line_breakpoints_forgets_an_undefined_macro() -> None:
+    source = "#define L 11\n#undef L\n#line L\nx\n"
+    assert _line_breakpoints(source) == []
+
+
+def test_line_breakpoints_rebinds_a_redefined_macro() -> None:
+    source = "#define L 11\n#define L 22\n#line L\nx\n"
+    assert _line_breakpoints(source) == [(3, 22)]
+
+
+def test_line_breakpoints_joins_a_spliced_macro_value() -> None:
+    # Mirrors `test_line_breakpoints_joins_a_spliced_line_directive_digit`:
+    # `#define L \` + newline + `11` is one logical `#define L 11` to cpp, so
+    # the value must still resolve even though the digits are spliced.
+    source = "#define L \\\n11\n#line L\nx\n"
+    assert _line_breakpoints(source) == [(3, 11)]
+
+
+def test_line_breakpoints_resolves_a_macro_valued_line_directive_over_crlf() -> None:
+    # `_CONTINUATION_RE`/`_DEFINE_RE` tolerate a CRLF source even though
+    # `list_units` itself normalizes newlines — `annotate_array_extents` is
+    # also callable directly on arbitrary text (see `_CONTINUATION_RE`'s own
+    # comment). `_DEFINE_RE`'s `$` must still land before the `\n`, not get
+    # thrown off by the `\r` `.strip()` removes from the captured value.
+    source = "#define L 11\r\n#line L\r\nx\r\n"
+    assert _line_breakpoints(source) == [(2, 11)]
+
+
+def test_line_breakpoints_resolves_a_macro_valued_line_directive_to_zero() -> None:
+    # `#line 0` is UB per ISO C (the digit-sequence must be >= 1) and this
+    # scan already passes a literal `#line 0` straight through unguarded; the
+    # macro path must not behave any differently — it records whatever value
+    # cpp would substitute, however meaningless downstream, rather than
+    # silently dropping it or raising.
+    source = "#define L 0\n#line L\nx\n"
+    assert _line_breakpoints(source) == [(2, 0)]
+
+
+def test_line_breakpoints_ignores_a_macro_defined_inside_a_dead_if0_body() -> None:
+    # PR #156's own dead-branch exclusion applies equally to a `#define`: cpp
+    # never processes this redefinition, so the trustworthy top-level binding
+    # of `L` must survive it unchanged.
+    source = "#define L 11\n#if 0\n#define L 999\n#endif\n#line L\nx\n"
+    assert _line_breakpoints(source) == [(5, 11)]
+
+
+def test_line_breakpoints_ignores_an_undef_inside_a_dead_if0_body() -> None:
+    # The unbinding half of the dead-branch exclusion above: cpp never
+    # processes this `#undef`, so the trustworthy top-level binding of `L`
+    # must survive it unchanged.
+    source = "#define L 11\n#if 0\n#undef L\n#endif\n#line L\nx\n"
+    assert _line_breakpoints(source) == [(5, 11)]
+
+
+def test_line_breakpoints_does_not_guess_a_macro_defined_in_an_ifdef_branch() -> None:
+    # Neither arm's `#define` can be proven live or dead by this scan — cpp's
+    # real `L` depends on whether `FOO` is defined, which needs macro state
+    # this scan does not have. Binding to whichever arm happened to run last
+    # in the scan (here, the `#else`'s 22) would risk resolving `#line L` to a
+    # value cpp itself would never produce, so neither arm's `#define` may
+    # ever establish a trusted binding.
+    source = "#ifdef FOO\n#define L 11\n#else\n#define L 22\n#endif\n#line L\nx\n"
+    assert _line_breakpoints(source) == []
+
+
+def test_line_breakpoints_does_not_guess_a_macro_touched_in_a_live_nested_branch() -> (
+    None
+):
+    # The inner `#if 1` is itself provably always-taken, but reaching it at
+    # all still depends on the outer opaque `#ifdef FOO` — so whether `L` is
+    # ever (re)defined remains exactly as unknown as the ifdef-only case above.
+    source = "#ifdef FOO\n#if 1\n#define L 5\n#endif\n#endif\n#line L\nx\n"
+    assert _line_breakpoints(source) == []
+
+
+def test_annotate_array_extents_resolves_a_macro_valued_line_directive() -> None:
+    # End-to-end version of the issue's own example: an active pointer `f`
+    # sits behind `#define L 11` / `#line L`, and an inactive array-shaped `f`
+    # sits behind a second, `#if 0`-guarded `#line L`. Confirmed against
+    # esbmc's own parse tree: clang reports the active definition at presumed
+    # line 11 — before this fix, the macro-valued directive was silently
+    # dropped, both candidates fell back to their (much closer together)
+    # physical lines, and the nearest-before tiebreak preferred the inactive,
+    # array-shaped one.
+    source = (
+        "#define L 11\n#line L\nvoid f(int *p) { *p = 1; }\n"
+        "#if 0\n#line L\nvoid f(int p[20]) { }\n#endif\n"
+    )
+    unit = Unit("f", (Param("p", "int *"),), def_line=11)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
+# Issue #165 follow-up to #156/#157, fix 2: a literal `#if`/`#elif` condition
+# wrapped in parens spanning its entire text.
+
+
+def test_line_breakpoints_treats_a_parenthesized_zero_as_known_dead() -> None:
+    source = "#if (0)\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(5, 9)]
+
+
+def test_line_breakpoints_treats_a_doubly_parenthesized_zero_as_known_dead() -> None:
+    source = "#if ((0))\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(5, 9)]
+
+
+def test_line_breakpoints_treats_a_parenthesized_one_as_known_live() -> None:
+    # Mirrors the `(0)` case, and — since a known-live `#if` kills its
+    # `#else` — also exercises that the paren-normalization feeds the same
+    # `decided` chain-state a bare `#if 1` would.
+    source = "#if (1)\n#line 5\nx\n#else\n#line 9\ny\n#endif\n"
+    assert _line_breakpoints(source) == [(2, 5)]
+
+
+def test_line_breakpoints_treats_a_parenthesized_elif_zero_as_known_dead() -> None:
+    source = "#if X\n#elif (0)\n#line 5\nx\n#endif\n"
+    assert _line_breakpoints(source) == []
+
+
+def test_line_breakpoints_treats_a_parenthesized_elif_one_as_known_live() -> None:
+    source = "#if X\n#elif (1)\n#line 5\nx\n#endif\n"
+    assert _line_breakpoints(source) == [(3, 5)]
+
+
+def test_line_breakpoints_does_not_treat_a_paren_wrapped_prefix_zero_as_false() -> None:
+    # `(0 || FEATURE)` — the parens span the whole condition, but what they
+    # wrap is not a bare literal, so this must stay exactly as opaque as the
+    # unparenthesized `0 || FEATURE` case it mirrors.
+    source = "#if (0 || FEATURE)\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(2, 5), (5, 9)]
+
+
+def test_line_breakpoints_does_not_treat_a_paren_wrapped_subexpr_as_false() -> None:
+    # `(0)` here wraps only a subexpression, not the whole condition — the
+    # trailing `|| FEATURE` means the outer text does not even end in `)`, so
+    # this must stay opaque exactly like `test_..._paren_wrapped_prefix_zero`.
+    source = "#if (0) || FEATURE\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(2, 5), (5, 9)]
+
+
+def test_line_breakpoints_does_not_treat_a_trailing_paren_group_as_wrapping() -> None:
+    # `(0)+(1)` both starts and ends in parens, but the leading pair closes at
+    # index 2 — it wraps a subexpression, not the whole condition — so nothing
+    # is peeled and the compound stays opaque (cpp would even evaluate this
+    # one to a literal `1`, which this scan deliberately does not attempt).
+    source = "#if (0)+(1)\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(2, 5), (5, 9)]
+
+
+def test_line_breakpoints_leaves_unbalanced_parens_opaque() -> None:
+    # Mid-edit source can hold a condition whose parens never balance (more
+    # opens than closes): the whole-span scan must exhaust its paren walk
+    # without ever finding a match and leave the text alone — opaque, like
+    # any other condition this scan cannot evaluate.
+    source = "#if (0 || (1)\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(2, 5), (5, 9)]
+
+
+def test_annotate_array_extents_ignores_a_parenthesized_zero_if_body() -> None:
+    # End-to-end mirror of the issue's own example, confirmed against esbmc's
+    # own parse tree: clang skips the `#if (0)` branch outright (as it does a
+    # bare `#if 0`), so the active pointer `f` is reported at presumed line 9.
+    source = (
+        "#if (0)\n#line 5\nvoid f(int p[20]) { }\n#endif\n"
+        "#line 9\nvoid f(int *p) { *p = 1; }\n"
+    )
+    unit = Unit("f", (Param("p", "int *"),), def_line=9)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
 def test_blank_comment_preserves_line_numbers_across_a_multiline_comment() -> None:
     # `_param_list_text` compares byte-offset-derived line numbers in the
     # comment-stripped text against `Unit.def_line`, which clang reports against
