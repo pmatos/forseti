@@ -1616,6 +1616,12 @@ def _verifiable_source(
     into the "now" mtime by omitting it (review feedback on PR #159, issue
     #150).
 
+    That pairing is only guaranteed at stage time: nothing re-checks it once the
+    snapshot is written. If the live file's mtime moves afterward with
+    unchanged content, `__TIMESTAMP__` inside the verify and outside it diverge
+    — a separate, documented residual at `verify_and_record`'s post-verify
+    drift check, not this function's to close (issue #164).
+
     A leading UTF-8 BOM is written at byte zero, ahead of the directive,
     instead of being pushed into the middle of the file: clang only recognizes
     a BOM there, and one sitting in front of the directive is read as part of
@@ -2261,6 +2267,13 @@ def verify_and_record(
             # before `extract_function_defs` ran. Staging still uses `raw` itself
             # (identical content, already what was enumerated) with this
             # refreshed timestamp.
+            #
+            # This narrows the `__TIMESTAMP__`-fidelity window, it does not close
+            # it: the snapshot below still stages with whatever `mtime_ns` reads
+            # *here*, and nothing re-checks it again from this point through the
+            # verify loop's return — see the drift-check note further down
+            # (`verify_and_record`, near `drifted = content_hash(...)`) for the
+            # accepted residual across that remaining interval.
             mtime_ns = fresh_mtime_ns
             # Reconcile + record every current function BEFORE the slow verifies:
             # drop functions the file no longer defines, reset the Stop-gate's
@@ -2419,6 +2432,43 @@ def verify_and_record(
     # is H, every verdict recorded alongside it was computed against content
     # hashing to H (modulo the self-include residual above), and the file itself
     # still hashed to H at least once, right after the verifies finished.
+    #
+    # A second, narrower residual survives alongside the self-include one:
+    # `drifted` below compares bytes, never mtime, so a source touched (editor,
+    # backup, unrelated tooling — anything) with *identical* bytes anywhere
+    # between the pre-verify refresh above and this re-hash returning leaves
+    # `on_disk == digest` true while the live file's mtime has moved past the
+    # `mtime_ns` baked into the snapshot at staging time. A translation unit
+    # branching on `__TIMESTAMP__` (see `_verifiable_source`) was therefore
+    # verified against the *old* timestamp, the live file now reads the new
+    # one, and this check — content-only — calls it undrifted: a fresh
+    # `scanned` stamp, never retried. Deliberately not chased further: a fix
+    # that was tried — folding a live-mtime-vs-`mtime_ns` comparison into
+    # `drifted` — empirically breaks
+    # `test_transient_rewrite_during_verify_is_closed_by_the_snapshot`
+    # (confirmed locally: adding the comparison flips that test's verdicts
+    # from `["verified"]` to `["error"]`, because it now takes the `withdrawn`
+    # branch above and returns `_blocking_error`'s verdict instead), because
+    # that test's own restore-write (B back to A) bumps the live mtime on its
+    # way to converging content back to `digest`; the "fix" would withdraw the
+    # stamp and discard a verdict this whole PR exists to make safe. The
+    # instinct generalizes badly, too: mtime can move for reasons that have
+    # nothing to do with the verified content, at any point during a
+    # multi-second ESBMC subprocess call, so comparing live-mtime-at-return
+    # against embedded-mtime-at-stage is an unbounded window — every retry
+    # re-opens it, making this a liveness risk (perpetually unstamped), not a
+    # soundness gain. `gate_lock` cannot close this either way: it only
+    # serializes this gate's own state read/modify/write among hook
+    # processes, so holding it across the whole verify subprocess call would
+    # not stop an editor, backup, or unrelated tool from touching the live
+    # file's mtime mid-verify — none of those writers take this lock at all.
+    # Accepted as a documented gap, not a bug to fix (issue #164); pinned by
+    # `test_scanned_stamp_survives_a_live_mtime_only_drift_during_verify`,
+    # which drives `verify_and_record` itself and shows the stamp surviving a
+    # live mtime-only touch during verify (the mechanism it rides on —
+    # `_verifiable_source` freezing the snapshot's mtime at stage time — is
+    # characterized on its own by
+    # `test_snapshot_mtime_drift_after_staging_is_a_known_residual`).
     withdrawn = False
     drifted = content_hash(file_path) != digest
     if drifted:
