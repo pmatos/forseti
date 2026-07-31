@@ -31,10 +31,12 @@ from forseti.esbmc import (
 from forseti.esbmc.units import Param
 from forseti.precond import ASSESSMENT_EXIT_CODES, Assessment
 from forseti.precond.discharge import (
+    CallerCheck,
     CallerOutcome,
     DischargeResult,
     discharge_precondition,
     emit_obligations,
+    open_caller_checks,
 )
 from forseti.precond.synth import (
     NON_VACUITY_LABEL,
@@ -119,15 +121,27 @@ def _run(
     units: tuple[Unit, ...] = (CALLEE, CALLER),
     function: str = "sum_bytes",
     source_text: str = SOURCE,
-    external: Callable[[Path, str], tuple[str, ...]] = lambda _s, _f: (),
-    escapes: Callable[[Path, str], tuple[str, ...]] = lambda _s, _f: (),
-    aliases: Callable[[Path, str], tuple[str, ...]] = lambda _s, _f: (),
-    implicit_invocations: Callable[[Path, str], tuple[str, ...]] = lambda _s, _f: (),
-    asm_statements: Callable[[Path, str], tuple[str, ...]] = lambda _s, _f: (),
+    foreign: tuple[str, ...] = (),
+    escaped: tuple[str, ...] = (),
+    aliased: tuple[str, ...] = (),
+    implicit: tuple[str, ...] = (),
+    asm_sites: tuple[str, ...] = (),
+    open_callers: Callable[[Path, str], tuple[CallerCheck, ...]] | None = None,
     raw: Callable[..., EsbmcResult] | None = None,
 ) -> DischargeResult:
     src = tmp / "frame.c"
     src.write_text(source_text)
+    openings = open_callers or (
+        lambda _s, sym: open_caller_checks(
+            sym,
+            _s,
+            foreign=foreign,
+            escaped=escaped,
+            aliased=aliased,
+            implicit=implicit,
+            asm_sites=asm_sites,
+        )
+    )
     return discharge_precondition(
         src,
         function=function,
@@ -136,11 +150,7 @@ def _run(
         work_dir=tmp,
         raw_verify=raw or _raw(caller_verdicts or {}),
         list_units_fn=lambda _s: list(units),
-        external_callers_fn=external,
-        address_escapes_fn=escapes,
-        aliases_fn=aliases,
-        implicit_invocations_fn=implicit_invocations,
-        asm_statements_fn=asm_statements,
+        open_callers_fn=openings,
     )
 
 
@@ -291,11 +301,7 @@ def test_one_broken_caller_outranks_the_clean_ones(tmp_path: Path) -> None:
         work_dir=tmp_path,
         raw_verify=raw,
         list_units_fn=lambda _s: [CALLEE, CALLER, second],
-        external_callers_fn=lambda _s, _f: (),
-        address_escapes_fn=lambda _s, _f: (),
-        aliases_fn=lambda _s, _f: (),
-        implicit_invocations_fn=lambda _s, _f: (),
-        asm_statements_fn=lambda _s, _f: (),
+        open_callers_fn=lambda _s, _f: (),
     )
     assert result.assessment is Assessment.VIOLATED
     assert "payload_checksum()" in result.detail
@@ -306,7 +312,7 @@ def test_a_caller_outside_the_file_withholds_the_upgrade(tmp_path: Path) -> None
     # A `static inline` in an included header is a caller in this translation
     # unit that `list_units` cannot enumerate by design. Claiming "every caller"
     # while some were never listed would be a claim about a set we never saw.
-    result = _run(tmp_path, external=lambda _s, _f: ("header_client",))
+    result = _run(tmp_path, foreign=("header_client",))
     assert result.assessment is Assessment.ASSUMED_VERIFIED
     unchecked = [c for c in result.callers if c.caller == "header_client"]
     assert unchecked and unchecked[0].outcome is CallerOutcome.UNCHECKED
@@ -314,7 +320,7 @@ def test_a_caller_outside_the_file_withholds_the_upgrade(tmp_path: Path) -> None
 
 
 def test_an_outside_caller_counts_even_with_no_local_caller(tmp_path: Path) -> None:
-    result = _run(tmp_path, units=(CALLEE,), external=lambda _s, _f: ("header_client",))
+    result = _run(tmp_path, units=(CALLEE,), foreign=("header_client",))
     assert result.assessment is Assessment.ASSUMED_VERIFIED
     assert [c.caller for c in result.callers] == ["header_client"]
     assert "no caller" not in result.label  # there *is* one; we just cannot check it
@@ -324,7 +330,7 @@ def test_an_escaped_address_withholds_the_upgrade(tmp_path: Path) -> None:
     # `static cb_t fp = sum_bytes;` plus an indirect `fp(...)` is a caller no
     # name-based enumeration can reach: the indirect call names the *variable*.
     # A clean sweep of the callers we can see says nothing about that path.
-    result = _run(tmp_path, escapes=lambda _s, _f: ("fp",))
+    result = _run(tmp_path, escaped=("fp",))
     assert result.assessment is Assessment.ASSUMED_VERIFIED
     unresolved = [c for c in result.callers if c.caller == "fp"]
     assert unresolved and unresolved[0].outcome is CallerOutcome.UNRESOLVED
@@ -334,7 +340,7 @@ def test_an_escaped_address_withholds_the_upgrade(tmp_path: Path) -> None:
 
 
 def test_an_escape_counts_even_with_no_local_caller(tmp_path: Path) -> None:
-    result = _run(tmp_path, units=(CALLEE,), escapes=lambda _s, _f: ("fp",))
+    result = _run(tmp_path, units=(CALLEE,), escaped=("fp",))
     assert result.assessment is Assessment.ASSUMED_VERIFIED
     assert [c.caller for c in result.callers] == ["fp"]
     assert "no caller" not in result.label  # one exists; it just cannot be named
@@ -346,7 +352,7 @@ def test_an_inline_asm_statement_withholds_the_upgrade(tmp_path: Path) -> None:
     # attribute would print — so nothing but a dedicated, symbol-agnostic scan
     # can say this caller set might not be complete. A clean sweep of the one
     # caller the enumeration *can* see must not upgrade regardless.
-    result = _run(tmp_path, asm_statements=lambda _s, _f: ("via_asm",))
+    result = _run(tmp_path, asm_sites=("via_asm",))
     assert result.assessment is Assessment.ASSUMED_VERIFIED
     unresolved = [c for c in result.callers if c.caller == "via_asm"]
     assert unresolved and unresolved[0].outcome is CallerOutcome.UNRESOLVED
@@ -356,17 +362,17 @@ def test_an_inline_asm_statement_withholds_the_upgrade(tmp_path: Path) -> None:
 
 
 def test_an_asm_statement_counts_even_with_no_local_caller(tmp_path: Path) -> None:
-    result = _run(tmp_path, units=(CALLEE,), asm_statements=lambda _s, _f: ("via_asm",))
+    result = _run(tmp_path, units=(CALLEE,), asm_sites=("via_asm",))
     assert result.assessment is Assessment.ASSUMED_VERIFIED
     assert [c.caller for c in result.callers] == ["via_asm"]
     assert "no caller" not in result.label  # one exists; it just cannot be named
 
 
 def test_a_failed_external_listing_is_an_error(tmp_path: Path) -> None:
-    def boom(_source: Path, _symbol: str) -> tuple[str, ...]:
+    def boom(_source: Path, _symbol: str) -> tuple[CallerCheck, ...]:
         raise ListUnitsError("esbmc --parse-tree-only failed: gone")
 
-    result = _run(tmp_path, external=boom)
+    result = _run(tmp_path, open_callers=boom)
     assert result.assessment is Assessment.ERROR
     assert "gone" in result.detail
 
@@ -524,7 +530,7 @@ def test_an_escape_outranks_an_anchored_caller(tmp_path: Path) -> None:
     # unenumerable path must still withhold the whole upgrade rather than be
     # counted as one more caller the anchor speaks for.
     entry = Unit("run", (), ("sum_bytes",))
-    result = _run(tmp_path, units=(CALLEE, entry), escapes=lambda _s, _f: ("fp",))
+    result = _run(tmp_path, units=(CALLEE, entry), escaped=("fp",))
     assert result.assessment is Assessment.ASSUMED_VERIFIED
     assert "discharge incomplete" in result.label
 
@@ -575,11 +581,7 @@ def test_unreadable_source_is_an_error(tmp_path: Path) -> None:
         work_dir=tmp_path,
         raw_verify=_raw({}),
         list_units_fn=lambda _s: [CALLEE, CALLER],
-        external_callers_fn=lambda _s, _f: (),
-        address_escapes_fn=lambda _s, _f: (),
-        aliases_fn=lambda _s, _f: (),
-        implicit_invocations_fn=lambda _s, _f: (),
-        asm_statements_fn=lambda _s, _f: (),
+        open_callers_fn=lambda _s, _f: (),
     )
     assert result.assessment is Assessment.ERROR
     assert "could not read" in result.detail
