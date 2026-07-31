@@ -287,6 +287,126 @@ class DischargeResult:
         return payload
 
 
+def open_caller_checks(
+    function: str,
+    source: Path,
+    *,
+    foreign: tuple[str, ...],
+    escaped: tuple[str, ...],
+    aliased: tuple[str, ...],
+    implicit: tuple[str, ...],
+    asm_sites: tuple[str, ...],
+) -> tuple[CallerCheck, ...]:
+    """The callers that keep "every caller in this TU" from being a real claim.
+
+    Five ways the caller set can be wider than what `list_units` shows, each of
+    which keeps "every caller here" from being a claim about a set we never saw:
+    a `static inline` in an included header is part of this translation unit but
+    is not a unit `list_units` reports (`foreign`); an address taken rather than
+    called can be invoked from anywhere through the pointer that holds it
+    (`escaped`); an alias attribute gives the callee a second name whose call
+    sites reference only that name (`aliased`); a constructor/destructor
+    attribute names no one at all — the loader invokes the callee's own
+    declaration directly, supplying none of the arguments any explicit caller
+    does (`implicit`); and a GNU inline ``asm("call f")`` names its target only
+    inside a string clang's own AST dump never prints, so no scan can tell which
+    symbol, if any, it reaches (`asm_sites`).
+
+    Pure: names in, `CallerCheck`s out, in a stable order the aggregation relies
+    on — `foreign` (``UNCHECKED``) first, then the four ``UNRESOLVED`` kinds.
+    """
+    return (
+        tuple(
+            CallerCheck(
+                name,
+                CallerOutcome.UNCHECKED,
+                f"defined outside {source}, so the gate cannot enumerate it as a unit "
+                "or build a harness for it",
+            )
+            for name in foreign
+        )
+        + tuple(
+            CallerCheck(
+                site,
+                CallerOutcome.UNRESOLVED,
+                f"names {function}() outside a direct call — an address taken, or "
+                "an attribute such as a cleanup handler — so a call path the "
+                "enumeration cannot follow may reach it from anywhere in this "
+                "translation unit",
+            )
+            for site in escaped
+        )
+        + tuple(
+            CallerCheck(
+                name,
+                CallerOutcome.UNRESOLVED,
+                f"is another name for {function}() (an alias attribute or a shared "
+                "assembly label), and a call written through it references only "
+                "that name, so its callers are not in the set that was checked",
+            )
+            for name in aliased
+        )
+        + tuple(
+            CallerCheck(
+                f"<{kind}>",
+                CallerOutcome.UNRESOLVED,
+                f"carries a {kind} attribute, so the loader invokes {function}() "
+                "directly at load/unload time, supplying none of the arguments "
+                "any explicit call site in this translation unit does",
+            )
+            for kind in implicit
+        )
+        + tuple(
+            CallerCheck(
+                site,
+                CallerOutcome.UNRESOLVED,
+                "contains or is named by GNU inline assembly that may invoke "
+                f"{function}() by a path that leaves no `DeclRefExpr` for this "
+                "enumeration to ever see",
+            )
+            for site in asm_sites
+        )
+    )
+
+
+def find_open_callers(
+    source: Path,
+    function: str,
+    *,
+    esbmc_bin: str = "esbmc",
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+) -> tuple[CallerCheck, ...]:
+    """Enumerate the callers `list_units` cannot, as withholding `CallerCheck`s.
+
+    The one seam the discharge driver crosses to ask "is this callee's caller set
+    open?" — a thin adapter over the five `esbmc` listing calls, whose
+    `CallerCheck` shaping lives in `open_caller_checks`. `list_asm_statements`
+    still gets `function`: a ``GCCAsmStmt`` can never be narrowed by it (see
+    `parse_asm_statements`), but a ``FileScopeAsmDecl`` can, so it is threaded
+    through like every other listing here. A ``ListUnitsError`` from any listing
+    propagates to the caller, which reports it rather than silently discharging.
+    """
+    return open_caller_checks(
+        function,
+        source,
+        foreign=list_external_callers(
+            source, function, esbmc_bin=esbmc_bin, timeout_s=timeout_s
+        ),
+        escaped=list_address_escapes(
+            source, function, esbmc_bin=esbmc_bin, timeout_s=timeout_s
+        ),
+        aliased=list_symbol_aliases(
+            source, function, esbmc_bin=esbmc_bin, timeout_s=timeout_s
+        ),
+        implicit=list_implicit_invocations(
+            source, function, esbmc_bin=esbmc_bin, timeout_s=timeout_s
+        ),
+        asm_sites=list_asm_statements(
+            source, function, esbmc_bin=esbmc_bin, timeout_s=timeout_s
+        ),
+    )
+
+
 def _memoized(lister: Callable[[Path], list[Unit]]) -> Callable[[Path], list[Unit]]:
     """`lister` with a one-entry-per-path cache, so the TU is parsed once.
 
@@ -344,24 +464,19 @@ def discharge_precondition(
     work_dir: Path | None = None,
     raw_verify: VerifyPort | None = None,
     list_units_fn: Callable[[Path], list[Unit]] | None = None,
-    external_callers_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
-    address_escapes_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
-    aliases_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
-    implicit_invocations_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
-    asm_statements_fn: Callable[[Path, str], tuple[str, ...]] | None = None,
+    open_callers_fn: Callable[[Path, str], tuple[CallerCheck, ...]] | None = None,
 ) -> DischargeResult:
     """Verify `source::function` against its precondition, then discharge it.
 
     Runs S2 first and *only ever upgrades* its verdict: anything other than
     ``ASSUMED_VERIFIED`` (a real violation, ``NEEDS_CONTRACT``, an error) passes
     through untouched, because there is no assumption to discharge. `raw_verify`,
-    `list_units_fn`, `external_callers_fn`, `address_escapes_fn`, `aliases_fn`,
-    `implicit_invocations_fn` and `asm_statements_fn` inject the esbmc calls for
-    tests; production adds a ``-I`` for the source's own directory so the
-    generated copy's relative ``#include``\\ s still resolve. `asm_statements_fn`
-    still gets `function` — a ``GCCAsmStmt`` can never be narrowed by it (see
-    `parse_asm_statements`), but a ``FileScopeAsmDecl`` can, so it is threaded
-    through like every other listing here.
+    `list_units_fn` and `open_callers_fn` inject the esbmc calls for tests;
+    production adds a ``-I`` for the source's own directory so the generated
+    copy's relative ``#include``\\ s still resolve. `open_callers_fn` is the one
+    seam over the whole caller-completeness question — the five ESBMC listings
+    that `find_open_callers` fans out to (see `open_caller_checks` for the ways
+    the caller set can be open).
     """
     lister = _memoized(
         list_units_fn
@@ -391,28 +506,8 @@ def discharge_precondition(
         esbmc_bin=esbmc_bin,
         extra_flags=(f"-I{source.resolve().parent}",),
     )
-    external = external_callers_fn or (
-        lambda src, sym: list_external_callers(
-            src, sym, esbmc_bin=esbmc_bin, timeout_s=timeout_s
-        )
-    )
-    escapes = address_escapes_fn or (
-        lambda src, sym: list_address_escapes(
-            src, sym, esbmc_bin=esbmc_bin, timeout_s=timeout_s
-        )
-    )
-    aliases = aliases_fn or (
-        lambda src, sym: list_symbol_aliases(
-            src, sym, esbmc_bin=esbmc_bin, timeout_s=timeout_s
-        )
-    )
-    implicit_invocations = implicit_invocations_fn or (
-        lambda src, sym: list_implicit_invocations(
-            src, sym, esbmc_bin=esbmc_bin, timeout_s=timeout_s
-        )
-    )
-    asm_statements = asm_statements_fn or (
-        lambda src, sym: list_asm_statements(
+    open_callers = open_callers_fn or (
+        lambda src, sym: find_open_callers(
             src, sym, esbmc_bin=esbmc_bin, timeout_s=timeout_s
         )
     )
@@ -421,11 +516,7 @@ def discharge_precondition(
         function,
         unit_result,
         lister(source),
-        external,
-        escapes,
-        aliases,
-        implicit_invocations,
-        asm_statements,
+        open_callers,
         max_len,
         ladder_cap,
         raw,
@@ -441,11 +532,7 @@ def _discharge(
     function: str,
     unit_result: PreconditionResult,
     units: list[Unit],
-    external_callers_fn: Callable[[Path, str], tuple[str, ...]],
-    address_escapes_fn: Callable[[Path, str], tuple[str, ...]],
-    aliases_fn: Callable[[Path, str], tuple[str, ...]],
-    implicit_invocations_fn: Callable[[Path, str], tuple[str, ...]],
-    asm_statements_fn: Callable[[Path, str], tuple[str, ...]],
+    open_callers_fn: Callable[[Path, str], tuple[CallerCheck, ...]],
     max_len: int,
     ladder_cap: int,
     raw: VerifyPort,
@@ -501,77 +588,13 @@ def _discharge(
     # named from another one, so "every caller here" is every caller; an
     # externally visible one exports the obligation to clients we never see.
     internal = any(u.internal_linkage for u in units if u.name == function)
-    # The five ways the caller set can be wider than what `units` shows, each of
-    # which keeps "every caller in this TU" from being a claim about a set we
-    # never saw: a `static inline` in an included header is part of this
-    # translation unit but is not a unit `list_units` reports; an address taken
-    # rather than called can be invoked from anywhere through the pointer that
-    # holds it; an alias attribute gives the callee a second name whose call
-    # sites reference only that name; a constructor/destructor attribute names
-    # no one at all — the loader invokes the callee's own declaration directly,
-    # supplying none of the arguments any explicit caller does; and a GNU inline
-    # ``asm("call f")`` names its target only inside a string clang's own AST
-    # dump never prints, so no scan can tell which symbol, if any, it reaches.
+    # The callers `list_units` cannot see — five ways the caller set can be wider
+    # than `units`, each withholding the upgrade (see `open_caller_checks`). One
+    # seam owns the fan-out and the taxonomy; a failed listing surfaces as ERROR.
     try:
-        foreign = external_callers_fn(source, function)
-        escaped = address_escapes_fn(source, function)
-        aliased = aliases_fn(source, function)
-        implicit = implicit_invocations_fn(source, function)
-        asm_sites = asm_statements_fn(source, function)
+        unenumerable = open_callers_fn(source, function)
     except ListUnitsError as exc:
         return DischargeResult(function, Assessment.ERROR, str(exc), unit_result)
-    unenumerable = (
-        tuple(
-            CallerCheck(
-                name,
-                CallerOutcome.UNCHECKED,
-                f"defined outside {source}, so the gate cannot enumerate it as a unit "
-                "or build a harness for it",
-            )
-            for name in foreign
-        )
-        + tuple(
-            CallerCheck(
-                site,
-                CallerOutcome.UNRESOLVED,
-                f"names {function}() outside a direct call — an address taken, or "
-                "an attribute such as a cleanup handler — so a call path the "
-                "enumeration cannot follow may reach it from anywhere in this "
-                "translation unit",
-            )
-            for site in escaped
-        )
-        + tuple(
-            CallerCheck(
-                name,
-                CallerOutcome.UNRESOLVED,
-                f"is another name for {function}() (an alias attribute or a shared "
-                "assembly label), and a call written through it references only "
-                "that name, so its callers are not in the set that was checked",
-            )
-            for name in aliased
-        )
-        + tuple(
-            CallerCheck(
-                f"<{kind}>",
-                CallerOutcome.UNRESOLVED,
-                f"carries a {kind} attribute, so the loader invokes {function}() "
-                "directly at load/unload time, supplying none of the arguments "
-                "any explicit call site in this translation unit does",
-            )
-            for kind in implicit
-        )
-        + tuple(
-            CallerCheck(
-                site,
-                CallerOutcome.UNRESOLVED,
-                "contains or is named by GNU inline assembly that may invoke "
-                f"{function}() by a path that leaves no `DeclRefExpr` for this "
-                "enumeration to ever see",
-            )
-            for site in asm_sites
-        )
-    )
     # A re-entry is never an *anchor*: something outside the recursion has to
     # enter the callee in the first place, so with no other caller the obligation
     # is still exported rather than discharged here.
