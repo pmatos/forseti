@@ -2,11 +2,16 @@
 # Produces GitHub Releases + a maintained CHANGELOG.md from Conventional Commits.
 # Ecosystem publishing (crates.io / PyPI) is deliberately NOT wired here — add the
 # relevant plugin (@semantic-release/exec, semantic-release-cargo, etc.) per repo.
+#
+# Releases are cut on a weekly batch schedule (Sundays 00:00 UTC) rather than on
+# every push, so semantic-release derives the next version from whatever
+# Conventional Commit types accumulated on main that week. No-op if nothing
+# releasable landed. Use workflow_dispatch to cut a release on demand.
 name: Release
 
 on:
-  push:
-    branches: [main]
+  schedule:
+    - cron: "0 0 * * 0"
   workflow_dispatch:
 
 permissions:
