@@ -21,7 +21,7 @@ dev = [
     "pytest-cov>=7.1.0",
     "hypothesis>=6.161.8",
     "mypy>=2.3.0",
-    "ruff>=0.16.0",
+    "ruff>=0.16.1",
     "forseti[mcp]",
 ]
 
