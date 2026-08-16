@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from forseti.esbmc import (
+    CallerOpenings,
     EsbmcResult,
     ListUnitsError,
     RunMeta,
@@ -653,42 +654,28 @@ def test_every_assessment_has_an_exit_code() -> None:
     assert set(ASSESSMENT_EXIT_CODES) == set(Assessment)
 
 
-def test_discharge_forwards_the_requested_timeout_to_every_listing_call(
+def test_discharge_forwards_the_requested_timeout_to_every_parse_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # `-t/--timeout` maps to `timeout_s`; every ESBMC parse-tree listing call this
-    # driver makes on its own — not just the actual verification runs — must
-    # honour it, or a short user-requested timeout still lets up to six
-    # independent 30-second defaults run before verification even begins.
+    # `-t/--timeout` maps to `timeout_s`; every ESBMC parse-tree run this driver
+    # makes on its own — not just the actual verification runs — must honour it.
+    # The five caller-completeness listings now share one dump, so the driver
+    # makes two such runs (the unit list and the openings dump) where it once made
+    # up to six; a short user-requested timeout must still reach both.
     seen: dict[str, float | None] = {}
 
     def _list_units(_src, *, esbmc_bin, timeout_s):  # type: ignore[no-untyped-def]
         seen["list_units"] = timeout_s
         return [CALLEE, CALLER]
 
-    def _recorder(name: str):  # type: ignore[no-untyped-def]
-        def _fn(_src, _sym, *, esbmc_bin, timeout_s):  # type: ignore[no-untyped-def]
-            seen[name] = timeout_s
-            return ()
-
-        return _fn
+    def _openings(_src, _sym, *, esbmc_bin, timeout_s):  # type: ignore[no-untyped-def]
+        seen["caller_openings"] = timeout_s
+        return CallerOpenings(
+            foreign=(), escaped=(), aliased=(), implicit=(), asm_sites=()
+        )
 
     monkeypatch.setattr("forseti.precond.discharge.list_units", _list_units)
-    monkeypatch.setattr(
-        "forseti.precond.discharge.list_external_callers", _recorder("external")
-    )
-    monkeypatch.setattr(
-        "forseti.precond.discharge.list_address_escapes", _recorder("escapes")
-    )
-    monkeypatch.setattr(
-        "forseti.precond.discharge.list_symbol_aliases", _recorder("aliases")
-    )
-    monkeypatch.setattr(
-        "forseti.precond.discharge.list_implicit_invocations", _recorder("implicit")
-    )
-    monkeypatch.setattr(
-        "forseti.precond.discharge.list_asm_statements", _recorder("asm")
-    )
+    monkeypatch.setattr("forseti.precond.discharge.list_caller_openings", _openings)
 
     src = tmp_path / "frame.c"
     src.write_text(SOURCE)
@@ -701,11 +688,4 @@ def test_discharge_forwards_the_requested_timeout_to_every_listing_call(
         work_dir=tmp_path,
         raw_verify=_raw({}),
     )
-    assert seen == {
-        "list_units": 1.0,
-        "external": 1.0,
-        "escapes": 1.0,
-        "aliases": 1.0,
-        "implicit": 1.0,
-        "asm": 1.0,
-    }
+    assert seen == {"list_units": 1.0, "caller_openings": 1.0}

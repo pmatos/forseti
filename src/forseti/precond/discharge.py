@@ -172,11 +172,7 @@ from forseti.esbmc import (
     Unit,
     Verified,
     Violated,
-    list_address_escapes,
-    list_asm_statements,
-    list_external_callers,
-    list_implicit_invocations,
-    list_symbol_aliases,
+    list_caller_openings,
     list_units,
 )
 from forseti.orchestrator.ladder import verify_ladder
@@ -379,31 +375,24 @@ def find_open_callers(
     """Enumerate the callers `list_units` cannot, as withholding `CallerCheck`s.
 
     The one seam the discharge driver crosses to ask "is this callee's caller set
-    open?" — a thin adapter over the five `esbmc` listing calls, whose
-    `CallerCheck` shaping lives in `open_caller_checks`. `list_asm_statements`
-    still gets `function`: a ``GCCAsmStmt`` can never be narrowed by it (see
-    `parse_asm_statements`), but a ``FileScopeAsmDecl`` can, so it is threaded
-    through like every other listing here. A ``ListUnitsError`` from any listing
-    propagates to the caller, which reports it rather than silently discharging.
+    open?" — a thin adapter over `list_caller_openings`, which parses the
+    translation unit *once* and answers all five completeness questions from that
+    dump (the five separate listing calls used to parse it five times). The
+    `CallerCheck` shaping lives in `open_caller_checks`. A ``ListUnitsError`` from
+    the listing propagates to the caller, which reports it rather than silently
+    discharging.
     """
+    openings = list_caller_openings(
+        source, function, esbmc_bin=esbmc_bin, timeout_s=timeout_s
+    )
     return open_caller_checks(
         function,
         source,
-        foreign=list_external_callers(
-            source, function, esbmc_bin=esbmc_bin, timeout_s=timeout_s
-        ),
-        escaped=list_address_escapes(
-            source, function, esbmc_bin=esbmc_bin, timeout_s=timeout_s
-        ),
-        aliased=list_symbol_aliases(
-            source, function, esbmc_bin=esbmc_bin, timeout_s=timeout_s
-        ),
-        implicit=list_implicit_invocations(
-            source, function, esbmc_bin=esbmc_bin, timeout_s=timeout_s
-        ),
-        asm_sites=list_asm_statements(
-            source, function, esbmc_bin=esbmc_bin, timeout_s=timeout_s
-        ),
+        foreign=openings.foreign,
+        escaped=openings.escaped,
+        aliased=openings.aliased,
+        implicit=openings.implicit,
+        asm_sites=openings.asm_sites,
     )
 
 
