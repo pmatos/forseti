@@ -957,19 +957,40 @@ def _skip_suffix_attributes(text: str, pos: int) -> int:
             pos += 1
 
 
-def _definition_signature(
-    source_no_comments: str, fn_name: str
-) -> tuple[str, int] | None:
-    """`fn_name`'s definition: its parameter-list text and its ``{`` index.
+@dataclass(frozen=True)
+class _DefinitionMatch:
+    """One definition-shaped occurrence of a name: its line, its ``{``, its params.
 
-    Scans for ``fn_name (`` and balances parentheses to the matching ``)``; the
-    occurrence whose ``)`` is followed (past whitespace and any suffix
-    attributes) by ``{`` is the definition — so a prototype (``);``) or a call
-    site (``) ;``, ``))``) is skipped. Deliberately narrow: clang already told
-    us the canonical types and which parameters are pointers, so this only has
-    to isolate the declarator text to harvest an array extent from — never to
-    classify a type.
+    ``line`` is the 1-based *physical* line of the ``fn_name (`` token, which
+    `_select_definition` translates to a presumed coordinate before it anchors on
+    `def_line`. ``brace`` indexes the body's ``{``; ``params`` is the declarator
+    text between ``(`` and its matching ``)``. A body opener and a parameter list
+    are the same occurrence seen two ways, so both entry points read them off this.
     """
+
+    line: int
+    brace: int
+    params: str
+
+
+def _definition_candidates(
+    source_no_comments: str, fn_name: str
+) -> list[_DefinitionMatch]:
+    """Every definition-shaped occurrence of `fn_name`, in textual order.
+
+    Scans for ``fn_name (`` and balances parentheses to the matching ``)``; an
+    occurrence whose ``)`` is followed (past whitespace and any suffix attributes)
+    by ``{`` is *definition-shaped* — so a prototype (``);``) or a call site
+    (``) ;``, ``))``) is skipped. Deliberately narrow: clang already told us the
+    canonical types and which parameters are pointers, so this only has to isolate
+    the declarator text to harvest an array extent from, and the ``{`` to inject an
+    obligation after — never to classify a type.
+
+    The single scanner behind both `find_definition_brace` (S3 obligation
+    injection) and `_param_list_text` (extent harvesting): keeping one scan is what
+    stops the #145 anchor from reaching one caller and not the other.
+    """
+    matches: list[_DefinitionMatch] = []
     for match in re.finditer(rf"\b{re.escape(fn_name)}\s*\(", source_no_comments):
         depth = 0
         j = match.end() - 1  # index of the '('
@@ -989,11 +1010,73 @@ def _definition_signature(
             k += 1
         k = _skip_suffix_attributes(source_no_comments, k)
         if k < len(source_no_comments) and source_no_comments[k] == "{":
-            return source_no_comments[match.end() : j], k
-    return None
+            line = source_no_comments.count("\n", 0, match.start()) + 1
+            matches.append(
+                _DefinitionMatch(line, k, source_no_comments[match.end() : j])
+            )
+    return matches
 
 
-def find_definition_brace(source_text: str, fn_name: str) -> int | None:
+def _select_definition(
+    matches: list[_DefinitionMatch], source_no_comments: str, def_line: int | None
+) -> _DefinitionMatch | None:
+    """The definition-shaped occurrence `def_line` anchors to, or the first.
+
+    Textual order alone cannot tell two definition-shaped occurrences of the same
+    name apart — e.g. an inactive ``#if 0`` body ahead of the one clang actually
+    compiled (issue #145). When `def_line` is given (the compiled definition's
+    line, from `Unit.def_line`), the occurrence at or nearest *after* that line is
+    preferred over one before it — `def_line` points at the declaration's opening
+    line, which the ``fn_name (`` text can follow by a line or two (a return type
+    on its own line). Without `def_line` the first definition-shaped occurrence is
+    used, as before.
+
+    `def_line` is clang's *presumed* line — the coordinate a ``#line``/linemarker
+    directive in the source can rewrite away from physical line count. Comparing
+    it against a raw physical line count would silently anchor to the wrong
+    occurrence whenever such a directive is present, so each candidate's physical
+    line is first translated to the same presumed coordinate system before the
+    comparison (issue #145 follow-up: a directive after an inactive ``#if 0`` body
+    can make the active definition's presumed line collide with, or fall behind,
+    the inactive one's physical line).
+
+    Two candidates can still translate to the *same* presumed line even after
+    `_line_breakpoints` excludes a ``#line`` sitting inside a literal ``#if 0``/
+    ``#elif 0`` branch — e.g. two directives outside any conditional at all, each
+    immediately ahead of a definition-shaped occurrence. `min`'s stability would
+    otherwise silently keep whichever candidate is textually first. As a last
+    resort, ties are broken by physical line, preferring the later occurrence —
+    consistent with this anchor's own default assumption (issue #145): an
+    inactive alternative more often sits *before* the active one than after.
+
+    A duplicate directive inside an *opaque* conditional (``#ifdef``) is not this
+    case: this textual scan cannot tell which branch cpp took, so nothing here —
+    this tiebreak included — can pick the right candidate in both compiles of
+    such an input; it is a residual, not a target.
+    """
+    if not matches:
+        return None
+    if def_line is None:
+        return matches[0]
+    breakpoints = _line_breakpoints(source_no_comments)
+    # Sort key: candidates at or after `def_line` (key[0] == False) all sort before
+    # any that are only before it, then nearest wins within each group — "at or
+    # nearest after", falling back to nearest-before only if none qualify. `-m.line`
+    # (physical line) only breaks a tie left by the first two components — two
+    # candidates translated to the same presumed distance from `def_line`.
+    return min(
+        matches,
+        key=lambda m: (
+            _presumed_line(m.line, breakpoints) < def_line,
+            abs(_presumed_line(m.line, breakpoints) - def_line),
+            -m.line,
+        ),
+    )
+
+
+def find_definition_brace(
+    source_text: str, fn_name: str, def_line: int | None = None
+) -> int | None:
     """Index of the ``{`` opening `fn_name`'s definition body in `source_text`.
 
     ``None`` when no definition of that name is isolable (a prototype-only
@@ -1001,9 +1084,18 @@ def find_definition_brace(source_text: str, fn_name: str) -> int | None:
     signature). The index is into the **original** text — comments are masked
     length-preservingly first, so a ``{`` inside a comment cannot be mistaken for
     the body's while the offset stays usable for injection (RFC-0003 S3).
+
+    `def_line` (the compiled definition's presumed line, `Unit.def_line`) anchors
+    the choice when the same name has more than one definition-shaped occurrence:
+    an inactive ``#if 0`` body ahead of the compiled one must not capture the
+    injection point, or an obligation would land in dead code cpp deletes and go
+    unchecked (issue #145; the anchor lives in `_select_definition`).
     """
-    found = _definition_signature(mask_comments(source_text), fn_name)
-    return None if found is None else found[1]
+    masked = mask_comments(source_text)
+    chosen = _select_definition(
+        _definition_candidates(masked, fn_name), masked, def_line
+    )
+    return None if chosen is None else chosen.brace
 
 
 @dataclass(frozen=True)
@@ -1246,86 +1338,18 @@ def _param_list_text(
 ) -> str | None:
     """The parameter-list text of `fn_name`'s *definition*, or ``None``.
 
-    Scans for ``fn_name (`` and balances parentheses to the matching ``)``; an
-    occurrence whose ``)`` is followed (past whitespace and any suffix
-    attributes) by ``{`` is *definition-shaped* — so a prototype (``);``) or a
-    call site (``) ;``, ``))``) is skipped. Deliberately narrow: clang already
-    told us the canonical types and which parameters are pointers, so this
-    only has to isolate the declarator text to harvest an array extent from —
-    never to classify a type.
-
-    Textual order alone cannot tell two definition-shaped occurrences of the same
-    name apart — e.g. an inactive ``#if 0`` body ahead of the one clang actually
-    compiled (issue #145). When `def_line` is given (the compiled definition's
-    line, from `Unit.def_line`), the occurrence at or nearest *after* that line is
-    preferred over one before it — `def_line` points at the declaration's opening
-    line, which the ``fn_name (`` text can follow by a line or two (a return type
-    on its own line). Without `def_line` the first definition-shaped occurrence is
-    used, as before.
-
-    `def_line` is clang's *presumed* line — the coordinate a ``#line``/linemarker
-    directive in the source can rewrite away from physical line count. Comparing
-    it against a raw physical line count would silently anchor to the wrong
-    occurrence whenever such a directive is present, so each candidate's physical
-    line is first translated to the same presumed coordinate system before the
-    comparison (issue #145 follow-up: a directive after an inactive ``#if 0`` body
-    can make the active definition's presumed line collide with, or fall behind,
-    the inactive one's physical line).
-
-    Two candidates can still translate to the *same* presumed line even after
-    `_line_breakpoints` excludes a ``#line`` sitting inside a literal ``#if 0``/
-    ``#elif 0`` branch — e.g. two directives outside any conditional at all, each
-    immediately ahead of a definition-shaped occurrence. `min`'s stability would
-    otherwise silently keep whichever candidate is textually first. As a last
-    resort, ties are broken by physical line, preferring the later occurrence —
-    consistent with this anchor's own default assumption (issue #145): an
-    inactive alternative more often sits *before* the active one than after.
-
-    A duplicate directive inside an *opaque* conditional (``#ifdef``) is not this
-    case: this textual scan cannot tell which branch cpp took, so nothing here —
-    this tiebreak included — can pick the right candidate in both compiles of
-    such an input; it is a residual, not a target.
+    The declarator text between ``(`` and its matching ``)`` for the
+    definition-shaped occurrence `def_line` anchors to — see `_definition_candidates`
+    for what counts as definition-shaped and `_select_definition` for how
+    `def_line` (issue #145) picks the compiled definition over an inactive
+    ``#if 0`` alternative.
     """
-    candidates: list[tuple[int, str]] = []
-    for match in re.finditer(rf"\b{re.escape(fn_name)}\s*\(", source_no_comments):
-        depth = 0
-        j = match.end() - 1  # index of the '('
-        while j < len(source_no_comments):
-            char = source_no_comments[j]
-            if char == "(":
-                depth += 1
-            elif char == ")":
-                depth -= 1
-                if depth == 0:
-                    break
-            j += 1
-        else:
-            continue  # unbalanced — not a usable signature
-        k = j + 1
-        while k < len(source_no_comments) and source_no_comments[k].isspace():
-            k += 1
-        k = _skip_suffix_attributes(source_no_comments, k)
-        if k < len(source_no_comments) and source_no_comments[k] == "{":
-            line = source_no_comments.count("\n", 0, match.start()) + 1
-            candidates.append((line, source_no_comments[match.end() : j]))
-    if not candidates:
-        return None
-    if def_line is None:
-        return candidates[0][1]
-    breakpoints = _line_breakpoints(source_no_comments)
-    # Sort key: candidates at or after `def_line` (key[0] == False) all sort before
-    # any that are only before it, then nearest wins within each group — "at or
-    # nearest after", falling back to nearest-before only if none qualify. `-c[0]`
-    # (physical line) only breaks a tie left by the first two components — two
-    # candidates translated to the same presumed distance from `def_line`.
-    return min(
-        candidates,
-        key=lambda c: (
-            _presumed_line(c[0], breakpoints) < def_line,
-            abs(_presumed_line(c[0], breakpoints) - def_line),
-            -c[0],
-        ),
-    )[1]
+    chosen = _select_definition(
+        _definition_candidates(source_no_comments, fn_name),
+        source_no_comments,
+        def_line,
+    )
+    return None if chosen is None else chosen.params
 
 
 def annotate_array_extents(units: list[Unit], source_text: str) -> list[Unit]:

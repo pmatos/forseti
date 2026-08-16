@@ -143,6 +143,29 @@ def test_a_source_path_escapes_quotes_and_backslashes() -> None:
     assert backslashed.splitlines()[0] == '#line 1 "C:\\\\path.c"'
 
 
+_IF0_DUP = """\
+#if 0
+void f(int *p) { /* never compiled */ }
+#endif
+void f(int *p) { *p = 0; }
+"""
+
+
+def test_injection_targets_the_compiled_definition_not_a_dead_if0_body() -> None:
+    # Issue #145 on the S3 obligation path: an inactive `#if 0` definition ahead
+    # of the one clang compiled must not capture the injection point. The plan
+    # anchors on `unit.def_line` (the compiled definition's presumed line, line 4
+    # here); without it the obligation lands after the dead brace, cpp deletes it,
+    # and a caller passing an invalid/too-small pointer would be reported
+    # DISCHARGED against a callee carrying no obligation at all (a silent pass).
+    unit = Unit("f", (Param("p", "int *"),), def_line=4)
+    lines = inject_obligations(_IF0_DUP, plan_unit(unit)).splitlines()
+    assert lines.count(lines[3]) == 1  # sanity: distinct live/dead body lines
+    assert "__ESBMC_assert" in lines[3]  # rides the live body (line 4)
+    assert "__ESBMC_assert" not in lines[1]  # never the dead `#if 0` body (line 2)
+    assert f'"{OBLIGATION_LABEL_PREFIX}f:p"' in lines[3]
+
+
 def test_unresolved_plan_is_declined() -> None:
     plan = plan_unit(Unit("f", (Param("p", "void *"),)))
     with pytest.raises(SynthError, match="unresolved"):
