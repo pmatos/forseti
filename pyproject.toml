@@ -11,10 +11,11 @@ dependencies = []
 
 [project.optional-dependencies]
 # The MCP server (forseti.core.mcp_server) needs the MCP SDK; kept optional so
-# the base install and the loop/esbmc path stay dependency-free. Pinned to a
-# FastMCP-supporting range: mcp==1.0.0 predates mcp.server.fastmcp, so a loose
-# >=1.0 could install an SDK where `from mcp.server.fastmcp import FastMCP` fails.
-mcp = ["mcp>=1.28.1,<2"]
+# the base install and the loop/esbmc path stay dependency-free. Pinned to the
+# MCPServer-supporting range: mcp 2.0.0 renamed mcp.server.fastmcp.FastMCP to
+# mcp.server.mcpserver.MCPServer, so a loose >=1.0 could install an SDK where
+# `from mcp.server.mcpserver import MCPServer` fails.
+mcp = ["mcp>=2.0.0,<3"]
 # dev pulls in the mcp extra so CI type-checks and tests the server too.
 dev = [
     "pytest>=9.1.1",

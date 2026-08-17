@@ -41,12 +41,12 @@ def test_mcp_without_the_sdk_exits_one(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # Simulate the base install: `mcp` present but hollow, so mcp_server's
-    # `from mcp.server.fastmcp import FastMCP` raises. Drop any already-imported
+    # `from mcp.server.mcpserver import MCPServer` raises. Drop any already-imported
     # mcp_server first, or the cached module would satisfy the import.
     monkeypatch.delitem(sys.modules, "forseti.core.mcp_server", raising=False)
     monkeypatch.setitem(sys.modules, "mcp", types.ModuleType("mcp"))
     monkeypatch.delitem(sys.modules, "mcp.server", raising=False)
-    monkeypatch.delitem(sys.modules, "mcp.server.fastmcp", raising=False)
+    monkeypatch.delitem(sys.modules, "mcp.server.mcpserver", raising=False)
 
     assert main(["mcp"]) == 1
     err = capsys.readouterr().err
