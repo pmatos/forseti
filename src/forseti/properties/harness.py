@@ -147,6 +147,28 @@ class UnitSignature:
     return_ctype: str
     params: tuple[Param, ...]
 
+    @property
+    def param_names(self) -> frozenset[str]:
+        """Every parameter name, regardless of role."""
+        return frozenset(p.name for p in self.params)
+
+    @property
+    def output_param_names(self) -> frozenset[str]:
+        """Names of the output parameters -- the `out=True` buffer params.
+
+        The unit *writes* these; the postcondition may name them after the call
+        but a precondition may not constrain them (there is nothing there yet). A
+        scalar-backed output (`length == "1"`) is an output like any other.
+        """
+        return frozenset(
+            p.name for p in self.params if isinstance(p, BufferParam) and p.out
+        )
+
+    @property
+    def input_param_names(self) -> frozenset[str]:
+        """Names of the input parameters -- every parameter that is not an output."""
+        return self.param_names - self.output_param_names
+
 
 @dataclass(frozen=True)
 class SemanticSpec:
@@ -325,8 +347,7 @@ def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | 
     if not spec.postcondition.strip():
         return "semantic property has an empty postcondition"
 
-    param_names = {p.name for p in signature.params}
-    if spec.result_var in param_names:
+    if spec.result_var in signature.param_names:
         return f"result_var {spec.result_var!r} collides with a parameter name"
 
     if signature.return_ctype.strip() == "void" and references(
@@ -337,9 +358,7 @@ def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | 
             f"{signature.symbol!r} returns void"
         )
 
-    output_params = [
-        p.name for p in signature.params if isinstance(p, BufferParam) and p.out
-    ]
+    output_params = signature.output_param_names
     scalar_outputs = {
         p.name
         for p in signature.params
@@ -355,7 +374,10 @@ def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | 
     # `u` in a suffixed literal like `10u`, so an output named `u`/`L`/`UL` cannot be
     # spuriously flagged by an input-only precondition such as `x < 10u`.
     for pre in spec.preconditions:
-        for name in output_params:
+        # `output_param_names` is an unordered frozenset; sort so that a clause
+        # naming several outputs reports the same one every run (reproducible
+        # verdicts -- salted hashing would otherwise vary the message).
+        for name in sorted(output_params):
             if references(pre, name):
                 return (
                     f"domain expr {pre!r} constrains output parameter "
