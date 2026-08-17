@@ -32,7 +32,6 @@ from .cexpr import identifiers, unsafe_reason
 # the emitted headers cannot drift out of lockstep (#81).
 from .harness import (
     HARNESS_MACROS,
-    BufferParam,
     SemanticSpec,
     UnitSignature,
     renderability_reason,
@@ -300,11 +299,8 @@ def validate_candidate(
             return f"vacuous domain expr {pre!r}: references no parameter"
 
     if signature is not None:
-        params = {p.name for p in signature.params}
-        output_params = {
-            p.name for p in signature.params if isinstance(p, BufferParam) and p.out
-        }
-        input_params = params - output_params
+        params = signature.param_names
+        input_params = signature.input_param_names
         allowed = params | {RESULT_IDENT} | HARNESS_MACROS
         for ident in expr_idents:
             if ident not in allowed:

@@ -728,3 +728,51 @@ def test_default_includes_are_emitted_and_named_once() -> None:
     for header in DEFAULT_INCLUDES:
         assert f"#include <{header}>" in out
     assert {"INT_MIN", "SIZE_MAX", "NULL"} <= HARNESS_MACROS
+
+
+# --- UnitSignature parameter roles ---------------------------------------
+# A signature is the single authority on which of its parameters are inputs and
+# which are outputs; the proposer's gate and the harness renderer both consult
+# it instead of re-deriving `isinstance(p, BufferParam) and p.out`. Expected
+# partitions below are written out by hand, not recomputed from the model.
+
+_MIXED_SIG = UnitSignature(
+    "copy_into",
+    "int",
+    (
+        ScalarParam("int", "x"),
+        BufferParam("unsigned char", "buf", "len"),  # input buffer
+        ScalarParam("size_t", "len"),
+        BufferParam("int", "out", "n", out=True),  # output buffer (array)
+        BufferParam("uint32_t", "cp", "1", out=True),  # scalar-backed output
+    ),
+)
+
+
+def test_param_names_is_every_parameter() -> None:
+    assert _MIXED_SIG.param_names == frozenset({"x", "buf", "len", "out", "cp"})
+
+
+def test_output_param_names_are_the_out_buffers() -> None:
+    # Only `out=True` buffer params are outputs -- a scalar-backed output (`cp`,
+    # length "1") counts too; plain scalars and input buffers do not.
+    assert _MIXED_SIG.output_param_names == frozenset({"out", "cp"})
+
+
+def test_input_param_names_are_the_complement_of_outputs() -> None:
+    assert _MIXED_SIG.input_param_names == frozenset({"x", "buf", "len"})
+
+
+def test_all_scalar_signature_has_no_output_params() -> None:
+    assert ABS_SIG.output_param_names == frozenset()
+    assert ABS_SIG.input_param_names == frozenset({"x"})
+    assert ABS_SIG.param_names == frozenset({"x"})
+
+
+def test_input_and_output_names_partition_param_names() -> None:
+    # The two role sets are disjoint and together cover every parameter.
+    assert (
+        _MIXED_SIG.input_param_names | _MIXED_SIG.output_param_names
+        == _MIXED_SIG.param_names
+    )
+    assert not (_MIXED_SIG.input_param_names & _MIXED_SIG.output_param_names)
