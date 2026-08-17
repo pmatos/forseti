@@ -12,12 +12,14 @@ from pathlib import Path
 import pytest
 
 from forseti.esbmc.units import (
+    CallerOpenings,
     ListUnitsError,
     Param,
     Unit,
     _line_breakpoints,
     annotate_array_extents,
     find_definition_brace,
+    list_caller_openings,
     list_units,
     mask_comments,
     parse_address_escapes,
@@ -1222,6 +1224,98 @@ def test_list_units_raises_on_failed_parse(tmp_path: Path) -> None:
     bad.write_text("int f( {\n")  # malformed C → parse error
     with pytest.raises(ListUnitsError):
         list_units(bad)
+
+
+# --- list_caller_openings: one shared dump, five caller-completeness answers ---
+#
+# The five ways `list_units` can under-report a callee's callers each have their
+# own `parse_*` pass; `list_caller_openings` runs one `esbmc --parse-tree-only`
+# and answers all five from that single dump. Tested at the seam by faking the
+# dump and the passes — the passes themselves are covered against captured AST
+# above, and the shared parse is verified end-to-end by the discharge suite.
+
+
+def test_list_caller_openings_parses_once_and_forwards_the_run_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The point of the shared-dump seam: enumerating the openings used to run one
+    # `esbmc --parse-tree-only` per question (five parses of the same TU); this
+    # parses once, and every parse argument the caller chose must reach that run.
+    calls: list[tuple[Path, str, float, tuple[str, ...]]] = []
+
+    def _fake_parse_tree(source, esbmc_bin, timeout_s, extra_flags):  # type: ignore[no-untyped-def]
+        calls.append((source, esbmc_bin, timeout_s, tuple(extra_flags)))
+        return "TranslationUnitDecl 0x1 <<invalid sloc>> <invalid sloc>\n"
+
+    monkeypatch.setattr("forseti.esbmc.units._parse_tree", _fake_parse_tree)
+    src = Path("/proj/frame.c")
+    list_caller_openings(
+        src, "sum_bytes", esbmc_bin="my-esbmc", timeout_s=2.5, extra_flags=("-I.",)
+    )
+    assert calls == [(src, "my-esbmc", 2.5, ("-I.",))]
+
+
+def test_list_caller_openings_routes_each_pass_to_its_own_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A five-way unpack where four passes share the `(ast_text, symbol)` signature
+    # is exactly where `escaped=parse_symbol_aliases(...)` would slip through; pin
+    # each field to its own pass with a distinct sentinel.
+    monkeypatch.setattr("forseti.esbmc.units._parse_tree", lambda *a: "AST")
+    monkeypatch.setattr(
+        "forseti.esbmc.units.parse_external_callers", lambda *a: ("foreign",)
+    )
+    monkeypatch.setattr(
+        "forseti.esbmc.units.parse_address_escapes", lambda *a: ("escaped",)
+    )
+    monkeypatch.setattr(
+        "forseti.esbmc.units.parse_symbol_aliases", lambda *a: ("aliased",)
+    )
+    monkeypatch.setattr(
+        "forseti.esbmc.units.parse_implicit_invocations", lambda *a: ("implicit",)
+    )
+    monkeypatch.setattr("forseti.esbmc.units.parse_asm_statements", lambda *a: ("asm",))
+    openings = list_caller_openings(Path("/proj/frame.c"), "sum_bytes")
+    assert openings == CallerOpenings(
+        foreign=("foreign",),
+        escaped=("escaped",),
+        aliased=("aliased",),
+        implicit=("implicit",),
+        asm_sites=("asm",),
+    )
+
+
+def test_list_caller_openings_threads_source_and_symbol_into_the_external_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `parse_external_callers` alone needs `source`: it excludes in-file definitions
+    # by full-path match, so the same source the run parsed must reach it, or a
+    # header-defined caller is silently mis-classified.
+    seen: dict[str, tuple[str, Path, str]] = {}
+
+    def _ext(ast_text, source, symbol):  # type: ignore[no-untyped-def]
+        seen["args"] = (ast_text, source, symbol)
+        return ()
+
+    monkeypatch.setattr("forseti.esbmc.units._parse_tree", lambda *a: "AST-TEXT")
+    monkeypatch.setattr("forseti.esbmc.units.parse_external_callers", _ext)
+    src = Path("/proj/frame.c")
+    list_caller_openings(src, "sum_bytes")
+    assert seen["args"] == ("AST-TEXT", src, "sum_bytes")
+
+
+def test_list_caller_openings_propagates_a_failed_parse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A failed parse must raise, never yield empty openings — empty would let the
+    # discharge driver treat an unparseable TU as having no hidden callers and
+    # discharge on the strength of an enumeration that never ran.
+    def _boom(*_a: object) -> str:
+        raise ListUnitsError("parse failed")
+
+    monkeypatch.setattr("forseti.esbmc.units._parse_tree", _boom)
+    with pytest.raises(ListUnitsError):
+        list_caller_openings(Path("/proj/frame.c"), "sum_bytes")
 
 
 # --- the call set and the body locator (RFC-0003 S3) ---------------------------

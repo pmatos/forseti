@@ -1457,10 +1457,10 @@ def list_symbol_aliases(
     """Declarations in `source`'s translation unit that alias `symbol`.
 
     The third way the caller enumeration can be incomplete — see
-    `parse_symbol_aliases`. Each of these asks its own question of its own
-    dump, which costs a parse run apiece; sharing one dump across them is a
-    worthwhile follow-up, not a reason to fuse the questions. Raises
-    `ListUnitsError` on the same conditions as `list_units`.
+    `parse_symbol_aliases`. This single-question form runs its own parse;
+    `list_caller_openings` shares one dump across all five questions (without
+    fusing them) and is what the discharge driver uses. Raises `ListUnitsError`
+    on the same conditions as `list_units`.
     """
     ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
     return parse_symbol_aliases(ast_text, symbol)
@@ -1500,6 +1500,66 @@ def list_asm_statements(
     """
     ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
     return parse_asm_statements(ast_text, symbol)
+
+
+@dataclass(frozen=True)
+class CallerOpenings:
+    """The five ways `list_units`'s caller enumeration can under-report `symbol`.
+
+    Each field is the result of one caller-completeness pass over a *single*
+    ``esbmc --parse-tree-only`` dump, in the order the five `list_*` functions
+    above declare them:
+
+    - `foreign`   — definitions outside `source` naming `symbol`
+      (`parse_external_callers`)
+    - `escaped`   — sites naming `symbol` outside a direct call
+      (`parse_address_escapes`)
+    - `aliased`   — declarations that are another name for `symbol`
+      (`parse_symbol_aliases`)
+    - `implicit`  — load-time attributes on `symbol`'s own declaration
+      (`parse_implicit_invocations`)
+    - `asm_sites` — sites GNU inline asm might route to `symbol`
+      (`parse_asm_statements`)
+
+    The questions stay distinct — one field, one `parse_*` pass each — they only
+    share the dump, which is what `list_caller_openings` buys over the five
+    single-question `list_*` calls.
+    """
+
+    foreign: tuple[str, ...]
+    escaped: tuple[str, ...]
+    aliased: tuple[str, ...]
+    implicit: tuple[str, ...]
+    asm_sites: tuple[str, ...]
+
+
+def list_caller_openings(
+    source: Path,
+    symbol: str,
+    *,
+    esbmc_bin: str = "esbmc",
+    timeout_s: float = 30.0,
+    extra_flags: Sequence[str] = (),
+) -> CallerOpenings:
+    """All five caller-completeness listings for `symbol`, from one shared dump.
+
+    The five `list_*` functions above each run their own
+    ``esbmc --parse-tree-only`` over the same translation unit, so enumerating a
+    callee's openings parsed the TU five times. This parses once and runs the
+    five `parse_*` passes over that single dump — the seam `find_open_callers`
+    crosses. Each pass keeps its own semantics (e.g. `parse_external_callers`
+    still takes `source`, to exclude in-file definitions). Raises `ListUnitsError`
+    on the same conditions as `list_units`, so an unparseable TU never reads as
+    "no hidden callers".
+    """
+    ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
+    return CallerOpenings(
+        foreign=parse_external_callers(ast_text, source, symbol),
+        escaped=parse_address_escapes(ast_text, symbol),
+        aliased=parse_symbol_aliases(ast_text, symbol),
+        implicit=parse_implicit_invocations(ast_text, symbol),
+        asm_sites=parse_asm_statements(ast_text, symbol),
+    )
 
 
 def list_units(

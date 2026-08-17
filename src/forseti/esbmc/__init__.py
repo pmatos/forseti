@@ -27,12 +27,14 @@ from .result import (
 )
 from .runner import build_argv, classify, verify
 from .units import (
+    CallerOpenings,
     ListUnitsError,
     Param,
     Unit,
     find_definition_brace,
     list_address_escapes,
     list_asm_statements,
+    list_caller_openings,
     list_external_callers,
     list_implicit_invocations,
     list_symbol_aliases,
@@ -55,6 +57,7 @@ from .verify_cli import (
 __all__ = [
     "EXIT_CODES",
     "Assignment",
+    "CallerOpenings",
     "Counterexample",
     "Error",
     "EsbmcResult",
@@ -78,6 +81,7 @@ __all__ = [
     "find_definition_brace",
     "list_address_escapes",
     "list_asm_statements",
+    "list_caller_openings",
     "list_external_callers",
     "list_implicit_invocations",
     "list_symbol_aliases",
