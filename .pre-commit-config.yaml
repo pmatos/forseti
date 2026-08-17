@@ -2,6 +2,8 @@
 # Install once with `pre-commit install`; run over everything with
 # `pre-commit run --all-files`. mypy runs from the active environment (install
 # the dev extra first: `pip install -e ".[dev]"`).
+default_install_hook_types: [pre-commit, commit-msg]
+
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.15
@@ -23,3 +25,9 @@ repos:
         types: [python]
         pass_filenames: false
         args: [src, tests]
+
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.4.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]

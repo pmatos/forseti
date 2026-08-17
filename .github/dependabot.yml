@@ -8,7 +8,7 @@ updates:
     assignees:
       - "pmatos"
     commit-message:
-      prefix: "deps"
+      prefix: "chore"
       include: "scope"
 
   # GitHub Actions
