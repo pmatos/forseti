@@ -566,7 +566,10 @@ def inject_obligations(
     """
     pointers = _obligation_targets(plan)
     function = plan.unit.name
-    brace = find_definition_brace(source_text, function)
+    # Anchor on the compiled definition's line (issue #145): an inactive `#if 0`
+    # body of the same name ahead of it must not capture the injection point, or
+    # the obligation lands in dead code cpp deletes and goes unchecked.
+    brace = find_definition_brace(source_text, function, plan.unit.def_line)
     if brace is None:
         raise SynthError(f"no definition of {function}() found in the source text")
     if site_probe:

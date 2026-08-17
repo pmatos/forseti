@@ -1318,6 +1318,37 @@ def test_find_definition_brace_rejects_an_unbalanced_suffix_attribute() -> None:
     assert find_definition_brace(source, "f") is None
 
 
+# An inactive `#if 0` definition of `f` (line 2) ahead of the one clang compiles
+# (line 4) — the #145 shape, textually first but never compiled.
+_IF0_DUP_DEF = """\
+#if 0
+void f(int *p) { /* dead */ }
+#endif
+void f(int *p) { *p = 0; }
+"""
+
+
+def test_find_definition_brace_anchors_to_the_compiled_definition() -> None:
+    # Issue #145 on the obligation-injection path (RFC-0003 S3): an inactive
+    # `#if 0` body ahead of the definition clang actually compiled must not win.
+    # Given `def_line` (the compiled definition's presumed line, `Unit.def_line`),
+    # the occurrence at or after it is preferred — the *same* anchor
+    # `_param_list_text` uses for extent harvesting — so S3 injects into the live
+    # body, not dead code cpp deletes (which would leave the obligation unchecked).
+    active = find_definition_brace(_IF0_DUP_DEF, "f", 4)
+    assert active is not None
+    assert _IF0_DUP_DEF[active] == "{"
+    assert _IF0_DUP_DEF[:active].count("\n") == 3  # the live body on line 4, not 2
+
+
+def test_find_definition_brace_without_an_anchor_keeps_the_first_match() -> None:
+    # Backward-compatible: callers with no `def_line` (a single definition, or a
+    # deliberately un-anchored probe) still get the first definition-shaped match.
+    first = find_definition_brace(_IF0_DUP_DEF, "f")
+    assert first is not None
+    assert _IF0_DUP_DEF[:first].count("\n") == 1
+
+
 _HEADER_CALLER_AST = """\
 TranslationUnitDecl 0x3000 <<invalid sloc>> <invalid sloc>
 |-FunctionDecl 0x3001 </tmp/foo.c:1:1, col:40> col:6 leaf 'void (int *)'
