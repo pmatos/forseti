@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from .propose import (
     DEFAULT_MAX_CANDIDATES,
@@ -110,9 +110,9 @@ def propose_tool(
     return result.to_dict()
 
 
-def build_server(name: str = "forseti") -> FastMCP:
-    """A `FastMCP` server exposing Forseti Core's tools (`verify`, `propose`)."""
-    server: FastMCP = FastMCP(name, instructions=_INSTRUCTIONS)
+def build_server(name: str = "forseti") -> MCPServer:
+    """An `MCPServer` exposing Forseti Core's tools (`verify`, `propose`)."""
+    server: MCPServer = MCPServer(name, instructions=_INSTRUCTIONS)
     server.add_tool(
         verify_tool,
         name="verify",

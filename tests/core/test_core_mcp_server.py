@@ -66,7 +66,7 @@ def test_build_server_registers_verify_tool() -> None:
     assert "verify" in names
     verify = next(t for t in tools if t.name == "verify")
     # The tool's input schema is derived from verify_tool's signature.
-    assert "source" in verify.inputSchema.get("properties", {})
+    assert "source" in verify.input_schema.get("properties", {})
 
 
 def test_build_server_registers_propose_tool() -> None:
@@ -75,7 +75,7 @@ def test_build_server_registers_propose_tool() -> None:
     names = {t.name for t in tools}
     assert "propose" in names
     propose = next(t for t in tools if t.name == "propose")
-    props = propose.inputSchema.get("properties", {})
+    props = propose.input_schema.get("properties", {})
     assert "source" in props
     assert "function" in props
 
@@ -129,8 +129,8 @@ def test_verify_stdio_roundtrip() -> None:
             )
 
     result = asyncio.run(asyncio.wait_for(roundtrip(), timeout=60.0))
-    assert result.isError is False
-    payload = result.structuredContent
+    assert result.is_error is False
+    payload = result.structured_content
     assert payload is not None
     assert payload["verdict"] == "violated"
     assert payload["counterexample"]
