@@ -21,7 +21,7 @@ dev = [
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
     "hypothesis>=6.165.9",
-    "mypy>=2.3.1",
+    "ty>=0.0.72",
     "ruff>=0.16.3",
     "forseti[mcp]",
 ]
@@ -37,19 +37,22 @@ where = ["src"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 
-[tool.mypy]
-python_version = "3.12"
-strict = true
-
 [tool.ruff]
 target-version = "py312"
 line-length = 88
 
 [tool.ruff.lint]
 # E/F: pycodestyle + pyflakes; I: import sorting; B: bugbear; UP: pyupgrade;
-# SIM: simplify; RUF: ruff-native. `from __future__ import annotations` is used
-# throughout, so UP/I are near no-ops.
-select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+# SIM: simplify; RUF: ruff-native; ANN: every def must be annotated -- ty (our
+# type checker) has no `strict = true`-equivalent annotation-completeness
+# rule of its own, so this is what stands in for that half of what mypy strict
+# used to enforce. `from __future__ import annotations` is used throughout, so
+# UP/I are near no-ops.
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF", "ANN"]
+# ANN401 (`Any` in an annotation) is a deliberate, common choice in this
+# codebase (e.g. JSON payloads, **kwargs forwarding) -- not the "annotations
+# exist" property ANN otherwise enforces.
+ignore = ["ANN401"]
 
 [tool.coverage.run]
 source = ["forseti"]

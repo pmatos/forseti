@@ -53,7 +53,7 @@ def next_state(result: EsbmcResult) -> LoopState:
     """Map one ESBMC verdict to the loop state it leads to.
 
     The `match` is exhaustive over the sealed `EsbmcResult` union: the final
-    `assert_never` makes adding a new verdict arm a mypy error here, so no
+    `assert_never` makes adding a new verdict arm a type error here, so no
     outcome can be silently dropped.
     """
     match result:

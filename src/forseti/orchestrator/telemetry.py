@@ -93,8 +93,8 @@ class JsonlSink:
 
 
 if TYPE_CHECKING:
-    # mypy-only structural guards: fail type-checking if a concrete sink drifts
-    # from the protocol (mirrors the fix.py guard pattern).
+    # Type-check-only structural guards: fail type-checking if a concrete sink
+    # drifts from the protocol (mirrors the fix.py guard pattern).
     def _null_is_sink(s: NullSink) -> EventSink:
         return s
 

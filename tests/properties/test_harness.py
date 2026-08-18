@@ -628,7 +628,7 @@ class _FakeParam:
 
 
 def test_unknown_param_subtype_is_error() -> None:
-    bogus = UnitSignature("f", "int", (_FakeParam(),))  # type: ignore[arg-type]
+    bogus = UnitSignature("f", "int", (_FakeParam(),))  # ty: ignore[invalid-argument-type]
     with pytest.raises(HarnessError):
         render_semantic_harness(
             unit_source="int f(void) { return 0; }",

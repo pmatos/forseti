@@ -370,7 +370,7 @@ def _opt_str(value: object) -> str:
 
 
 if TYPE_CHECKING:
-    # mypy-only structural guard: fail type-checking if the concrete store ever
-    # drifts from the protocol it must satisfy (mirrors fix.py).
+    # Type-check-only structural guard: fail type-checking if the concrete
+    # store ever drifts from the protocol it must satisfy (mirrors fix.py).
     def _store_is_candidatestore(s: PropertyStore) -> CandidateStore:
         return s

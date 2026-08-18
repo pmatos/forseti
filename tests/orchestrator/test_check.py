@@ -603,8 +603,8 @@ def test_settled_constructor_carries_bound_result_and_harness() -> None:
 
 
 if TYPE_CHECKING:
-    # mypy-only structural guards: fail type-checking if a concrete class drifts
-    # from the port it must satisfy (mirrors the fix.py / test_loop.py pattern).
+    # Type-check-only structural guards: fail type-checking if a concrete class
+    # drifts from the port it must satisfy (mirrors the fix.py / test_loop.py pattern).
     from forseti.esbmc import verify as _real_verify
     from forseti.orchestrator import (
         HarnessWriterPort,

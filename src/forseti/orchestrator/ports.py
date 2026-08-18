@@ -26,9 +26,15 @@ from forseti.properties import Property, PropertyStatus
 
 
 class VerifyPort(Protocol):
-    """Runs ESBMC on `source` at bound `unwind` and returns the verdict."""
+    """Runs ESBMC on `source` at bound `unwind` and returns the verdict.
 
-    def __call__(self, source: Path, *, unwind: int) -> EsbmcResult: ...
+    `source` is positional-only: every implementation is called positionally
+    (`verify_fn(path, unwind=k)`), and a fixed parameter name would otherwise
+    make callables that name it differently (lambdas, fakes) structurally
+    incompatible.
+    """
+
+    def __call__(self, source: Path, /, *, unwind: int) -> EsbmcResult: ...
 
 
 class FixPort(Protocol):

@@ -1243,7 +1243,7 @@ def test_list_caller_openings_parses_once_and_forwards_the_run_arguments(
     # parses once, and every parse argument the caller chose must reach that run.
     calls: list[tuple[Path, str, float, tuple[str, ...]]] = []
 
-    def _fake_parse_tree(source, esbmc_bin, timeout_s, extra_flags):  # type: ignore[no-untyped-def]
+    def _fake_parse_tree(source, esbmc_bin, timeout_s, extra_flags):  # noqa: ANN001, ANN202
         calls.append((source, esbmc_bin, timeout_s, tuple(extra_flags)))
         return "TranslationUnitDecl 0x1 <<invalid sloc>> <invalid sloc>\n"
 
@@ -1293,7 +1293,7 @@ def test_list_caller_openings_threads_source_and_symbol_into_the_external_scan(
     # header-defined caller is silently mis-classified.
     seen: dict[str, tuple[str, Path, str]] = {}
 
-    def _ext(ast_text, source, symbol):  # type: ignore[no-untyped-def]
+    def _ext(ast_text, source, symbol):  # noqa: ANN001, ANN202
         seen["args"] = (ast_text, source, symbol)
         return ()
 

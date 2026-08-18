@@ -221,7 +221,7 @@ def test_cli_propose_llm_error_exits_one(
 
 
 if TYPE_CHECKING:
-    # mypy-only structural guards: the fakes must satisfy the LLMClient protocol.
+    # Type-check-only structural guards: the fakes must satisfy the LLMClient protocol.
     def _fake_is_client(c: FakeLLMClient) -> LLMClient:
         return c
 

@@ -20,8 +20,8 @@ from forseti.esbmc.verify_cli import DEFAULT_TIMEOUT_S, DEFAULT_UNWIND
 
 # The library/MCP defaults re-source the shared CLI defaults (esbmc.verify_cli)
 # so a programmatic `verify_source` call and either CLI can never drift on the
-# bound k or the timeout budget. Listed in `__all__` so this stays an explicit
-# re-export (mypy --strict) for `mcp_server`/`cli`, which import them from here.
+# bound k or the timeout budget. Listed in `__all__` to document this module's
+# public re-export surface for `mcp_server`/`cli`, which import them from here.
 __all__ = [
     "DEFAULT_TIMEOUT_S",
     "DEFAULT_UNWIND",
@@ -31,7 +31,7 @@ __all__ = [
 ]
 
 # One JSON object per verdict. `object` (not `Any`) keeps the dict honest under
-# mypy --strict while staying trivially `json.dumps`-able.
+# type-checking while staying trivially `json.dumps`-able.
 Payload = dict[str, object]
 
 

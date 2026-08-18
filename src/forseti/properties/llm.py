@@ -116,7 +116,7 @@ class ClaudeCliClient:
 
 
 if TYPE_CHECKING:
-    # mypy-only structural guard: fail type-checking if ClaudeCliClient ever
-    # drifts from the LLMClient protocol it must satisfy (mirrors fix.py).
+    # Type-check-only structural guard: fail type-checking if ClaudeCliClient
+    # ever drifts from the LLMClient protocol it must satisfy (mirrors fix.py).
     def _client_is_llmclient(c: ClaudeCliClient) -> LLMClient:
         return c

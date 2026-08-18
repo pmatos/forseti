@@ -42,7 +42,7 @@ unsigned caller(const unsigned char *frame, size_t len) {
 """
 
 
-def _plan(unit: Unit = SUM_BYTES):  # type: ignore[no-untyped-def]
+def _plan(unit: Unit = SUM_BYTES):  # noqa: ANN202
     return plan_unit(unit)
 
 
