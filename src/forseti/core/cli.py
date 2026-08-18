@@ -47,14 +47,8 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
-from forseti.adapters.claude_code import (
-    post_bash,
-    post_tool_use,
-    session_start,
-    stop_gate,
-)
 from forseti.adapters.claude_code.install import (
-    InstallOutcome,
+    HOOK_NAMES,
     ProjectSettingsError,
     install,
 )
@@ -472,14 +466,6 @@ def _run_propose(args: argparse.Namespace) -> int:
     return 0
 
 
-_CLAUDE_CODE_HOOKS: dict[str, Callable[[], int]] = {
-    "session-start": session_start.main,
-    "post-tool-use": post_tool_use.main,
-    "post-bash": post_bash.main,
-    "stop-gate": stop_gate.main,
-}
-
-
 def _add_claude_code_hook_parser(
     sub: argparse._SubParsersAction[argparse.ArgumentParser],
 ) -> None:
@@ -493,12 +479,33 @@ def _add_claude_code_hook_parser(
             "wires these into a project's settings file (RFC-0004)."
         ),
     )
-    p.add_argument("name", choices=sorted(_CLAUDE_CODE_HOOKS), help="which hook to run")
+    p.add_argument("name", choices=sorted(HOOK_NAMES), help="which hook to run")
     p.set_defaults(func=_run_claude_code_hook)
 
 
 def _run_claude_code_hook(args: argparse.Namespace) -> int:
-    return _CLAUDE_CODE_HOOKS[args.name]()
+    # Imported lazily, one module per invocation: each hook fires as its own
+    # short-lived `forseti claude-code-hook <name>` process (potentially
+    # hundreds per session), and the gate itself shells out to `forseti
+    # verify`/`list-units` once per unit -- neither path should pay to import
+    # the other three hook modules it never calls.
+    if args.name == "session-start":
+        from forseti.adapters.claude_code import session_start
+
+        return session_start.main()
+    if args.name == "post-tool-use":
+        from forseti.adapters.claude_code import post_tool_use
+
+        return post_tool_use.main()
+    if args.name == "post-bash":
+        from forseti.adapters.claude_code import post_bash
+
+        return post_bash.main()
+    if args.name == "stop-gate":
+        from forseti.adapters.claude_code import stop_gate
+
+        return stop_gate.main()
+    raise AssertionError(f"unreachable: unknown hook {args.name!r} (argparse choices)")
 
 
 def _add_enable_project_parser(
@@ -533,21 +540,13 @@ def _add_enable_project_parser(
     p.set_defaults(func=_run_enable_project)
 
 
-_ENABLE_PROJECT_VERBS = {
-    InstallOutcome.CREATED: "installed",
-    InstallOutcome.UPDATED: "updated",
-    InstallOutcome.UNCHANGED: "already up to date",
-}
-
-
 def _run_enable_project(args: argparse.Namespace) -> int:
     try:
         settings_path, outcome = install(args.project_dir, shared=args.shared)
     except (ProjectSettingsError, OSError) as exc:
         print(f"forseti enable-project: {exc}", file=sys.stderr)
         return 1
-    verb = _ENABLE_PROJECT_VERBS[outcome]
-    message = f"Claude Code verify-gate hooks {verb} at {settings_path}"
+    message = f"Claude Code verify-gate hooks {outcome.value} at {settings_path}"
     print(f"forseti enable-project: {message}")
     return 0
 

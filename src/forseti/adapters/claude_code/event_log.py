@@ -41,17 +41,23 @@ STOP = "stop"  # the Stop-gate decision (block | residual | allow)
 SESSION = "session"  # a SessionStart baseline of the pre-session dirty C tree
 
 
+def write_text_atomic(path: str | os.PathLike[str], text: str) -> None:
+    """Write `text` to `path` atomically: pid-qualified temp file + rename.
+
+    Never leaves a torn/partial file behind -- a process killed mid-write
+    leaves the temp file, not a truncated `path`. Shared by every writer in
+    this package that persists a single JSON document to disk.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
 def events_path(project_dir: str | os.PathLike[str]) -> Path:
     """The trace file for a project: ``<project_dir>/.forseti/events.jsonl``."""
     return Path(project_dir) / _STATE_DIR / _EVENTS_FILE
-
-
-def project_dir(data: dict[str, Any]) -> str:
-    """The project root for a hook payload.
-
-    ``CLAUDE_PROJECT_DIR`` if set, else the payload's ``cwd``, else the OS cwd.
-    """
-    return os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or os.getcwd()
 
 
 def log_event(project_dir: str | os.PathLike[str], type: str, **fields: Any) -> None:

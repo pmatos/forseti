@@ -122,7 +122,7 @@ def _report(verdicts: list[gate.UnitVerdict]) -> int:
 def main() -> int:
     raw = sys.stdin.read()
     data = json.loads(raw) if raw.strip() else {}
-    project_dir = event_log.project_dir(data)
+    project_dir = gate.project_dir(data)
 
     # Read state once for the baseline HEAD (so the scan also catches C committed
     # in the same Bash command) and to pick the files that actually changed since

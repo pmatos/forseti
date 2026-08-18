@@ -13,14 +13,19 @@ version marker -- rerunning always regenerates forseti's entries from whatever
 from __future__ import annotations
 
 import json
-import os
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from . import event_log
+
 _MARKER_PREFIX = "forseti claude-code-hook "
 
 # (event, matcher, hook name, timeout_s) -- mirrors claude-code/hooks/hooks.json
+# (checked equal by test_install.py), the plugin manifest for these same four
+# hooks. `HOOK_NAMES` below is core/cli.py's single source for the
+# `claude-code-hook <name>` argparse choices (checked by
+# test_core_cli_dispatch.py), so the in-process dispatcher can't drift either.
 _HOOK_SPECS: tuple[tuple[str, str, str, int], ...] = (
     ("SessionStart", "*", "session-start", 60),
     ("PostToolUse", "Write|Edit|MultiEdit", "post-tool-use", 300),
@@ -28,13 +33,15 @@ _HOOK_SPECS: tuple[tuple[str, str, str, int], ...] = (
     ("Stop", "*", "stop-gate", 120),
 )
 
+HOOK_NAMES: frozenset[str] = frozenset(spec[2] for spec in _HOOK_SPECS)
+
 
 class InstallOutcome(Enum):
-    """What `install` did to the target settings file."""
+    """What `install` did to the target settings file (`.value` is CLI-facing prose)."""
 
-    CREATED = "created"
+    CREATED = "installed"
     UPDATED = "updated"
-    UNCHANGED = "unchanged"
+    UNCHANGED = "already up to date"
 
 
 class ProjectSettingsError(Exception):
@@ -135,9 +142,6 @@ def install(project_dir: Path, *, shared: bool = False) -> tuple[Path, InstallOu
     if updated == existing:
         return settings_path, InstallOutcome.UNCHANGED
 
-    claude_dir.mkdir(parents=True, exist_ok=True)
-    tmp_path = settings_path.parent / f"{settings_path.name}.{os.getpid()}.tmp"
-    tmp_path.write_text(json.dumps(updated, indent=2) + "\n")
-    tmp_path.replace(settings_path)
+    event_log.write_text_atomic(settings_path, json.dumps(updated, indent=2) + "\n")
     outcome = InstallOutcome.CREATED if not existed else InstallOutcome.UPDATED
     return settings_path, outcome

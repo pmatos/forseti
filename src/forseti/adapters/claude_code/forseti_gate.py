@@ -32,6 +32,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from . import event_log
+
 # The safety-property profile. Bounds / pointer / div-by-zero are ESBMC defaults;
 # signed overflow is opt-in, so we add it. Unsigned overflow is intentionally
 # left OFF — wraparound is legal and common (hashes, counters) and enabling it
@@ -215,6 +217,14 @@ def resolve_forseti_cmd() -> list[str]:
     if found:
         return [found]
     return [sys.executable, "-m", "forseti.core"]
+
+
+def project_dir(data: dict[str, Any]) -> str:
+    """The project root for a hook payload.
+
+    ``CLAUDE_PROJECT_DIR`` if set, else the payload's ``cwd``, else the OS cwd.
+    """
+    return os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or os.getcwd()
 
 
 def is_c_source(path: str | os.PathLike[str]) -> bool:
@@ -1863,14 +1873,11 @@ def load_state(project_dir: str) -> dict[str, Any]:
 
 
 def save_state(project_dir: str, state: dict[str, Any]) -> None:
-    # Write atomically (temp + os.replace) so a hook killed mid-write can never
-    # leave a truncated gate_state.json — load_state fails open to an empty unit
-    # set, which would make the Stop-gate forget outstanding violations.
+    # Write atomically so a hook killed mid-write can never leave a truncated
+    # gate_state.json — load_state fails open to an empty unit set, which
+    # would make the Stop-gate forget outstanding violations.
     path = _gate_path(project_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
-    os.replace(tmp, path)
+    event_log.write_text_atomic(path, json.dumps(state, indent=2, sort_keys=True))
 
 
 def record(state: dict[str, Any], verdict: UnitVerdict) -> None:

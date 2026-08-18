@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from forseti.adapters.claude_code.install import HOOK_NAMES
 from forseti.core import cli
 from forseti.core.cli import _build_parser, main
 
@@ -54,6 +55,18 @@ def test_every_subcommand_binds_a_callable_handler() -> None:
         assert handler is expected_handler, (
             f"subcommand {name!r} binds {handler!r}, expected {expected_handler!r}"
         )
+
+
+def test_claude_code_hook_choices_match_install_hook_specs() -> None:
+    # The `claude-code-hook <name>` positional's argparse `choices` and
+    # `install._HOOK_SPECS` (what `enable-project` writes into settings.json)
+    # each name the same four hooks independently; pin them together so one
+    # can't drift from the other.
+    subparsers = _registered_subparsers(_build_parser())
+    name_action = next(
+        a for a in subparsers["claude-code-hook"]._actions if a.dest == "name"
+    )
+    assert set(name_action.choices or []) == HOOK_NAMES
 
 
 def test_main_dispatches_to_the_bound_handler(

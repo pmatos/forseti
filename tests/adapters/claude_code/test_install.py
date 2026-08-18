@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from forseti.adapters.claude_code import install as install_module
 from forseti.adapters.claude_code.install import (
     InstallOutcome,
     ProjectSettingsError,
@@ -18,7 +19,7 @@ from forseti.adapters.claude_code.install import (
     merge_hooks,
 )
 
-_MARKER = "forseti claude-code-hook "
+_MARKER = install_module._MARKER_PREFIX
 
 
 def test_merge_hooks_on_empty_settings_adds_all_four_events() -> None:
@@ -29,6 +30,21 @@ def test_merge_hooks_on_empty_settings_adds_all_four_events() -> None:
         for group in groups:
             for hook in group["hooks"]:
                 assert hook["command"].startswith(_MARKER)
+
+
+def test_hook_specs_match_the_plugin_manifest() -> None:
+    # install.py's `_HOOK_SPECS` is a hand-kept mirror of the plugin manifest
+    # (its own comment says so); this pins the two together so one can drift
+    # from the other only if this test is also updated.
+    manifest_path = (
+        Path(__file__).resolve().parents[3]
+        / "adapters"
+        / "claude-code"
+        / "hooks"
+        / "hooks.json"
+    )
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["hooks"] == install_module._generated_matcher_groups()
 
 
 def test_merge_hooks_preserves_unrelated_keys_and_hooks() -> None:

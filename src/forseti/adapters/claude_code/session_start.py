@@ -41,7 +41,7 @@ def main() -> int:
     if str(data.get("source", "startup")) not in _FRESH_SOURCES:
         return 0
 
-    project_dir = event_log.project_dir(data)
+    project_dir = gate.project_dir(data)
     n = gate.baseline_scanned(project_dir)
     if n is None:
         # Not a git repo — the out-of-band scan is inactive anyway; nothing to seed.

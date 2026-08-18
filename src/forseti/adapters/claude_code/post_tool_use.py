@@ -39,7 +39,7 @@ def main() -> int:
     if not file_path or not gate.is_c_source(file_path):
         return 0
 
-    project_dir = event_log.project_dir(data)
+    project_dir = gate.project_dir(data)
     if not os.path.isabs(file_path):
         file_path = os.path.join(project_dir, file_path)
     if not os.path.exists(file_path):

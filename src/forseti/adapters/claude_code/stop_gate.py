@@ -112,7 +112,7 @@ def _emit(obj: dict[str, Any]) -> int:
 def main() -> int:
     raw = sys.stdin.read()
     data = json.loads(raw) if raw.strip() else {}
-    project_dir = event_log.project_dir(data)
+    project_dir = gate.project_dir(data)
 
     # Discover C files changed out-of-band (Bash) that the gate has not verified.
     # This is an ESBMC-free, git-fast backstop — the heavy verify runs in the
