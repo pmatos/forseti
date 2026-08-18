@@ -62,7 +62,7 @@ class ClaudeCliClient:
 
     model: str = "sonnet"
     claude_bin: str = "claude"
-    timeout_s: float = 120.0
+    timeout_s: float = 240.0
     extra_args: tuple[str, ...] = ("--strict-mcp-config",)
     provider: ClassVar[str] = "claude -p"
 

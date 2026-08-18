@@ -37,7 +37,7 @@ from forseti.properties import (
 )
 
 DEFAULT_MODEL = "sonnet"
-DEFAULT_TIMEOUT_S = 120.0
+DEFAULT_TIMEOUT_S = 240.0
 DEFAULT_MAX_CANDIDATES = MAX_CANDIDATES_DEFAULT
 DEFAULT_STORE_ROOT = Path(".forseti")
 
