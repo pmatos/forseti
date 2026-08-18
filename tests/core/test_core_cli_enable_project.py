@@ -71,6 +71,37 @@ def test_claude_code_hook_session_start_dispatches(
     assert code == 0
 
 
+def test_claude_code_hook_post_tool_use_dispatches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No tool_input.file_path -- post_tool_use's own early-return path, but this
+    # test's job is only to confirm `claude-code-hook post-tool-use` reaches
+    # `post_tool_use.main()` at all (its own logic is covered by
+    # tests/adapters/claude_code/test_post_tool_use.py).
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"cwd": str(tmp_path)})))
+    code = main(["claude-code-hook", "post-tool-use"])
+    assert code == 0
+
+
+def test_claude_code_hook_post_bash_dispatches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Not a git repo -- out-of-band discovery is inactive and there is nothing
+    # stale to verify, so post_bash.main() takes its own early-return path.
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"cwd": str(tmp_path)})))
+    code = main(["claude-code-hook", "post-bash"])
+    assert code == 0
+
+
+def test_claude_code_hook_stop_gate_dispatches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Not a git repo, nothing outstanding -- stop_gate.main() allows cleanly.
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"cwd": str(tmp_path)})))
+    code = main(["claude-code-hook", "stop-gate"])
+    assert code == 0
+
+
 def test_claude_code_hook_unknown_name_exits_two() -> None:
     with pytest.raises(SystemExit) as excinfo:
         main(["claude-code-hook", "does-not-exist"])

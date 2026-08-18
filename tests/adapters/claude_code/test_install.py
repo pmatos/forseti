@@ -108,6 +108,16 @@ def test_merge_hooks_drops_matcher_group_left_empty_by_removal() -> None:
     assert merged["hooks"]["Stop"][0]["hooks"][0]["command"] == f"{_MARKER}stop-gate"
 
 
+def test_merge_hooks_preserves_a_non_dict_matcher_group_verbatim() -> None:
+    # A matcher-group *entry* that isn't itself a dict is malformed but not
+    # forseti's problem to fix -- it survives untouched, alongside forseti's own
+    # freshly generated group for the same event.
+    existing = {"hooks": {"Stop": ["not-a-dict-group"]}}
+    merged = merge_hooks(existing)
+    assert "not-a-dict-group" in merged["hooks"]["Stop"]
+    assert len(merged["hooks"]["Stop"]) == 2
+
+
 def test_merge_hooks_on_null_hooks_raises() -> None:
     with pytest.raises(ProjectSettingsError):
         merge_hooks({"hooks": None})
