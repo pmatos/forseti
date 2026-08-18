@@ -144,6 +144,31 @@ def test_merge_hooks_preserves_a_command_merely_resembling_the_legacy_shape() ->
     assert other_command in commands
 
 
+def test_merge_hooks_preserves_a_foreign_hook_sharing_a_legacy_basename() -> None:
+    # review feedback on PR #201: the legacy pattern must not match on hook
+    # basename alone -- an unrelated tool's own `hooks/session_start.py`,
+    # under its own unrelated path, is not forseti's to touch even though it
+    # shares one of forseti's four basenames.
+    foreign_command = 'python3 "/opt/another-plugin/hooks/session_start.py"'
+    existing = {
+        "hooks": {
+            "SessionStart": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {"type": "command", "command": foreign_command, "timeout": 30}
+                    ],
+                }
+            ]
+        }
+    }
+    merged = merge_hooks(existing)
+    commands = [
+        h["command"] for g in merged["hooks"]["SessionStart"] for h in g["hooks"]
+    ]
+    assert foreign_command in commands
+
+
 def test_merge_hooks_drops_matcher_group_left_empty_by_removal() -> None:
     existing = {
         "hooks": {

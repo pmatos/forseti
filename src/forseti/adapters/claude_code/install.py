@@ -28,8 +28,12 @@ from . import event_log
 
 _MARKER_PREFIX = "forseti claude-code-hook "
 
+# Anchored to the only two path forms forseti's own pre-PR README/plugin
+# manifest ever actually used -- not an arbitrary `.../hooks/<name>.py`, which
+# would misclassify (and silently delete) an unrelated tool's own hook that
+# happens to share one of forseti's hook basenames under its own `hooks/` dir.
 _LEGACY_HOOK_RE = re.compile(
-    r'^python3\s+"[^"]*/hooks/'
+    r'^python3\s+"(?:\$\{CLAUDE_PLUGIN_ROOT\}|[^"]*/adapters/claude-code)/hooks/'
     r"(?:session_start|post_tool_use|post_bash|stop_gate)"
     r'\.py"$'
 )
