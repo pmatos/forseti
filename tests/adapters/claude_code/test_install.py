@@ -110,6 +110,26 @@ def test_merge_hooks_drops_matcher_group_left_empty_by_removal() -> None:
     assert merged["hooks"]["Stop"][0]["hooks"][0]["command"] == f"{_MARKER}stop-gate"
 
 
+def test_merge_hooks_preserves_a_matcher_group_with_no_forseti_hooks() -> None:
+    # review feedback on PR #201: a group with zero forseti hooks in it (empty
+    # or omitted `hooks`) must survive untouched -- `remaining` being empty
+    # there is not the same as "forseti's removal emptied it".
+    existing = {
+        "hooks": {
+            "Stop": [
+                {"matcher": "SomeOtherTool", "hooks": []},
+                {"matcher": "AnotherTool"},  # `hooks` omitted entirely
+            ]
+        }
+    }
+    merged = merge_hooks(existing)
+    stop_groups = merged["hooks"]["Stop"]
+    assert {"matcher": "SomeOtherTool", "hooks": []} in stop_groups
+    assert {"matcher": "AnotherTool"} in stop_groups
+    forseti_groups = [g for g in stop_groups if g.get("matcher") == "*"]
+    assert len(forseti_groups) == 1
+
+
 def test_merge_hooks_preserves_a_non_dict_matcher_group_verbatim() -> None:
     # A matcher-group *entry* that isn't itself a dict is malformed but not
     # forseti's problem to fix -- it survives untouched, alongside forseti's own
@@ -146,6 +166,27 @@ def test_install_shared_writes_settings_json(tmp_path: Path) -> None:
 
 def test_install_rerun_is_unchanged(tmp_path: Path) -> None:
     install(tmp_path)
+    _, outcome = install(tmp_path)
+    assert outcome is InstallOutcome.UNCHANGED
+
+
+def test_install_rerun_with_an_empty_foreign_group_stays_unchanged(
+    tmp_path: Path,
+) -> None:
+    # Companion to test_merge_hooks_preserves_a_matcher_group_with_no_forseti_hooks:
+    # preserving that group *by identity* (not a rebuilt dict) matters for
+    # install()'s own idempotency, since `updated == existing` is a plain
+    # dict comparison -- materializing an unwanted "hooks": [] key on an
+    # omitted-`hooks` group would make every rerun report UPDATED forever.
+    settings_path, _ = install(tmp_path)
+    data = json.loads(settings_path.read_text())
+    # Inserted *before* forseti's own group: a rerun always re-appends
+    # forseti's fresh groups at the end regardless of where they started
+    # (unrelated pre-existing behavior), so this is the list shape a rerun
+    # itself would reproduce -- the fixed point this test is checking for.
+    data["hooks"]["Stop"].insert(0, {"matcher": "SomeOtherTool"})
+    settings_path.write_text(json.dumps(data))
+
     _, outcome = install(tmp_path)
     assert outcome is InstallOutcome.UNCHANGED
 

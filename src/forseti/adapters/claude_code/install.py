@@ -79,10 +79,11 @@ def merge_hooks(existing: dict[str, Any]) -> dict[str, Any]:
     Total over any `existing` whose `"hooks"` value has the shape Claude Code
     itself writes (absent, or a dict mapping event name to a list of matcher
     groups): every non-forseti hook, matcher, and top-level key survives
-    unchanged; only matcher-groups whose hooks are all forseti's own marker are
-    dropped before the fresh set is appended. Raises `ProjectSettingsError` if
-    `"hooks"` or any event's value doesn't have that shape, rather than
-    silently dropping/corrupting it.
+    unchanged; a matcher-group is dropped only when removing forseti's own
+    hooks from it is what left it with none (an already-empty or -omitted
+    `hooks` array is preserved as-is, not read as "all forseti's own" and
+    dropped). Raises `ProjectSettingsError` if `"hooks"` or any event's value
+    doesn't have that shape, rather than silently dropping/corrupting it.
     """
     merged = dict(existing)
     raw_hooks = merged.get("hooks", {})
@@ -102,9 +103,16 @@ def merge_hooks(existing: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(group, dict):
                 kept.append(group)
                 continue
-            remaining = [h for h in group.get("hooks", []) if not _is_forseti_hook(h)]
-            if remaining:
+            original = group.get("hooks", [])
+            remaining = [h for h in original if not _is_forseti_hook(h)]
+            if len(remaining) == len(original):
+                # No forseti hook was in this group at all -- preserve it
+                # exactly (not a rebuilt dict), so an omitted `hooks` key or
+                # any other extra field on it survives untouched too.
+                kept.append(group)
+            elif remaining:
                 kept.append({**group, "hooks": remaining})
+            # else: every hook in this group was forseti's own -- drop it.
         kept.extend(generated.get(event, []))
         hooks[event] = kept
 
