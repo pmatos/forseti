@@ -223,6 +223,19 @@ def test_merge_hooks_preserves_a_non_dict_matcher_group_verbatim() -> None:
     assert len(merged["hooks"]["Stop"]) == 2
 
 
+def test_merge_hooks_preserves_a_matcher_group_with_a_null_hooks_value() -> None:
+    # review feedback on PR #201: a matcher group with "hooks": null (or any
+    # other non-list value) has the key *present*, so `group.get("hooks", [])`
+    # never falls back to its default -- iterating a bare None used to raise
+    # an uncaught TypeError, escaping the documented ProjectSettingsError
+    # contract this same function already enforces one level up. Not
+    # forseti's malformed shape to fix -- preserve it untouched.
+    existing = {"hooks": {"Stop": [{"matcher": "*", "hooks": None}]}}
+    merged = merge_hooks(existing)
+    assert {"matcher": "*", "hooks": None} in merged["hooks"]["Stop"]
+    assert len(merged["hooks"]["Stop"]) == 2
+
+
 def test_merge_hooks_preserves_a_non_dict_individual_hook_verbatim() -> None:
     # A *hook* entry (inside a group's "hooks" list) that isn't itself a dict
     # is malformed but not forseti's own -- the group survives untouched,

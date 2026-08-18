@@ -122,6 +122,12 @@ def merge_hooks(existing: dict[str, Any]) -> dict[str, Any]:
                 kept.append(group)
                 continue
             original = group.get("hooks", [])
+            if not isinstance(original, list):
+                # Malformed foreign group ("hooks": null or similar) -- not
+                # forseti's shape to fix; preserve it untouched, same as a
+                # non-dict group above, rather than crash iterating it.
+                kept.append(group)
+                continue
             remaining = [h for h in original if not _is_forseti_hook(h)]
             if len(remaining) == len(original):
                 # No forseti hook was in this group at all -- preserve it
