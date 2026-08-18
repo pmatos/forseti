@@ -198,6 +198,64 @@ def test_merge_hooks_preserves_a_non_dict_matcher_group_verbatim() -> None:
     assert len(merged["hooks"]["Stop"]) == 2
 
 
+def test_merge_hooks_preserves_a_non_dict_individual_hook_verbatim() -> None:
+    # A *hook* entry (inside a group's "hooks" list) that isn't itself a dict
+    # is malformed but not forseti's own -- the group survives untouched,
+    # alongside forseti's own freshly generated group for the same event.
+    existing = {"hooks": {"Stop": [{"matcher": "*", "hooks": ["not-a-dict-hook"]}]}}
+    merged = merge_hooks(existing)
+    stop_groups = merged["hooks"]["Stop"]
+    assert {"matcher": "*", "hooks": ["not-a-dict-hook"]} in stop_groups
+    assert len(stop_groups) == 2
+
+
+def test_merge_hooks_preserves_a_hook_with_a_non_string_command() -> None:
+    # A hook dict missing (or with a non-string) "command" can't be forseti's
+    # own marker-carrying entry -- preserve it as-is.
+    existing = {"hooks": {"Stop": [{"matcher": "*", "hooks": [{"type": "command"}]}]}}
+    merged = merge_hooks(existing)
+    assert {"type": "command"} in merged["hooks"]["Stop"][0]["hooks"]
+
+
+def test_merge_hooks_partial_removal_keeps_the_foreign_hook_in_place() -> None:
+    # A single matcher group holding both a stale forseti hook and an
+    # unrelated one: only forseti's own is stripped, the rest of the group
+    # (its foreign hook, matcher) stays -- not split into a separate group.
+    existing = {
+        "hooks": {
+            "Stop": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {"type": "command", "command": "echo mine", "timeout": 5},
+                        {
+                            "type": "command",
+                            "command": f"{_MARKER}stop-gate",
+                            "timeout": 1,
+                        },
+                    ],
+                }
+            ]
+        }
+    }
+    merged = merge_hooks(existing)
+    stop_groups = merged["hooks"]["Stop"]
+    mine_group = [
+        g
+        for g in stop_groups
+        if any(h.get("command") == "echo mine" for h in g["hooks"])
+    ]
+    assert mine_group == [
+        {
+            "matcher": "*",
+            "hooks": [{"type": "command", "command": "echo mine", "timeout": 5}],
+        }
+    ]
+    forseti_groups = [g for g in stop_groups if g is not mine_group[0]]
+    assert len(forseti_groups) == 1
+    assert forseti_groups[0]["hooks"][0]["command"] == f"{_MARKER}stop-gate"
+
+
 def test_merge_hooks_on_null_hooks_raises() -> None:
     with pytest.raises(ProjectSettingsError):
         merge_hooks({"hooks": None})
