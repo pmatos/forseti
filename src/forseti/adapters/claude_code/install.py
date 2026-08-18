@@ -8,11 +8,18 @@ carries a `"forseti claude-code-hook "`-prefixed command, its ownership marker:
 rerun, leaving any other hook/key in the file untouched. There is no separate
 version marker -- rerunning always regenerates forseti's entries from whatever
 `forseti` is currently installed, so it is idempotent by construction.
+
+Also recognizes (and drops, same as its own marker) the pre-RFC-0004 manual
+install commands -- `python3 "<path>/hooks/<name>.py"`, hand-copied from the
+old README or plugin manifest before the hook scripts moved into this
+package -- so a project that adopted forseti before `enable-project` existed
+doesn't keep invoking a script this relocation deletes.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -20,6 +27,12 @@ from typing import Any
 from . import event_log
 
 _MARKER_PREFIX = "forseti claude-code-hook "
+
+_LEGACY_HOOK_RE = re.compile(
+    r'^python3\s+"[^"]*/hooks/'
+    r"(?:session_start|post_tool_use|post_bash|stop_gate)"
+    r'\.py"$'
+)
 
 # (event, matcher, hook name, timeout_s) -- mirrors claude-code/hooks/hooks.json
 # (checked equal by test_install.py), the plugin manifest for these same four
@@ -57,11 +70,12 @@ def _hook_entry(hook_name: str, timeout_s: int) -> dict[str, Any]:
 
 
 def _is_forseti_hook(hook: object) -> bool:
-    return (
-        isinstance(hook, dict)
-        and isinstance(hook.get("command"), str)
-        and hook["command"].startswith(_MARKER_PREFIX)
-    )
+    if not isinstance(hook, dict):
+        return False
+    command = hook.get("command")
+    if not isinstance(command, str):
+        return False
+    return command.startswith(_MARKER_PREFIX) or bool(_LEGACY_HOOK_RE.match(command))
 
 
 def _generated_matcher_groups() -> dict[str, list[dict[str, Any]]]:

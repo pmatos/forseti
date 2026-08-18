@@ -86,6 +86,64 @@ def test_merge_hooks_rerun_replaces_stale_entries_without_duplicating() -> None:
     assert twice == once
 
 
+@pytest.mark.parametrize(
+    "hook_name", ["session_start", "post_tool_use", "post_bash", "stop_gate"]
+)
+@pytest.mark.parametrize(
+    "path_prefix", ["/home/user/adapters/claude-code", "${CLAUDE_PLUGIN_ROOT}"]
+)
+def test_merge_hooks_drops_legacy_pre_rfc0004_commands(
+    hook_name: str, path_prefix: str
+) -> None:
+    # review feedback on PR #201: the pre-RFC-0004 manual/plugin install
+    # (`python3 "<path>/hooks/<name>.py"`) invoked scripts this PR deletes --
+    # left wired up, they're a dead command Claude Code still fires every
+    # turn. Recognized and dropped like forseti's own marker.
+    existing = {
+        "hooks": {
+            "Stop" if hook_name == "stop_gate" else "SessionStart": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f'python3 "{path_prefix}/hooks/{hook_name}.py"',
+                            "timeout": 60,
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    merged = merge_hooks(existing)
+    event = "Stop" if hook_name == "stop_gate" else "SessionStart"
+    commands = [h["command"] for g in merged["hooks"][event] for h in g["hooks"]]
+    assert not any("hooks/" in c and ".py" in c for c in commands)
+    assert all(c.startswith(_MARKER) for c in commands)
+
+
+def test_merge_hooks_preserves_a_command_merely_resembling_the_legacy_shape() -> None:
+    # The legacy pattern is anchored to forseti's own four hook basenames --
+    # an unrelated tool's `python3 ".../hooks/other_script.py"` is not forseti's
+    # to touch.
+    other_command = 'python3 "/opt/other-tool/hooks/other_script.py"'
+    existing = {
+        "hooks": {
+            "Stop": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {"type": "command", "command": other_command, "timeout": 30}
+                    ],
+                }
+            ]
+        }
+    }
+    merged = merge_hooks(existing)
+    commands = [h["command"] for g in merged["hooks"]["Stop"] for h in g["hooks"]]
+    assert other_command in commands
+
+
 def test_merge_hooks_drops_matcher_group_left_empty_by_removal() -> None:
     existing = {
         "hooks": {
