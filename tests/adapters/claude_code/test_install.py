@@ -411,3 +411,28 @@ def test_install_on_non_object_json_raises(tmp_path: Path) -> None:
 
     with pytest.raises(ProjectSettingsError):
         install(tmp_path)
+
+
+def test_install_rejects_a_symlinked_settings_file(tmp_path: Path) -> None:
+    # review feedback on PR #201: an atomic rewrite (temp file + rename)
+    # replaces whatever is *at* the target path -- if that's a symlink (e.g.
+    # into a dotfiles repo), the link itself is silently swapped for a plain
+    # file rather than writing through it. Reject explicitly instead.
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    real = tmp_path / "real-settings.json"
+    real.write_text("{}")
+    (claude_dir / "settings.local.json").symlink_to(real)
+
+    with pytest.raises(ProjectSettingsError):
+        install(tmp_path)
+    assert real.read_text() == "{}"  # untouched
+
+
+def test_install_rejects_a_broken_symlinked_settings_file(tmp_path: Path) -> None:
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "settings.local.json").symlink_to(tmp_path / "does-not-exist.json")
+
+    with pytest.raises(ProjectSettingsError):
+        install(tmp_path)

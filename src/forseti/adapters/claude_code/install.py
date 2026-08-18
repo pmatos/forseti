@@ -144,10 +144,18 @@ def install(project_dir: Path, *, shared: bool = False) -> tuple[Path, InstallOu
     Writes `.claude/settings.json` when `shared` (git-committed, team-wide) else
     the default `.claude/settings.local.json` (gitignored, personal). Raises
     `ProjectSettingsError` on unreadable/malformed existing JSON rather than
-    overwriting it. The write is atomic (temp file + rename).
+    overwriting it. The write is atomic (temp file + rename), which -- if the
+    target were a symlink (e.g. into a dotfiles repo) -- would silently
+    replace the link itself with a plain file rather than writing through it;
+    raises `ProjectSettingsError` instead of doing that.
     """
     claude_dir = project_dir / ".claude"
     settings_path = claude_dir / ("settings.json" if shared else "settings.local.json")
+    if settings_path.is_symlink():
+        raise ProjectSettingsError(
+            f"{settings_path} is a symlink -- refusing to replace it (an atomic "
+            "rewrite would swap in a plain file, silently breaking the link)"
+        )
     existed = settings_path.exists()
 
     if existed:
