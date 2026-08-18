@@ -30,6 +30,7 @@ import tempfile
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 # The safety-property profile. Bounds / pointer / div-by-zero are ESBMC defaults;
 # signed overflow is opt-in, so we add it. Unsigned overflow is intentionally
@@ -1267,7 +1268,9 @@ def _pending_owner(entry: object) -> tuple[object, object] | None:
     return entry.get("hash"), entry.get("pid")
 
 
-def stale_sources(project_dir: str, state: dict, files: Iterable[str]) -> list[str]:
+def stale_sources(
+    project_dir: str, state: dict[str, Any], files: Iterable[str]
+) -> list[str]:
     """Subset of `files` needing a (re-)verify: changed content, or a killed verify.
 
     A file is stale when it has never been verified (`scanned` has no entry), when
@@ -1302,7 +1305,7 @@ def stale_sources(project_dir: str, state: dict, files: Iterable[str]) -> list[s
     return stale
 
 
-def pending_retry_sources(project_dir: str, state: dict) -> list[str]:
+def pending_retry_sources(project_dir: str, state: dict[str, Any]) -> list[str]:
     """Absolute paths whose bytes *now on disk* have an unfinished verify on record.
 
     A discovery source in its own right, and the one git cannot provide (PR #148
@@ -1332,7 +1335,7 @@ def pending_retry_sources(project_dir: str, state: dict) -> list[str]:
 
 
 def sources_needing_verify(
-    project_dir: str, state: dict, discovered: Iterable[str] | None
+    project_dir: str, state: dict[str, Any], discovered: Iterable[str] | None
 ) -> list[str]:
     """Everything a scan must (re-)verify: stale discovered C + interrupted verifies.
 
@@ -1370,8 +1373,8 @@ def _baselined_blobs(baseline: object, rel: str) -> tuple[str, ...]:
 
 
 def divergent_blob_sources(
-    project_dir: str, state: dict, *, baseline_head: str | None = None
-) -> list[dict]:
+    project_dir: str, state: dict[str, Any], *, baseline_head: str | None = None
+) -> list[dict[str, Any]]:
     """C whose STAGED or COMMITTED blob was never verified (issue #99 review).
 
     `stale_sources` hashes only the worktree copy, so a Bash command that stages one
@@ -1413,7 +1416,7 @@ def divergent_blob_sources(
         (rel, f":{rel}", "staged") for rel in staged_source_paths(project_dir)
     ]
 
-    results: list[dict] = []
+    results: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for repo_rel, ref, reason in candidates:
         abspath = _in_scope_c_abspath(project_dir, root, proj_real, repo_rel)
@@ -1835,11 +1838,11 @@ def gate_lock(project_dir: str) -> Iterator[None]:
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def load_state(project_dir: str) -> dict:
+def load_state(project_dir: str) -> dict[str, Any]:
     path = _gate_path(project_dir)
     if path.exists():
         try:
-            state = json.loads(path.read_text())
+            state: dict[str, Any] = json.loads(path.read_text())
             state.setdefault("units", {})
             state.setdefault("stop_attempts", 0)
             state.setdefault("scanned", {})
@@ -1859,7 +1862,7 @@ def load_state(project_dir: str) -> dict:
     }
 
 
-def save_state(project_dir: str, state: dict) -> None:
+def save_state(project_dir: str, state: dict[str, Any]) -> None:
     # Write atomically (temp + os.replace) so a hook killed mid-write can never
     # leave a truncated gate_state.json — load_state fails open to an empty unit
     # set, which would make the Stop-gate forget outstanding violations.
@@ -1870,12 +1873,12 @@ def save_state(project_dir: str, state: dict) -> None:
     os.replace(tmp, path)
 
 
-def record(state: dict, verdict: UnitVerdict) -> None:
+def record(state: dict[str, Any], verdict: UnitVerdict) -> None:
     state["units"][verdict.unit_id] = asdict(verdict)
 
 
 def prune_missing_units(
-    state: dict, project_dir: str, file_path: str, keep: set[str]
+    state: dict[str, Any], project_dir: str, file_path: str, keep: set[str]
 ) -> None:
     """Drop tracked units for `file_path` whose function is not in `keep`.
 
@@ -1896,7 +1899,7 @@ def prune_missing_units(
         del state["units"][uid]
 
 
-def prune_deleted_units(state: dict, project_dir: str) -> list[str]:
+def prune_deleted_units(state: dict[str, Any], project_dir: str) -> list[str]:
     """Drop recorded units whose backing C source no longer exists on disk.
 
     `record`/`verify_and_record` only ever upsert per file, so a C source removed
@@ -1942,7 +1945,7 @@ def prune_deleted_units(state: dict, project_dir: str) -> list[str]:
 _NON_BLOCKING_VERDICTS = frozenset({"verified", NEEDS_CONTRACT})
 
 
-def blocking_units(state: dict) -> list[dict]:
+def blocking_units(state: dict[str, Any]) -> list[dict[str, Any]]:
     """Units the Stop-gate must block on: not `verified` and not `needs_contract`.
 
     `verified` passed; `needs_contract` is honestly-unverified but is not something
@@ -1958,7 +1961,7 @@ def blocking_units(state: dict) -> list[dict]:
     ]
 
 
-def needs_contract_units(state: dict) -> list[dict]:
+def needs_contract_units(state: dict[str, Any]) -> list[dict[str, Any]]:
     """Units marked `needs_contract` — reported as a loud residual, never blocking."""
     return [u for u in state["units"].values() if u.get("verdict") == NEEDS_CONTRACT]
 

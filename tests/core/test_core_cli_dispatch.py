@@ -39,6 +39,8 @@ def test_every_subcommand_binds_a_callable_handler() -> None:
         "synth",
         "discharge",
         "propose",
+        "claude-code-hook",
+        "enable-project",
         "mcp",
     }
     for name, subparser in subparsers.items():

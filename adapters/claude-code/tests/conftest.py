@@ -1,14 +1,14 @@
-"""Put the adapter's `hooks/` and `tools/` on sys.path for the adapter tests.
+"""Put the adapter's `tools/` on sys.path for the remaining adapter-local tests.
 
-The Claude Code adapter is a self-contained plugin outside the `forseti` package
-(the root `pytest`/`mypy`/`ruff` run on `src tests` only), so its modules are not
-importable as a package. These tests import them directly by adding the two
-script directories to sys.path.
+The hook logic itself now ships inside the `forseti` package
+(`src/forseti/adapters/claude_code/`, RFC-0004) and is covered under the
+canonical `tests/adapters/claude_code/` suite. `tools/trace_to_mermaid.py` is a
+standalone dev tool that stays outside the package, so its test still imports
+it directly by adding `tools/` to sys.path.
 """
 
 import os
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-for _sub in ("hooks", "tools"):
-    sys.path.insert(0, os.path.join(_HERE, "..", _sub))
+sys.path.insert(0, os.path.join(_HERE, "..", "tools"))

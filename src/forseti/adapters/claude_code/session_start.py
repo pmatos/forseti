@@ -25,18 +25,17 @@ from __future__ import annotations
 import json
 import os
 import sys
+from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import event_log
-import forseti_gate as gate
+from . import event_log
+from . import forseti_gate as gate
 
 # A new or cleared context — (re)establish the baseline. On "resume"/"compact"
 # the session's `scanned` map is still live, so we must not overwrite it.
 _FRESH_SOURCES = {"startup", "clear"}
 
 
-def _project_dir(data: dict) -> str:
+def _project_dir(data: dict[str, Any]) -> str:
     return os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or os.getcwd()
 
 

@@ -2,7 +2,7 @@
 
 Run from the repo root with the dev venv::
 
-    .venv/bin/python -m pytest adapters/claude-code/tests -q
+    .venv/bin/python -m pytest tests/adapters/claude_code -q
 
 Discovery is `git status`-scoped, so the git-backed tests build a throwaway repo
 under ``tmp_path``. The ESBMC-gated end-to-end tests skip without `esbmc` +
@@ -19,14 +19,19 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import NoReturn
 
-import event_log
-import forseti_gate as gate
-import post_bash
 import pytest
-import session_start
-import stop_gate
+
+from forseti.adapters.claude_code import (
+    event_log,
+    post_bash,
+    session_start,
+    stop_gate,
+)
+from forseti.adapters.claude_code import forseti_gate as gate
 
 
 @pytest.fixture(autouse=True)
@@ -48,7 +53,10 @@ def _git_commit_all(path: Path) -> None:
 
 
 def _run(
-    hook_main, project_dir: Path, monkeypatch: pytest.MonkeyPatch, **payload
+    hook_main: Callable[[], int],
+    project_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    **payload: object,
 ) -> int:
     """Drive a hook's ``main()`` with a stdin payload pointing at `project_dir`."""
     body = {"cwd": str(project_dir), **payload}
@@ -655,7 +663,14 @@ def _enumerate_one_unit(monkeypatch: pytest.MonkeyPatch, name: str = "f") -> Non
 def _kill_during_verify(monkeypatch: pytest.MonkeyPatch, calls: list[str]) -> None:
     """Make every `verify_function` call die as if the hook were killed."""
 
-    def _boom(file_path, function, *, project_dir, k=gate.DEFAULT_K, verify_path=None):
+    def _boom(
+        file_path: str,
+        function: str,
+        *,
+        project_dir: str,
+        k: int = gate.DEFAULT_K,
+        verify_path: str | None = None,
+    ) -> NoReturn:
         calls.append(function)
         raise _Killed(function)
 
@@ -750,7 +765,12 @@ def test_blocking_error_on_a_retry_spends_an_attempt(
     with pytest.raises(_Killed):
         gate.verify_and_record(str(src), project_dir=str(tmp_path))
 
-    def _unavailable(file_path, *, project_dir, content=None):
+    def _unavailable(
+        file_path: str | os.PathLike[str],
+        *,
+        project_dir: str,
+        content: bytes | None = None,
+    ) -> NoReturn:
         raise gate.UnitsUnavailable("forseti CLI could not be launched")
 
     monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
@@ -886,8 +906,13 @@ def test_cleanup_preserves_a_newer_runs_pending_marker(
     newer: dict[str, str] = {}
 
     def _verify_while_a_newer_run_starts(
-        fp, fn, *, project_dir, k=gate.DEFAULT_K, verify_path=None
-    ):
+        fp: str,
+        fn: str,
+        *,
+        project_dir: str,
+        k: int = gate.DEFAULT_K,
+        verify_path: str | None = None,
+    ) -> gate.UnitVerdict:
         newer["digest"] = _concurrent_run_starts(
             tmp_path, src, "int f(void){return 1;}\n"
         )
@@ -917,8 +942,13 @@ def test_cleanup_preserves_a_concurrent_retry_of_the_same_content(
     _enumerate_one_unit(monkeypatch)
 
     def _verify_while_same_content_retries(
-        fp, fn, *, project_dir, k=gate.DEFAULT_K, verify_path=None
-    ):
+        fp: str,
+        fn: str,
+        *,
+        project_dir: str,
+        k: int = gate.DEFAULT_K,
+        verify_path: str | None = None,
+    ) -> gate.UnitVerdict:
         _concurrent_run_starts(tmp_path, src, src.read_text())  # identical bytes
         return gate.UnitVerdict("same.c::f", "same.c", "f", "verified", k)
 
@@ -948,9 +978,19 @@ def test_cleanup_survives_a_concurrent_error_charging_its_marker(
     _enumerate_one_unit(monkeypatch)
 
     def _verify_while_a_concurrent_scan_errors(
-        fp, fn, *, project_dir, k=gate.DEFAULT_K, verify_path=None
-    ):
-        def _unavailable(file_path, *, project_dir, content=None):
+        fp: str,
+        fn: str,
+        *,
+        project_dir: str,
+        k: int = gate.DEFAULT_K,
+        verify_path: str | None = None,
+    ) -> gate.UnitVerdict:
+        def _unavailable(
+            file_path: str | os.PathLike[str],
+            *,
+            project_dir: str,
+            content: bytes | None = None,
+        ) -> NoReturn:
             raise gate.UnitsUnavailable("forseti CLI could not be launched")
 
         monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
@@ -987,7 +1027,12 @@ def test_blocking_error_charge_stops_at_the_cap(
         del state["scanned"]["spent.c"]
         gate.save_state(str(tmp_path), state)
 
-    def _unavailable(file_path, *, project_dir, content=None):
+    def _unavailable(
+        file_path: str | os.PathLike[str],
+        *,
+        project_dir: str,
+        content: bytes | None = None,
+    ) -> NoReturn:
         raise gate.UnitsUnavailable("forseti CLI could not be launched")
 
     monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
@@ -1019,8 +1064,11 @@ def test_blocking_error_preserves_a_newer_runs_pending_marker(
     newer: dict[str, str] = {}
 
     def _newer_run_starts_then_enumeration_fails(
-        file_path, *, project_dir, content=None
-    ):
+        file_path: str | os.PathLike[str],
+        *,
+        project_dir: str,
+        content: bytes | None = None,
+    ) -> NoReturn:
         newer["digest"] = _concurrent_run_starts(
             tmp_path, src, "int f(void){return 1;}\n"
         )
@@ -1073,8 +1121,11 @@ def test_enumeration_failure_defers_to_a_run_that_already_finished(
     newer: dict[str, str] = {}
 
     def _newer_run_finishes_then_enumeration_fails(
-        file_path, *, project_dir, content=None
-    ):
+        file_path: str | os.PathLike[str],
+        *,
+        project_dir: str,
+        content: bytes | None = None,
+    ) -> NoReturn:
         newer["digest"] = _newer_run_finishes(tmp_path, src, "int f(void){return 1;}\n")
         raise gate.UnitsUnavailable("forseti CLI could not be launched")
 
@@ -1107,7 +1158,12 @@ def test_enumeration_failure_defers_on_content_already_gated(
     src.write_text("int f(void){return 0;}\n")
     _newer_run_finishes(tmp_path, src, "int f(void){return 0;}\n")
 
-    def _unavailable(file_path, *, project_dir, content=None):
+    def _unavailable(
+        file_path: str | os.PathLike[str],
+        *,
+        project_dir: str,
+        content: bytes | None = None,
+    ) -> NoReturn:
         raise gate.UnitsUnavailable("esbmc not found on PATH")
 
     monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
@@ -1130,7 +1186,12 @@ def test_enumeration_failure_blocks_when_the_stamp_is_for_other_content(
     _newer_run_finishes(tmp_path, src, "int f(void){return 0;}\n")
     src.write_text("int f(void){return 1;}\n")  # edited past the stamp
 
-    def _unavailable(file_path, *, project_dir, content=None):
+    def _unavailable(
+        file_path: str | os.PathLike[str],
+        *,
+        project_dir: str,
+        content: bytes | None = None,
+    ) -> NoReturn:
         raise gate.UnitsUnavailable("esbmc not found on PATH")
 
     monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
@@ -1155,7 +1216,12 @@ def test_blocking_error_preserves_a_concurrent_same_content_marker(
     src = tmp_path / "shared.c"
     digest = _concurrent_run_starts(tmp_path, src, "int f(void){return 0;}\n")
 
-    def _unavailable(file_path, *, project_dir, content=None):
+    def _unavailable(
+        file_path: str | os.PathLike[str],
+        *,
+        project_dir: str,
+        content: bytes | None = None,
+    ) -> NoReturn:
         raise gate.UnitsUnavailable("forseti CLI could not be launched")
 
     monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
@@ -1191,7 +1257,12 @@ def test_errored_retries_are_capped_then_residual(
 
     scans: list[str] = []
 
-    def _unavailable(file_path, *, project_dir, content=None):
+    def _unavailable(
+        file_path: str | os.PathLike[str],
+        *,
+        project_dir: str,
+        content: bytes | None = None,
+    ) -> NoReturn:
         scans.append(str(file_path))
         raise gate.UnitsUnavailable("forseti CLI could not be launched")
 
@@ -1227,7 +1298,12 @@ def test_recovered_enumeration_clears_the_error_and_the_marker(
     with contextlib.suppress(_Killed):
         _run(post_bash.main, tmp_path, monkeypatch)
 
-    def _unavailable(file_path, *, project_dir, content=None):
+    def _unavailable(
+        file_path: str | os.PathLike[str],
+        *,
+        project_dir: str,
+        content: bytes | None = None,
+    ) -> NoReturn:
         raise gate.UnitsUnavailable("forseti CLI could not be launched")
 
     monkeypatch.setattr(gate, "extract_function_defs", _unavailable)
@@ -1272,10 +1348,17 @@ def test_unreadable_file_leaves_the_pending_marker_alone(tmp_path: Path) -> None
 # --- a pending marker is a discovery source of its own (PR #148 review) -----
 
 
-def _verified_verdict(rel: str, function: str = "f"):
+def _verified_verdict(rel: str, function: str = "f") -> Callable[..., gate.UnitVerdict]:
     """Stand-in `verify_function` whose verdict lands (the retry that finishes)."""
 
-    def _verify(fp, fn, *, project_dir, k=gate.DEFAULT_K, verify_path=None):
+    def _verify(
+        fp: str,
+        fn: str,
+        *,
+        project_dir: str,
+        k: int = gate.DEFAULT_K,
+        verify_path: str | None = None,
+    ) -> gate.UnitVerdict:
         return gate.UnitVerdict(f"{rel}::{fn}", rel, fn, "verified", k)
 
     return _verify

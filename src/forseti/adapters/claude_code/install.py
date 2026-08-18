@@ -1,0 +1,130 @@
+"""`forseti enable-project`: install/update the Claude Code verify-gate hooks.
+
+RFC-0004. Generates the four SessionStart/PostToolUse/Stop hook entries (matching
+`adapters/claude-code/hooks/hooks.json`'s plugin manifest) and merges them into
+a target project's Claude Code settings file. Every hook entry `forseti` writes
+carries a `"forseti claude-code-hook "`-prefixed command, its ownership marker:
+`merge_hooks` uses that marker to replace only forseti's own prior entries on a
+rerun, leaving any other hook/key in the file untouched. There is no separate
+version marker -- rerunning always regenerates forseti's entries from whatever
+`forseti` is currently installed, so it is idempotent by construction.
+"""
+
+from __future__ import annotations
+
+import json
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+_MARKER_PREFIX = "forseti claude-code-hook "
+
+# (event, matcher, hook name, timeout_s) -- mirrors claude-code/hooks/hooks.json
+_HOOK_SPECS: tuple[tuple[str, str, str, int], ...] = (
+    ("SessionStart", "*", "session-start", 60),
+    ("PostToolUse", "Write|Edit|MultiEdit", "post-tool-use", 300),
+    ("PostToolUse", "Bash", "post-bash", 300),
+    ("Stop", "*", "stop-gate", 120),
+)
+
+
+class InstallOutcome(Enum):
+    """What `install` did to the target settings file."""
+
+    CREATED = "created"
+    UPDATED = "updated"
+    UNCHANGED = "unchanged"
+
+
+class ProjectSettingsError(Exception):
+    """The target settings file exists but cannot be safely read as forseti's own."""
+
+
+def _hook_entry(hook_name: str, timeout_s: int) -> dict[str, Any]:
+    return {
+        "type": "command",
+        "command": f"{_MARKER_PREFIX}{hook_name}",
+        "timeout": timeout_s,
+    }
+
+
+def _is_forseti_hook(hook: object) -> bool:
+    return (
+        isinstance(hook, dict)
+        and isinstance(hook.get("command"), str)
+        and hook["command"].startswith(_MARKER_PREFIX)
+    )
+
+
+def _generated_matcher_groups() -> dict[str, list[dict[str, Any]]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for event, matcher, hook_name, timeout_s in _HOOK_SPECS:
+        groups.setdefault(event, []).append(
+            {"matcher": matcher, "hooks": [_hook_entry(hook_name, timeout_s)]}
+        )
+    return groups
+
+
+def merge_hooks(existing: dict[str, Any]) -> dict[str, Any]:
+    """Return `existing` with forseti's own hook entries replaced by the current set.
+
+    Pure and total: every non-forseti hook, matcher, and top-level key survives
+    unchanged; only matcher-groups whose hooks are all forseti's own marker are
+    dropped before the fresh set is appended.
+    """
+    merged = dict(existing)
+    hooks: dict[str, Any] = dict(merged.get("hooks", {}))
+    generated = _generated_matcher_groups()
+
+    for event in set(hooks) | set(generated):
+        kept: list[Any] = []
+        for group in hooks.get(event, []):
+            if not isinstance(group, dict):
+                kept.append(group)
+                continue
+            remaining = [h for h in group.get("hooks", []) if not _is_forseti_hook(h)]
+            if remaining:
+                kept.append({**group, "hooks": remaining})
+        kept.extend(generated.get(event, []))
+        hooks[event] = kept
+
+    merged["hooks"] = hooks
+    return merged
+
+
+def install(project_dir: Path, *, shared: bool = False) -> tuple[Path, InstallOutcome]:
+    """Install/update the Claude Code verify-gate hooks for `project_dir`.
+
+    Writes `.claude/settings.json` when `shared` (git-committed, team-wide) else
+    the default `.claude/settings.local.json` (gitignored, personal). Raises
+    `ProjectSettingsError` on unreadable/malformed existing JSON rather than
+    overwriting it. The write is atomic (temp file + rename).
+    """
+    claude_dir = project_dir / ".claude"
+    settings_path = claude_dir / ("settings.json" if shared else "settings.local.json")
+    existed = settings_path.exists()
+
+    if existed:
+        try:
+            existing = json.loads(settings_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ProjectSettingsError(
+                f"{settings_path}: cannot read existing settings ({exc})"
+            ) from exc
+        if not isinstance(existing, dict):
+            raise ProjectSettingsError(
+                f"{settings_path}: top-level JSON must be an object"
+            )
+    else:
+        existing = {}
+
+    updated = merge_hooks(existing)
+    if updated == existing:
+        return settings_path, InstallOutcome.UNCHANGED
+
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = settings_path.parent / (settings_path.name + ".tmp")
+    tmp_path.write_text(json.dumps(updated, indent=2) + "\n")
+    tmp_path.replace(settings_path)
+    outcome = InstallOutcome.CREATED if not existed else InstallOutcome.UPDATED
+    return settings_path, outcome

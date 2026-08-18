@@ -2,10 +2,12 @@
 """Render a Forseti loop trace (``.forseti/events.jsonl``) as a mermaid diagram.
 
 Reads the append-only event trace written by the verify-gate hooks
-(``hooks/event_log.py``) and prints a mermaid ``sequenceDiagram`` of the
-write -> verify -> counterexample -> fix back-and-forth between four actors:
-Claude, the PostToolUse Gate, ESBMC, and the Stop-gate. Paste the output into any
-mermaid renderer (GitHub, mermaid.live, an Obsidian note) to see the loop.
+(``forseti.adapters.claude_code.event_log``) and prints a mermaid
+``sequenceDiagram`` of the write -> verify -> counterexample -> fix
+back-and-forth between four actors: Claude, the PostToolUse Gate, ESBMC, and
+the Stop-gate. Paste the output into any mermaid renderer (GitHub,
+mermaid.live, an Obsidian note) to see the loop. Needs ``forseti`` installed
+(RFC-0004 moved the hook logic, including ``event_log``, into the package).
 
 Usage::
 
@@ -19,16 +21,11 @@ the diagram title.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(
-    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hooks")
-)
-
-import event_log
+from forseti.adapters.claude_code import event_log
 
 _PARTICIPANTS = (
     ("C", "Claude"),

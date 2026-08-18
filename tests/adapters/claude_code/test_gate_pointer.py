@@ -10,7 +10,7 @@ CLI so they run everywhere.
 Run from the repo root with the dev venv (put its ``forseti`` first on PATH so a
 broken launcher elsewhere is shadowed)::
 
-    PATH=.venv/bin:$PATH .venv/bin/python -m pytest adapters/claude-code/tests -q
+    PATH=.venv/bin:$PATH .venv/bin/python -m pytest tests/adapters/claude_code -q
 """
 
 from __future__ import annotations
@@ -22,13 +22,16 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import forseti_gate as gate
 import pytest
+
+from forseti.adapters.claude_code import forseti_gate as gate
 
 _HAVE_ESBMC = shutil.which("esbmc") is not None and shutil.which("forseti") is not None
 
@@ -132,10 +135,6 @@ def _echoing_forseti_cmd(
     return [sys.executable, str(script)]
 
 
-def _git_init(path: Path) -> None:
-    subprocess.run(["git", "init", "-q", str(path)], check=True)
-
-
 def _content_keyed_verify_forseti_cmd(
     tmp_path: Path, *, during_verify: str = "", original: str = "alpha\n"
 ) -> list[str]:
@@ -200,7 +199,9 @@ def _units_payload(*units: tuple[str, bool]) -> str:
     )
 
 
-def test_extract_function_defs_parses_cli_json(tmp_path: Path, monkeypatch) -> None:
+def test_extract_function_defs_parses_cli_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     payload = _units_payload(("a", False), ("b", True))
     monkeypatch.setattr(
         gate, "resolve_forseti_cmd", lambda: _fake_forseti_cmd(tmp_path, stdout=payload)
@@ -209,7 +210,9 @@ def test_extract_function_defs_parses_cli_json(tmp_path: Path, monkeypatch) -> N
     assert [(d.name, d.takes_pointer) for d in defs] == [("a", False), ("b", True)]
 
 
-def test_extract_functions_returns_names(tmp_path: Path, monkeypatch) -> None:
+def test_extract_functions_returns_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     payload = _units_payload(("a", True), ("b", False))
     monkeypatch.setattr(
         gate, "resolve_forseti_cmd", lambda: _fake_forseti_cmd(tmp_path, stdout=payload)
@@ -224,7 +227,7 @@ def test_extract_functions_returns_names(tmp_path: Path, monkeypatch) -> None:
     "budget, expected", [(0.5, "0.5"), (2.5, "2.5"), (30.0, "30.0")]
 )
 def test_list_units_timeout_reaches_the_cli_unrounded(
-    tmp_path: Path, monkeypatch, budget: float, expected: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, budget: float, expected: str
 ) -> None:
     # `list-units` passes its --timeout straight to `subprocess.run(timeout=...)`,
     # where 0 expires immediately (esbmc's own --timeout, which reads 0 as
@@ -247,7 +250,7 @@ def test_list_units_timeout_reaches_the_cli_unrounded(
 
 
 def test_extract_function_defs_raises_on_nonzero_exit(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A failed parse (nonzero exit) must raise, never be read as "no units" — the
     # latter would let the gate silently skip a unit.
@@ -260,7 +263,9 @@ def test_extract_function_defs_raises_on_nonzero_exit(
         gate.extract_function_defs(str(tmp_path / "x.c"), project_dir=str(tmp_path))
 
 
-def test_extract_function_defs_raises_on_bad_json(tmp_path: Path, monkeypatch) -> None:
+def test_extract_function_defs_raises_on_bad_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(
         gate,
         "resolve_forseti_cmd",
@@ -271,7 +276,7 @@ def test_extract_function_defs_raises_on_bad_json(tmp_path: Path, monkeypatch) -
 
 
 def test_extract_function_defs_raises_on_malformed_payload(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Valid JSON, wrong shape (a units entry missing `function`) must degrade to a
     # blocking UnitsUnavailable, never crash the hook with KeyError/TypeError.
@@ -296,7 +301,7 @@ def test_extract_function_defs_raises_on_malformed_payload(
     ],
 )
 def test_extract_function_defs_raises_on_non_boolean_takes_pointer(
-    tmp_path: Path, monkeypatch, takes_pointer: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, takes_pointer: str
 ) -> None:
     # `takes_pointer` decides whether a unit is verified or parked in non-blocking
     # NEEDS_CONTRACT, so coercing it is unsafe: `bool("false")` is True, which would
@@ -311,7 +316,7 @@ def test_extract_function_defs_raises_on_non_boolean_takes_pointer(
 
 
 def test_extract_function_defs_raises_on_missing_takes_pointer(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # An absent `takes_pointer` used to default to False ("scalar"), silently
     # gating a unit whose classification the CLI never actually reported. Like an
@@ -329,7 +334,7 @@ def test_extract_function_defs_raises_on_missing_takes_pointer(
     ["123", "null", '""', '["f"]'],  # non-string or empty name
 )
 def test_extract_function_defs_raises_on_bad_function_name(
-    tmp_path: Path, monkeypatch, function: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, function: str
 ) -> None:
     # A non-string name was previously coerced with `str()`, so `123` became the
     # unit "123" and `forseti verify --function 123` would fail downstream with a
@@ -343,7 +348,7 @@ def test_extract_function_defs_raises_on_bad_function_name(
 
 
 def test_extract_function_defs_raises_on_non_object_units_entry(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A list-valued `units` whose entries are scalars must not crash the hook with
     # AttributeError/TypeError — it degrades to a blocking UnitsUnavailable.
@@ -357,7 +362,7 @@ def test_extract_function_defs_raises_on_non_object_units_entry(
 
 
 def test_non_boolean_takes_pointer_records_blocking_error(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # End to end: the reviewer's scenario — a list-valued `units` with the truthy
     # string "false" — must persist a blocking `error` verdict, never a silent pass
@@ -386,7 +391,7 @@ def test_non_boolean_takes_pointer_records_blocking_error(
     ],
 )
 def test_extract_function_defs_raises_when_units_absent_or_not_a_list(
-    tmp_path: Path, monkeypatch, stdout: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stdout: str
 ) -> None:
     # An exit-0 payload without a list-valued `units` (e.g. an older `forseti`
     # build) must NOT default to "no units" — that would let an edited `.c` pass
@@ -399,7 +404,7 @@ def test_extract_function_defs_raises_when_units_absent_or_not_a_list(
 
 
 def test_extract_function_defs_empty_units_is_a_clean_pass(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # An *empty* list is a legitimate "file defines no functions" pass — only an
     # absent/non-list `units` blocks. Guards against over-rejecting the empty case.
@@ -415,7 +420,7 @@ def test_extract_function_defs_empty_units_is_a_clean_pass(
 
 
 def test_enumeration_parses_the_given_content_not_a_re_read(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # `content=` is the fix for issue #141: those exact bytes are what gets
     # parsed, so no re-read of the path can substitute different ones. Here the
@@ -434,7 +439,7 @@ def test_enumeration_parses_the_given_content_not_a_re_read(
 
 
 def test_snapshot_directory_stands_in_for_the_sources_own(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # clang resolves a quoted `#include "sibling.h"` against the directory of the
     # file it is reading, so the snapshot has to sit in that same directory — a
@@ -473,7 +478,7 @@ def test_snapshot_directory_stands_in_for_the_sources_own(
 
 
 def test_snapshot_preserves_the_source_extension_including_case(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # `is_c_source`/`extract_function_defs` lowercase the suffix to decide whether
     # to enumerate at all, but clang itself does not: an uppercase `.C` source is
@@ -528,7 +533,7 @@ def test_uppercase_c_source_snapshot_matches_in_place_enumeration(
 
 
 def test_snapshot_does_not_disturb_angle_include_or_iquote_precedence(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Why the snapshot is staged in the source's own directory rather than named
     # with `-I`: `-I` also joins the *angle-bracket* search, and lands after any
@@ -560,7 +565,7 @@ def test_snapshot_does_not_disturb_angle_include_or_iquote_precedence(
 
 
 def test_snapshot_stages_beside_the_lexical_directory_not_the_symlink_target(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # clang searches the directory of the path it was *given*, so for a symlinked
     # source that is the link's directory, not the target's. Staging beside the
@@ -592,7 +597,7 @@ def test_snapshot_stages_beside_the_lexical_directory_not_the_symlink_target(
 
 
 def test_snapshot_stages_beside_the_dir_resolved_against_project_dir(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The CLI subprocess runs with cwd=project_dir, so a relative `file_path` is
     # relative to *that*, not to the hook process's cwd. A bare `os.path.abspath`
@@ -615,7 +620,9 @@ def test_snapshot_stages_beside_the_dir_resolved_against_project_dir(
     assert siblings["helper.h"] == str((sub / "helper.h").resolve())
 
 
-def test_in_place_enumeration_uses_no_snapshot(tmp_path: Path, monkeypatch) -> None:
+def test_in_place_enumeration_uses_no_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # Without `content=` nothing is staged — the file is parsed where it lies,
     # exactly as before.
     dest = tmp_path / "argv.json"
@@ -633,7 +640,9 @@ def test_in_place_enumeration_uses_no_snapshot(tmp_path: Path, monkeypatch) -> N
     assert "--" not in argv
 
 
-def _unstageable_snapshot(monkeypatch, message: str = "No space left") -> None:
+def _unstageable_snapshot(
+    monkeypatch: pytest.MonkeyPatch, message: str = "No space left"
+) -> None:
     """Make staging the snapshot fail with a bare `OSError`: ENOSPC, an unwritable
     directory, ...
     """
@@ -641,11 +650,11 @@ def _unstageable_snapshot(monkeypatch, message: str = "No space left") -> None:
     def _boom(*args: object, **kwargs: object) -> None:
         raise OSError(message)
 
-    monkeypatch.setattr(gate.tempfile, "mkstemp", _boom)
+    monkeypatch.setattr(tempfile, "mkstemp", _boom)
 
 
 def test_unstageable_snapshot_raises_units_unavailable(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # An unwritable source directory, ENOSPC or EDQUOT must surface as the one
     # exception the gate knows how to block on. A bare OSError escapes to the
@@ -661,7 +670,7 @@ def test_unstageable_snapshot_raises_units_unavailable(
 
 
 def test_unstageable_snapshot_blocks_and_does_not_stamp(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # End to end, the fail-closed half: a file whose snapshot could not be staged
     # is never enumerated, so it must record a blocking `error` and must NOT be
@@ -682,7 +691,7 @@ def test_unstageable_snapshot_blocks_and_does_not_stamp(
 
 
 def test_snapshot_is_excluded_from_the_git_index_before_it_exists(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A concurrent `git add -A` — an IDE, another automation job, a user's own
     # habit — can land at any point while the snapshot sits on disk for the
@@ -717,7 +726,7 @@ def test_snapshot_is_excluded_from_the_git_index_before_it_exists(
 
 
 def test_snapshot_exclusion_is_a_noop_outside_a_git_work_tree(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # No git index exists outside a work tree, so registering the exclude
     # pattern must not become a hard dependency of enumeration succeeding —
@@ -736,7 +745,7 @@ def test_snapshot_exclusion_is_a_noop_outside_a_git_work_tree(
 
 
 def test_unregisterable_git_exclude_blocks_with_units_unavailable(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Every OSError this staging path can raise has to land as UnitsUnavailable
     # (fail closed) — including one from registering the exclude pattern
@@ -760,7 +769,7 @@ def test_unregisterable_git_exclude_blocks_with_units_unavailable(
             )
         return real_run(argv, **kwargs)
 
-    monkeypatch.setattr(gate.subprocess, "run", _fake_run)
+    monkeypatch.setattr(subprocess, "run", _fake_run)
     src = tmp_path / "x.c"
     src.write_text("int f(void) { return 0; }\n")
     with pytest.raises(gate.UnitsUnavailable, match="exclude"):
@@ -768,7 +777,7 @@ def test_unregisterable_git_exclude_blocks_with_units_unavailable(
 
 
 def test_git_probe_failure_inside_a_work_tree_blocks_with_units_unavailable(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A confirmed non-work-tree (`rev-parse` runs and exits non-zero) is the
     # only case safe to no-op. `rev-parse` failing to *run at all* inside a
@@ -784,7 +793,7 @@ def test_git_probe_failure_inside_a_work_tree_blocks_with_units_unavailable(
             raise subprocess.TimeoutExpired(cmd=argv, timeout=30)
         return real_run(argv, **kwargs)
 
-    monkeypatch.setattr(gate.subprocess, "run", _fake_run)
+    monkeypatch.setattr(subprocess, "run", _fake_run)
     monkeypatch.setattr(
         gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
     )
@@ -803,7 +812,7 @@ def test_git_probe_failure_inside_a_work_tree_blocks_with_units_unavailable(
 
 
 def test_rev_parse_error_other_than_confirmed_non_worktree_blocks(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A non-zero `rev-parse` exit is not by itself proof of "no work tree
     # anywhere in the ancestry" — a malformed nested `.git` gitfile makes
@@ -823,7 +832,7 @@ def test_rev_parse_error_other_than_confirmed_non_worktree_blocks(
             )
         return real_run(argv, **kwargs)
 
-    monkeypatch.setattr(gate.subprocess, "run", _fake_run)
+    monkeypatch.setattr(subprocess, "run", _fake_run)
     monkeypatch.setattr(
         gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
     )
@@ -842,7 +851,7 @@ def test_rev_parse_error_other_than_confirmed_non_worktree_blocks(
 
 
 def test_git_ceiling_directories_does_not_defeat_the_exclude(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # `GIT_CEILING_DIRECTORIES` only stops git's *upward* repository discovery
     # at a listed boundary — it does not mean no repository exists past it.
@@ -887,7 +896,7 @@ def test_git_ceiling_directories_does_not_defeat_the_exclude(
 
 
 def test_gitignore_whitelist_defeats_exclude_blocks_with_units_unavailable(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # gitignore(5) gives a tracked `.gitignore` higher precedence than
     # `$GIT_DIR/info/exclude` — a whitelist-style `.gitignore` (`*` then
@@ -918,7 +927,7 @@ def test_gitignore_whitelist_defeats_exclude_blocks_with_units_unavailable(
 
 
 def test_gitignore_negation_targeting_mkstemps_shape_blocks_with_units_unavailable(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A negation naming `tempfile.mkstemp`'s own generated shape (its random
     # suffix is 8 characters — a private, undocumented `tempfile`
@@ -949,7 +958,7 @@ def test_gitignore_negation_targeting_mkstemps_shape_blocks_with_units_unavailab
 
 
 def test_snapshot_cleanup_failure_after_success_blocks(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The happy path: enumeration itself succeeds, but the final `os.unlink`
     # fails (a lost-write-permission race, an NFS hiccup). That must not be
@@ -963,7 +972,7 @@ def test_snapshot_cleanup_failure_after_success_blocks(
             raise OSError("permission denied")
         real_unlink(path, dir_fd=dir_fd)
 
-    monkeypatch.setattr(gate.os, "unlink", _boom)
+    monkeypatch.setattr(os, "unlink", _boom)
     monkeypatch.setattr(
         gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
     )
@@ -975,7 +984,7 @@ def test_snapshot_cleanup_failure_after_success_blocks(
 
 
 def test_snapshot_cleanup_failure_does_not_mask_a_pending_enumeration_failure(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # When the CLI call itself already failed, a *secondary* cleanup failure
     # must not replace that primary, more actionable exception — cleanup is
@@ -988,7 +997,7 @@ def test_snapshot_cleanup_failure_does_not_mask_a_pending_enumeration_failure(
             raise OSError("permission denied")
         real_unlink(path, dir_fd=dir_fd)
 
-    monkeypatch.setattr(gate.os, "unlink", _boom)
+    monkeypatch.setattr(os, "unlink", _boom)
     monkeypatch.setattr(
         gate,
         "resolve_forseti_cmd",
@@ -1004,7 +1013,7 @@ def test_snapshot_cleanup_failure_does_not_mask_a_pending_enumeration_failure(
 
 
 def test_snapshot_is_removed_when_the_write_is_interrupted(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A KeyboardInterrupt (or any other non-OSError) raised while writing the
     # snapshot's content used to escape both the write's `except OSError` and
@@ -1025,7 +1034,7 @@ def test_snapshot_is_removed_when_the_write_is_interrupted(
         os.close(fd)
         return _InterruptingHandle()
 
-    monkeypatch.setattr(gate.os, "fdopen", _fdopen)
+    monkeypatch.setattr(os, "fdopen", _fdopen)
     src = tmp_path / "x.c"
     src.write_text("int f(void) { return 0; }\n")
 
@@ -1046,7 +1055,7 @@ def test_snapshot_is_removed_when_the_write_is_interrupted(
 
 
 def test_exclude_is_registered_against_the_source_repo_not_the_project_root(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A source living in a *different* repository than `project_dir` (a
     # submodule, a sibling checkout reached via a symlink) must have the
@@ -1076,7 +1085,7 @@ def test_exclude_is_registered_against_the_source_repo_not_the_project_root(
 
 
 def test_exclude_is_registered_in_the_repo_root_for_a_nested_source(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The common shape: one repo at `project_dir`, source one level down (e.g.
     # `src/x.c`). `git rev-parse --git-path info/exclude` run from a
@@ -1103,7 +1112,7 @@ def test_exclude_is_registered_in_the_repo_root_for_a_nested_source(
 
 
 def test_preexisting_non_utf8_exclude_content_does_not_crash(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # `.git/info/exclude` is git's own file, read as raw bytes by git itself —
     # a non-UTF-8 byte sequence already in it (e.g. a pattern written under a
@@ -1131,7 +1140,7 @@ def test_preexisting_non_utf8_exclude_content_does_not_crash(
 
 
 def test_missing_git_info_directory_is_created_before_writing_exclude(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # `git rev-parse --git-path info/exclude` only computes a path — it does
     # not create `.git/info/`, which is legitimately absent for a repo made
@@ -1157,7 +1166,7 @@ def test_missing_git_info_directory_is_created_before_writing_exclude(
 
 
 def test_transient_rewrite_during_enumeration_is_enumerated_faithfully(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The A -> B -> A interleaving: a concurrent `> f.c` rewrite passes through a
     # zero-byte instant, which enumerates as a *successful* empty list. Re-reading
@@ -1192,7 +1201,7 @@ def test_transient_rewrite_during_enumeration_is_enumerated_faithfully(
 
 
 def test_persistent_rewrite_during_enumeration_does_not_prune_or_stamp(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A rewrite that lands and *stays* is a different failure: we enumerated A but
     # the file now holds B, so recording A's units against B would be a lie. The
@@ -1225,7 +1234,7 @@ def test_persistent_rewrite_during_enumeration_does_not_prune_or_stamp(
 
 
 def test_stamp_is_not_reclaimed_from_a_run_that_already_finished(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Taking the stamp is a claim to be authoritative, so the content check has to
     # happen under the same lock that writes it. Checked before the lock, this run
@@ -1273,7 +1282,7 @@ def test_stamp_is_not_reclaimed_from_a_run_that_already_finished(
 
 
 def test_stamp_is_not_reclaimed_after_losing_the_lock_race(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The sharper half of the same race: the window that matters is between this
     # run's content check and its stamp, and waiting for the gate lock is what
@@ -1290,10 +1299,11 @@ def test_stamp_is_not_reclaimed_after_losing_the_lock_race(
     monkeypatch.setattr(
         gate, "resolve_forseti_cmd", lambda: _echoing_forseti_cmd(tmp_path)
     )
-    real_lock, landed = gate.gate_lock, []
+    real_lock = gate.gate_lock
+    landed: list[bool] = []
 
     @contextlib.contextmanager
-    def lock_a_concurrent_run_got_first(project_dir: str):
+    def lock_a_concurrent_run_got_first(project_dir: str) -> Iterator[None]:
         with real_lock(project_dir):
             if not landed:
                 landed.append(True)
@@ -1319,7 +1329,7 @@ def test_stamp_is_not_reclaimed_after_losing_the_lock_race(
 
 
 def test_enumerate_drift_block_defers_to_a_stamp_taken_after_the_check(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The enumerate-side drift check reads `scanned` under the stamp lock and then
     # releases it, so a concurrent run can stamp what is on disk before the block
@@ -1343,7 +1353,7 @@ def test_enumerate_drift_block_defers_to_a_stamp_taken_after_the_check(
     real_lock, locks = gate.gate_lock, []
 
     @contextlib.contextmanager
-    def lock_a_concurrent_run_stamped_in(project_dir: str):
+    def lock_a_concurrent_run_stamped_in(project_dir: str) -> Iterator[None]:
         with real_lock(project_dir):
             locks.append(1)
             if len(locks) == 2:  # the one `_blocking_error` takes
@@ -1369,7 +1379,7 @@ def test_enumerate_drift_block_defers_to_a_stamp_taken_after_the_check(
 
 
 def test_persistent_rewrite_during_verify_withdraws_the_stamp_and_blocks(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # This fake CLI answers a canned verdict without reading its own source
     # argument, so it stands in for *any* run whose reported verdict has moved
@@ -1411,7 +1421,7 @@ def test_persistent_rewrite_during_verify_withdraws_the_stamp_and_blocks(
 
 
 def test_rewrite_during_verify_releases_the_claim_when_deferring(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The other drift exit: a concurrent run owns the stamp, so this run neither
     # withdraws nor blocks. It has still finished, so its own claim must be
@@ -1453,7 +1463,7 @@ def test_rewrite_during_verify_releases_the_claim_when_deferring(
 
 
 def test_transient_rewrite_during_verify_is_closed_by_the_snapshot(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Issue #150. A transient A -> B -> A *during a verify* used to leave B's
     # verdict attached to A's stamp: the post-loop re-hash can only compare
@@ -1494,7 +1504,7 @@ def test_transient_rewrite_during_verify_is_closed_by_the_snapshot(
 
 
 def test_rewrite_during_verify_defers_to_a_concurrent_runs_stamp(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Withdrawing the stamp must be ownership-scoped, and so must the block.
     # Concurrent hooks share gate_state.json, so a run that has since re-stamped
@@ -1552,7 +1562,7 @@ def test_rewrite_during_verify_defers_to_a_concurrent_runs_stamp(
 
 
 def test_drift_block_defers_to_a_stamp_taken_after_the_withdrawal(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The sibling above catches the concurrent run *before* the withdrawal; this
     # one catches it after. Withdrawing releases the lock, so a hook for the newer
@@ -1577,10 +1587,11 @@ def test_drift_block_defers_to_a_stamp_taken_after_the_withdrawal(
             during_verify=f"open({str(src)!r}, 'w').write('beta\\n')",
         ),
     )
-    real_lock, landed = gate.gate_lock, []
+    real_lock = gate.gate_lock
+    landed: list[bool] = []
 
     @contextlib.contextmanager
-    def lock_a_concurrent_run_finished_in(project_dir: str):
+    def lock_a_concurrent_run_finished_in(project_dir: str) -> Iterator[None]:
         with real_lock(project_dir):
             state = gate.load_state(project_dir)
             gave_up_the_stamp = "x.c" not in state["scanned"]
@@ -1610,7 +1621,7 @@ def test_drift_block_defers_to_a_stamp_taken_after_the_withdrawal(
 
 
 def test_drift_block_still_lands_when_no_stamp_vouches_for_the_file(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The other half of that test: "a stamp exists" is not the condition — "a stamp
     # equal to what is on disk" is. Here a concurrent run stamps a third content
@@ -1630,10 +1641,13 @@ def test_drift_block_still_lands_when_no_stamp_vouches_for_the_file(
             during_verify=f"open({str(src)!r}, 'w').write('beta\\n')",
         ),
     )
-    real_lock, landed = gate.gate_lock, []
+    real_lock = gate.gate_lock
+    landed: list[bool] = []
 
     @contextlib.contextmanager
-    def lock_a_concurrent_run_stamped_other_content_in(project_dir: str):
+    def lock_a_concurrent_run_stamped_other_content_in(
+        project_dir: str,
+    ) -> Iterator[None]:
         with real_lock(project_dir):
             state = gate.load_state(project_dir)
             gave_up_the_stamp = "x.c" not in state["scanned"]
@@ -1775,7 +1789,7 @@ def test_snapshot_mtime_drift_after_staging_is_a_known_residual(tmp_path: Path) 
 
 
 def test_scanned_stamp_survives_a_live_mtime_only_drift_during_verify(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Issue #164: this is what actually pins the residual described in
     # `verify_and_record`'s drift-check comment — the sibling test above only
@@ -1853,7 +1867,9 @@ def test_verifiable_source_without_bom_is_unaffected(tmp_path: Path) -> None:
     assert written == f'#line 1 "{src}"\n'.encode() + content
 
 
-def _unstageable_verify_snapshot(monkeypatch, message: str = "No space left") -> None:
+def _unstageable_verify_snapshot(
+    monkeypatch: pytest.MonkeyPatch, message: str = "No space left"
+) -> None:
     """Make staging the *verify* snapshot fail with a bare `OSError`.
 
     Discriminates on `mkstemp`'s `prefix` kwarg: `verify_and_record` stages the
@@ -1862,18 +1878,18 @@ def _unstageable_verify_snapshot(monkeypatch, message: str = "No space left") ->
     real `tempfile.mkstemp` — only the later, verify-boundary call
     (`_VERIFY_SNAPSHOT_PREFIX`) is the one these tests mean to fail.
     """
-    real_mkstemp = gate.tempfile.mkstemp
+    real_mkstemp = tempfile.mkstemp
 
-    def _boom(*args: object, **kwargs: object):
+    def _boom(*args: Any, **kwargs: Any) -> tuple[int, str]:
         if kwargs.get("prefix") == gate._VERIFY_SNAPSHOT_PREFIX:
             raise OSError(message)
         return real_mkstemp(*args, **kwargs)
 
-    monkeypatch.setattr(gate.tempfile, "mkstemp", _boom)
+    monkeypatch.setattr(tempfile, "mkstemp", _boom)
 
 
 def test_unstageable_verify_snapshot_raises_units_unavailable(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # An unwritable directory, ENOSPC or EDQUOT must surface as the one
     # exception the gate knows how to block on, exactly like the enumeration
@@ -1894,7 +1910,7 @@ def test_unstageable_verify_snapshot_raises_units_unavailable(
 
 
 def test_unstageable_verify_snapshot_defers_quietly_and_charges_a_retry(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Unlike the enumeration-side staging failure, this one lands AFTER the
     # stamp and the pending `unknown` units are already recorded (enumeration
@@ -1928,7 +1944,7 @@ def test_unstageable_verify_snapshot_defers_quietly_and_charges_a_retry(
 
 
 def test_unstageable_verify_snapshot_takes_three_failures_to_exhaust_retries(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # MAX_PENDING_VERIFY_ATTEMPTS == 3, so it must take three *separate*
     # staging failures — not two — before the file drops out of
@@ -1954,7 +1970,7 @@ def test_unstageable_verify_snapshot_takes_three_failures_to_exhaust_retries(
 
 
 def test_verify_and_record_retries_when_mtime_races_the_read(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # `read()` and `fstat()` are two separate syscalls even through the same fd,
     # so a rewrite landing strictly between them (or straddling the read) can
@@ -1983,7 +1999,7 @@ def test_verify_and_record_retries_when_mtime_races_the_read(
             return SimpleNamespace(st_mtime_ns=real.st_mtime_ns + calls["n"])
         return real
 
-    monkeypatch.setattr(gate.os, "fstat", flaky_fstat)
+    monkeypatch.setattr(os, "fstat", flaky_fstat)
     monkeypatch.setattr(
         gate,
         "resolve_forseti_cmd",
@@ -2001,7 +2017,7 @@ def test_verify_and_record_retries_when_mtime_races_the_read(
 
 
 def test_verify_and_record_fails_closed_when_mtime_never_stabilizes(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A file some other process keeps rewriting on every single attempt must
     # not spin forever, and must not proceed with an unpaired (content, mtime)
@@ -2021,7 +2037,7 @@ def test_verify_and_record_fails_closed_when_mtime_never_stabilizes(
         calls["n"] += 1
         return SimpleNamespace(st_mtime_ns=real.st_mtime_ns + calls["n"])
 
-    monkeypatch.setattr(gate.os, "fstat", always_moving_fstat)
+    monkeypatch.setattr(os, "fstat", always_moving_fstat)
     _seed_scanned(tmp_path)
 
     verdicts = gate.verify_and_record(str(src), project_dir=str(tmp_path))
@@ -2033,7 +2049,7 @@ def test_verify_and_record_fails_closed_when_mtime_never_stabilizes(
 
 
 def test_mtime_never_stabilizing_defers_to_a_concurrent_runs_stamp(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Unlike an unreadable file (which also fails `content_hash`, so
     # `stale_sources` skips it entirely), a file whose mtime never stabilizes
@@ -2056,7 +2072,7 @@ def test_mtime_never_stabilizing_defers_to_a_concurrent_runs_stamp(
         calls["n"] += 1
         return SimpleNamespace(st_mtime_ns=real.st_mtime_ns + calls["n"])
 
-    monkeypatch.setattr(gate.os, "fstat", always_moving_fstat)
+    monkeypatch.setattr(os, "fstat", always_moving_fstat)
     state = gate.load_state(str(tmp_path))
     state.setdefault("scanned", {})["x.c"] = hashlib.sha256(
         content.encode()
@@ -2073,7 +2089,7 @@ def test_mtime_never_stabilizing_defers_to_a_concurrent_runs_stamp(
 
 
 def test_verify_and_record_stages_the_mtime_seen_at_verify_time_not_before_enumeration(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The reviewer's exact scenario: the source is touched with identical bytes
     # *after* the top-of-function bracket pairs `raw`/`mtime_ns` but *during* the
@@ -2100,7 +2116,13 @@ def test_verify_and_record_stages_the_mtime_seen_at_verify_time_not_before_enume
     real_verifiable_source = gate._verifiable_source
 
     @contextlib.contextmanager
-    def capturing_verifiable_source(file_path, content, *, project_dir, mtime_ns):
+    def capturing_verifiable_source(
+        file_path: str | os.PathLike[str],
+        content: bytes,
+        *,
+        project_dir: str,
+        mtime_ns: int,
+    ) -> Iterator[str]:
         captured["mtime_ns"] = mtime_ns
         with real_verifiable_source(
             file_path, content, project_dir=project_dir, mtime_ns=mtime_ns
@@ -2116,7 +2138,7 @@ def test_verify_and_record_stages_the_mtime_seen_at_verify_time_not_before_enume
 
 
 def test_pointer_only_file_never_stages_a_verify_snapshot(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Every def in this file takes a pointer, so `verify_function` is never
     # reached for it — staging a snapshot nothing downstream would use must not
@@ -2171,7 +2193,7 @@ def _capturing_verify_forseti_cmd(tmp_path: Path, dest: Path) -> list[str]:
 
 
 def test_verify_snapshot_path_is_rewritten_to_the_real_file(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The CLI is invoked on the immutable snapshot, not `src` — but every path
     # it echoes back (`argv`, the counterexample) must name the real file, or
@@ -2280,7 +2302,7 @@ def test_verify_snapshot_of_bom_prefixed_source_still_verifies(tmp_path: Path) -
 
 
 def test_verify_snapshot_is_removed_after_verify_and_record(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     src = tmp_path / "x.c"
     src.write_text("f\n")
@@ -2381,7 +2403,7 @@ def test_discover_changed_c_sources_gates_a_bash_edit_to_a_tracked_snapshot_look
 
 
 def test_units_absent_payload_records_blocking_error(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # End to end: an exit-0 payload with no `units` key must make verify_and_record
     # persist a blocking `error` verdict, not silently pass the edited file.
@@ -2399,7 +2421,9 @@ def test_units_absent_payload_records_blocking_error(
     assert gate.blocking_units(state)  # non-empty → the Stop-gate blocks
 
 
-def test_header_edit_short_circuits_to_clean_pass(tmp_path: Path, monkeypatch) -> None:
+def test_header_edit_short_circuits_to_clean_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # ESBMC can't parse a .h standalone, so a header is out of gate scope: enumerate
     # nothing (clean pass) WITHOUT shelling out — the fake CLI here would fail if
     # called, proving the .c allowlist short-circuits before the subprocess.
@@ -2418,7 +2442,7 @@ def test_header_edit_short_circuits_to_clean_pass(tmp_path: Path, monkeypatch) -
 
 
 def test_enumeration_failure_records_blocking_error(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # If units can't be enumerated, verify_and_record must persist a blocking
     # `error` verdict — an edited-but-unparseable file cannot pass silently.
@@ -2438,7 +2462,7 @@ def test_enumeration_failure_records_blocking_error(
 
 
 def test_enumeration_failure_does_not_stamp_scanned(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Interaction between the out-of-band scan (#99) and list-units enumeration
     # (#131): a file whose units could not be enumerated must NOT be recorded in
@@ -2461,7 +2485,9 @@ def test_enumeration_failure_does_not_stamp_scanned(
     assert gate.blocking_units(state)
 
 
-def test_unreadable_file_does_not_stamp_scanned(tmp_path: Path, monkeypatch) -> None:
+def test_unreadable_file_does_not_stamp_scanned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # Same invariant on the sibling failure path: an unreadable file records a
     # blocking `error` and stays out of `scanned`. Enumeration must not even be
     # attempted, so the fake CLI is armed to fail if it is called.
@@ -2481,7 +2507,9 @@ def test_unreadable_file_does_not_stamp_scanned(tmp_path: Path, monkeypatch) -> 
     assert gate.blocking_units(state)
 
 
-def test_pointer_unit_recorded_needs_contract(tmp_path: Path, monkeypatch) -> None:
+def test_pointer_unit_recorded_needs_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # A pointer-taking unit (from the CLI) is classified NEEDS_CONTRACT without
     # ever shelling out to esbmc verify.
     monkeypatch.setattr(
@@ -2571,7 +2599,7 @@ def test_relative_include_resolves_through_the_snapshot(
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
 def test_include_above_the_project_root_is_no_longer_a_residual(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # This used to be a characterization test, not an endorsement: the mirrored
     # design that preceded `_enumerable_source`'s same-directory staging (issue
@@ -3011,7 +3039,7 @@ def test_function_like_macro_not_enumerated(tmp_path: Path) -> None:
 # --- blocking vs needs_contract classification -----------------------------
 
 
-def _state(*verdicts: str) -> dict:
+def _state(*verdicts: str) -> dict[str, Any]:
     units = {
         f"u{i}": {"unit_id": f"u{i}", "verdict": v} for i, v in enumerate(verdicts)
     }
@@ -3055,7 +3083,7 @@ def test_mixed_file_scalar_gated_pointer_needs_contract(tmp_path: Path) -> None:
 # --- FORSETI_BUILD_FLAGS reaches both the enumeration and the verify (#131) ---
 
 
-def _captured_verify_argv(monkeypatch, tmp_path: Path) -> list[str]:
+def _captured_verify_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[str]:
     """Run `verify_function` against a stubbed subprocess and return its argv."""
     seen: list[str] = []
 
@@ -3064,17 +3092,19 @@ def _captured_verify_argv(monkeypatch, tmp_path: Path) -> list[str]:
         stderr = ""
         returncode = 0
 
-    def _fake_run(argv, **kwargs):
+    def _fake_run(argv: list[str], **kwargs: Any) -> _Proc:
         seen.extend(argv)
         return _Proc()
 
-    monkeypatch.setattr(gate.subprocess, "run", _fake_run)
+    monkeypatch.setattr(subprocess, "run", _fake_run)
     monkeypatch.setattr(gate, "resolve_forseti_cmd", lambda: ["forseti"])
     gate.verify_function("x.c", "f", project_dir=str(tmp_path))
     return seen
 
 
-def test_build_flags_reach_the_list_units_parse(tmp_path: Path, monkeypatch) -> None:
+def test_build_flags_reach_the_list_units_parse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # A TU that only parses with the project's `-I` must be enumerated with it:
     # otherwise esbmc exits nonzero and *every* edited file blocks with an
     # `error`, which is the gate refusing to work rather than gating.
@@ -3091,7 +3121,7 @@ def test_build_flags_reach_the_list_units_parse(tmp_path: Path, monkeypatch) -> 
 
 
 def test_build_flags_are_shell_split_not_split_on_spaces(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A quoted include path with a space must survive as ONE argument; naive
     # `.split()` would hand esbmc `-I/opt/my` and a stray `sdk/include`, and the
@@ -3108,7 +3138,9 @@ def test_build_flags_are_shell_split_not_split_on_spaces(
     assert argv[argv.index("--") + 1 :] == ["-I/opt/my sdk/include", "-DX=1"]
 
 
-def test_no_build_flags_adds_no_separator(tmp_path: Path, monkeypatch) -> None:
+def test_no_build_flags_adds_no_separator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # The default path stays exactly as it was: no `--`, no empty passthrough.
     monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
     dest = tmp_path / "argv.json"
@@ -3121,7 +3153,9 @@ def test_no_build_flags_adds_no_separator(tmp_path: Path, monkeypatch) -> None:
     assert "--" not in json.loads(dest.read_text())["argv"]
 
 
-def test_build_flags_reach_the_verify_too(tmp_path: Path, monkeypatch) -> None:
+def test_build_flags_reach_the_verify_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # The verify must see the same translation unit the unit list came from —
     # enumerating with `-DFOO` and verifying without it would gate a different
     # set of functions than the ones that were found.
@@ -3134,7 +3168,9 @@ def test_build_flags_reach_the_verify_too(tmp_path: Path, monkeypatch) -> None:
     ]
 
 
-def test_safety_flags_do_not_leak_into_the_parse(tmp_path: Path, monkeypatch) -> None:
+def test_safety_flags_do_not_leak_into_the_parse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # `--overflow-check` is a property-checking flag; a `--parse-tree-only` run
     # has no properties to check. Keeping the two sets apart is the point of the
     # split — the enumeration gets build flags only.
@@ -3152,7 +3188,7 @@ def test_safety_flags_do_not_leak_into_the_parse(tmp_path: Path, monkeypatch) ->
 
 
 def test_build_flags_are_read_per_call_not_at_import(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Read at call time, so a hook process that sets the variable after this
     # module is imported still gets its flags forwarded.
@@ -3168,7 +3204,7 @@ def test_build_flags_are_read_per_call_not_at_import(
 
 
 def test_malformed_build_flags_block_instead_of_crashing(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Quoting IS this knob's interface (that's why it is shlex-split), so an
     # unbalanced quote is the expected typo. It must land as the blocking `error`
@@ -3190,7 +3226,7 @@ def test_malformed_build_flags_block_instead_of_crashing(
 
 
 def test_malformed_build_flags_do_not_crash_a_direct_verify(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # `verify_function` is reachable without going through the enumeration, so it
     # needs its own conversion rather than relying on failing earlier.
@@ -3200,7 +3236,9 @@ def test_malformed_build_flags_do_not_crash_a_direct_verify(
     assert "FORSETI_BUILD_FLAGS" in (verdict.detail or "")
 
 
-def test_wellformed_build_flags_still_parse(tmp_path: Path, monkeypatch) -> None:
+def test_wellformed_build_flags_still_parse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # The guard must not swallow valid config: balanced quoting still splits.
     monkeypatch.setenv("FORSETI_BUILD_FLAGS", "'-I/opt/my sdk' -DX")
     assert gate._build_flags() == ("-I/opt/my sdk", "-DX")
@@ -3208,7 +3246,7 @@ def test_wellformed_build_flags_still_parse(tmp_path: Path, monkeypatch) -> None
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
 def test_snapshot_enumeration_matches_the_in_place_parse(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # End to end against the real frontend, on the shape an include flag gets
     # wrong: `#include <config.h>` with a same-named header sitting beside the
@@ -3249,7 +3287,7 @@ def test_snapshot_enumeration_matches_the_in_place_parse(
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
 def test_verify_snapshot_matches_the_in_place_verify(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # End to end against the real frontend, on the exact shape a snapshot
     # mirrored *elsewhere* gets wrong

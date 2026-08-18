@@ -75,37 +75,30 @@ function level — that is all v0 checks. Generated *semantic* properties (propo
 
 ## Enable it
 
-Hooks load at **session start**, so after either method, **restart Claude Code**
-(`claude`), then confirm with `/hooks`.
+Hooks load at **session start**, so after any method below, **restart Claude
+Code** (`claude`), then confirm with `/hooks`.
 
-**As a plugin (recommended, portable):** install this directory as a plugin (via
-your marketplace, or point Claude Code at `adapters/claude-code/`). The
-`hooks/hooks.json` wires both hooks using `${CLAUDE_PLUGIN_ROOT}`.
+**`forseti enable-project` (recommended):** with `forseti` installed and on
+`PATH`, from the target project run:
 
-**As project settings (no plugin):** add to the target project's
-`.claude/settings.json`, replacing `ABS_PATH` with the absolute path to this
-directory:
-
-```json
-{
-  "hooks": {
-    "SessionStart": [
-      { "matcher": "*",
-        "hooks": [{ "type": "command", "command": "python3 \"ABS_PATH/hooks/session_start.py\"", "timeout": 60 }] }
-    ],
-    "PostToolUse": [
-      { "matcher": "Write|Edit|MultiEdit",
-        "hooks": [{ "type": "command", "command": "python3 \"ABS_PATH/hooks/post_tool_use.py\"", "timeout": 300 }] },
-      { "matcher": "Bash",
-        "hooks": [{ "type": "command", "command": "python3 \"ABS_PATH/hooks/post_bash.py\"", "timeout": 300 }] }
-    ],
-    "Stop": [
-      { "matcher": "*",
-        "hooks": [{ "type": "command", "command": "python3 \"ABS_PATH/hooks/stop_gate.py\"", "timeout": 120 }] }
-    ]
-  }
-}
+```console
+$ forseti enable-project
 ```
+
+This writes the four hook entries into `.claude/settings.local.json`
+(gitignored, personal) via `forseti`'s own CLI, using `forseti claude-code-hook
+<name>` as each hook's command — no file path to hand-copy, no dependency on
+where any Forseti checkout happens to live on disk (RFC-0004). Pass `--shared`
+to write `.claude/settings.json` instead (git-committed, applies to the whole
+team), or a directory argument to target a project other than the current one.
+Safe to rerun any time (after a `forseti` upgrade, say): it always regenerates
+its own hook entries and leaves everything else in the file untouched.
+
+**As a plugin (also portable, no `forseti` CLI call needed):** install this
+directory as a plugin (via your marketplace, or point Claude Code at
+`adapters/claude-code/`). `hooks/hooks.json` wires the same four hooks, also via
+`forseti claude-code-hook <name>` — so a project just needs `forseti` on `PATH`
+either way.
 
 ## Try the demo
 
@@ -175,12 +168,12 @@ turns a verdict into an error.
 
 | Setting | Where | Default | Notes |
 |---|---|---|---|
-| Safety flags | `SAFETY_FLAGS` in `hooks/forseti_gate.py` | `--overflow-check` | bounds/pointer/div-by-zero are ESBMC defaults; unsigned-overflow left OFF (legal wraparound) |
+| Safety flags | `SAFETY_FLAGS` in `src/forseti/adapters/claude_code/forseti_gate.py` | `--overflow-check` | bounds/pointer/div-by-zero are ESBMC defaults; unsigned-overflow left OFF (legal wraparound) |
 | Unwind bound *k* | `FORSETI_UNWIND` env | `1` | a `VERIFIED` is only "up to k"; **loops need a higher k** |
 | Verify timeout | `FORSETI_VERIFY_TIMEOUT_S` env | `110` | per-function budget, passed to `forseti verify --timeout` so ESBMC honors it (the subprocess is bounded ~15 s higher). Each verdict is persisted the moment it lands, so the `300` s PostToolUse hook timeout must stay above this per-function budget — raise both together for very slow units. |
 | List-units timeout | `FORSETI_LIST_UNITS_TIMEOUT_S` env | `30` | budget for the one `forseti list-units` parse per edited file; a `--parse-tree-only` run does no solving, so this rarely needs raising |
 | Build flags | `FORSETI_BUILD_FLAGS` env | *(none)* | the project's own `-I`/`-D`, shell-quoted (`-Iinclude -Ivendor/tls -DNDEBUG`). Forwarded to **both** `forseti list-units` and `forseti verify`, so the enumeration and the verify see the same translation unit. Set this if your C only compiles with include paths: without them ESBMC cannot resolve an `#include`, the enumeration fails, and every edited file blocks with an `error`. Unlike `SAFETY_FLAGS` these are build-time, not property-checking, flags. |
-| Stop-gate attempts | `MAX_STOP_ATTEMPTS` in `forseti_gate.py` | `3` | blocks then lets the turn end with a loud residual |
+| Stop-gate attempts | `MAX_STOP_ATTEMPTS` in `src/forseti/adapters/claude_code/forseti_gate.py` | `3` | blocks then lets the turn end with a loud residual |
 | Out-of-band include | `FORSETI_GATE_INCLUDE` env | *(all C files)* | `:`/`,`-separated globs; if set, only changed C files matching one are scanned. A bare name (`src`) matches any path segment; a glob (`kernels/*.c`) matches the project-relative path. |
 | Out-of-band exclude | `FORSETI_GATE_EXCLUDE` env | `third_party`, `vendor`, `node_modules` | same syntax; excludes win over includes. Setting it **replaces** the defaults. Git's own ignore rules already drop gitignored build output before this applies. |
 

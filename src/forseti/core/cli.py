@@ -25,6 +25,13 @@ Subcommands:
   for candidate properties over that unit and persist the survivors (``--json``
   emits the same payload the MCP tool returns). Exit 0 on a completed run,
   1 when the run itself fails (LLM/parse/store/IO) — never a silent empty run.
+- ``forseti claude-code-hook <name>`` — dispatch to one of the Claude Code
+  adapter's verify-gate hooks (RFC-0004). Internal: wired into a project's
+  settings file by ``enable-project``, not meant to be run by hand.
+- ``forseti enable-project [DIR] [--shared]`` — install/update the Claude Code
+  verify-gate hooks for a project (RFC-0004). Idempotent: always regenerates
+  forseti's own hook entries from the currently installed version, leaving
+  every other hook/key in the target settings file untouched.
 - ``forseti mcp`` — start the Core MCP server on stdio (needs the ``mcp`` extra;
   imported lazily so plain ``verify`` works without the SDK).
 
@@ -40,6 +47,13 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
+from forseti.adapters.claude_code import (
+    post_bash,
+    post_tool_use,
+    session_start,
+    stop_gate,
+)
+from forseti.adapters.claude_code.install import ProjectSettingsError, install
 from forseti.esbmc import (
     ListUnitsError,
     Violated,
@@ -454,6 +468,83 @@ def _run_propose(args: argparse.Namespace) -> int:
     return 0
 
 
+_CLAUDE_CODE_HOOKS: dict[str, Callable[[], int]] = {
+    "session-start": session_start.main,
+    "post-tool-use": post_tool_use.main,
+    "post-bash": post_bash.main,
+    "stop-gate": stop_gate.main,
+}
+
+
+def _add_claude_code_hook_parser(
+    sub: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    p = sub.add_parser(
+        "claude-code-hook",
+        help="run a Claude Code verify-gate hook (internal; wired by enable-project)",
+        description=(
+            "Dispatch to one of the Claude Code adapter's hook handlers, reading "
+            "the hook JSON payload from stdin the way Claude Code's hook protocol "
+            "expects. Not meant to be invoked by hand -- `forseti enable-project` "
+            "wires these into a project's settings file (RFC-0004)."
+        ),
+    )
+    p.add_argument("name", choices=sorted(_CLAUDE_CODE_HOOKS), help="which hook to run")
+    p.set_defaults(func=_run_claude_code_hook)
+
+
+def _run_claude_code_hook(args: argparse.Namespace) -> int:
+    return _CLAUDE_CODE_HOOKS[args.name]()
+
+
+def _add_enable_project_parser(
+    sub: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    p = sub.add_parser(
+        "enable-project",
+        help="install/update the Claude Code verify-gate hooks for a project",
+        description=(
+            "Write (or idempotently update) the Claude Code adapter's "
+            "SessionStart/PostToolUse/Stop hook entries into a project's Claude "
+            "Code settings file. Always regenerates forseti's own hook entries "
+            "from the currently installed forseti version; every other hook or "
+            "key already in the file is left untouched (RFC-0004)."
+        ),
+    )
+    p.add_argument(
+        "project_dir",
+        type=Path,
+        nargs="?",
+        default=Path("."),
+        help="the project root (default: the current directory)",
+    )
+    p.add_argument(
+        "--shared",
+        action="store_true",
+        help=(
+            "write to .claude/settings.json (git-committed, team-wide) instead "
+            "of the default .claude/settings.local.json (gitignored, personal)"
+        ),
+    )
+    p.set_defaults(func=_run_enable_project)
+
+
+def _run_enable_project(args: argparse.Namespace) -> int:
+    try:
+        settings_path, outcome = install(args.project_dir, shared=args.shared)
+    except ProjectSettingsError as exc:
+        print(f"forseti enable-project: {exc}", file=sys.stderr)
+        return 1
+    verb = {
+        "created": "installed",
+        "updated": "updated",
+        "unchanged": "already up to date",
+    }[outcome.value]
+    message = f"Claude Code verify-gate hooks {verb} at {settings_path}"
+    print(f"forseti enable-project: {message}")
+    return 0
+
+
 def _add_mcp_parser(
     sub: argparse._SubParsersAction[argparse.ArgumentParser],
 ) -> None:
@@ -493,6 +584,8 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_synth_parser(sub)
     _add_discharge_parser(sub)
     _add_propose_parser(sub)
+    _add_claude_code_hook_parser(sub)
+    _add_enable_project_parser(sub)
     _add_mcp_parser(sub)
     return parser
 

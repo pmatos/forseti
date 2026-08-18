@@ -14,20 +14,19 @@ from __future__ import annotations
 import json
 import os
 import sys
+from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import event_log
-import forseti_gate as gate
+from . import event_log
+from . import forseti_gate as gate
 
 _CEX_CLIP = 1200
 
 
-def _project_dir(data: dict) -> str:
+def _project_dir(data: dict[str, Any]) -> str:
     return os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or os.getcwd()
 
 
-def _residual(failures: list[dict]) -> str:
+def _residual(failures: list[dict[str, Any]]) -> str:
     lines = []
     for u in failures:
         lines.append(
@@ -41,7 +40,7 @@ def _residual(failures: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _needs_message(needs: list[dict]) -> str:
+def _needs_message(needs: list[dict[str, Any]]) -> str:
     """Loud, non-blocking note for NEEDS_CONTRACT units at turn end (never silent)."""
     ids = ", ".join(str(u.get("unit_id")) for u in needs)
     return (
@@ -71,7 +70,7 @@ def _oob_note(project_dir: str, oob: list[str]) -> str:
     )
 
 
-def _blob_note(blob: list[dict]) -> str:
+def _blob_note(blob: list[dict[str, Any]]) -> str:
     """Loud note for C staged/committed out-of-band whose blob was never verified.
 
     The worktree copy can hash clean while the *index* or *HEAD* holds a divergent,
@@ -110,7 +109,7 @@ def _blob_note(blob: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _emit(obj: dict) -> int:
+def _emit(obj: dict[str, Any]) -> int:
     print(json.dumps(obj))
     return 0
 

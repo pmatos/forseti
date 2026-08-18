@@ -13,16 +13,15 @@ from __future__ import annotations
 import json
 import os
 import sys
+from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import event_log
-import forseti_gate as gate
+from . import event_log
+from . import forseti_gate as gate
 
 _CEX_CLIP = 1500
 
 
-def _project_dir(data: dict) -> str:
+def _project_dir(data: dict[str, Any]) -> str:
     return os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or os.getcwd()
 
 
