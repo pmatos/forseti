@@ -308,6 +308,7 @@ def test_discover_respells_through_a_symlinked_project_root(tmp_path: Path) -> N
     # resolved root; that is the key `unit_id` must agree with.
     direct_path = str(link / "sub" / "x.c")
     found = gate.discover_changed_c_sources(str(link))
+    assert found is not None
     assert found == [direct_path]  # not the resolved-root spelling
     assert gate.unit_id(str(link), found[0]) == gate.unit_id(str(link), direct_path)
     assert gate.unit_id(str(link), found[0]) == os.path.join("sub", "x.c")
@@ -327,6 +328,7 @@ def test_discover_preserves_a_symlinked_source_alias(tmp_path: Path) -> None:
     (tmp_path / "sub" / "alias.c").symlink_to("target.c")  # untracked, in-project
 
     found = gate.discover_changed_c_sources(str(tmp_path))
+    assert found is not None
 
     alias_path = str(tmp_path / "sub" / "alias.c")
     target_path = str(tmp_path / "sub" / "target.c")
@@ -425,6 +427,7 @@ def test_discover_preserves_directory_spelling_when_a_symlink_replaces_it(
     (tmp_path / "a").symlink_to("b")  # the Bash swap: directory -> symlink
 
     found = gate.discover_changed_c_sources(str(tmp_path))
+    assert found is not None
 
     a_path = str(tmp_path / "a" / "x.c")
     b_path = str(tmp_path / "b" / "x.c")
@@ -466,6 +469,7 @@ def test_discover_preserves_root_spelling_when_the_project_root_becomes_a_symlin
     proj.symlink_to("b")  # the Bash swap: the project root itself -> symlink
 
     found = gate.discover_changed_c_sources(str(proj))
+    assert found is not None
 
     # Spelled through the project root's own (lexical) name — the same key a
     # direct PostToolUse edit through the alias produces — not dropped.
@@ -504,6 +508,7 @@ def test_discover_root_swap_dedupes_reports_that_spell_to_the_same_path(
     proj.symlink_to("b")
 
     found = gate.discover_changed_c_sources(str(proj))
+    assert found is not None
 
     assert found == [str(proj / "x.c")]  # once, not once per git report
     assert gate.stale_sources(str(proj), state, found) == found

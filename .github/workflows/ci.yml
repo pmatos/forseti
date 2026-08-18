@@ -78,8 +78,8 @@ jobs:
           ruff check src tests
           ruff format --check src tests
 
-      - name: Type-check (mypy --strict)
-        run: mypy src tests
+      - name: Type-check (ty)
+        run: ty check src tests
 
       - name: Tests (pytest)
         # 96, not 95, and the two numbers measure the same report: pytest-cov's
@@ -96,7 +96,7 @@ jobs:
         # Upload whenever a report exists, including when the step above failed
         # the job on coverage — that is exactly when it is most worth seeing.
         # `!cancelled()` alone is too broad: it is also true when an *earlier*
-        # step fails (ruff, mypy, pip install, the ESBMC SHA check), which skips
+        # step fails (ruff, ty, pip install, the ESBMC SHA check), which skips
         # pytest via its implicit success() and leaves no coverage.xml. The
         # action would then hard-fail on "no reports found" under
         # fail_ci_if_error, adding a red herring next to the real failure.

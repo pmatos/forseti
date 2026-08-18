@@ -649,8 +649,8 @@ def test_emit_obligations_reports_an_unreadable_source(tmp_path: Path) -> None:
 
 
 def test_every_assessment_has_an_exit_code() -> None:
-    # mypy cannot catch a missing dict key; a new member without one would be a
-    # KeyError at the moment the CLI reports it.
+    # Static type-checking cannot catch a missing dict key; a new member
+    # without one would be a KeyError at the moment the CLI reports it.
     assert set(ASSESSMENT_EXIT_CODES) == set(Assessment)
 
 
@@ -664,11 +664,11 @@ def test_discharge_forwards_the_requested_timeout_to_every_parse_run(
     # up to six; a short user-requested timeout must still reach both.
     seen: dict[str, float | None] = {}
 
-    def _list_units(_src, *, esbmc_bin, timeout_s):  # type: ignore[no-untyped-def]
+    def _list_units(_src, *, esbmc_bin, timeout_s):  # noqa: ANN001, ANN202
         seen["list_units"] = timeout_s
         return [CALLEE, CALLER]
 
-    def _openings(_src, _sym, *, esbmc_bin, timeout_s):  # type: ignore[no-untyped-def]
+    def _openings(_src, _sym, *, esbmc_bin, timeout_s):  # noqa: ANN001, ANN202
         seen["caller_openings"] = timeout_s
         return CallerOpenings(
             foreign=(), escaped=(), aliased=(), implicit=(), asm_sites=()

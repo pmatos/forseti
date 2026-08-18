@@ -1,6 +1,6 @@
-# Local mirror of the CI gates (ruff + mypy) so failures surface before push.
+# Local mirror of the CI gates (ruff + ty) so failures surface before push.
 # Install once with `pre-commit install`; run over everything with
-# `pre-commit run --all-files`. mypy runs from the active environment (install
+# `pre-commit run --all-files`. ty runs from the active environment (install
 # the dev extra first: `pip install -e ".[dev]"`).
 default_install_hook_types: [pre-commit, commit-msg]
 
@@ -9,7 +9,7 @@ repos:
     rev: v0.15.15
     hooks:
       # Scoped to src/tests to mirror CI (`ruff check/format ... src tests`);
-      # adapters/ is outside the checked set, like mypy.
+      # adapters/ is outside the checked set, like ty.
       - id: ruff-check
         args: [--fix]
         files: ^(src|tests)/
@@ -18,9 +18,9 @@ repos:
 
   - repo: local
     hooks:
-      - id: mypy
-        name: mypy (strict)
-        entry: mypy
+      - id: ty
+        name: ty
+        entry: ty check
         language: system
         types: [python]
         pass_filenames: false

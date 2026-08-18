@@ -132,7 +132,7 @@ def test_static_minimum_floor_still_explores_the_weakest_caller(
     assert "array bounds violated" in raw
 
 
-def _discharge(name: str, function: str = "sum_bytes"):  # type: ignore[no-untyped-def]
+def _discharge(name: str, function: str = "sum_bytes"):  # noqa: ANN202
     return discharge_precondition(EXAMPLES / name, function=function, max_len=MAX_LEN)
 
 

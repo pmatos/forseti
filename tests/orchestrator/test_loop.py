@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from forseti.esbmc import verify
     from forseti.orchestrator import VerifyPort
 
-    # The real `verify` must satisfy the narrow port (mypy-only guard; no
+    # The real `verify` must satisfy the narrow port (type-check-only guard; no
     # runtime effect). Fails type-checking if the Protocol variance ever breaks.
     _check: VerifyPort = verify
 

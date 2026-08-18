@@ -479,8 +479,8 @@ def test_to_dict_is_json_serialisable() -> None:
 
 
 if TYPE_CHECKING:
-    # mypy-only structural guards (mirrors fix.py / test_loop.py): the fakes must
-    # satisfy the seams they stand in for.
+    # Type-check-only structural guards (mirrors fix.py / test_loop.py): the
+    # fakes must satisfy the seams they stand in for.
     def _fake_client_is_llmclient(c: FakeLLMClient) -> LLMClient:
         return c
 

@@ -364,7 +364,7 @@ def _outcome_for(result: EsbmcResult) -> PropertyOutcome:
     """Map an ESBMC verdict to a property outcome (exhaustive over the union).
 
     The final `assert_never` mirrors `state.py`'s `next_state`: adding a new
-    `EsbmcResult` variant becomes a mypy error here, so no verdict is dropped.
+    `EsbmcResult` variant becomes a type error here, so no verdict is dropped.
     """
     match result:
         case Verified():

@@ -134,8 +134,8 @@ class ProviderFixPort:
 
 
 if TYPE_CHECKING:
-    # mypy-only structural guards: fail type-checking if a concrete class ever
-    # drifts from the protocol it is meant to satisfy (mirrors test_loop.py).
+    # Type-check-only structural guards: fail type-checking if a concrete class
+    # ever drifts from the protocol it is meant to satisfy (mirrors test_loop.py).
     from .ports import FixPort
 
     def _provider_is_fixprovider(p: RecordedFixProvider) -> FixProvider:

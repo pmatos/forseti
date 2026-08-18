@@ -17,10 +17,10 @@ extra; the base install and the loop/esbmc path stay dependency-free.
 Canonical commands (from the repo root):
 
 ```
-pip install -e ".[dev]"          # package + dev tools (ruff, mypy, pytest, pytest-cov, hypothesis)
+pip install -e ".[dev]"          # package + dev tools (ruff, ty, pytest, pytest-cov, hypothesis)
 ruff check src tests             # lint
 ruff format --check src tests    # format check
-mypy src tests                   # type-check (strict)
+ty check src tests               # type-check
 pytest -q                        # tests
 ```
 
