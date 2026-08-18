@@ -63,7 +63,7 @@ def write_text_atomic(path: str | os.PathLike[str], text: str) -> None:
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        os.write(fd, text.encode())
+        os.write(fd, text.encode("utf-8"))
     finally:
         os.close(fd)
     with contextlib.suppress(FileNotFoundError):

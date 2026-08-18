@@ -348,6 +348,37 @@ def test_install_on_malformed_json_raises_and_leaves_file_untouched(
     assert settings_path.read_text() == "not json"
 
 
+def test_install_on_non_utf8_bytes_raises_project_settings_error(
+    tmp_path: Path,
+) -> None:
+    # review feedback on PR #201: read_text() with no explicit encoding falls
+    # back to the locale codec; a byte sequence that codec rejects must still
+    # hit the documented ProjectSettingsError contract, not an uncaught
+    # UnicodeDecodeError (a ValueError subclass json.JSONDecodeError alone
+    # doesn't catch).
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    settings_path = claude_dir / "settings.local.json"
+    settings_path.write_bytes(b'{"key": "\xff\xfe not valid utf-8"}')
+
+    with pytest.raises(ProjectSettingsError):
+        install(tmp_path)
+
+
+def test_install_preserves_non_ascii_content_in_existing_settings(
+    tmp_path: Path,
+) -> None:
+    settings_path, _ = install(tmp_path)
+    data = json.loads(settings_path.read_text(encoding="utf-8"))
+    data["permissions"] = {"note": "café — 日本語"}
+    settings_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    _, outcome = install(tmp_path)
+    assert outcome is InstallOutcome.UNCHANGED
+    restored = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert restored["permissions"] == {"note": "café — 日本語"}
+
+
 def test_install_on_non_object_json_raises(tmp_path: Path) -> None:
     claude_dir = tmp_path / ".claude"
     claude_dir.mkdir()

@@ -148,8 +148,12 @@ def install(project_dir: Path, *, shared: bool = False) -> tuple[Path, InstallOu
 
     if existed:
         try:
-            existing = json.loads(settings_path.read_text())
-        except (OSError, json.JSONDecodeError) as exc:
+            existing = json.loads(settings_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            # ValueError, not just json.JSONDecodeError: a byte sequence the
+            # locale codec would otherwise misdecode into mojibake instead
+            # raises UnicodeDecodeError here (also a ValueError subclass),
+            # so it hits this same honest-error path rather than escaping it.
             raise ProjectSettingsError(
                 f"{settings_path}: cannot read existing settings ({exc})"
             ) from exc
