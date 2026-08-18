@@ -12,22 +12,16 @@ unverified residual — never a silent pass.
 from __future__ import annotations
 
 import json
-import os
 import sys
+from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import event_log
-import forseti_gate as gate
+from . import event_log
+from . import forseti_gate as gate
 
 _CEX_CLIP = 1200
 
 
-def _project_dir(data: dict) -> str:
-    return os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or os.getcwd()
-
-
-def _residual(failures: list[dict]) -> str:
+def _residual(failures: list[dict[str, Any]]) -> str:
     lines = []
     for u in failures:
         lines.append(
@@ -41,7 +35,7 @@ def _residual(failures: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _needs_message(needs: list[dict]) -> str:
+def _needs_message(needs: list[dict[str, Any]]) -> str:
     """Loud, non-blocking note for NEEDS_CONTRACT units at turn end (never silent)."""
     ids = ", ".join(str(u.get("unit_id")) for u in needs)
     return (
@@ -71,7 +65,7 @@ def _oob_note(project_dir: str, oob: list[str]) -> str:
     )
 
 
-def _blob_note(blob: list[dict]) -> str:
+def _blob_note(blob: list[dict[str, Any]]) -> str:
     """Loud note for C staged/committed out-of-band whose blob was never verified.
 
     The worktree copy can hash clean while the *index* or *HEAD* holds a divergent,
@@ -110,7 +104,7 @@ def _blob_note(blob: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _emit(obj: dict) -> int:
+def _emit(obj: dict[str, Any]) -> int:
     print(json.dumps(obj))
     return 0
 
@@ -118,7 +112,7 @@ def _emit(obj: dict) -> int:
 def main() -> int:
     raw = sys.stdin.read()
     data = json.loads(raw) if raw.strip() else {}
-    project_dir = _project_dir(data)
+    project_dir = gate.project_dir(data)
 
     # Discover C files changed out-of-band (Bash) that the gate has not verified.
     # This is an ESBMC-free, git-fast backstop — the heavy verify runs in the

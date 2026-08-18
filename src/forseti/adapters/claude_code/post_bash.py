@@ -20,19 +20,12 @@ loudly but never blocks (issue #122).
 from __future__ import annotations
 
 import json
-import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import event_log
-import forseti_gate as gate
+from . import event_log
+from . import forseti_gate as gate
 
 _CEX_CLIP = 1500
-
-
-def _project_dir(data: dict) -> str:
-    return os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or os.getcwd()
 
 
 def _needs_note(needs: list[gate.UnitVerdict]) -> str:
@@ -129,7 +122,7 @@ def _report(verdicts: list[gate.UnitVerdict]) -> int:
 def main() -> int:
     raw = sys.stdin.read()
     data = json.loads(raw) if raw.strip() else {}
-    project_dir = _project_dir(data)
+    project_dir = gate.project_dir(data)
 
     # Read state once for the baseline HEAD (so the scan also catches C committed
     # in the same Bash command) and to pick the files that actually changed since

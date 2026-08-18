@@ -23,21 +23,14 @@ mid-session out-of-band change is not masked.
 from __future__ import annotations
 
 import json
-import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import event_log
-import forseti_gate as gate
+from . import event_log
+from . import forseti_gate as gate
 
 # A new or cleared context — (re)establish the baseline. On "resume"/"compact"
 # the session's `scanned` map is still live, so we must not overwrite it.
 _FRESH_SOURCES = {"startup", "clear"}
-
-
-def _project_dir(data: dict) -> str:
-    return os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or os.getcwd()
 
 
 def main() -> int:
@@ -48,7 +41,7 @@ def main() -> int:
     if str(data.get("source", "startup")) not in _FRESH_SOURCES:
         return 0
 
-    project_dir = _project_dir(data)
+    project_dir = gate.project_dir(data)
     n = gate.baseline_scanned(project_dir)
     if n is None:
         # Not a git repo — the out-of-band scan is inactive anyway; nothing to seed.
