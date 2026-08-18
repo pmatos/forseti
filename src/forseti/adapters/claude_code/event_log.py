@@ -62,10 +62,11 @@ def write_text_atomic(path: str | os.PathLike[str], text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        os.write(fd, text.encode("utf-8"))
-    finally:
-        os.close(fd)
+    # A raw os.write() may legally write fewer bytes than given (a "short
+    # write"); fdopen's buffered file object loops internally to guarantee
+    # the whole payload lands, while still owning (and closing) `fd` itself.
+    with os.fdopen(fd, "wb") as f:
+        f.write(text.encode("utf-8"))
     with contextlib.suppress(FileNotFoundError):
         os.chmod(tmp, stat.S_IMODE(path.stat().st_mode))
     tmp.replace(path)

@@ -8,6 +8,7 @@ adapter (RFC-0004), not moved here.
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
 
 from forseti.adapters.claude_code import event_log
@@ -42,6 +43,37 @@ def test_read_events_skips_malformed_lines(tmp_path: Path) -> None:
 
 def test_read_events_absent_is_empty(tmp_path: Path) -> None:
     assert event_log.read_events(tmp_path) == []
+
+
+def test_write_text_atomic_round_trips_a_large_payload(tmp_path: Path) -> None:
+    # Not a synthetic short-write simulation (os.fdopen's BufferedWriter goes
+    # through io.FileIO, which retries at the C level below what Python's own
+    # os.write() can be monkeypatched to intercept) -- this instead confirms
+    # a payload well past a single small write lands byte-for-byte complete.
+    target = tmp_path / "nested" / "state.json"
+    payload = json.dumps({"data": "x" * 200_000})
+
+    event_log.write_text_atomic(target, payload)
+
+    assert target.read_text(encoding="utf-8") == payload
+    assert not list(target.parent.glob("*.tmp"))  # no leftover temp file
+
+
+def test_write_text_atomic_creates_a_fresh_file_at_0600(tmp_path: Path) -> None:
+    target = tmp_path / "state.json"
+    event_log.write_text_atomic(target, "{}")
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_write_text_atomic_preserves_an_existing_files_mode(tmp_path: Path) -> None:
+    target = tmp_path / "state.json"
+    target.write_text("{}")
+    target.chmod(0o644)
+
+    event_log.write_text_atomic(target, '{"updated": true}')
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o644
+    assert target.read_text() == '{"updated": true}'
 
 
 def test_log_event_never_raises_on_bad_target(tmp_path: Path) -> None:
