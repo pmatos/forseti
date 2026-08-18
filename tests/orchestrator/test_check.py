@@ -32,6 +32,7 @@ from forseti.orchestrator import (
     ListSink,
     PropertyCheckRun,
     PropertyOutcome,
+    PropertyVerdict,
     RenderedHarness,
     Unit,
     check_properties,
@@ -543,6 +544,62 @@ def test_persist_property_check_writes_jsonl(tmp_path: Path) -> None:
     assert record["unit"] == "u.c::f"
     assert record["run"]["counts"]["held"] == 1
     assert len(record["events"]) == len(sink.events)
+
+
+# --- PropertyVerdict named constructors -------------------------------------
+#
+# Each outcome shape (deferred / render-failed / settled) has its own constructor
+# so a call site names only the fields it carries, instead of padding the raw
+# dataclass with positional `None`s. Tested at the type's own seam.
+
+
+def test_skipped_constructor_builds_a_deferred_verdict() -> None:
+    verdict = PropertyVerdict.skipped(
+        "p1", "u.c::f", "reachability", reason="reachability deferred"
+    )
+    assert verdict.outcome is PropertyOutcome.SKIPPED
+    assert verdict.property_id == "p1"
+    assert verdict.unit_id == "u.c::f"
+    assert verdict.kind == "reachability"
+    assert verdict.skip_reason == "reachability deferred"
+    assert verdict.k is None
+    assert verdict.result is None
+    assert verdict.harness_source is None
+
+
+def test_render_failed_constructor_builds_an_error_verdict() -> None:
+    verdict = PropertyVerdict.render_failed(
+        "p1", "u.c::f", "semantic", reason="harness render failed: boom"
+    )
+    assert verdict.outcome is PropertyOutcome.ERROR
+    assert verdict.property_id == "p1"
+    assert verdict.unit_id == "u.c::f"
+    assert verdict.kind == "semantic"
+    assert verdict.skip_reason == "harness render failed: boom"
+    assert verdict.k is None
+    assert verdict.result is None
+    assert verdict.harness_source is None
+
+
+def test_settled_constructor_carries_bound_result_and_harness() -> None:
+    result = Verified(meta())
+    verdict = PropertyVerdict.settled(
+        "p1",
+        "u.c::f",
+        "semantic",
+        PropertyOutcome.HELD,
+        k=8,
+        result=result,
+        harness_source="/* harness p1 */",
+    )
+    assert verdict.outcome is PropertyOutcome.HELD
+    assert verdict.property_id == "p1"
+    assert verdict.unit_id == "u.c::f"
+    assert verdict.kind == "semantic"
+    assert verdict.k == 8
+    assert verdict.result is result
+    assert verdict.harness_source == "/* harness p1 */"
+    assert verdict.skip_reason is None
 
 
 if TYPE_CHECKING:

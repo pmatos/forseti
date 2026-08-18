@@ -103,6 +103,72 @@ class PropertyVerdict:
     harness_source: str | None
     skip_reason: str | None = None
 
+    @classmethod
+    def skipped(
+        cls, property_id: str, unit_id: str, kind: str, *, reason: str
+    ) -> PropertyVerdict:
+        """A deferred property (a reachability kind, ADR-0009 D2): `SKIPPED`, no
+        `k`/`result`/`harness_source`, carrying only the `reason` it was deferred.
+        """
+        return cls(
+            property_id,
+            unit_id,
+            kind,
+            PropertyOutcome.SKIPPED,
+            k=None,
+            result=None,
+            harness_source=None,
+            skip_reason=reason,
+        )
+
+    @classmethod
+    def render_failed(
+        cls, property_id: str, unit_id: str, kind: str, *, reason: str
+    ) -> PropertyVerdict:
+        """A property whose harness could not be rendered (#64 fail-loud
+        `HarnessError`): `ERROR` with no `k`/`result`/`harness_source` — esbmc was
+        never invoked — carrying the render-failure `reason`. Distinct from an
+        esbmc-error verdict (`settled` with an `Error` result), which does have a
+        harness and a result.
+        """
+        return cls(
+            property_id,
+            unit_id,
+            kind,
+            PropertyOutcome.ERROR,
+            k=None,
+            result=None,
+            harness_source=None,
+            skip_reason=reason,
+        )
+
+    @classmethod
+    def settled(
+        cls,
+        property_id: str,
+        unit_id: str,
+        kind: str,
+        outcome: PropertyOutcome,
+        *,
+        k: int | None,
+        result: EsbmcResult,
+        harness_source: str,
+    ) -> PropertyVerdict:
+        """A property verified to a terminal `outcome` along the k-ladder: the
+        settled bound `k`, the raw `result` (kept for #4 to re-render against
+        mutants), and the exact `harness_source` checked. No `skip_reason` — the
+        outcome speaks for itself.
+        """
+        return cls(
+            property_id,
+            unit_id,
+            kind,
+            outcome,
+            k=k,
+            result=result,
+            harness_source=harness_source,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         """A JSON-serializable dict — the shape the grading harness (#4) reads."""
         return {
@@ -214,15 +280,8 @@ def check_properties(
         if prop.kind is not PropertyKind.SEMANTIC:
             reason = "reachability harnessing deferred (ADR-0009 D2)"
             verdicts.append(
-                PropertyVerdict(
-                    prop.property_id,
-                    unit.unit_id,
-                    kind,
-                    PropertyOutcome.SKIPPED,
-                    None,
-                    None,
-                    None,
-                    reason,
+                PropertyVerdict.skipped(
+                    prop.property_id, unit.unit_id, kind, reason=reason
                 )
             )
             emit(
@@ -242,15 +301,8 @@ def check_properties(
             # than crash the whole unit's run or hand esbmc un-compilable C.
             reason = f"harness render failed: {exc}"
             verdicts.append(
-                PropertyVerdict(
-                    prop.property_id,
-                    unit.unit_id,
-                    kind,
-                    PropertyOutcome.ERROR,
-                    None,
-                    None,
-                    None,
-                    reason,
+                PropertyVerdict.render_failed(
+                    prop.property_id, unit.unit_id, kind, reason=reason
                 )
             )
             emit(
@@ -285,14 +337,14 @@ def check_properties(
         final = attempts[-1]
         outcome = _outcome_for(final.result)
         verdicts.append(
-            PropertyVerdict(
+            PropertyVerdict.settled(
                 prop.property_id,
                 unit.unit_id,
                 kind,
                 outcome,
-                final.k,
-                final.result,
-                rendered.source_text,
+                k=final.k,
+                result=final.result,
+                harness_source=rendered.source_text,
             )
         )
         emit(
