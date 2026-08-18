@@ -92,6 +92,16 @@ def test_merge_hooks_drops_matcher_group_left_empty_by_removal() -> None:
     assert merged["hooks"]["Stop"][0]["hooks"][0]["command"] == f"{_MARKER}stop-gate"
 
 
+def test_merge_hooks_on_null_hooks_raises() -> None:
+    with pytest.raises(ProjectSettingsError):
+        merge_hooks({"hooks": None})
+
+
+def test_merge_hooks_on_non_list_event_value_raises() -> None:
+    with pytest.raises(ProjectSettingsError):
+        merge_hooks({"hooks": {"Stop": {"matcher": "*"}}})
+
+
 def test_install_on_fresh_project_creates_settings_local(tmp_path: Path) -> None:
     settings_path, outcome = install(tmp_path)
     assert outcome is InstallOutcome.CREATED

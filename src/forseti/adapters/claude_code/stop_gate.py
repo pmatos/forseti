@@ -12,7 +12,6 @@ unverified residual — never a silent pass.
 from __future__ import annotations
 
 import json
-import os
 import sys
 from typing import Any
 
@@ -20,10 +19,6 @@ from . import event_log
 from . import forseti_gate as gate
 
 _CEX_CLIP = 1200
-
-
-def _project_dir(data: dict[str, Any]) -> str:
-    return os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or os.getcwd()
 
 
 def _residual(failures: list[dict[str, Any]]) -> str:
@@ -117,7 +112,7 @@ def _emit(obj: dict[str, Any]) -> int:
 def main() -> int:
     raw = sys.stdin.read()
     data = json.loads(raw) if raw.strip() else {}
-    project_dir = _project_dir(data)
+    project_dir = event_log.project_dir(data)
 
     # Discover C files changed out-of-band (Bash) that the gate has not verified.
     # This is an ESBMC-free, git-fast backstop — the heavy verify runs in the

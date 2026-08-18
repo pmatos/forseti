@@ -53,7 +53,11 @@ from forseti.adapters.claude_code import (
     session_start,
     stop_gate,
 )
-from forseti.adapters.claude_code.install import ProjectSettingsError, install
+from forseti.adapters.claude_code.install import (
+    InstallOutcome,
+    ProjectSettingsError,
+    install,
+)
 from forseti.esbmc import (
     ListUnitsError,
     Violated,
@@ -529,17 +533,20 @@ def _add_enable_project_parser(
     p.set_defaults(func=_run_enable_project)
 
 
+_ENABLE_PROJECT_VERBS = {
+    InstallOutcome.CREATED: "installed",
+    InstallOutcome.UPDATED: "updated",
+    InstallOutcome.UNCHANGED: "already up to date",
+}
+
+
 def _run_enable_project(args: argparse.Namespace) -> int:
     try:
         settings_path, outcome = install(args.project_dir, shared=args.shared)
-    except ProjectSettingsError as exc:
+    except (ProjectSettingsError, OSError) as exc:
         print(f"forseti enable-project: {exc}", file=sys.stderr)
         return 1
-    verb = {
-        "created": "installed",
-        "updated": "updated",
-        "unchanged": "already up to date",
-    }[outcome.value]
+    verb = _ENABLE_PROJECT_VERBS[outcome]
     message = f"Claude Code verify-gate hooks {verb} at {settings_path}"
     print(f"forseti enable-project: {message}")
     return 0

@@ -13,6 +13,7 @@ version marker -- rerunning always regenerates forseti's entries from whatever
 from __future__ import annotations
 
 import json
+import os
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -68,12 +69,24 @@ def _generated_matcher_groups() -> dict[str, list[dict[str, Any]]]:
 def merge_hooks(existing: dict[str, Any]) -> dict[str, Any]:
     """Return `existing` with forseti's own hook entries replaced by the current set.
 
-    Pure and total: every non-forseti hook, matcher, and top-level key survives
+    Total over any `existing` whose `"hooks"` value has the shape Claude Code
+    itself writes (absent, or a dict mapping event name to a list of matcher
+    groups): every non-forseti hook, matcher, and top-level key survives
     unchanged; only matcher-groups whose hooks are all forseti's own marker are
-    dropped before the fresh set is appended.
+    dropped before the fresh set is appended. Raises `ProjectSettingsError` if
+    `"hooks"` or any event's value doesn't have that shape, rather than
+    silently dropping/corrupting it.
     """
     merged = dict(existing)
-    hooks: dict[str, Any] = dict(merged.get("hooks", {}))
+    raw_hooks = merged.get("hooks", {})
+    if not isinstance(raw_hooks, dict):
+        raise ProjectSettingsError('existing settings\' "hooks" key must be an object')
+    hooks: dict[str, Any] = dict(raw_hooks)
+    for event, groups in hooks.items():
+        if not isinstance(groups, list):
+            raise ProjectSettingsError(
+                f'existing settings\' "hooks"."{event}" must be a list'
+            )
     generated = _generated_matcher_groups()
 
     for event in set(hooks) | set(generated):
@@ -123,7 +136,7 @@ def install(project_dir: Path, *, shared: bool = False) -> tuple[Path, InstallOu
         return settings_path, InstallOutcome.UNCHANGED
 
     claude_dir.mkdir(parents=True, exist_ok=True)
-    tmp_path = settings_path.parent / (settings_path.name + ".tmp")
+    tmp_path = settings_path.parent / f"{settings_path.name}.{os.getpid()}.tmp"
     tmp_path.write_text(json.dumps(updated, indent=2) + "\n")
     tmp_path.replace(settings_path)
     outcome = InstallOutcome.CREATED if not existed else InstallOutcome.UPDATED

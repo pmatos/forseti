@@ -46,6 +46,14 @@ def events_path(project_dir: str | os.PathLike[str]) -> Path:
     return Path(project_dir) / _STATE_DIR / _EVENTS_FILE
 
 
+def project_dir(data: dict[str, Any]) -> str:
+    """The project root for a hook payload.
+
+    ``CLAUDE_PROJECT_DIR`` if set, else the payload's ``cwd``, else the OS cwd.
+    """
+    return os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or os.getcwd()
+
+
 def log_event(project_dir: str | os.PathLike[str], type: str, **fields: Any) -> None:
     """Append one event to the project's trace; never raise into the caller.
 

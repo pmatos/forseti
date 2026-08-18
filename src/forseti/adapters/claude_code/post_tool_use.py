@@ -13,16 +13,11 @@ from __future__ import annotations
 import json
 import os
 import sys
-from typing import Any
 
 from . import event_log
 from . import forseti_gate as gate
 
 _CEX_CLIP = 1500
-
-
-def _project_dir(data: dict[str, Any]) -> str:
-    return os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or os.getcwd()
 
 
 def _needs_note(needs: list[gate.UnitVerdict]) -> str:
@@ -44,7 +39,7 @@ def main() -> int:
     if not file_path or not gate.is_c_source(file_path):
         return 0
 
-    project_dir = _project_dir(data)
+    project_dir = event_log.project_dir(data)
     if not os.path.isabs(file_path):
         file_path = os.path.join(project_dir, file_path)
     if not os.path.exists(file_path):
