@@ -23,8 +23,10 @@ loop mechanics; weave the transcript in by timestamp if the prose is wanted.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import stat
 import time
 from pathlib import Path
 from typing import Any
@@ -47,11 +49,25 @@ def write_text_atomic(path: str | os.PathLike[str], text: str) -> None:
     Never leaves a torn/partial file behind -- a process killed mid-write
     leaves the temp file, not a truncated `path`. Shared by every writer in
     this package that persists a single JSON document to disk.
+
+    The temp file is created at mode 0600, then widened to `path`'s own mode
+    just before the swap if `path` already exists (left at 0600 for a fresh
+    file). `Path.replace` installs the *temp* file's inode, not `path`'s old
+    one, so without this a settings file a user `chmod 600`'d (it can hold a
+    Claude Code `env` block with API keys) would silently widen to the
+    process umask default on every rerun -- and never sit world-readable even
+    for the instant between the write and the swap.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(text)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, text.encode())
+    finally:
+        os.close(fd)
+    with contextlib.suppress(FileNotFoundError):
+        os.chmod(tmp, stat.S_IMODE(path.stat().st_mode))
     tmp.replace(path)
 
 

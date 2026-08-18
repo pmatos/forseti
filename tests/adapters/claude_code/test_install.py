@@ -7,6 +7,8 @@ I/O. `install` is exercised against `tmp_path`, never a real project.
 from __future__ import annotations
 
 import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -158,6 +160,22 @@ def test_install_rerun_after_stale_edit_reports_updated(tmp_path: Path) -> None:
     assert outcome is InstallOutcome.UPDATED
     restored = json.loads(settings_path.read_text())
     assert restored["hooks"]["Stop"][0]["hooks"][0]["timeout"] == 120
+
+
+def test_install_rerun_preserves_a_restrictive_existing_mode(tmp_path: Path) -> None:
+    # review feedback on PR #201: an atomic write installs a *new* inode
+    # (temp file + rename), so without copying the old file's mode across, a
+    # settings file the user `chmod 600`'d -- it can hold a Claude Code `env`
+    # block with API keys -- would silently widen to the umask default.
+    settings_path, _ = install(tmp_path)
+    data = json.loads(settings_path.read_text())
+    data["hooks"]["Stop"][0]["hooks"][0]["timeout"] = 1  # force a real rewrite
+    settings_path.write_text(json.dumps(data))
+    os.chmod(settings_path, 0o600)
+
+    _, outcome = install(tmp_path)
+    assert outcome is InstallOutcome.UPDATED
+    assert stat.S_IMODE(settings_path.stat().st_mode) == 0o600
 
 
 def test_install_on_malformed_json_raises_and_leaves_file_untouched(
