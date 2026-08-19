@@ -113,8 +113,10 @@ class StubProvider:
 
     def __init__(self, patch: str) -> None:
         self._patch = patch
+        self.calls = 0
 
     def propose_fix(self, request: FixRequest) -> str:
+        self.calls += 1
         return self._patch
 
 
@@ -165,6 +167,43 @@ def test_provider_fix_port_refuses_to_clobber_a_stale_candidate(
         fix(source, violated())
 
     assert stale.read_text() == "stale leftover\n"
+
+
+def test_provider_fix_port_skips_provider_call_on_stale_candidate(
+    tmp_path: Path,
+) -> None:
+    # The collision check runs before propose_fix, so a stale leftover is
+    # caught without paying for a (possibly LLM-backed) fix proposal that
+    # would only be discarded.
+    source = tmp_path / "kernel.c"
+    source.write_text("orig\n")
+    (tmp_path / "kernel.fix1.c").write_text("stale leftover\n")
+    provider = StubProvider("patched\n")
+    fix = ProviderFixPort(provider)
+
+    with pytest.raises(FileExistsError):
+        fix(source, violated())
+
+    assert provider.calls == 0
+
+
+def test_provider_fix_port_rejects_an_unrelated_source_from_a_reused_instance(
+    tmp_path: Path,
+) -> None:
+    # A ProviderFixPort instance is scoped to the first source it ever saw.
+    # Reusing one instance across two different units must fail loud instead
+    # of silently writing the second unit's fix beside the first unit's file
+    # under the first unit's stem.
+    unit_a = tmp_path / "unit_a.c"
+    unit_a.write_text("orig a\n")
+    unit_b = tmp_path / "unit_b.c"
+    unit_b.write_text("orig b\n")
+    fix = ProviderFixPort(StubProvider("patched\n"))
+
+    fix(unit_a, violated())
+
+    with pytest.raises(ValueError, match="unrelated source"):
+        fix(unit_b, violated())
 
 
 class FakeVerify:

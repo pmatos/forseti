@@ -131,25 +131,47 @@ class ProviderFixPort:
     fails loud rather than silently being overwritten. Because it returns the
     next path to verify, `run_loop`'s existing "fix then re-verify" loop *is*
     the apply+re-enter — the driver is unchanged.
+
+    One instance is scoped to one unit: `source` on the *first* call pins
+    `self._original`, and every later call must pass either that same path or
+    one of this instance's own prior outputs (round 2+, fed back in by
+    `run_loop`) — never an unrelated file. Reusing one instance across two
+    different units would otherwise silently write the second unit's fix
+    beside the *first* unit's source under the first unit's stem, so an
+    unrelated `source` fails loud instead. The collision check also runs
+    before asking the provider for a patch, not after, so a stale leftover is
+    caught before paying for a (possibly LLM-backed) `propose_fix` call that
+    would only be discarded.
     """
 
     def __init__(self, provider: FixProvider) -> None:
         self._provider = provider
         self._attempt = 0
         self._original: Path | None = None
+        self._issued: set[Path] = set()
 
     def __call__(self, source: Path, violated: Violated) -> Path:
         if self._original is None:
             self._original = source
-        request = FixRequest.from_violation(source, source.read_text(), violated)
-        patched = self._provider.propose_fix(request)
-        self._attempt += 1
+        elif source != self._original and source not in self._issued:
+            raise ValueError(
+                f"ProviderFixPort is bound to {self._original} (the first "
+                f"source it ever saw); got unrelated source {source}. Use a "
+                "separate ProviderFixPort per unit."
+            )
+        attempt = self._attempt + 1
         dest = (
             self._original.parent
-            / f"{self._original.stem}.fix{self._attempt}{self._original.suffix}"
+            / f"{self._original.stem}.fix{attempt}{self._original.suffix}"
         )
+        if dest.exists():
+            raise FileExistsError(f"candidate already exists: {dest}")
+        request = FixRequest.from_violation(source, source.read_text(), violated)
+        patched = self._provider.propose_fix(request)
         with dest.open("x") as f:
             f.write(patched)
+        self._attempt = attempt
+        self._issued.add(dest)
         return dest
 
 
