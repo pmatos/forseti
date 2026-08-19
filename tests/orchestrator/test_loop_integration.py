@@ -84,13 +84,13 @@ def test_abs_int_min_loop_converges_via_provider(tmp_path: Path) -> None:
     # RecordedFixProvider proposes abs_fixed.c's text and ProviderFixPort writes
     # + re-enters VERIFY. Proves the typed-cex parse and the applier write
     # compose across a real esbmc run, not just the fakes. Driven from a tmp
-    # copy, not examples/abs.c directly: ProviderFixPort now writes its
-    # candidate beside `source` (issue #39), and examples/ is tracked source,
-    # not a scratch directory.
+    # copy, not examples/abs.c directly: ProviderFixPort writes its candidate
+    # beside `source`, and examples/ is tracked source, not a scratch
+    # directory.
     unit = tmp_path / "abs.c"
     shutil.copy(EXAMPLES / "abs.c", unit)
     provider = RecordedFixProvider({unit: EXAMPLES / "abs_fixed.c"})
-    fix = ProviderFixPort(provider)
+    fix = ProviderFixPort(provider, original=unit)
 
     run = run_loop(unit, verify=verify, fix=fix, unwind=1, max_iterations=2)
 
@@ -105,11 +105,11 @@ def test_abs_int_min_loop_converges_via_provider(tmp_path: Path) -> None:
 def test_abs_run_emits_telemetry_and_renders_transcript(tmp_path: Path) -> None:
     # Acceptance: the transcript is verified on the real #2 abs run, and the loop
     # emits a `converged` event through the pluggable sink. Driven from a tmp
-    # copy for the same reason as the provider test above (issue #39).
+    # copy for the same reason as the provider test above.
     unit = tmp_path / "abs.c"
     shutil.copy(EXAMPLES / "abs.c", unit)
     provider = RecordedFixProvider({unit: EXAMPLES / "abs_fixed.c"})
-    fix = ProviderFixPort(provider)
+    fix = ProviderFixPort(provider, original=unit)
     sink = ListSink()
 
     run = run_loop(

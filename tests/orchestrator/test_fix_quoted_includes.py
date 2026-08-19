@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from forseti.esbmc import Error, Verified, Violated, verify
+from forseti.esbmc import Verified, Violated, verify
 from forseti.orchestrator import (
     LoopState,
     ProviderFixPort,
@@ -40,17 +40,16 @@ def test_fix_with_sibling_quoted_header_reverifies_without_parse_error(
         FIXTURES / "quoted_include_helper.h", tmp_path / "quoted_include_helper.h"
     )
     provider = RecordedFixProvider({unit: FIXTURES / "quoted_include_kernel_fixed.c"})
-    fix = ProviderFixPort(provider)
+    fix = ProviderFixPort(provider, original=unit)
 
     run = run_loop(unit, verify=verify, fix=fix, unwind=1, max_iterations=2)
 
     # First pass: the original, in-place bug -> VIOLATED (never an Error: its
     # own directory always resolved the sibling header).
     assert isinstance(run.iterations[0].result, Violated)
-    # Second pass: the applied candidate, written beside `unit` -> VERIFIED,
-    # not Error. An Error here would mean the sibling header failed to
-    # resolve from the candidate's write location -- the #39 regression.
-    assert not isinstance(run.iterations[-1].result, Error)
+    # Second pass: the applied candidate, written beside `unit` -> VERIFIED.
+    # An Error here would mean the sibling header failed to resolve from the
+    # candidate's write location -- the #39 regression.
     assert isinstance(run.iterations[-1].result, Verified)
     assert run.final_state is LoopState.DONE
 

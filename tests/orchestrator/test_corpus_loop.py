@@ -61,13 +61,13 @@ def _drive(bug: str, clean: str, k: int, *, tmp_path: Path, sink: ListSink) -> L
     """Drive the loop bug -> recorded fix -> clean at bound k (no human, no LLM).
 
     Driven from a tmp copy of the bug source, not examples/ directly:
-    ProviderFixPort now writes its candidate beside `source` (issue #39), and
-    examples/ is tracked source, not a scratch directory.
+    ProviderFixPort writes its candidate beside `source`, and examples/ is
+    tracked source, not a scratch directory.
     """
     staged = tmp_path / bug
     shutil.copy(EXAMPLES / bug, staged)
     provider = RecordedFixProvider({staged: EXAMPLES / clean})
-    fix = ProviderFixPort(provider)
+    fix = ProviderFixPort(provider, original=staged)
     return run_loop(
         staged, verify=_verify, fix=fix, unwind=k, max_iterations=2, sink=sink
     )

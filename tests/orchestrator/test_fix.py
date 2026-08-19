@@ -123,7 +123,7 @@ class StubProvider:
 def test_provider_fix_port_writes_and_returns_versioned_path(tmp_path: Path) -> None:
     source = tmp_path / "kernel.c"
     source.write_text("orig\n")
-    fix = ProviderFixPort(StubProvider("patched\n"))
+    fix = ProviderFixPort(StubProvider("patched\n"), original=source)
 
     dest1 = fix(source, violated())
 
@@ -145,7 +145,7 @@ def test_provider_fix_port_second_round_stays_beside_original(
     # kernel.fix1.fix2.c instead of kernel.fix2.c.
     source = tmp_path / "kernel.c"
     source.write_text("orig\n")
-    fix = ProviderFixPort(StubProvider("patched\n"))
+    fix = ProviderFixPort(StubProvider("patched\n"), original=source)
 
     dest1 = fix(source, violated())
     dest2 = fix(dest1, violated())
@@ -161,29 +161,16 @@ def test_provider_fix_port_refuses_to_clobber_a_stale_candidate(
     source.write_text("orig\n")
     stale = tmp_path / "kernel.fix1.c"
     stale.write_text("stale leftover\n")
-    fix = ProviderFixPort(StubProvider("patched\n"))
+    provider = StubProvider("patched\n")
+    fix = ProviderFixPort(provider, original=source)
 
     with pytest.raises(FileExistsError):
         fix(source, violated())
 
     assert stale.read_text() == "stale leftover\n"
-
-
-def test_provider_fix_port_skips_provider_call_on_stale_candidate(
-    tmp_path: Path,
-) -> None:
     # The collision check runs before propose_fix, so a stale leftover is
     # caught without paying for a (possibly LLM-backed) fix proposal that
     # would only be discarded.
-    source = tmp_path / "kernel.c"
-    source.write_text("orig\n")
-    (tmp_path / "kernel.fix1.c").write_text("stale leftover\n")
-    provider = StubProvider("patched\n")
-    fix = ProviderFixPort(provider)
-
-    with pytest.raises(FileExistsError):
-        fix(source, violated())
-
     assert provider.calls == 0
 
 
@@ -198,7 +185,7 @@ def test_provider_fix_port_rejects_an_unrelated_source_from_a_reused_instance(
     unit_a.write_text("orig a\n")
     unit_b = tmp_path / "unit_b.c"
     unit_b.write_text("orig b\n")
-    fix = ProviderFixPort(StubProvider("patched\n"))
+    fix = ProviderFixPort(StubProvider("patched\n"), original=unit_a)
 
     fix(unit_a, violated())
 
@@ -224,7 +211,7 @@ def test_scripted_provider_drives_loop_abs_to_fixed(tmp_path: Path) -> None:
     unit = tmp_path / "abs.c"
     shutil.copy(EXAMPLES / "abs.c", unit)
     provider = RecordedFixProvider({unit: EXAMPLES / "abs_fixed.c"})
-    fix = ProviderFixPort(provider)
+    fix = ProviderFixPort(provider, original=unit)
     verify = FakeVerify([violated(), Verified(meta())])
 
     run = run_loop(unit, verify=verify, fix=fix, unwind=1, max_iterations=2)
