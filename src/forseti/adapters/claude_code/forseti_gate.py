@@ -174,7 +174,7 @@ _NEEDS_CONTRACT_DETAIL = (
 # that exclusion exists to catch.
 _ENUM_SNAPSHOT_PREFIX = ".forseti-units-"
 
-# The verify snapshot's filename prefix (issue #150). `_untracked_verify_snapshot`
+# The verify snapshot's filename prefix (issue #150). `_untracked_snapshot`
 # rejects a path whose basename starts with it *and* that git cannot show as
 # tracked — ahead of `FORSETI_GATE_EXCLUDE`/`FORSETI_GATE_INCLUDE` (a project can
 # replace, not extend, that env var), a snapshot a killed hook could not clean up
@@ -184,6 +184,12 @@ _ENUM_SNAPSHOT_PREFIX = ".forseti-units-"
 # `_verifiable_source`) still lets it through the discovery scans as a dotfile,
 # which is exactly what that exclusion exists to catch.
 _VERIFY_SNAPSHOT_PREFIX = ".forseti-verify-"
+
+# The two snapshot prefixes as one `str.startswith` argument so `_untracked_snapshot`
+# recognizes a leftover of *either* kind in a single check. They are disjoint at
+# match — neither is a prefix of the other — so testing both never widens what any
+# one of them matched alone.
+_SNAPSHOT_PREFIXES: tuple[str, ...] = (_ENUM_SNAPSHOT_PREFIX, _VERIFY_SNAPSHOT_PREFIX)
 
 
 @dataclass(frozen=True)
@@ -992,69 +998,40 @@ def git_committed_files_since(project_dir: str, baseline_head: str | None) -> li
 
 def _untracked_snapshot(root: str, rel: str) -> bool:
     """True only when repo-root-relative `rel` is a *provably untracked* leftover
-    matching the enumeration snapshot's basename prefix (`_ENUM_SNAPSHOT_PREFIX`).
+    of either snapshot kind — its basename starts with `_ENUM_SNAPSHOT_PREFIX`
+    (enumeration, `_enumerable_source`) or `_VERIFY_SNAPSHOT_PREFIX` (verify,
+    `_verifiable_source`).
 
-    A snapshot `_enumerable_source` could not clean up (a kill) must never be
-    handed back to `verify_and_record` as a source in its own right — that is
-    this check's job. But a repository can also already *track* a legitimate
-    source whose name happens to share the prefix; excluding by name alone would
-    silently drop a real, changed file from every scan (a Bash edit to it would
-    ship unverified, since the direct Write/Edit hook never sees a Bash write).
-    So the exemption only fires when git can affirmatively say the path is not in
-    its index — never when the question can't be asked. A missing/unreachable git,
-    a timeout, or `root` not being a work tree all read `_git` as ``None``; treated
-    as "provably untracked" that would fail *open* (exempt, i.e. silently drop, a
-    file that might well be a real tracked source) in the one predicate whose job
-    this round is to stop exactly that silent bypass — so ``None`` never exempts.
+    A snapshot either stager could not clean up (a kill) must never be handed back
+    to `verify_and_record` as a source in its own right — that is this check's job,
+    for both kinds at once. The two prefixes are disjoint at match (neither is a
+    prefix of the other), so a single `startswith` over both recognizes exactly the
+    union each once matched alone. But a repository can also already *track* a
+    legitimate source whose name happens to share a prefix; excluding by name alone
+    would silently drop a real, changed file from every scan (a Bash edit to it
+    would ship unverified, since the direct Write/Edit hook never sees a Bash write
+    — review feedback on PR #159, issue #150). So the exemption only fires when git
+    can affirmatively say the path is not in its index — never when the question
+    can't be asked. A missing/unreachable git, a timeout, or `root` not being a
+    work tree all read `_git` as ``None``; treating that as "provably untracked"
+    would fail *open* (exempt, i.e. silently drop, a file that might well be a real
+    tracked source) in the one predicate whose job this round is to stop exactly
+    that silent bypass — so ``None`` never exempts.
 
     ``:(literal)`` keeps `rel` from being read as a glob/pathspec-magic pattern —
-    a tracked file literally named ``.forseti-units-[a].c`` would otherwise be
-    matched as a character class instead of itself and could read as untracked.
+    a tracked file literally named ``.forseti-units-[a].c`` (or
+    ``.forseti-verify-[a].c``) would otherwise be matched as a character class
+    instead of itself and could read as untracked.
 
     The residual this leaves, deliberately: a *new*, not-yet-tracked legitimate
-    source that happens to share the prefix is still silently exempt until it is
+    source that happens to share a prefix is still silently exempt until it is
     `git add`ed. Narrowing further (e.g. also requiring `mkstemp`'s random-suffix
     shape) is a second, overlapping guard for the same gap trackedness already
     closes for the common case (a killed hook's snapshot is never staged, per
     `_index_ignore_snapshot`) — not worth it for how exotic a deliberately
     prefix-named untracked source is.
     """
-    if not os.path.basename(rel).startswith(_ENUM_SNAPSHOT_PREFIX):
-        return False
-    listed = _git(root, "ls-files", "-z", "--", f":(literal){rel}")
-    return listed is not None and not listed.strip()
-
-
-def _untracked_verify_snapshot(root: str, rel: str) -> bool:
-    """True only when repo-root-relative `rel` is a *provably untracked* leftover
-    matching the verify snapshot's basename prefix (`_VERIFY_SNAPSHOT_PREFIX`).
-
-    A snapshot `_verifiable_source` could not clean up (a kill) must never be
-    handed back to `verify_and_record` as a source in its own right — that is
-    this check's job. But a repository can also already *track* a legitimate
-    source whose name happens to share the prefix; excluding by name alone would
-    silently drop a real, changed file from every scan (a Bash edit to it would
-    ship unverified, since the direct Write/Edit hook never sees a Bash write —
-    review feedback on PR #159, issue #150). So the exemption only fires when git
-    can affirmatively say the path is not in its index — never when the question
-    can't be asked. A missing/unreachable git, a timeout, or `root` not being a
-    work tree all read `_git` as ``None``; treating that as "provably untracked"
-    would fail *open* (exempt, i.e. silently drop, a file that might well be a
-    real tracked source) in the one predicate whose job this round is to stop
-    exactly that silent bypass — so ``None`` never exempts.
-
-    ``:(literal)`` keeps `rel` from being read as a glob/pathspec-magic pattern —
-    a tracked file literally named ``.forseti-verify-[a].c`` would otherwise be
-    matched as a character class instead of itself and could read as untracked.
-
-    The residual this leaves, deliberately: a *new*, not-yet-tracked legitimate
-    source that happens to share the prefix is still silently exempt until it is
-    `git add`ed. Narrowing further (e.g. also requiring `mkstemp`'s random-suffix
-    shape) is a second, overlapping guard for the same gap trackedness already
-    closes for the common case — not worth it for how exotic a deliberately
-    prefix-named untracked source is.
-    """
-    if not os.path.basename(rel).startswith(_VERIFY_SNAPSHOT_PREFIX):
+    if not os.path.basename(rel).startswith(_SNAPSHOT_PREFIXES):
         return False
     listed = _git(root, "ls-files", "-z", "--", f":(literal){rel}")
     return listed is not None and not listed.strip()
@@ -1182,7 +1159,7 @@ def _in_scope_c_abspath(
     if offset == os.pardir or offset.startswith(os.pardir + os.sep):
         return None  # lexically outside project_dir's own subtree
     spelled = os.path.join(project_dir, offset)
-    if _untracked_snapshot(root, rel) or _untracked_verify_snapshot(root, rel):
+    if _untracked_snapshot(root, rel):
         return None
     if not _included(offset):
         return None
@@ -1661,7 +1638,7 @@ def _verifiable_source(
     the source's real basename, suffix and all (review feedback on PR #159,
     issue #150).
 
-    The name carries `_VERIFY_SNAPSHOT_PREFIX` so `_untracked_verify_snapshot`
+    The name carries `_VERIFY_SNAPSHOT_PREFIX` so `_untracked_snapshot`
     excludes it from the gate's own discovery for as long as it is untracked —
     see there for why a *tracked* file sharing the prefix must not be exempted
     the same way. `git status` still lists it until the `finally` below runs
