@@ -112,30 +112,25 @@ class ProviderFixPort:
 
     On each call it reads the current source, builds the `FixRequest`, asks the
     provider for patched text, and writes that text to a fresh versioned unit
-    (`<stem>.fix<N><suffix>`) *beside the original source* — same directory,
-    returning its path. Same directory, because a non-self-contained C unit
-    with sibling quoted includes (`#include "harness.h"`) resolves those
-    relative to the including file's own directory; writing the candidate
-    elsewhere breaks that resolution and can turn a real re-verify into a
-    parse error even though the original source verified (issue #39). The
-    residual this trades for is narrow: a unit that `#include`s *itself* by
-    its own literal filename still reaches the live original, since a fresh
-    `.fixN` name can never occupy it. Writing a new file per fix keeps every
-    `Iteration.source` a distinct path and never mutates `original`;
-    exclusive creation means a stale leftover from a previous run fails loud
-    rather than silently being overwritten, and that check runs before asking
-    the provider for a patch, so it's caught before paying for a (possibly
-    LLM-backed) `propose_fix` call that would only be discarded. Because it
-    returns the next path to verify, `run_loop`'s existing "fix then
-    re-verify" loop *is* the apply+re-enter — the driver is unchanged.
+    (`<stem>.fix<N><suffix>`) beside the original source. Same directory,
+    because a non-self-contained C unit with sibling quoted includes
+    (`#include "harness.h"`) resolves those relative to the including file's
+    own directory; writing the candidate elsewhere breaks that resolution on
+    re-verify (issue #39). The residual: a unit that `#include`s itself by its
+    own literal filename still reaches the live original, since a fresh
+    `.fixN` name can never occupy it.
+
+    Writing a new file per fix keeps every `Iteration.source` a distinct path
+    and never mutates `original`. Exclusive creation means a stale leftover
+    from a previous run fails loud instead of being silently overwritten.
+    Because it returns the next path to verify, `run_loop`'s existing "fix
+    then re-verify" loop *is* the apply+re-enter — the driver is unchanged.
 
     One instance is scoped to one unit, named explicitly by the `original`
     constructor argument. Every `__call__` must pass either that same path or
-    one of this instance's own prior outputs (round 2+, fed back in by
-    `run_loop`) — never an unrelated file; reusing one instance across two
-    different units would otherwise silently write the second unit's fix
-    beside the first unit's source, so an unrelated `source` fails loud
-    instead.
+    one of this instance's own prior outputs (fed back in by `run_loop` on
+    round 2+) — an unrelated source fails loud instead of silently writing a
+    second unit's fix under the first unit's stem.
     """
 
     def __init__(self, provider: FixProvider, *, original: Path) -> None:
@@ -143,32 +138,33 @@ class ProviderFixPort:
         self._original = original
         self._attempt = 0
 
-    def __call__(self, source: Path, violated: Violated) -> Path:
-        prior_outputs = {
+    def _candidate(self, attempt: int) -> Path:
+        return (
             self._original.parent
-            / f"{self._original.stem}.fix{i}{self._original.suffix}"
-            for i in range(1, self._attempt + 1)
-        }
+            / f"{self._original.stem}.fix{attempt}{self._original.suffix}"
+        )
+
+    def __call__(self, source: Path, violated: Violated) -> Path:
+        prior_outputs = {self._candidate(i) for i in range(1, self._attempt + 1)}
         if source != self._original and source not in prior_outputs:
             raise ValueError(
                 f"ProviderFixPort is bound to {self._original}; got unrelated "
                 f"source {source}. Use a separate ProviderFixPort per unit."
             )
         attempt = self._attempt + 1
-        dest = (
-            self._original.parent
-            / f"{self._original.stem}.fix{attempt}{self._original.suffix}"
-        )
-        # Checked before propose_fix so a stale leftover is caught without
-        # paying for a (possibly LLM-backed) fix proposal that would only be
-        # discarded.
+        dest = self._candidate(attempt)
         if dest.exists():
             raise FileExistsError(f"candidate already exists: {dest}")
         request = FixRequest.from_violation(source, source.read_text(), violated)
         patched = self._provider.propose_fix(request)
+        # Burn the attempt number before writing, not before propose_fix: a
+        # propose_fix failure leaves no file behind and should stay retryable
+        # under the same number, but a write failure (e.g. disk full) after
+        # `open("x")` already created `dest` must not let the next call
+        # recompute and collide with that same `dest` forever.
+        self._attempt = attempt
         with dest.open("x") as f:
             f.write(patched)
-        self._attempt = attempt
         return dest
 
 
