@@ -90,7 +90,7 @@ def test_abs_int_min_loop_converges_via_provider(tmp_path: Path) -> None:
     unit = tmp_path / "abs.c"
     shutil.copy(EXAMPLES / "abs.c", unit)
     provider = RecordedFixProvider({unit: EXAMPLES / "abs_fixed.c"})
-    fix = ProviderFixPort(provider, original=unit)
+    fix = ProviderFixPort(provider, original=unit, work_dir=unit.parent)
 
     run = run_loop(unit, verify=verify, fix=fix, unwind=1, max_iterations=2)
 
@@ -109,7 +109,7 @@ def test_abs_run_emits_telemetry_and_renders_transcript(tmp_path: Path) -> None:
     unit = tmp_path / "abs.c"
     shutil.copy(EXAMPLES / "abs.c", unit)
     provider = RecordedFixProvider({unit: EXAMPLES / "abs_fixed.c"})
-    fix = ProviderFixPort(provider, original=unit)
+    fix = ProviderFixPort(provider, original=unit, work_dir=unit.parent)
     sink = ListSink()
 
     run = run_loop(

@@ -67,7 +67,7 @@ def _drive(bug: str, clean: str, k: int, *, tmp_path: Path, sink: ListSink) -> L
     staged = tmp_path / bug
     shutil.copy(EXAMPLES / bug, staged)
     provider = RecordedFixProvider({staged: EXAMPLES / clean})
-    fix = ProviderFixPort(provider, original=staged)
+    fix = ProviderFixPort(provider, original=staged, work_dir=staged.parent)
     return run_loop(
         staged, verify=_verify, fix=fix, unwind=k, max_iterations=2, sink=sink
     )

@@ -112,19 +112,39 @@ class ProviderFixPort:
 
     On each call it reads the current source, builds the `FixRequest`, asks the
     provider for patched text, and writes that text to a fresh versioned unit
-    (`<stem>.fix<N><suffix>`) beside the original source. Same directory,
-    because a non-self-contained C unit with sibling quoted includes
-    (`#include "harness.h"`) resolves those relative to the including file's
-    own directory; writing the candidate elsewhere breaks that resolution on
-    re-verify (issue #39). The residual: a unit that `#include`s itself by its
-    own literal filename still reaches the live original, since a fresh
-    `.fixN` name can never occupy it.
+    (`<stem>.fix<N><suffix>`) under `work_dir`, returning its path. `work_dir`
+    is caller-chosen and always writable by contract — unlike `original`,
+    which may live in a read-only checkout or mounted source tree (PR #207
+    review). Writing a new file per fix keeps every `Iteration.source` a
+    distinct path and never mutates `original`; exclusive creation means a
+    stale leftover from a previous run fails loud instead of being silently
+    overwritten. Because it returns the next path to verify, `run_loop`'s
+    existing "fix then re-verify" loop *is* the apply+re-enter — the driver is
+    unchanged.
 
-    Writing a new file per fix keeps every `Iteration.source` a distinct path
-    and never mutates `original`. Exclusive creation means a stale leftover
-    from a previous run fails loud instead of being silently overwritten.
-    Because it returns the next path to verify, `run_loop`'s existing "fix
-    then re-verify" loop *is* the apply+re-enter — the driver is unchanged.
+    Quoted-include resolution (issue #39) is a `work_dir` choice, not
+    something this class does for you. A non-self-contained C unit with
+    sibling quoted includes (`#include "harness.h"`) resolves those relative
+    to the including file's own directory:
+
+    - Pass `work_dir=original.parent` (same directory) when `original`'s
+      directory is writable and that's the simplest choice — sibling includes
+      then resolve for free, exactly as they did in place. The residual: a
+      unit that `#include`s itself by its own literal filename still reaches
+      the live original, since a fresh `.fixN` name can never occupy it.
+    - When `original`'s directory is read-only, pass a separate writable
+      `work_dir` and carry the original include directory into verification
+      instead, e.g. `functools.partial(verify, extra_flags=("-I",
+      str(original.parent)))` as the `VerifyPort` given to `run_loop` —
+      `forseti.esbmc.verify` already accepts `extra_flags`, so this needs no
+      change to `VerifyPort`'s protocol, just a closure at the call site.
+      Quoted-include search checks the including file's own directory
+      (`work_dir`) first and falls back to `-I` dirs, so this reproduces the
+      original resolution — including `../`-relative sibling includes,
+      resolved against the real `original.parent` — without mirroring any
+      files into `work_dir`. The residual: a same-named file already sitting
+      in `work_dir` would shadow the real header, so give each fix session
+      its own dedicated `work_dir`.
 
     One instance is scoped to one unit, named explicitly by the `original`
     constructor argument. Every `__call__` must pass either that same path or
@@ -133,15 +153,19 @@ class ProviderFixPort:
     second unit's fix under the first unit's stem.
     """
 
-    def __init__(self, provider: FixProvider, *, original: Path) -> None:
+    def __init__(
+        self, provider: FixProvider, *, original: Path, work_dir: Path
+    ) -> None:
         self._provider = provider
         self._original = original
+        self._work_dir = work_dir
         self._attempt = 0
         self._last_output: Path | None = None
+        work_dir.mkdir(parents=True, exist_ok=True)
 
     def _candidate(self, attempt: int) -> Path:
         return (
-            self._original.parent
+            self._work_dir
             / f"{self._original.stem}.fix{attempt}{self._original.suffix}"
         )
 

@@ -7,6 +7,7 @@ in for a real ESBMC trace, and a recorded provider replays known-good source.
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
@@ -123,7 +124,9 @@ class StubProvider:
 def test_provider_fix_port_writes_and_returns_versioned_path(tmp_path: Path) -> None:
     source = tmp_path / "kernel.c"
     source.write_text("orig\n")
-    fix = ProviderFixPort(StubProvider("patched\n"), original=source)
+    fix = ProviderFixPort(
+        StubProvider("patched\n"), original=source, work_dir=source.parent
+    )
 
     dest1 = fix(source, violated())
 
@@ -133,6 +136,37 @@ def test_provider_fix_port_writes_and_returns_versioned_path(tmp_path: Path) -> 
 
     dest2 = fix(source, violated())
     assert dest2.name == "kernel.fix2.c"
+
+
+def test_provider_fix_port_writes_to_work_dir_when_source_dir_is_read_only(
+    tmp_path: Path,
+) -> None:
+    # PR #207 review: the previous API could read from a read-only checkout
+    # and place candidates in a caller-provided writable work_dir; #39's
+    # same-directory-only write broke that. work_dir must be honoured even
+    # when the source directory itself can't be written to.
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permission bits")
+    source_dir = tmp_path / "readonly_source"
+    source_dir.mkdir()
+    source = source_dir / "kernel.c"
+    source.write_text("orig\n")
+    work_dir = tmp_path / "work"
+    original_mode = source_dir.stat().st_mode
+    source_dir.chmod(0o555)
+    try:
+        fix = ProviderFixPort(
+            StubProvider("patched\n"), original=source, work_dir=work_dir
+        )
+
+        dest = fix(source, violated())
+
+        assert dest.parent == work_dir
+        assert dest.read_text() == "patched\n"
+        # Nothing was ever written into the read-only source directory.
+        assert [p.name for p in source_dir.iterdir()] == ["kernel.c"]
+    finally:
+        source_dir.chmod(original_mode)
 
 
 def test_provider_fix_port_second_round_stays_beside_original(
@@ -145,7 +179,9 @@ def test_provider_fix_port_second_round_stays_beside_original(
     # kernel.fix1.fix2.c instead of kernel.fix2.c.
     source = tmp_path / "kernel.c"
     source.write_text("orig\n")
-    fix = ProviderFixPort(StubProvider("patched\n"), original=source)
+    fix = ProviderFixPort(
+        StubProvider("patched\n"), original=source, work_dir=source.parent
+    )
 
     dest1 = fix(source, violated())
     dest2 = fix(dest1, violated())
@@ -162,7 +198,7 @@ def test_provider_fix_port_refuses_to_clobber_a_stale_candidate(
     stale = tmp_path / "kernel.fix1.c"
     stale.write_text("stale leftover\n")
     provider = StubProvider("patched\n")
-    fix = ProviderFixPort(provider, original=source)
+    fix = ProviderFixPort(provider, original=source, work_dir=source.parent)
 
     with pytest.raises(FileExistsError):
         fix(source, violated())
@@ -185,7 +221,9 @@ def test_provider_fix_port_rejects_an_unrelated_source_from_a_reused_instance(
     unit_a.write_text("orig a\n")
     unit_b = tmp_path / "unit_b.c"
     unit_b.write_text("orig b\n")
-    fix = ProviderFixPort(StubProvider("patched\n"), original=unit_a)
+    fix = ProviderFixPort(
+        StubProvider("patched\n"), original=unit_a, work_dir=unit_a.parent
+    )
 
     fix(unit_a, violated())
 
@@ -211,7 +249,7 @@ def test_scripted_provider_drives_loop_abs_to_fixed(tmp_path: Path) -> None:
     unit = tmp_path / "abs.c"
     shutil.copy(EXAMPLES / "abs.c", unit)
     provider = RecordedFixProvider({unit: EXAMPLES / "abs_fixed.c"})
-    fix = ProviderFixPort(provider, original=unit)
+    fix = ProviderFixPort(provider, original=unit, work_dir=unit.parent)
     verify = FakeVerify([violated(), Verified(meta())])
 
     run = run_loop(unit, verify=verify, fix=fix, unwind=1, max_iterations=2)
