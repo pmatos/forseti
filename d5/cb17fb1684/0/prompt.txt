@@ -1,0 +1,36 @@
+I thought we had enabled semantic versioning here, semantic releases and commit title guidelines but running a tool install results in Installed 1 package in 1ms
+ ~ forseti==0.0.0 (from file:///home/pmatos/dev/forseti)
+
+The 0.0.0 tells me something is not working. We have done this elsewhere in github.com/pmatos/jsse if you need some inspiration to set things up. Another thing we should do - done in github.com/pmatos/symphonika - is automatic updates when the tool notices there's a new version available.
+
+---
+
+print an update command.
+
+---
+
+yes - latest github release artifact.
+
+---
+
+Check once every 12hrs but warn every time the tool is called in a banner before executing anything. If we have a quiet flag, don't print the update banner.
+
+---
+
+only user-facing CLI commands.
+
+---
+
+Go with 1.
+
+---
+
+Yes
+
+---
+
+Yes
+
+---
+
+Yes - implement using $tdd
