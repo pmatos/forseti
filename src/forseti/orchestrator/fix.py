@@ -137,6 +137,7 @@ class ProviderFixPort:
         self._provider = provider
         self._original = original
         self._attempt = 0
+        self._last_output: Path | None = None
 
     def _candidate(self, attempt: int) -> Path:
         return (
@@ -145,8 +146,11 @@ class ProviderFixPort:
         )
 
     def __call__(self, source: Path, violated: Violated) -> Path:
-        prior_outputs = {self._candidate(i) for i in range(1, self._attempt + 1)}
-        if source != self._original and source not in prior_outputs:
+        # `run_loop` only ever feeds back its own last output (`current = fix(
+        # current, violation)`), so the last output is the only prior output
+        # that can legitimately reappear as `source` — no need to remember
+        # every attempt this instance has ever produced.
+        if source != self._original and source != self._last_output:
             raise ValueError(
                 f"ProviderFixPort is bound to {self._original}; got unrelated "
                 f"source {source}. Use a separate ProviderFixPort per unit."
@@ -157,12 +161,14 @@ class ProviderFixPort:
             raise FileExistsError(f"candidate already exists: {dest}")
         request = FixRequest.from_violation(source, source.read_text(), violated)
         patched = self._provider.propose_fix(request)
-        # Burn the attempt number before writing, not before propose_fix: a
-        # propose_fix failure leaves no file behind and should stay retryable
-        # under the same number, but a write failure (e.g. disk full) after
-        # `open("x")` already created `dest` must not let the next call
-        # recompute and collide with that same `dest` forever.
+        # Burn the attempt number and record this as the accepted next input
+        # before writing, not before propose_fix: a propose_fix failure
+        # leaves no file behind and should stay retryable under the same
+        # number, but a write failure (e.g. disk full) after `open("x")`
+        # already created `dest` must not let the next call recompute and
+        # collide with that same `dest` forever.
         self._attempt = attempt
+        self._last_output = dest
         with dest.open("x") as f:
             f.write(patched)
         return dest
