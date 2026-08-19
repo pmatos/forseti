@@ -169,24 +169,25 @@ def test_provider_fix_port_writes_to_work_dir_when_source_dir_is_read_only(
         source_dir.chmod(original_mode)
 
 
-def test_provider_fix_port_second_round_stays_beside_original(
+def test_provider_fix_port_second_round_keeps_the_original_stem(
     tmp_path: Path,
 ) -> None:
     # run_loop feeds round 1's dest back in as round 2's `source` (Iteration's
     # `current = fix(current, violation)`). The applier must still derive the
-    # directory and stem from the *original* source, not from that relocated
-    # path, or round 2 would land beside round 1's candidate and be named
-    # kernel.fix1.fix2.c instead of kernel.fix2.c.
+    # stem from the *original* source, not from that relocated path, or round
+    # 2 would be named kernel.fix1.fix2.c instead of kernel.fix2.c. work_dir is
+    # deliberately not source.parent here, so a regression that re-derives the
+    # write location from `source` (round 2's relocated path) instead of the
+    # fixed work_dir would show up as dest2.parent, not just dest2.name.
     source = tmp_path / "kernel.c"
     source.write_text("orig\n")
-    fix = ProviderFixPort(
-        StubProvider("patched\n"), original=source, work_dir=source.parent
-    )
+    work_dir = tmp_path / "work"
+    fix = ProviderFixPort(StubProvider("patched\n"), original=source, work_dir=work_dir)
 
     dest1 = fix(source, violated())
     dest2 = fix(dest1, violated())
 
-    assert dest2.parent == source.parent
+    assert dest2.parent == work_dir
     assert dest2.name == "kernel.fix2.c"
 
 
@@ -215,8 +216,8 @@ def test_provider_fix_port_rejects_an_unrelated_source_from_a_reused_instance(
 ) -> None:
     # A ProviderFixPort instance is scoped to the first source it ever saw.
     # Reusing one instance across two different units must fail loud instead
-    # of silently writing the second unit's fix beside the first unit's file
-    # under the first unit's stem.
+    # of silently writing the second unit's fix into work_dir under the first
+    # unit's stem.
     unit_a = tmp_path / "unit_a.c"
     unit_a.write_text("orig a\n")
     unit_b = tmp_path / "unit_b.c"
