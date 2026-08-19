@@ -121,18 +121,50 @@ class StubProvider:
 def test_provider_fix_port_writes_and_returns_versioned_path(tmp_path: Path) -> None:
     source = tmp_path / "kernel.c"
     source.write_text("orig\n")
-    work_dir = tmp_path / "work"
-    fix = ProviderFixPort(StubProvider("patched\n"), work_dir=work_dir)
+    fix = ProviderFixPort(StubProvider("patched\n"))
 
     dest1 = fix(source, violated())
 
-    assert work_dir.is_dir()
-    assert dest1.parent == work_dir
+    assert dest1.parent == source.parent
     assert dest1.name == "kernel.fix1.c"
     assert dest1.read_text() == "patched\n"
 
     dest2 = fix(source, violated())
     assert dest2.name == "kernel.fix2.c"
+
+
+def test_provider_fix_port_second_round_stays_beside_original(
+    tmp_path: Path,
+) -> None:
+    # run_loop feeds round 1's dest back in as round 2's `source` (Iteration's
+    # `current = fix(current, violation)`). The applier must still derive the
+    # directory and stem from the *original* source, not from that relocated
+    # path, or round 2 would land beside round 1's candidate and be named
+    # kernel.fix1.fix2.c instead of kernel.fix2.c.
+    source = tmp_path / "kernel.c"
+    source.write_text("orig\n")
+    fix = ProviderFixPort(StubProvider("patched\n"))
+
+    dest1 = fix(source, violated())
+    dest2 = fix(dest1, violated())
+
+    assert dest2.parent == source.parent
+    assert dest2.name == "kernel.fix2.c"
+
+
+def test_provider_fix_port_refuses_to_clobber_a_stale_candidate(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "kernel.c"
+    source.write_text("orig\n")
+    stale = tmp_path / "kernel.fix1.c"
+    stale.write_text("stale leftover\n")
+    fix = ProviderFixPort(StubProvider("patched\n"))
+
+    with pytest.raises(FileExistsError):
+        fix(source, violated())
+
+    assert stale.read_text() == "stale leftover\n"
 
 
 class FakeVerify:
@@ -153,7 +185,7 @@ def test_scripted_provider_drives_loop_abs_to_fixed(tmp_path: Path) -> None:
     unit = tmp_path / "abs.c"
     shutil.copy(EXAMPLES / "abs.c", unit)
     provider = RecordedFixProvider({unit: EXAMPLES / "abs_fixed.c"})
-    fix = ProviderFixPort(provider, work_dir=tmp_path / "work")
+    fix = ProviderFixPort(provider)
     verify = FakeVerify([violated(), Verified(meta())])
 
     run = run_loop(unit, verify=verify, fix=fix, unwind=1, max_iterations=2)
@@ -161,6 +193,6 @@ def test_scripted_provider_drives_loop_abs_to_fixed(tmp_path: Path) -> None:
     assert run.final_state is LoopState.DONE
     assert provider.calls == 1
     # The path the final (VERIFIED) pass ran on is the applier's output; read it
-    # back from the run rather than guessing the work/abs.fix1.c filename.
+    # back from the run rather than guessing the abs.fix1.c filename.
     applied = run.iterations[-1].source
     assert applied.read_text() == (EXAMPLES / "abs_fixed.c").read_text()

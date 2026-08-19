@@ -112,24 +112,44 @@ class ProviderFixPort:
 
     On each call it reads the current source, builds the `FixRequest`, asks the
     provider for patched text, and writes that text to a fresh versioned unit
-    (`<stem>.fix<N><suffix>`) under `work_dir`, returning its path. Writing a new
-    file per fix keeps every `Iteration.source` a distinct path and never mutates
-    the input. Because it returns the next path to verify, `run_loop`'s existing
-    "fix then re-verify" loop *is* the apply+re-enter — the driver is unchanged.
+    (`<stem>.fix<N><suffix>`) *beside the original source* — same directory,
+    returning its path. Same directory, not an unrelated `work_dir`, because a
+    non-self-contained C unit with sibling quoted includes (`#include
+    "harness.h"`) resolves those relative to the including file's own
+    directory; writing the candidate elsewhere breaks that resolution and can
+    turn a real re-verify into a parse error even though the original source
+    verified (issue #39). The residual this trades for is narrow: a unit that
+    `#include`s *itself* by its own literal filename still reaches the live
+    original, since a fresh `.fixN` name can never occupy it. The directory and
+    stem are always derived from the *first* `source` this instance ever saw,
+    not the `source` passed on later rounds — after round 1 that argument is
+    this applier's own previous output, and re-deriving from it would both
+    double the `.fix1.fix2` suffix and (if a provider is ever driven from a
+    relocated candidate) drift off the real source tree. Writing a new file per
+    fix keeps every `Iteration.source` a distinct path and never mutates the
+    original; exclusive creation means a stale leftover from a previous run
+    fails loud rather than silently being overwritten. Because it returns the
+    next path to verify, `run_loop`'s existing "fix then re-verify" loop *is*
+    the apply+re-enter — the driver is unchanged.
     """
 
-    def __init__(self, provider: FixProvider, *, work_dir: Path) -> None:
+    def __init__(self, provider: FixProvider) -> None:
         self._provider = provider
-        self._work_dir = work_dir
         self._attempt = 0
-        work_dir.mkdir(parents=True, exist_ok=True)
+        self._original: Path | None = None
 
     def __call__(self, source: Path, violated: Violated) -> Path:
+        if self._original is None:
+            self._original = source
         request = FixRequest.from_violation(source, source.read_text(), violated)
         patched = self._provider.propose_fix(request)
         self._attempt += 1
-        dest = self._work_dir / f"{source.stem}.fix{self._attempt}{source.suffix}"
-        dest.write_text(patched)
+        dest = (
+            self._original.parent
+            / f"{self._original.stem}.fix{self._attempt}{self._original.suffix}"
+        )
+        with dest.open("x") as f:
+            f.write(patched)
         return dest
 
 
