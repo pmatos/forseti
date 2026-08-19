@@ -3,7 +3,7 @@
   "checkpoint_id": "d5cb17fb1684",
   "session_id": "01a01a02-35c6-7a32-976d-190b139ad18c",
   "strategy": "manual-commit",
-  "created_at": "2026-08-19T13:04:27.370496312Z",
+  "created_at": "2026-08-19T13:04:55.606469015Z",
   "branch": "main",
   "checkpoints_count": 8,
   "files_touched": [
@@ -12,44 +12,29 @@
   "agent": "Codex",
   "model": "gpt-5.6-sol",
   "turn_id": "a284f70fb8c7",
-  "compact_transcript_start": 0,
+  "checkpoint_transcript_start": 264,
+  "transcript_lines_at_start": 264,
+  "compact_transcript_start": 41,
   "token_usage": {
-    "input_tokens": 124234,
+    "input_tokens": 5385,
     "cache_creation_tokens": 0,
-    "cache_read_tokens": 2063104,
-    "output_tokens": 22517,
-    "api_call_count": 29
+    "cache_read_tokens": 348416,
+    "output_tokens": 1051,
+    "api_call_count": 3
   },
   "session_metrics": {
     "turn_count": 8
   },
   "initial_attribution": {
-    "calculated_at": "2026-08-19T13:04:27.315990989Z",
-    "agent_lines": 173,
-    "agent_removed": 0,
+    "calculated_at": "2026-08-19T13:04:55.551923928Z",
+    "agent_lines": 1,
+    "agent_removed": 1,
     "human_added": 0,
     "human_modified": 0,
     "human_removed": 0,
-    "total_committed": 173,
-    "total_lines_changed": 173,
+    "total_committed": 1,
+    "total_lines_changed": 2,
     "agent_percentage": 100,
     "metric_version": 2
-  },
-  "prompt_attributions": [
-    {
-      "checkpoint_number": 1,
-      "user_lines_added": 1536,
-      "user_lines_removed": 0,
-      "agent_lines_added": 0,
-      "agent_lines_removed": 0,
-      "user_added_per_file": {
-        ".claude/settings.json": 84,
-        ".codex/config.toml": 3,
-        ".codex/hooks.json": 52,
-        "docs/research/0001-specula-relevance.md": 326,
-        "package-lock.json": 6,
-        "uv.lock": 1065
-      }
-    }
-  ]
+  }
 }
