@@ -1,7 +1,6 @@
-# semantic-release baseline for NON-JS repos (Rust / Python / Racket / C / ...).
-# Produces GitHub Releases + a maintained CHANGELOG.md from Conventional Commits.
-# Ecosystem publishing (crates.io / PyPI) is deliberately NOT wired here — add the
-# relevant plugin (@semantic-release/exec, semantic-release-cargo, etc.) per repo.
+# Produces GitHub Releases, a maintained CHANGELOG.md, and an installable Python
+# wheel from Conventional Commits. PyPI publishing is deliberately not wired:
+# GitHub Release assets are Forseti's canonical distribution channel.
 #
 # Releases are cut on a weekly batch schedule (Sundays 00:00 UTC) rather than on
 # every push, so semantic-release derives the next version from whatever
@@ -31,10 +30,16 @@ jobs:
       - uses: actions/setup-node@v7.0.0
         with:
           node-version: lts/*
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install wheel build tools
+        run: python -m pip install --upgrade "build>=1.4.3" "setuptools>=84.0.0"
       - uses: cycjimmy/semantic-release-action@v6.0.0
         with:
           extra_plugins: |
             @semantic-release/changelog@6
             @semantic-release/git@10
+            @semantic-release/exec@7
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

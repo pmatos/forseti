@@ -10,6 +10,10 @@ real-verdict end-to-end path lives in test_verify_integration.py.
 
 from __future__ import annotations
 
+import importlib.metadata
+import io
+import json
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +69,67 @@ def test_verified_exits_zero_and_renders_header(
     code = cli.main(["f.c"])
     assert code == 0
     assert "VERIFIED" in capsys.readouterr().out
+
+
+def test_user_facing_esbmc_command_warns_when_a_new_wheel_exists(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    wheel_url = (
+        "https://github.com/pmatos/forseti/releases/download/"
+        "v1.8.0/forseti-1.8.0-py3-none-any.whl"
+    )
+    payload = {
+        "tag_name": "v1.8.0",
+        "assets": [
+            {
+                "name": "forseti-1.8.0-py3-none-any.whl",
+                "browser_download_url": wheel_url,
+            }
+        ],
+    }
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "1.7.5")
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda _request, *, timeout: io.BytesIO(json.dumps(payload).encode()),
+    )
+    _patch_verify(monkeypatch, Verified(_meta()))
+
+    assert cli.main(["f.c"]) == 0
+    captured = capsys.readouterr()
+    assert "VERIFIED" in captured.out
+    assert captured.err == (
+        "╭─ Forseti update available: 1.7.5 → 1.8.0\n"
+        f"│ uv tool install --force {wheel_url}\n"
+        "╰─\n"
+    )
+
+
+def test_version_option_reports_the_installed_distribution_version(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "1.7.5")
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda _request, *, timeout: io.BytesIO(
+            json.dumps({"tag_name": "v1.7.5", "assets": []}).encode()
+        ),
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--version"])
+
+    assert excinfo.value.code == 0
+    captured = capsys.readouterr()
+    assert captured.out == "forseti-esbmc 1.7.5\n"
+    assert captured.err == ""
 
 
 def test_violated_exits_one_and_prints_counterexample(

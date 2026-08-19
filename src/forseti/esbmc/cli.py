@@ -8,6 +8,9 @@ the classification lives in the library, never here.
 from __future__ import annotations
 
 import argparse
+import sys
+
+from forseti.update_notice import installed_version, update_notice
 
 from .render import EXIT_CODES, render_result
 from .runner import verify
@@ -22,11 +25,19 @@ def _build_parser() -> argparse.ArgumentParser:
             "verified (up to k) | violated | unknown | error."
         ),
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {installed_version() or 'unknown'}",
+    )
     add_verify_arguments(parser)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    notice = update_notice()
+    if notice is not None:
+        print(notice, file=sys.stderr)
     args = _build_parser().parse_args(argv)
     result = verify(args.source, **verify_kwargs(args))
     print(render_result(result, args.source, args.unwind))

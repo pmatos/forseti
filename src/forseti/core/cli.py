@@ -80,6 +80,7 @@ from forseti.properties import (
     ProposalParseError,
     ProposalResult,
 )
+from forseti.update_notice import installed_version, update_notice
 
 from . import EXIT_CODES
 from .propose import (
@@ -581,6 +582,11 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="forseti",
         description="Forseti Core: write -> verify -> counterexample -> fix.",
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {installed_version() or 'unknown'}",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     # Each `_add_*` helper binds its own handler via `set_defaults(func=...)`, so
     # registering a subcommand *is* wiring its dispatch — there is no parallel
@@ -597,7 +603,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if not arguments or arguments[0] not in {"claude-code-hook", "mcp"}:
+        notice = update_notice()
+        if notice is not None:
+            print(notice, file=sys.stderr)
+    args = _build_parser().parse_args(arguments)
     # `required=True` guarantees a subcommand (and thus a bound `func`) was
     # parsed, or argparse exits before we get here.
     handler: Callable[[argparse.Namespace], int] = args.func
