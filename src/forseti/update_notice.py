@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import importlib.metadata
 import json
 import os
@@ -44,7 +45,7 @@ def update_notice() -> str | None:
     else:
         try:
             candidate = _fetch_candidate(current_version)
-        except (OSError, TypeError, ValueError):
+        except (OSError, TypeError, ValueError, http.client.HTTPException):
             candidate = cache.candidate if cache is not None else None
         with suppress(OSError):
             _write_cache(cache_path, _Cache(checked_at=now, candidate=candidate))

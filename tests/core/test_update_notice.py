@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import importlib.metadata
 import io
 import json
@@ -164,6 +165,31 @@ def test_github_failure_is_silent_and_throttled(
         raise urllib.error.URLError("offline")
 
     monkeypatch.setattr(urllib.request, "urlopen", unavailable)
+    project = tmp_path / "project"
+
+    assert main(["enable-project", str(project)]) == 0
+    assert capsys.readouterr().err == ""
+    assert main(["enable-project", str(project)]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_http_protocol_failure_is_silent_and_throttled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "1.7.5")
+    attempted = False
+
+    def truncated(_request: object, *, timeout: float) -> _Response:
+        nonlocal attempted
+        if attempted:
+            pytest.fail("a failed check was not throttled")
+        attempted = True
+        raise http.client.IncompleteRead(b"")
+
+    monkeypatch.setattr(urllib.request, "urlopen", truncated)
     project = tmp_path / "project"
 
     assert main(["enable-project", str(project)]) == 0
