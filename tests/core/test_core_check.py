@@ -217,6 +217,69 @@ def test_cli_check_json_ok(
     assert payload["counts"]["held"] == 1
 
 
+def test_cli_check_unwind_above_default_ladder_floor_does_not_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--unwind 8` alone (no explicit `--unwind-ladder`) used to build the fixed
+    default ladder `(8, 16)` regardless, producing the non-increasing `(8, 8,
+    16)` and an uncaught `ValueError` (issue #95 review). The derived default
+    should drop `8` and keep the rungs above it -- `(16,)`."""
+    source = _write_unit(tmp_path)
+    unit_id = f"{source}::my_abs"
+    root = tmp_path / ".forseti"
+    _seed_store(root, _semantic(unit_id, "result >= 0", ("x > INT64_MIN",)))
+
+    fake = FakeVerify([Verified(_meta(8))])
+    monkeypatch.setattr(
+        "forseti.core.cli.check_source", partial(check_source, verify_port=fake)
+    )
+    code = main(
+        [
+            "check",
+            str(source),
+            "--function",
+            "my_abs",
+            "--store-root",
+            str(root),
+            "--unwind",
+            "8",
+        ]
+    )
+    assert code == 0
+    assert fake.unwinds == [8]  # no escalation needed -- (16,) never used
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_cli_check_explicit_ladder_still_raises_a_clean_diagnostic(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An explicitly-supplied non-increasing ladder is still a user error, but
+    the CLI must report it, not crash."""
+    source = _write_unit(tmp_path)
+    unit_id = f"{source}::my_abs"
+    root = tmp_path / ".forseti"
+    _seed_store(root, _semantic(unit_id, "result >= 0", ("x > INT64_MIN",)))
+
+    code = main(
+        [
+            "check",
+            str(source),
+            "--function",
+            "my_abs",
+            "--store-root",
+            str(root),
+            "--unwind",
+            "10",
+            "--unwind-ladder",
+            "8,16",
+        ]
+    )
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "forseti check:" in err
+    assert "Traceback" not in err
+
+
 def test_cli_check_store_error_exits_one(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

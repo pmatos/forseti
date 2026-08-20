@@ -527,11 +527,12 @@ def _add_check_parser(
     p.add_argument(
         "--unwind-ladder",
         type=_parse_ladder,
-        default=CHECK_DEFAULT_UNWIND_LADDER,
+        default=None,
         metavar="K1,K2,...",
         help=(
             "comma-separated bounds tried after --unwind on an UNKNOWN verdict "
-            f"(default: {','.join(map(str, CHECK_DEFAULT_UNWIND_LADDER))})"
+            f"(default: whichever of {','.join(map(str, CHECK_DEFAULT_UNWIND_LADDER))} "
+            "exceed --unwind, so raising -k/--unwind alone still works)"
         ),
     )
     p.add_argument(
@@ -607,18 +608,25 @@ def _render_check(run: PropertyCheckRun) -> str:
 
 
 def _run_check(args: argparse.Namespace) -> int:
+    unwind_ladder = args.unwind_ladder
+    if unwind_ladder is None:
+        # --unwind-ladder wasn't given: derive it from the chosen --unwind so
+        # `-k 8` (or higher) doesn't collide with the fixed default rungs and
+        # raise ValueError below (issue #95 review) -- an explicit
+        # --unwind-ladder (including "" -> ()) always passes through as-is.
+        unwind_ladder = tuple(k for k in CHECK_DEFAULT_UNWIND_LADDER if k > args.unwind)
     try:
         result = check_source(
             args.source,
             function=args.function,
             store_root=args.store_root,
             unwind=args.unwind,
-            unwind_ladder=args.unwind_ladder,
+            unwind_ladder=unwind_ladder,
             timeout_s=args.timeout,
             extra_flags=tuple(args.esbmc_args),
             esbmc_bin=args.esbmc_bin,
         )
-    except (PropertyStoreError, OSError) as exc:
+    except (PropertyStoreError, OSError, ValueError) as exc:
         print(f"forseti check: {exc}", file=sys.stderr)
         return 1
     if args.json:
