@@ -109,10 +109,16 @@ class SemanticCheckSummary:
     --json`'s own `verdicts[]` shape, plus `unit_id`). `unresolved` are the
     same shape for UNKNOWN/ERROR outcomes -- CLAUDE.md's "never silently pass
     UNKNOWN" applies here too, so those are reported rather than dropped.
-    `checked`/`deferred` count units-with-candidates actually checked vs. held
-    back by `MAX_UNITS_PER_TURN` -- so a project with more proposed units than
-    one turn's budget is told it, rather than reading as fully covered.
-    `failed` counts a unit `_check_unit` could not get any verdicts for at all
+    `skipped` are the same shape for SKIPPED outcomes -- a reachability-kind
+    property `forseti check` deliberately defers (ADR-0009 D2), not a failure,
+    but still not a property that was actually checked; a unit whose only
+    stored candidate is reachability-kind would otherwise `check` clean
+    (`checked` incremented, no violation/unresolved/failed) and read as fully
+    covered when nothing was ever verified (issue #95 review). `checked`/
+    `deferred` count units-with-candidates actually checked vs. held back by
+    `MAX_UNITS_PER_TURN` -- so a project with more proposed units than one
+    turn's budget is told it, rather than reading as fully covered. `failed`
+    counts a unit `_check_unit` could not get any verdicts for at all
     (subprocess timeout, bad build flags, an unparseable payload) -- distinct
     from `unresolved`, which is a property `forseti check` *did* run but
     couldn't settle; a unit that never ran isn't silently indistinguishable
@@ -124,6 +130,7 @@ class SemanticCheckSummary:
     deferred: int
     unresolved: tuple[dict[str, Any], ...] = ()
     failed: int = 0
+    skipped: tuple[dict[str, Any], ...] = ()
 
     @property
     def empty(self) -> bool:
@@ -132,6 +139,7 @@ class SemanticCheckSummary:
             and not self.deferred
             and not self.unresolved
             and not self.failed
+            and not self.skipped
         )
 
 
@@ -302,6 +310,7 @@ def semantic_check_summary(
     deferred = max(0, len(candidates) - MAX_UNITS_PER_TURN)
     violations: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
     checked = 0
     failed = 0
     # Aggregate wall-clock cap across this whole loop, not just each unit's own
@@ -337,6 +346,8 @@ def semantic_check_summary(
                 violations.append(verdict)
             elif outcome in ("unknown", "error"):
                 unresolved.append(verdict)
+            elif outcome == "skipped":
+                skipped.append(verdict)
     return SemanticCheckSummary(
-        tuple(violations), checked, deferred, tuple(unresolved), failed
+        tuple(violations), checked, deferred, tuple(unresolved), failed, tuple(skipped)
     )

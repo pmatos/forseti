@@ -168,6 +168,18 @@ def _semantic_message(summary: property_gate.SemanticCheckSummary) -> str:
             "silent pass (CLAUDE.md); investigate FORSETI_PROPERTY_CHECK_TIMEOUT_S "
             "or the project's build flags."
         )
+    if summary.skipped:
+        n = len(summary.skipped)
+        verb = "was" if n == 1 else "were"
+        lines += _property_lines(
+            f"⚠ Forseti: {n} generated propert{_plural(n)} {verb} skipped "
+            "(`forseti check` deferred a reachability-kind property, ADR-0009 "
+            "D2) — not a failure, but not actually checked either; never a "
+            "silent pass (CLAUDE.md):",
+            summary.skipped,
+            "•",
+            lambda v: f"({v.get('skip_reason')})",
+        )
     if summary.deferred:
         # NOT "rerun to cover them": checking never mutates a property's
         # stored status, so the selection is the same deterministic prefix
@@ -314,6 +326,7 @@ def main() -> int:
                 n_semantic_violations=len(semantic.violations),
                 n_semantic_unresolved=len(semantic.unresolved),
                 n_semantic_failed=semantic.failed,
+                n_semantic_skipped=len(semantic.skipped),
                 attempt=0,
             )
             return _emit({"systemMessage": "\n\n".join(notes)})

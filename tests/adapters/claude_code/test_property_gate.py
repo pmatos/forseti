@@ -375,6 +375,30 @@ def test_unresolved_outcomes_are_reported_not_dropped(
     assert not summary.empty  # never a silent pass
 
 
+def test_skipped_outcomes_are_reported_not_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reachability-kind property `forseti check` defers (SKIPPED, ADR-0009
+    D2) is not a failure, but it also isn't an actual check -- a unit whose
+    only stored candidate is reachability-kind must not read as a quiet,
+    fully-covered pass (issue #95 review).
+    """
+    source = tmp_path / "f.c"
+    unit_id = f"{source}::my_abs"
+    _add_candidate(tmp_path, unit_id)
+    state = _state(_unit(str(source), "my_abs"))
+
+    monkeypatch.setattr(subprocess, "run", _fake_run(_payload(unit_id, "skipped")))
+
+    summary = property_gate.semantic_check_summary(str(tmp_path), state)
+
+    assert summary.violations == ()
+    assert summary.unresolved == ()
+    assert len(summary.skipped) == 1
+    assert summary.skipped[0]["outcome"] == "skipped"
+    assert not summary.empty  # never a silent pass
+
+
 def test_held_property_reports_no_violation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
