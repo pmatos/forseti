@@ -89,6 +89,45 @@ def test_check_source_resolves_sibling_quoted_include_from_elsewhere(
     assert any((root / "check-work").glob("*.c"))
 
 
+def test_check_source_extra_flags_include_dir_wins_over_sibling_angle_bracket(
+    tmp_path: Path,
+) -> None:
+    """A project `-I` (`extra_flags`) must resolve `<...>` before the unit's own
+    directory, or a same-named sibling header silently shadows the project's
+    (issue #95 review: `-I` affects angle-bracket lookup order same as quoted,
+    unlike a quote-only `-iquote` esbmc doesn't have)."""
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    (src_dir / "config.h").write_text("#define BOUND 999999\n")
+    unit = src_dir / "kernel.c"
+    unit.write_text(
+        "#include <config.h>\n\nint bound_ok(int x) {\n    return x < BOUND;\n}\n"
+    )
+
+    proj_include = tmp_path / "proj_include"
+    proj_include.mkdir()
+    (proj_include / "config.h").write_text("#define BOUND 5\n")
+
+    unit_id = f"{unit}::bound_ok"
+    root = tmp_path / ".forseti"
+    store = PropertyStore.open(root)
+    # BOUND is visible in the harness scope (the #include is inlined ahead of
+    # main); only holds if `<config.h>` resolved to the project's copy (5),
+    # not the sibling's (999999) sitting next to the unit.
+    store.add(_semantic(unit_id, "BOUND == 5"))
+    store.close()
+
+    run = check_source(
+        unit,
+        function="bound_ok",
+        store_root=root,
+        extra_flags=(f"-I{proj_include}",),
+    )
+
+    assert run.counts()["error"] == 0
+    assert run.counts()["held"] == 1
+
+
 def test_cli_check_exit_codes_and_json(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

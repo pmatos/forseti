@@ -79,10 +79,14 @@ def check_source(
     property is `SKIPPED` (deferred, ADR-0009 D2), never verified.
 
     Harnesses are written under `store_root/"check-work"` (module docstring:
-    never beside `source`); `-I<source's resolved parent>` is always added
-    ahead of any caller-supplied `extra_flags` so a quoted include in the
-    inlined unit source still resolves. A raw `sqlite3.Error` opening or
-    reading the store
+    never beside `source`); `-I<source's resolved parent>` is appended *after*
+    any caller-supplied `extra_flags` so a quoted include in the inlined unit
+    source still resolves, without letting a same-named header sitting next to
+    `source` shadow a project header for an angle-bracket include that
+    `extra_flags`'s own `-I` entries would otherwise resolve first (`-I`
+    affects both quote- and angle-bracket lookup in the same order it's
+    given — esbmc has no quote-only `-iquote` to separate the two). A raw
+    `sqlite3.Error` opening or reading the store
     (e.g. a corrupt `forseti.db`) is translated to `PropertyStoreError`, the
     same domain-level failure `propose_source` raises for the same case.
 
@@ -98,7 +102,7 @@ def check_source(
         verify,
         timeout_s=timeout_s,
         esbmc_bin=esbmc_bin,
-        extra_flags=(f"-I{source.resolve().parent}", *extra_flags),
+        extra_flags=(*extra_flags, f"-I{source.resolve().parent}"),
     )
     try:
         with PropertyStore.open(store_root) as store:
