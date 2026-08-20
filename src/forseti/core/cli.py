@@ -93,9 +93,6 @@ from forseti.update_notice import installed_version, update_notice
 
 from . import EXIT_CODES
 from .check import (
-    DEFAULT_STORE_ROOT as CHECK_DEFAULT_STORE_ROOT,
-)
-from .check import (
     DEFAULT_TIMEOUT_S as CHECK_TIMEOUT_S,
 )
 from .check import (
@@ -385,6 +382,24 @@ def _run_discharge(args: argparse.Namespace) -> int:
     return ASSESSMENT_EXIT_CODES[result.assessment]
 
 
+def _add_unit_store_arguments(p: argparse.ArgumentParser) -> None:
+    """`<source> --function NAME [--store-root DIR]`, shared by propose/check."""
+    p.add_argument("source", type=Path, help="source file defining the unit")
+    p.add_argument(
+        "--function",
+        required=True,
+        metavar="NAME",
+        help="the function under test (the `symbol` of `path::symbol`)",
+    )
+    p.add_argument(
+        "--store-root",
+        type=Path,
+        default=DEFAULT_STORE_ROOT,
+        metavar="DIR",
+        help=f"the .forseti store directory (default: {DEFAULT_STORE_ROOT})",
+    )
+
+
 def _add_propose_parser(
     sub: argparse._SubParsersAction[argparse.ArgumentParser],
 ) -> None:
@@ -397,24 +412,11 @@ def _add_propose_parser(
             "survivors as CANDIDATE."
         ),
     )
-    p.add_argument("source", type=Path, help="source file defining the unit")
-    p.add_argument(
-        "--function",
-        required=True,
-        metavar="NAME",
-        help="the function under test (the `symbol` of `path::symbol`)",
-    )
+    _add_unit_store_arguments(p)
     p.add_argument(
         "--no-store",
         action="store_true",
         help="dry run: propose and validate without writing to the store",
-    )
-    p.add_argument(
-        "--store-root",
-        type=Path,
-        default=DEFAULT_STORE_ROOT,
-        metavar="DIR",
-        help=f"the .forseti store directory (default: {DEFAULT_STORE_ROOT})",
     )
     p.add_argument(
         "--model",
@@ -514,20 +516,7 @@ def _add_check_parser(
             "skipped for a deferred reachability property (ADR-0009 D2)."
         ),
     )
-    p.add_argument("source", type=Path, help="source file defining the unit")
-    p.add_argument(
-        "--function",
-        required=True,
-        metavar="NAME",
-        help="the function under test (the `symbol` of `path::symbol`)",
-    )
-    p.add_argument(
-        "--store-root",
-        type=Path,
-        default=CHECK_DEFAULT_STORE_ROOT,
-        metavar="DIR",
-        help=f"the .forseti store directory (default: {CHECK_DEFAULT_STORE_ROOT})",
-    )
+    _add_unit_store_arguments(p)
     p.add_argument(
         "-k",
         "--unwind",

@@ -62,16 +62,21 @@ _VIOLATION = {
 }
 
 
+def _patch_summary(
+    monkeypatch: pytest.MonkeyPatch, summary: property_gate.SemanticCheckSummary
+) -> None:
+    monkeypatch.setattr(
+        property_gate, "semantic_check_summary", lambda project_dir, state: summary
+    )
+
+
 def test_semantic_violation_reports_but_does_not_block(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _git_init(tmp_path)
-    monkeypatch.setattr(
-        property_gate,
-        "semantic_check_summary",
-        lambda project_dir, state: property_gate.SemanticCheckSummary(
-            (_VIOLATION,), checked=1, deferred=0
-        ),
+    _patch_summary(
+        monkeypatch,
+        property_gate.SemanticCheckSummary((_VIOLATION,), checked=1, deferred=0),
     )
 
     result = _run_and_capture(tmp_path, monkeypatch, capsys)
@@ -87,11 +92,7 @@ def test_no_semantic_violation_is_a_quiet_allow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _git_init(tmp_path)
-    monkeypatch.setattr(
-        property_gate,
-        "semantic_check_summary",
-        lambda project_dir, state: property_gate.SemanticCheckSummary((), 0, 0),
-    )
+    _patch_summary(monkeypatch, property_gate.SemanticCheckSummary((), 0, 0))
 
     _run(tmp_path, monkeypatch)
 
@@ -117,12 +118,9 @@ def test_semantic_violation_folds_into_a_real_blocking_residual(
         }
         gate.save_state(str(tmp_path), state)
 
-    monkeypatch.setattr(
-        property_gate,
-        "semantic_check_summary",
-        lambda project_dir, state: property_gate.SemanticCheckSummary(
-            (_VIOLATION,), checked=1, deferred=0
-        ),
+    _patch_summary(
+        monkeypatch,
+        property_gate.SemanticCheckSummary((_VIOLATION,), checked=1, deferred=0),
     )
 
     result = _run_and_capture(tmp_path, monkeypatch, capsys)
@@ -143,12 +141,9 @@ def test_semantic_only_note_is_not_mislabeled_needs_contract(
     would give it a false positive (issue #95 review).
     """
     _git_init(tmp_path)
-    monkeypatch.setattr(
-        property_gate,
-        "semantic_check_summary",
-        lambda project_dir, state: property_gate.SemanticCheckSummary(
-            (_VIOLATION,), checked=1, deferred=0
-        ),
+    _patch_summary(
+        monkeypatch,
+        property_gate.SemanticCheckSummary((_VIOLATION,), checked=1, deferred=0),
     )
 
     _run_and_capture(tmp_path, monkeypatch, capsys)
@@ -162,11 +157,7 @@ def test_deferred_only_is_still_reported(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _git_init(tmp_path)
-    monkeypatch.setattr(
-        property_gate,
-        "semantic_check_summary",
-        lambda project_dir, state: property_gate.SemanticCheckSummary((), 0, 2),
-    )
+    _patch_summary(monkeypatch, property_gate.SemanticCheckSummary((), 0, 2))
 
     result = _run_and_capture(tmp_path, monkeypatch, capsys)
 

@@ -109,6 +109,24 @@ def _blob_note(blob: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _plural(n: int) -> str:
+    return "y" if n == 1 else "ies"
+
+
+def _property_lines(
+    header: str,
+    verdicts: tuple[dict[str, Any], ...],
+    marker: str,
+    detail: Any,
+) -> list[str]:
+    lines = [header]
+    for v in verdicts:
+        lines.append(
+            f"  {marker} {v.get('unit_id')} [{v.get('property_id')}] {detail(v)}"
+        )
+    return lines
+
+
 def _semantic_message(summary: property_gate.SemanticCheckSummary) -> str:
     """Loud, NON-blocking note for VIOLATED generated semantic properties.
 
@@ -121,28 +139,26 @@ def _semantic_message(summary: property_gate.SemanticCheckSummary) -> str:
     """
     lines: list[str] = []
     if summary.violations:
-        lines.append(
-            f"⚠ Forseti: {len(summary.violations)} generated semantic propert"
-            f"{'y' if len(summary.violations) == 1 else 'ies'} did NOT hold "
+        n = len(summary.violations)
+        lines += _property_lines(
+            f"⚠ Forseti: {n} generated semantic propert{_plural(n)} did NOT hold "
             "(`forseti check`, issue #95) — a subagent-proposed property failed "
-            "against real code. This is NOT currently blocking the turn:"
+            "against real code. This is NOT currently blocking the turn:",
+            summary.violations,
+            "✗",
+            lambda v: f"(k={v.get('k')})",
         )
-        for v in summary.violations:
-            lines.append(
-                f"  ✗ {v.get('unit_id')} [{v.get('property_id')}] (k={v.get('k')})"
-            )
     if summary.unresolved:
-        lines.append(
-            f"⚠ Forseti: {len(summary.unresolved)} generated semantic propert"
-            f"{'y' if len(summary.unresolved) == 1 else 'ies'} could not be resolved "
-            "(`forseti check` returned unknown/error, issue #95) — never a silent "
-            "pass (CLAUDE.md); raise the unwind bound or investigate the failure:"
+        n = len(summary.unresolved)
+        lines += _property_lines(
+            f"⚠ Forseti: {n} generated semantic propert{_plural(n)} could not be "
+            "resolved (`forseti check` returned unknown/error, issue #95) — never a "
+            "silent pass (CLAUDE.md); raise the unwind bound or investigate the "
+            "failure:",
+            summary.unresolved,
+            "?",
+            lambda v: f"({v.get('outcome')}, k={v.get('k')})",
         )
-        for v in summary.unresolved:
-            lines.append(
-                f"  ? {v.get('unit_id')} [{v.get('property_id')}] "
-                f"({v.get('outcome')}, k={v.get('k')})"
-            )
     if summary.deferred:
         lines.append(
             f"⚠ Forseti: {summary.deferred} unit(s) with stored properties were "
@@ -226,16 +242,18 @@ def main() -> int:
     # into whichever message this call ends up emitting — allow or block.
     semantic = property_gate.semantic_check_summary(project_dir, state)
 
+    # NEEDS_CONTRACT units (pointer/array, no harness yet) are honestly-unverified
+    # but a source fix can't resolve them, and a VIOLATED semantic property is a
+    # subagent-proposed contract failing rather than the built-in safety check
+    # (issue #95) — both are reported loudly here regardless of outstanding, never
+    # folded silently into either message.
+    notes = []
+    if needs:
+        notes.append(_needs_message(needs))
+    if not semantic.empty:
+        notes.append(_semantic_message(semantic))
+
     if not outstanding:
-        # Nothing blocks. NEEDS_CONTRACT units (pointer/array, no harness yet) are
-        # honestly-unverified but a source fix can't resolve them, so let the turn
-        # end — loudly if any are outstanding, never silently. A VIOLATED semantic
-        # property is reported the same loud-but-non-blocking way (issue #95).
-        notes = []
-        if needs:
-            notes.append(_needs_message(needs))
-        if not semantic.empty:
-            notes.append(_semantic_message(semantic))
         if notes:
             # "allow_needs_contract" only when a NEEDS_CONTRACT unit is actually
             # among the notes -- a turn with zero of those but a semantic-only
@@ -267,10 +285,7 @@ def main() -> int:
         sections.append(_oob_note(project_dir, oob))
     if blob:
         sections.append(_blob_note(blob))
-    if needs:
-        sections.append(_needs_message(needs))
-    if not semantic.empty:
-        sections.append(_semantic_message(semantic))
+    sections += notes
     detail = "\n\n".join(sections)
     n_out = len(blocking) + len(oob) + len(blob)
 

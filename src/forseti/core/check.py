@@ -31,6 +31,7 @@ from collections.abc import Sequence
 from functools import partial
 from pathlib import Path
 
+from forseti.core.propose import DEFAULT_STORE_ROOT
 from forseti.esbmc import verify
 from forseti.orchestrator import (
     PropertyCheckRun,
@@ -52,7 +53,6 @@ from forseti.properties import PropertyStore, PropertyStoreError
 DEFAULT_UNWIND = 4
 DEFAULT_UNWIND_LADDER: tuple[int, ...] = (8, 16)
 DEFAULT_TIMEOUT_S = 110.0
-DEFAULT_STORE_ROOT = Path(".forseti")
 _WORK_SUBDIR = "check-work"
 
 
@@ -66,7 +66,6 @@ def check_source(
     timeout_s: float | None = DEFAULT_TIMEOUT_S,
     extra_flags: Sequence[str] = (),
     esbmc_bin: str = "esbmc",
-    work_dir: Path | None = None,
     verify_port: VerifyPort | None = None,
 ) -> PropertyCheckRun:
     """Check `source`::`function`'s stored, checkable properties with ESBMC.
@@ -79,10 +78,11 @@ def check_source(
     silently settling below the ladder's own terminal verdict. A reachability
     property is `SKIPPED` (deferred, ADR-0009 D2), never verified.
 
-    `work_dir` defaults to `store_root/"check-work"` (module docstring: never
-    beside `source`); `-I<source's resolved parent>` is always added ahead of
-    any caller-supplied `extra_flags` so a quoted include in the inlined unit
-    source still resolves. A raw `sqlite3.Error` opening or reading the store
+    Harnesses are written under `store_root/"check-work"` (module docstring:
+    never beside `source`); `-I<source's resolved parent>` is always added
+    ahead of any caller-supplied `extra_flags` so a quoted include in the
+    inlined unit source still resolves. A raw `sqlite3.Error` opening or
+    reading the store
     (e.g. a corrupt `forseti.db`) is translated to `PropertyStoreError`, the
     same domain-level failure `propose_source` raises for the same case.
 
@@ -100,22 +100,18 @@ def check_source(
         esbmc_bin=esbmc_bin,
         extra_flags=(f"-I{source.resolve().parent}", *extra_flags),
     )
-    store: PropertyStore | None = None
     try:
-        store = PropertyStore.open(store_root)
-        return check_properties(
-            unit,
-            store=store,
-            render=SemanticHarnessWriter(),
-            verify=verify_fn,
-            work_dir=work_dir or (store_root / _WORK_SUBDIR),
-            unwind=unwind,
-            unwind_ladder=unwind_ladder,
-        )
+        with PropertyStore.open(store_root) as store:
+            return check_properties(
+                unit,
+                store=store,
+                render=SemanticHarnessWriter(),
+                verify=verify_fn,
+                work_dir=store_root / _WORK_SUBDIR,
+                unwind=unwind,
+                unwind_ladder=unwind_ladder,
+            )
     except sqlite3.Error as exc:
         raise PropertyStoreError(
             f"property store error at {store_root}: {exc}"
         ) from exc
-    finally:
-        if store is not None:
-            store.close()

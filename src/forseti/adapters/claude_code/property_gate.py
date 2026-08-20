@@ -104,8 +104,7 @@ def _units_with_candidates(
     with properties for only one of ten edited units pays the expensive
     `forseti check` subprocess exactly once.
     """
-    store = PropertyStore.open(Path(project_dir) / _STORE_ROOT_NAME)
-    try:
+    with PropertyStore.open(Path(project_dir) / _STORE_ROOT_NAME) as store:
         out = []
         for unit in units:
             rel, function = unit.get("file"), unit.get("function")
@@ -115,11 +114,9 @@ def _units_with_candidates(
             if store.list_for_unit(unit_id, {PropertyStatus.CANDIDATE}):
                 out.append(unit)
         return out
-    finally:
-        store.close()
 
 
-def _check_unit(project_dir: str, unit: dict[str, Any]) -> dict[str, Any] | None:
+def _check_unit(project_dir: str, unit: dict[str, Any]) -> list[Any] | None:
     """Run `forseti check --json` for one unit; `None` on any tooling failure.
 
     Never raised: a broken check must surface as "nothing found" here, not
@@ -145,7 +142,7 @@ def _check_unit(project_dir: str, unit: dict[str, Any]) -> dict[str, Any] | None
         "--unwind-ladder",
         "",  # no escalation -- see module docstring on the budget
         "--timeout",
-        str(max(1, round(CHECK_TIMEOUT_S))),
+        str(CHECK_TIMEOUT_S),
         "--json",
     ]
     try:
@@ -164,7 +161,7 @@ def _check_unit(project_dir: str, unit: dict[str, Any]) -> dict[str, Any] | None
         return None
     if not isinstance(payload, dict) or not isinstance(payload.get("verdicts"), list):
         return None
-    return payload
+    return payload["verdicts"]
 
 
 def semantic_check_summary(
@@ -193,19 +190,17 @@ def semantic_check_summary(
     if not candidates:
         return empty
 
-    to_check, deferred = (
-        candidates[:MAX_UNITS_PER_TURN],
-        candidates[MAX_UNITS_PER_TURN:],
-    )
+    to_check = candidates[:MAX_UNITS_PER_TURN]
+    deferred = max(0, len(candidates) - MAX_UNITS_PER_TURN)
     violations: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
     checked = 0
     for unit in to_check:
-        payload = _check_unit(project_dir, unit)
-        if payload is None:
+        verdicts = _check_unit(project_dir, unit)
+        if verdicts is None:
             continue
         checked += 1
-        for verdict in payload["verdicts"]:
+        for verdict in verdicts:
             if not isinstance(verdict, dict):
                 continue
             outcome = verdict.get("outcome")
@@ -213,6 +208,4 @@ def semantic_check_summary(
                 violations.append(verdict)
             elif outcome in ("unknown", "error"):
                 unresolved.append(verdict)
-    return SemanticCheckSummary(
-        tuple(violations), checked, len(deferred), tuple(unresolved)
-    )
+    return SemanticCheckSummary(tuple(violations), checked, deferred, tuple(unresolved))

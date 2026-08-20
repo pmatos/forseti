@@ -11,6 +11,7 @@ covered by `test_check_integration.py`.
 from __future__ import annotations
 
 import json
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -86,13 +87,17 @@ def _reachability(unit_id: str) -> Property:
     )
 
 
+def _seed_store(root: Path, prop: Property) -> None:
+    store = PropertyStore.open(root)
+    store.add(prop)
+    store.close()
+
+
 def test_check_source_held(tmp_path: Path) -> None:
     source = _write_unit(tmp_path)
     unit_id = f"{source}::my_abs"
     root = tmp_path / ".forseti"
-    store = PropertyStore.open(root)
-    store.add(_semantic(unit_id, "result >= 0", ("x > INT64_MIN",)))
-    store.close()
+    _seed_store(root, _semantic(unit_id, "result >= 0", ("x > INT64_MIN",)))
 
     fake = FakeVerify([Verified(_meta(4))])
     run = check_source(source, function="my_abs", store_root=root, verify_port=fake)
@@ -105,9 +110,7 @@ def test_check_source_ladders_on_unknown(tmp_path: Path) -> None:
     source = _write_unit(tmp_path)
     unit_id = f"{source}::my_abs"
     root = tmp_path / ".forseti"
-    store = PropertyStore.open(root)
-    store.add(_semantic(unit_id, "result >= 0", ("x > INT64_MIN",)))
-    store.close()
+    _seed_store(root, _semantic(unit_id, "result >= 0", ("x > INT64_MIN",)))
 
     fake = FakeVerify([Unknown(_meta(4), UnknownReason.TIMEOUT), Verified(_meta(8))])
     run = check_source(
@@ -136,9 +139,7 @@ def test_check_source_reachability_only_is_skipped_not_checked(tmp_path: Path) -
     source = _write_unit(tmp_path)
     unit_id = f"{source}::my_abs"
     root = tmp_path / ".forseti"
-    store = PropertyStore.open(root)
-    store.add(_reachability(unit_id))
-    store.close()
+    _seed_store(root, _reachability(unit_id))
 
     fake = FakeVerify([])  # reachability is SKIPPED, never verified
     run = check_source(source, function="my_abs", store_root=root, verify_port=fake)
@@ -160,9 +161,7 @@ def test_check_source_work_dir_defaults_beside_the_store_not_the_source(
     source.write_text(UNIT_SLICE)
     unit_id = f"{source}::my_abs"
     root = tmp_path / ".forseti"
-    store = PropertyStore.open(root)
-    store.add(_semantic(unit_id, "result >= 0", ("x > INT64_MIN",)))
-    store.close()
+    _seed_store(root, _semantic(unit_id, "result >= 0", ("x > INT64_MIN",)))
 
     fake = FakeVerify([Verified(_meta(4))])
     check_source(source, function="my_abs", store_root=root, verify_port=fake)
@@ -196,38 +195,12 @@ def test_cli_check_json_ok(
     source = _write_unit(tmp_path)
     unit_id = f"{source}::my_abs"
     root = tmp_path / ".forseti"
-    store = PropertyStore.open(root)
-    store.add(_semantic(unit_id, "result >= 0", ("x > INT64_MIN",)))
-    store.close()
+    _seed_store(root, _semantic(unit_id, "result >= 0", ("x > INT64_MIN",)))
 
-    calls: list[FakeVerify] = []
-
-    def fake_check_source(
-        source: Path,
-        *,
-        function: str,
-        store_root: Path,
-        unwind: int,
-        unwind_ladder: tuple[int, ...],
-        timeout_s: float | None,
-        extra_flags: tuple[str, ...],
-        esbmc_bin: str,
-    ) -> object:
-        fake = FakeVerify([Verified(_meta(4))])
-        calls.append(fake)
-        return check_source(
-            source,
-            function=function,
-            store_root=store_root,
-            unwind=unwind,
-            unwind_ladder=unwind_ladder,
-            timeout_s=timeout_s,
-            extra_flags=extra_flags,
-            esbmc_bin=esbmc_bin,
-            verify_port=fake,
-        )
-
-    monkeypatch.setattr("forseti.core.cli.check_source", fake_check_source)
+    fake = FakeVerify([Verified(_meta(4))])
+    monkeypatch.setattr(
+        "forseti.core.cli.check_source", partial(check_source, verify_port=fake)
+    )
     code = main(
         [
             "check",

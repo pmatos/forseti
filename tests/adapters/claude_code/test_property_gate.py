@@ -49,6 +49,40 @@ def _add_candidate(root: Path, unit_id: str, expression: str = "result >= 0") ->
     store.close()
 
 
+def _payload(
+    unit_id: str, outcome: str, *, property_id: str = "p1", k: int = 4
+) -> dict[str, Any]:
+    counts = {"held": 0, "violated": 0, "unknown": 0, "error": 0, "skipped": 0}
+    counts[outcome] = 1
+    return {
+        "unit_id": unit_id,
+        "counts": counts,
+        "verdicts": [
+            {
+                "property_id": property_id,
+                "unit_id": unit_id,
+                "kind": "semantic",
+                "outcome": outcome,
+                "k": k,
+            }
+        ],
+    }
+
+
+def _fake_run(
+    payload: dict[str, Any],
+    exit_code: int = 0,
+    captured: dict[str, Any] | None = None,
+) -> Any:
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if captured is not None:
+            captured["argv"] = argv
+            captured["cwd"] = kwargs.get("cwd")
+        return subprocess.CompletedProcess(argv, exit_code, stdout=json.dumps(payload))
+
+    return fake_run
+
+
 def test_no_store_file_is_a_fast_noop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -108,26 +142,9 @@ def test_candidate_for_a_verified_unit_shells_to_forseti_check(
     state = _state(_unit(str(source), "my_abs"))
 
     captured: dict[str, Any] = {}
-    violated_payload = {
-        "unit_id": unit_id,
-        "counts": {"held": 0, "violated": 1, "unknown": 0, "error": 0, "skipped": 0},
-        "verdicts": [
-            {
-                "property_id": "p1",
-                "unit_id": unit_id,
-                "kind": "semantic",
-                "outcome": "violated",
-                "k": 4,
-            }
-        ],
-    }
-
-    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        captured["argv"] = argv
-        captured["cwd"] = kwargs.get("cwd")
-        return subprocess.CompletedProcess(argv, 1, stdout=json.dumps(violated_payload))
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        subprocess, "run", _fake_run(_payload(unit_id, "violated"), 1, captured)
+    )
 
     summary = property_gate.semantic_check_summary(str(tmp_path), state)
 
@@ -165,25 +182,9 @@ def test_relative_unit_file_is_matched_by_the_check_subprocess(
     state = _state(_unit(rel, "my_abs"))
 
     captured: dict[str, Any] = {}
-    violated_payload = {
-        "unit_id": unit_id,
-        "counts": {"held": 0, "violated": 1, "unknown": 0, "error": 0, "skipped": 0},
-        "verdicts": [
-            {
-                "property_id": "p1",
-                "unit_id": unit_id,
-                "kind": "semantic",
-                "outcome": "violated",
-                "k": 4,
-            }
-        ],
-    }
-
-    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        captured["argv"] = argv
-        return subprocess.CompletedProcess(argv, 1, stdout=json.dumps(violated_payload))
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        subprocess, "run", _fake_run(_payload(unit_id, "violated"), 1, captured)
+    )
 
     summary = property_gate.semantic_check_summary(str(tmp_path), state)
 
@@ -208,26 +209,7 @@ def test_unresolved_outcomes_are_reported_not_dropped(
     _add_candidate(tmp_path, unit_id)
     state = _state(_unit(str(source), "my_abs"))
 
-    unresolved_payload = {
-        "unit_id": unit_id,
-        "counts": {"held": 0, "violated": 0, "unknown": 1, "error": 0, "skipped": 0},
-        "verdicts": [
-            {
-                "property_id": "p1",
-                "unit_id": unit_id,
-                "kind": "semantic",
-                "outcome": "unknown",
-                "k": 4,
-            }
-        ],
-    }
-
-    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(
-            argv, 0, stdout=json.dumps(unresolved_payload)
-        )
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "run", _fake_run(_payload(unit_id, "unknown")))
 
     summary = property_gate.semantic_check_summary(str(tmp_path), state)
 
@@ -245,24 +227,7 @@ def test_held_property_reports_no_violation(
     _add_candidate(tmp_path, unit_id)
     state = _state(_unit(str(source), "my_abs"))
 
-    held_payload = {
-        "unit_id": unit_id,
-        "counts": {"held": 1, "violated": 0, "unknown": 0, "error": 0, "skipped": 0},
-        "verdicts": [
-            {
-                "property_id": "p1",
-                "unit_id": unit_id,
-                "kind": "semantic",
-                "outcome": "held",
-                "k": 4,
-            }
-        ],
-    }
-
-    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(held_payload))
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "run", _fake_run(_payload(unit_id, "held")))
 
     summary = property_gate.semantic_check_summary(str(tmp_path), state)
 
