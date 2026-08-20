@@ -176,7 +176,37 @@ def test_check_source_work_dir_defaults_beside_the_store_not_the_source(
     check_source(source, function="my_abs", store_root=root, verify_port=fake)
 
     assert list(source_dir.glob("*.c")) == [source]  # no harness landed beside it
-    assert any((root / "check-work").glob("*.c"))
+    # A per-invocation subdirectory of check-work (issue #95 review), not
+    # directly under it -- glob recursively.
+    assert any((root / "check-work").glob("**/*.c"))
+
+
+def test_check_source_gives_each_call_its_own_work_dir(tmp_path: Path) -> None:
+    """Two invocations for the same unit+property must not share a harness
+    directory: `check_properties` derives a deterministic filename from the
+    unit/property IDs, so an overlapping second call (e.g. a subagent's own
+    `forseti check` racing the Stop-gate's) sharing the first call's directory
+    could overwrite its harness mid-run (issue #95 review)."""
+    source = _write_unit(tmp_path)
+    unit_id = f"{source}::my_abs"
+    root = tmp_path / ".forseti"
+    _seed_store(root, _semantic(unit_id, "result >= 0", ("x > INT64_MIN",)))
+
+    check_source(
+        source,
+        function="my_abs",
+        store_root=root,
+        verify_port=FakeVerify([Verified(_meta(4))]),
+    )
+    check_source(
+        source,
+        function="my_abs",
+        store_root=root,
+        verify_port=FakeVerify([Verified(_meta(4))]),
+    )
+
+    work_dirs = {p.parent for p in (root / "check-work").glob("**/*.c")}
+    assert len(work_dirs) == 2
 
 
 def _corrupt_store_root(tmp_path: Path) -> Path:

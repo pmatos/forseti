@@ -964,13 +964,18 @@ class _DefinitionMatch:
     ``line`` is the 1-based *physical* line of the ``fn_name (`` token, which
     `_select_definition` translates to a presumed coordinate before it anchors on
     `def_line`. ``brace`` indexes the body's ``{``; ``params`` is the declarator
-    text between ``(`` and its matching ``)``. A body opener and a parameter list
-    are the same occurrence seen two ways, so both entry points read them off this.
+    text between ``(`` and its matching ``)``. ``name_start`` indexes the ``fn_name``
+    token itself (the regex match's own start -- not re-derived by a later,
+    independent search, which is what let a string literal mentioning `fn_name`
+    after the real token, e.g. an ``__attribute__((annotate("main")))`` suffix,
+    get renamed instead of it). A body opener and a parameter list are the same
+    occurrence seen two ways, so both entry points read them off this.
     """
 
     line: int
     brace: int
     params: str
+    name_start: int
 
 
 def _definition_candidates(
@@ -1012,7 +1017,9 @@ def _definition_candidates(
         if k < len(source_no_comments) and source_no_comments[k] == "{":
             line = source_no_comments.count("\n", 0, match.start()) + 1
             matches.append(
-                _DefinitionMatch(line, k, source_no_comments[match.end() : j])
+                _DefinitionMatch(
+                    line, k, source_no_comments[match.end() : j], match.start()
+                )
             )
     return matches
 
@@ -1096,6 +1103,98 @@ def find_definition_brace(
         _definition_candidates(masked, fn_name), masked, def_line
     )
     return None if chosen is None else chosen.brace
+
+
+def _declaration_name_starts(source_no_comments: str, fn_name: str) -> list[int]:
+    """Every declaration-shaped (prototype, or a bare call statement) `fn_name`'s
+    own name-span start.
+
+    Mirrors `_definition_candidates`'s balanced-paren scan, but the opposite
+    filter: a `;` (not `{`) after the closing `)` and any suffix attributes —
+    ``int fn_name(...);`` or a standalone call ``fn_name(...);``. A separate,
+    smaller scanner rather than widening `_definition_candidates` itself: that
+    one anchors RFC-0003 S3's obligation injection and #145's `def_line`
+    disambiguation, both of which want *only* a definition — a prototype is
+    exactly what they must keep excluding.
+
+    Catching a plain call statement too (not just a genuine prototype) is
+    deliberate, not just tolerated: renaming a same-file call site alongside
+    every definition of the same name keeps both consistent (a call renamed
+    without its definition, or vice versa, would be the real bug) —
+    `rename_all_declarations_and_definitions`'s caller only ever runs this
+    against a single translation unit, so any occurrence of `fn_name(...)`
+    followed by `;` refers to the one declaration this scan is renaming away
+    either way.
+    """
+    starts: list[int] = []
+    for match in re.finditer(rf"\b{re.escape(fn_name)}\s*\(", source_no_comments):
+        depth = 0
+        j = match.end() - 1  # index of the '('
+        while j < len(source_no_comments):
+            char = source_no_comments[j]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        else:
+            continue  # unbalanced — not a usable signature
+        k = j + 1
+        while k < len(source_no_comments) and source_no_comments[k].isspace():
+            k += 1
+        k = _skip_suffix_attributes(source_no_comments, k)
+        if k < len(source_no_comments) and source_no_comments[k] == ";":
+            starts.append(match.start())
+    return starts
+
+
+def rename_all_declarations_and_definitions(
+    source_text: str, fn_name: str, new_name: str
+) -> str:
+    """`source_text` with **every** declaration or definition of `fn_name`
+    renamed to `new_name`.
+
+    `find_definition_brace`/`_select_definition` pick *one* occurrence (the one
+    `def_line` anchors to, or the textually-first) — the right choice for
+    injecting an obligation into the compiled definition. Renaming to avoid a
+    name collision is a different problem, on two fronts (issue #95 review):
+
+    - An inactive ``#if 0`` alternative ahead of the real definition is
+      textually just as definition-shaped (this scan has no preprocessor), so
+      renaming only the first occurrence can rename the dead one and leave
+      the real, colliding definition untouched. There is no compiled
+      `def_line` to anchor on for this caller's purpose anyway, so every
+      definition-shaped occurrence is renamed — dead code included, which is
+      harmless to touch.
+    - A *declaration* (prototype) is not itself a collision the way a second
+      definition is — a matching-signature ``int main(void);`` ahead of
+      ``int main(void) { ... }`` is legal C — but this scan cannot verify the
+      prototype's signature actually matches whatever the caller renames the
+      definition to become (a mismatched-type prototype left behind, e.g.
+      ``void main(void);`` ahead of an ``int main(void)`` definition, is a
+      hard `conflicting types` parse error, verified against a live esbmc
+      run). Renaming every declaration alongside every definition sidesteps
+      the signature question entirely rather than trying to answer it.
+
+    Each occurrence's own name span (`_DefinitionMatch.name_start` /
+    `_declaration_name_starts`, from the same regex match the respective scan
+    already isolated) is what gets replaced — never a fresh, independent
+    search for `fn_name` in the surrounding text, which a string literal or
+    attribute mentioning the name after the real token could shadow (an
+    ``__attribute__((annotate("main")))`` suffix). Occurrences are rewritten
+    last-to-first so each replacement's offset stays valid for the ones still
+    to come.
+    """
+    masked = mask_comments(source_text)
+    starts = {m.name_start for m in _definition_candidates(masked, fn_name)}
+    starts.update(_declaration_name_starts(masked, fn_name))
+    result = source_text
+    for start in sorted(starts, reverse=True):
+        end = start + len(fn_name)
+        result = result[:start] + new_name + result[end:]
+    return result
 
 
 @dataclass(frozen=True)

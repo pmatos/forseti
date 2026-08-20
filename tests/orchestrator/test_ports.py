@@ -60,18 +60,79 @@ def test_from_path_leaves_main_free_source_unchanged(tmp_path: Path) -> None:
     assert unit.source_text == text
 
 
-def test_from_path_leaves_main_prototype_and_mentions_alone(tmp_path: Path) -> None:
-    """A bare declaration (no body) or a `main`-like substring is not a
-    definition-shaped occurrence — `find_definition_brace` returns `None` for
-    it, so nothing is renamed."""
+def test_from_path_renames_a_mismatched_main_prototype_too(tmp_path: Path) -> None:
+    """A bare declaration (no body) is not *definition*-shaped, but a
+    signature mismatch between it and whatever the definition gets renamed to
+    is a hard esbmc parse error ("conflicting types"), not merely a Python-
+    level `ERROR` verdict -- verified against a live esbmc run (issue #95
+    review). `from_path` renames the prototype too, not just the definition,
+    so no `main`-named declaration of any signature is left behind. A
+    `main`-like substring (not a `\\b`-bounded match) is still untouched."""
     source = tmp_path / "decl.c"
     text = (
-        "void main(void);  // forward-declared elsewhere, not defined here\n\n"
+        "void main(void);  // forward-declared elsewhere, mismatched on purpose\n\n"
         "int helper(int x) {\n    return x + 1;\n}\n\n"
-        "int mainframe(int x) {\n    return x;\n}\n"
+        "int mainframe(int x) {\n    return x;\n}\n\n"
+        "int main(void) {\n    return helper(1);\n}\n"
+    )
+    source.write_text(text)
+
+    unit = Unit.from_path(source, "helper")
+
+    assert "void main(void);" not in unit.source_text
+    assert "int main(void) {" not in unit.source_text
+    assert unit.source_text.count("__forseti_unused_main(void)") == 2
+    assert "int mainframe(int x)" in unit.source_text  # untouched substring
+
+
+def test_from_path_leaves_a_main_mention_alone(tmp_path: Path) -> None:
+    """A comment mention (not code) is neither declaration- nor
+    definition-shaped -- nothing is renamed."""
+    source = tmp_path / "decl.c"
+    text = (
+        "/* main() is mentioned here too */\n\n"
+        "int helper(int x) {\n    return x + 1;\n}\n"
     )
     source.write_text(text)
 
     unit = Unit.from_path(source, "helper")
 
     assert unit.source_text == text
+
+
+def test_from_path_renames_every_colliding_main_alternative(tmp_path: Path) -> None:
+    """An inactive `#if 0` alternative ahead of the real definition is just as
+    definition-shaped to this textual scan as the compiled one — leaving it
+    untouched would still collide with the harness's own generated `main`
+    (issue #95 review)."""
+    source = tmp_path / "prog.c"
+    source.write_text(
+        "#if 0\nint main(void) { return -1; }\n#endif\n"
+        "int helper(int x) {\n    return x + 1;\n}\n\n"
+        "int main(void) {\n    return helper(1);\n}\n"
+    )
+
+    unit = Unit.from_path(source, "helper")
+
+    assert unit.source_text.count("int __forseti_unused_main(void)") == 2
+    assert "int main(void)" not in unit.source_text
+
+
+def test_from_path_checking_main_itself_tracks_the_renamed_symbol(
+    tmp_path: Path,
+) -> None:
+    """Checking `main`'s own semantic properties is a legitimate request —
+    `from_path` still renames `main` away (the generated harness needs the
+    name for its own entry point either way), but `Unit.symbol` must track
+    the rename so `SemanticHarnessWriter` looks up the identifier that is
+    actually still present, not the now-absent `"main"` (issue #95 review:
+    without this, checking `main` itself made every property an unconditional
+    `ERROR`, "no such symbol")."""
+    source = tmp_path / "prog.c"
+    source.write_text("int main(void) {\n    return 0;\n}\n")
+
+    unit = Unit.from_path(source, "main")
+
+    assert unit.unit_id == f"{source}::main"  # store lookup key is unchanged
+    assert unit.symbol == "__forseti_unused_main"
+    assert "int __forseti_unused_main(void)" in unit.source_text

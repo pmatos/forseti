@@ -47,6 +47,7 @@ from .units import (
     parse_implicit_invocations,
     parse_symbol_aliases,
     parse_units,
+    rename_all_declarations_and_definitions,
 )
 from .verify_cli import (
     add_esbmc_invocation_arguments,
@@ -96,6 +97,7 @@ __all__ = [
     "parse_implicit_invocations",
     "parse_symbol_aliases",
     "parse_units",
+    "rename_all_declarations_and_definitions",
     "render_result",
     "result_to_dict",
     "verify",

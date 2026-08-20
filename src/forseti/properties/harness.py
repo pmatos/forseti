@@ -604,10 +604,19 @@ def _defines_main(source: str) -> bool:
 
     Reuses `find_definition_brace` (comment-aware; requires a `{` body, not
     just the name) rather than a raw `\\bmain\\s*\\(` substring search — the
-    latter also matches a forward-declared prototype (no body) or a bare
-    comment mentioning `main`, either of which would otherwise make this
-    reject a genuinely main-free unit that `Unit.from_path`'s own
-    `_rename_own_main` already correctly left untouched (issue #95 review).
+    latter also matches a bare comment mentioning `main`, which is not code
+    at all (issue #95 review).
+
+    Deliberately narrower than "would this fail to compile": a *declaration*
+    (prototype) is not itself a second definition the way this check cares
+    about, but a signature mismatch between a left-behind prototype and the
+    harness's own generated `int main(void) { ... }` is still a hard esbmc
+    parse error ("conflicting types"), verified against a live esbmc run —
+    this function alone does not catch that. Ensuring no `main`-named
+    declaration of any signature reaches here is `Unit.from_path`'s job
+    (`orchestrator/ports.py`'s `rename_all_declarations_and_definitions`; it
+    renames a declaration alongside every definition), not this render-level
+    guard's.
     """
     return find_definition_brace(source, "main") is not None
 

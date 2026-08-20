@@ -84,9 +84,11 @@ def test_check_source_resolves_sibling_quoted_include_from_elsewhere(
 
     assert run.counts()["held"] == 1
     assert run.counts()["error"] == 0  # an unresolved include would be an ERROR
-    # The harness landed under the store, never beside the tracked source.
+    # The harness landed under the store, never beside the tracked source --
+    # in a per-invocation subdirectory of check-work (issue #95 review), so
+    # glob recursively.
     assert list(unit.parent.glob("*.c")) == [unit]
-    assert any((root / "check-work").glob("*.c"))
+    assert any((root / "check-work").glob("**/*.c"))
 
 
 def test_check_source_extra_flags_include_dir_wins_over_sibling_angle_bracket(
@@ -150,6 +152,63 @@ def test_check_source_checks_a_helper_in_a_file_that_also_defines_main(
     store.close()
 
     run = check_source(unit, function="my_double", store_root=root)
+
+    assert run.counts()["error"] == 0
+    assert run.counts()["held"] == 1
+
+
+def test_check_source_checks_a_helper_beside_a_mismatched_main_prototype(
+    tmp_path: Path,
+) -> None:
+    """A realistic, internally-consistent `int main(int argc, char **argv)`
+    (prototype + matching definition, both valid, ordinary C) does not match
+    the harness's own hardcoded `int main(void) { ... }` entry point. If only
+    the definition is renamed away, the left-behind prototype still declares
+    `main` with `argc`/`argv` right next to the harness's `int main(void)` --
+    a hard esbmc parse error ("conflicting types"), not merely a
+    harness-render `ERROR` -- verified against a live esbmc run (issue #95
+    review). `Unit.from_path` must rename the prototype alongside the
+    definition, not just the definition, or this regresses to a parse
+    failure regardless of the property being checked."""
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    unit = src_dir / "prog.c"
+    unit.write_text(
+        "int main(int argc, char **argv);  // forward-declared, matches below\n\n"
+        "int my_double(int x) {\n    return x + x;\n}\n\n"
+        "int main(int argc, char **argv) {\n"
+        "    (void)argc;\n    (void)argv;\n    return my_double(2);\n}\n"
+    )
+
+    unit_id = f"{unit}::my_double"
+    root = tmp_path / ".forseti"
+    store = PropertyStore.open(root)
+    store.add(_semantic(unit_id, "result == x + x"))
+    store.close()
+
+    run = check_source(unit, function="my_double", store_root=root)
+
+    assert run.counts()["error"] == 0
+    assert run.counts()["held"] == 1
+
+
+def test_check_source_checks_main_itself(tmp_path: Path) -> None:
+    """Checking `main`'s own semantic properties is a legitimate request too
+    (issue #95 review): `Unit.from_path` still has to rename `main` out of
+    the way (the generated harness needs that name for its own entry point),
+    but the renderer must look up the identifier that actually survives the
+    rename, not the now-absent `"main"` -- otherwise every property here
+    would report an unconditional `ERROR` regardless of ESBMC."""
+    unit = tmp_path / "prog.c"
+    unit.write_text("int main(void) {\n    return 0;\n}\n")
+
+    unit_id = f"{unit}::main"
+    root = tmp_path / ".forseti"
+    store = PropertyStore.open(root)
+    store.add(_semantic(unit_id, "result == 0"))
+    store.close()
+
+    run = check_source(unit, function="main", store_root=root)
 
     assert run.counts()["error"] == 0
     assert run.counts()["held"] == 1

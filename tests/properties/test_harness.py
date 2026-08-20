@@ -622,12 +622,22 @@ def test_unit_source_with_main_is_error() -> None:
 
 
 def test_unit_source_with_main_prototype_is_not_error() -> None:
-    """A forward-declared `main` (no body) is not a definition -- it must not
-    trip the same guard a genuine `main` definition does (issue #95 review:
-    `Unit.from_path`'s `_rename_own_main` already deliberately leaves a bare
-    prototype untouched, so the renderer's own check must agree)."""
+    """A forward-declared `main` (no body) is not a *definition* -- this
+    render-level guard (which only asks "is `main` defined here?") does not
+    reject it (issue #95 review).
+
+    This does NOT by itself guarantee the rendered harness compiles: a
+    prototype whose signature doesn't match the harness's own generated
+    `int main(void) { ... }` (e.g. `void main(void);`) is a hard esbmc parse
+    error ("conflicting types"), verified against a live esbmc run -- a
+    signature-*matching* prototype like the one below is the case this render
+    guard alone actually leaves safe. Guaranteeing no left-behind prototype of
+    *any* signature reaches here is `Unit.from_path`'s job (it renames a
+    declaration alongside every definition, `orchestrator/ports.py`'s
+    `rename_all_declarations_and_definitions`), not this function's --
+    covered by `tests/orchestrator/test_ports.py`."""
     render_semantic_harness(
-        unit_source="void main(void);\n" + ABS_SLICE,
+        unit_source="int main(void);\n" + ABS_SLICE,
         signature=ABS_SIG,
         spec=SemanticSpec("result >= 0"),
     )

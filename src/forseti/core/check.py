@@ -11,22 +11,38 @@ invocation knobs, and runs `check_properties` with the real
 wire shape (mirrors `core/propose.py`'s `ProposalResult.to_dict()` reuse) — no
 separate serializer lives here.
 
-Harnesses are written under `store_root` (default `.forseti/check-work/`,
-already git-ignored — CLAUDE.md), never beside `source`: `check_properties`
-writes one `.c` file per property, and a plain `.c` sitting beside a tracked
-source is exactly what the Claude Code adapter's own out-of-band discovery
-(`git status`-driven) would pick up as a new, unverified unit — verifying the
-gate's own generated harness as if it were source. A rendered harness inlines
-`unit_source` verbatim (`render_semantic_harness`), so a quoted
-``#include "local.h"`` in the unit misses the harness's own directory and
-needs `-I<source's dir>` to resolve — the same `-I` the S3 discharge path
-already adds for its own generated copy (`precond/discharge.py`), not a
-mirrored/staged copy of the source tree.
+Harnesses are written under `store_root` (default `.forseti/check-work/<a
+per-invocation uuid4 subdirectory>/`, already git-ignored — CLAUDE.md), never
+beside `source`: `check_properties` writes one `.c` file per property, and a
+plain `.c` sitting beside a tracked source is exactly what the Claude Code
+adapter's own out-of-band discovery (`git status`-driven) would pick up as a
+new, unverified unit — verifying the gate's own generated harness as if it
+were source. The per-invocation subdirectory (not the shared `check-work`
+root) is what keeps two overlapping `check_source` calls against the same
+unit — a subagent's own `forseti check` racing the Stop-gate's — from
+overwriting each other's harness mid-run: `check_properties` derives a
+deterministic filename from the unit/property IDs, so sharing a directory
+would let one invocation clobber or half-read the other's file (issue #95
+review). A rendered harness inlines `unit_source` verbatim
+(`render_semantic_harness`), so a quoted ``#include "local.h"`` in the unit
+misses the harness's own directory and needs `-I<source's dir>` to resolve —
+the same `-I` the S3 discharge path already adds for its own generated copy
+(`precond/discharge.py`), not a mirrored/staged copy of the source tree.
+
+Known residual: nothing removes a call's uuid4 subdirectory afterward, so
+`check-work/` accumulates one small directory per `check_source` invocation
+over a long session (the Claude Code Stop-gate calls this once per turn per
+checked unit). Deliberately not addressed here: an eager cleanup would have
+to avoid deleting a sibling invocation's still-in-flight directory, which is
+exactly the race this per-invocation isolation exists to rule out — bounding
+or sweeping `check-work/` is a separate, follow-up concern, not a correctness
+issue for `check_source` itself (the directory is already git-ignored).
 """
 
 from __future__ import annotations
 
 import sqlite3
+import uuid
 from collections.abc import Sequence
 from functools import partial
 from pathlib import Path
@@ -93,8 +109,10 @@ def check_source(
 
     Passing `verify_port` bypasses `escalating_port` and this default outright.
 
-    Harnesses are written under `store_root/"check-work"` (module docstring:
-    never beside `source`); `-I<source's resolved parent>` is appended *after*
+    Harnesses are written under a fresh, per-call subdirectory of
+    `store_root/"check-work"` (module docstring: never beside `source`, never
+    shared with a concurrent invocation); `-I<source's resolved parent>` is
+    appended *after*
     any caller-supplied `extra_flags` so a quoted include in the inlined unit
     source still resolves, without letting a same-named header sitting next to
     `source` shadow a project header for an angle-bracket include that
@@ -129,7 +147,15 @@ def check_source(
                 store=store,
                 render=SemanticHarnessWriter(),
                 verify=verify_fn,
-                work_dir=store_root / _WORK_SUBDIR,
+                # A per-invocation subdirectory, not the shared `check-work`
+                # root: `check_properties` derives a *deterministic* filename
+                # from the unit/property IDs, so two overlapping invocations
+                # against the same unit (a subagent's own `forseti check`
+                # racing the Stop-gate's) would otherwise write, read, and
+                # overwrite the same path -- one process could verify a
+                # harness the other just clobbered mid-write, or read a
+                # half-written file (issue #95 review).
+                work_dir=store_root / _WORK_SUBDIR / uuid.uuid4().hex,
                 unwind=unwind,
                 unwind_ladder=unwind_ladder,
             )

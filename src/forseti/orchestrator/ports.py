@@ -16,14 +16,19 @@ live here so the driver need not import #62/#64 directly.
 
 from __future__ import annotations
 
-import re
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from forseti.esbmc import EsbmcResult, Violated, find_definition_brace, mask_comments
+from forseti.esbmc import (
+    EsbmcResult,
+    Violated,
+    rename_all_declarations_and_definitions,
+)
 from forseti.properties import Property, PropertyStatus
+
+_RENAMED_MAIN = "__forseti_unused_main"
 
 
 class VerifyPort(Protocol):
@@ -53,11 +58,16 @@ class Unit:
     disk-free (mirrors `FixRequest.source_text`). Passing the slice, not the
     `examples/*.c` file, is what keeps a hand-written property (the example's own
     `main`/`assert`) out of the checked path.
+
+    `symbol` is the identifier `source_text` actually defines — not necessarily
+    the one `from_path` was asked for (see its docstring on checking `main`
+    itself); `unit_id` always keeps the *requested* spelling, since that is the
+    store's own lookup key.
     """
 
-    unit_id: str  # "path::symbol"
+    unit_id: str  # "path::symbol", the requested spelling
     path: Path  # file defining `symbol`
-    symbol: str  # function under test
+    symbol: str  # function under test, as it actually appears in `source_text`
     source_text: str
 
     @classmethod
@@ -66,46 +76,35 @@ class Unit:
 
         `path` need not already be main-free: a normal executable translation
         unit (helper function + its own `main`) is a legitimate check target,
-        not just a hand-written `examples/*.c` kernel slice. `_rename_own_main`
-        renames a genuine `main` *definition* out of the way so `source_text`
-        satisfies this class's own main-free contract either way — a mere
-        prototype/declaration or a `main` appearing only in a call or comment
+        not just a hand-written `examples/*.c` kernel slice.
+        `rename_all_declarations_and_definitions` renames every genuine `main`
+        declaration or definition out of the way (every textual alternative,
+        e.g. an inactive ``#if 0`` definition, and any forward-declared
+        prototype regardless of whether its signature happens to match —
+        issue #95 review) so `source_text` satisfies this class's own
+        main-free contract either way — a `main` appearing only in a comment
         is left untouched (issue #95 review: `render_semantic_harness` rejects
         any `unit_source` defining `main`, which previously made every stored
-        property for such a unit an unconditional `ERROR`).
+        property for such a unit an unconditional `ERROR`; a *left-behind*
+        prototype with a signature that doesn't match the harness's own
+        generated ``int main(void)`` is a hard esbmc parse error, not merely
+        an `ERROR` verdict, so it has to go too rather than being merely
+        tolerated by a looser "is this a definition?" check).
+
+        When `symbol` itself is `"main"` — checking `main`'s own semantic
+        properties is a legitimate request — it gets renamed right along with
+        every other declaration/definition, so `Unit.symbol` tracks the
+        renamed identifier instead of the now-absent `"main"`: otherwise
+        `SemanticHarnessWriter` would look up a symbol the rename just erased
+        and report every property an `ERROR` (issue #95 review). `unit_id`
+        still uses the originally requested `symbol`, matching how the
+        property store already keys this unit.
         """
-        return cls(
-            f"{path}::{symbol}", path, symbol, _rename_own_main(path.read_text())
+        source_text = rename_all_declarations_and_definitions(
+            path.read_text(), "main", _RENAMED_MAIN
         )
-
-
-def _rename_own_main(source_text: str) -> str:
-    """`source_text` with a genuine `main` *definition* renamed out of the way.
-
-    Reuses `find_definition_brace` (RFC-0003 S3's own definition-shaped scan —
-    comment-aware, skips a prototype or a call site) to find the body brace of
-    an actual `main` definition, then renames the *last* `main` token before
-    that brace — the definition's own name, not an earlier prototype — leaving
-    return type, parameters, attributes, and body untouched. `None` (no
-    definition-shaped `main`) leaves `source_text` unchanged.
-
-    The token search itself runs over `mask_comments`' output, not the raw
-    text: `find_definition_brace` guarantees a *code* `main(` immediately
-    precedes `brace` (that's what "definition-shaped" means), so a comment
-    match is never the last one and a plain `matches` guard is dead code by
-    construction -- unless the search runs on the raw text, where a
-    `main`-shaped comment (``int main /* main */ (void) {``) sorts after the
-    real identifier and gets renamed instead of it, leaving the actual `main`
-    untouched. `mask_comments` is offset-preserving, so the span it finds
-    applies unchanged to the original `source_text`.
-    """
-    brace = find_definition_brace(source_text, "main")
-    if brace is None:
-        return source_text
-    masked = mask_comments(source_text)
-    name_match = list(re.finditer(r"\bmain\b", masked[:brace]))[-1]
-    start, end = name_match.span()
-    return f"{source_text[:start]}__forseti_unused_main{source_text[end:]}"
+        effective_symbol = _RENAMED_MAIN if symbol == "main" else symbol
+        return cls(f"{path}::{symbol}", path, effective_symbol, source_text)
 
 
 @dataclass(frozen=True)
