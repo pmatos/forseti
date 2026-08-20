@@ -40,6 +40,7 @@ def test_every_subcommand_binds_a_callable_handler() -> None:
         "synth",
         "discharge",
         "propose",
+        "check",
         "claude-code-hook",
         "enable-project",
         "mcp",

@@ -1,4 +1,4 @@
-# Forseti — Claude Code adapter (v0: safety verify-gate)
+# Forseti — Claude Code adapter (v0 safety verify-gate + v1 semantic properties)
 
 A **self-contained** Claude Code plugin that puts ESBMC inside the coding loop as
 a *hard gate*. It has **no dependency on the `esbmc-plugin`** and needs no MCP
@@ -61,8 +61,34 @@ decision — is appended to `.forseti/events.jsonl` (see **Loop trace** below).
 
 A harness is only needed to express a **contract you invented** ("the output is
 sorted", "abs(x) ≥ 0"). Language-level **safety** properties are free at the
-function level — that is all v0 checks. Generated *semantic* properties (propose
-→ render harness → check) are **v1**, not wired here yet.
+function level — that is what the hooks above check automatically, on every
+edit, for every unit.
+
+Generated *semantic* properties (propose → render harness → check, issue #95)
+are **v1**: they are not free (a contract has to be expressed, and proposing
+one costs an LLM call), so they are **not** run automatically on every edit.
+Instead:
+
+- **`forseti check <source> --function NAME`** — the v1 Core face: checks a
+  unit's already-*stored* properties (from `forseti propose`) against ESBMC,
+  one verdict each (`held`/`violated`/`unknown`/`error`/`skipped`), `--json`
+  for the machine-readable payload. See `forseti check --help`.
+- **The `forseti-property-check` subagent** (`agents/property-check.md`) —
+  invoke it explicitly, per unit, when you want a semantic contract checked:
+  it runs `forseti propose` (the expensive, latent step — a nested `claude -p`
+  call) then `forseti check`, and reports any `violated` property back like
+  the safety gate reports a counterexample. It is deliberately *not* wired
+  into the automatic PostToolUse/Stop hooks, for the same cost/latency reason.
+- **The Stop hook also surfaces (never blocks on) violated semantic
+  properties.** If a unit the safety gate already verified clean has stored
+  `CANDIDATE` properties (because you ran `forseti propose`/the subagent for
+  it at some point), the Stop-gate cheaply re-checks them and reports any
+  `VIOLATED` one loudly in its message — but does **not** fail the turn over
+  it. Making it block needs the same prune/reconciliation machinery the
+  safety-verdict `units` map already has (issue #99); that is a documented
+  follow-up (issue #95), not this cut. A project that never runs `forseti
+  propose` sees zero behaviour change (and zero extra cost — the check is
+  skipped outright when `.forseti/forseti.db` doesn't exist).
 
 ## Requirements
 
@@ -176,6 +202,9 @@ turns a verdict into an error.
 | Stop-gate attempts | `MAX_STOP_ATTEMPTS` in `src/forseti/adapters/claude_code/forseti_gate.py` | `3` | blocks then lets the turn end with a loud residual |
 | Out-of-band include | `FORSETI_GATE_INCLUDE` env | *(all C files)* | `:`/`,`-separated globs; if set, only changed C files matching one are scanned. A bare name (`src`) matches any path segment; a glob (`kernels/*.c`) matches the project-relative path. |
 | Out-of-band exclude | `FORSETI_GATE_EXCLUDE` env | `third_party`, `vendor`, `node_modules` | same syntax; excludes win over includes. Setting it **replaces** the defaults. Git's own ignore rules already drop gitignored build output before this applies. |
+| Semantic-check unwind bound *k* | `FORSETI_PROPERTY_UNWIND` env | `4` | the Stop-gate's own (tighter) bound for its automatic, non-blocking property re-check — separate from `forseti check`'s own CLI default (`4`, ladder `8,16`); the gate never ladders, to keep one property to one esbmc run inside the 120 s Stop hook budget |
+| Semantic-check per-call timeout | `FORSETI_PROPERTY_CHECK_TIMEOUT_S` env | `20` | budget for one `forseti check` subprocess the Stop-gate shells out to |
+| Semantic-check units per turn | `FORSETI_PROPERTY_MAX_UNITS` env | `3` | caps how many units-with-stored-properties one Stop-gate pass will actually check; the rest are reported as deferred, never silently skipped |
 
 ## Known limitations (v0)
 
@@ -264,9 +293,15 @@ turns a verdict into an error.
   not gated either way. A `.h` edit is a clean pass (nothing enumerated). This
   trades the old regex's behaviour, which errored on a header that happened to
   contain a definition; you can't verify what ESBMC won't parse.
-- **No k-escalation.** The gate verifies at one fixed k; an `UNKNOWN` (e.g. a
-  loop under-unwound) blocks with guidance to raise `FORSETI_UNWIND`, rather than
-  laddering k automatically.
+- **No k-escalation for the automatic safety gate.** The PostToolUse/Stop safety
+  checks verify at one fixed k; an `UNKNOWN` (e.g. a loop under-unwound) blocks
+  with guidance to raise `FORSETI_UNWIND`, rather than laddering k automatically.
+  `forseti check` (v1, semantic properties) *does* ladder by default — see
+  **Scope: v0 = safety, v1 = semantics** above — since a property expressed over
+  a loop routinely needs a higher k than a straight-line safety check does; the
+  Stop-gate's own automatic re-check of stored properties stays fixed-k
+  (`FORSETI_PROPERTY_UNWIND`, no ladder) to bound its cost inside the hook
+  timeout.
 - **Pointer/array units are not gated yet (`NEEDS_CONTRACT`).** At the function
   level ESBMC passes a pointer parameter an *unconstrained* value (object identity
   + offset over the whole object universe, including the invalid object), so any
@@ -279,8 +314,12 @@ turns a verdict into an error.
   reported loudly but non-blocking. Actually verifying these — by generating a
   memory precondition/harness — is [#122](https://github.com/pmatos/forseti/issues/122)
   (design in [RFC-0003](../../docs/design/0003-memory-preconditions.md)).
-- **Safety only.** Functional correctness beyond the built-in safety checks is
-  the v1 semantic-property path.
+- **Safety is automatic; semantics are opt-in and non-blocking.** The
+  automatic PostToolUse/Stop hooks still check only the built-in safety
+  properties. Functional correctness beyond that (v1, issue #95) requires an
+  explicit `forseti propose`/the `forseti-property-check` subagent per unit,
+  and a `VIOLATED` semantic property is surfaced loudly at Stop but does not
+  fail the turn — see **Scope: v0 = safety, v1 = semantics** above for why.
 - **Very slow, many-function files.** Verdicts persist incrementally so a hook
   kill can't cause a silent pass, but a file whose *total* verification exceeds
   the PostToolUse hook timeout can have its last, still-running function cut off
