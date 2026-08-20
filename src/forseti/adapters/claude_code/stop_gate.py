@@ -159,6 +159,15 @@ def _semantic_message(summary: property_gate.SemanticCheckSummary) -> str:
             "?",
             lambda v: f"({v.get('outcome')}, k={v.get('k')})",
         )
+    if summary.failed:
+        n = summary.failed
+        lines.append(
+            f"⚠ Forseti: {n} unit(s) with stored properties could not be checked "
+            "this turn at all (`forseti check` subprocess timeout, unparseable "
+            "FORSETI_BUILD_FLAGS, or a crashed/malformed invocation) — never a "
+            "silent pass (CLAUDE.md); investigate FORSETI_PROPERTY_CHECK_TIMEOUT_S "
+            "or the project's build flags."
+        )
     if summary.deferred:
         lines.append(
             f"⚠ Forseti: {summary.deferred} unit(s) with stored properties were "
@@ -267,6 +276,7 @@ def main() -> int:
                 n_needs_contract=len(needs),
                 n_semantic_violations=len(semantic.violations),
                 n_semantic_unresolved=len(semantic.unresolved),
+                n_semantic_failed=semantic.failed,
                 attempt=0,
             )
             return _emit({"systemMessage": "\n\n".join(notes)})

@@ -76,16 +76,27 @@ class SemanticCheckSummary:
     `checked`/`deferred` count units-with-candidates actually checked vs. held
     back by `MAX_UNITS_PER_TURN` -- so a project with more proposed units than
     one turn's budget is told it, rather than reading as fully covered.
+    `failed` counts a unit `_check_unit` could not get any verdicts for at all
+    (subprocess timeout, bad build flags, an unparseable payload) -- distinct
+    from `unresolved`, which is a property `forseti check` *did* run but
+    couldn't settle; a unit that never ran isn't silently indistinguishable
+    from one with nothing to report either (issue #95 review).
     """
 
     violations: tuple[dict[str, Any], ...]
     checked: int
     deferred: int
     unresolved: tuple[dict[str, Any], ...] = ()
+    failed: int = 0
 
     @property
     def empty(self) -> bool:
-        return not self.violations and not self.deferred and not self.unresolved
+        return (
+            not self.violations
+            and not self.deferred
+            and not self.unresolved
+            and not self.failed
+        )
 
 
 def _verified_units(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -97,12 +108,15 @@ def _verified_units(state: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _units_with_candidates(
     project_dir: str, units: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """Subset of `units` that have at least one stored CANDIDATE property.
+) -> list[tuple[dict[str, Any], int]]:
+    """`(unit, candidate_count)` for every `units` entry with >= 1 stored CANDIDATE.
 
     A cheap, in-process SQLite read -- no subprocess, no esbmc -- so a project
     with properties for only one of ten edited units pays the expensive
-    `forseti check` subprocess exactly once.
+    `forseti check` subprocess exactly once. The count is a byproduct of the
+    same read, reused to size `_check_unit`'s subprocess timeout -- `forseti
+    check` checks every stored property for the unit in one process, so a
+    fixed per-unit budget under-covers a unit with 2+ properties.
     """
     with PropertyStore.open(Path(project_dir) / _STORE_ROOT_NAME) as store:
         out = []
@@ -111,16 +125,24 @@ def _units_with_candidates(
             if not rel or not function:
                 continue
             unit_id = f"{rel}::{function}"
-            if store.list_for_unit(unit_id, {PropertyStatus.CANDIDATE}):
-                out.append(unit)
+            candidates = store.list_for_unit(unit_id, {PropertyStatus.CANDIDATE})
+            if candidates:
+                out.append((unit, len(candidates)))
         return out
 
 
-def _check_unit(project_dir: str, unit: dict[str, Any]) -> list[Any] | None:
+def _check_unit(
+    project_dir: str, unit: dict[str, Any], n_props: int
+) -> list[Any] | None:
     """Run `forseti check --json` for one unit; `None` on any tooling failure.
 
     Never raised: a broken check must surface as "nothing found" here, not
-    crash the Stop-gate over a best-effort feature (module docstring).
+    crash the Stop-gate over a best-effort feature (module docstring). `n_props`
+    (the unit's stored-candidate count) scales the subprocess's wall-clock
+    budget -- `--timeout` below is esbmc's *per-attempt* budget, but `forseti
+    check` runs it once per stored property for the unit, so a unit with 2+
+    properties needs more than one attempt's worth of wall clock (issue #95
+    review).
     """
     rel, function = unit["file"], unit["function"]
     # `rel`, unchanged: the subprocess already runs with `cwd=project_dir`, so
@@ -163,7 +185,7 @@ def _check_unit(project_dir: str, unit: dict[str, Any]) -> list[Any] | None:
             argv,
             capture_output=True,
             text=True,
-            timeout=CHECK_TIMEOUT_S + _SUBPROCESS_MARGIN_S,
+            timeout=max(1, n_props) * CHECK_TIMEOUT_S + _SUBPROCESS_MARGIN_S,
             cwd=project_dir,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -182,9 +204,10 @@ def semantic_check_summary(
 ) -> SemanticCheckSummary:
     """Scan safety-verified units for stored semantic properties and check them.
 
-    `[]`/empty when there is nothing to report: no store on disk, no
-    `verified` unit has any stored `CANDIDATE` property, or (best-effort) every
-    `forseti check` invocation attempted failed at the tooling level.
+    `[]`/empty when there is nothing to report: no store on disk, or no
+    `verified` unit has any stored `CANDIDATE` property. A `forseti check`
+    invocation that fails at the tooling level is not silently absorbed into
+    an empty summary -- it counts into `failed` instead (issue #95 review).
     """
     empty = SemanticCheckSummary((), 0, 0)
     if not (Path(project_dir) / _STORE_ROOT_NAME / "forseti.db").exists():
@@ -208,9 +231,11 @@ def semantic_check_summary(
     violations: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
     checked = 0
-    for unit in to_check:
-        verdicts = _check_unit(project_dir, unit)
+    failed = 0
+    for unit, n_props in to_check:
+        verdicts = _check_unit(project_dir, unit, n_props)
         if verdicts is None:
+            failed += 1
             continue
         checked += 1
         for verdict in verdicts:
@@ -221,4 +246,6 @@ def semantic_check_summary(
                 violations.append(verdict)
             elif outcome in ("unknown", "error"):
                 unresolved.append(verdict)
-    return SemanticCheckSummary(tuple(violations), checked, deferred, tuple(unresolved))
+    return SemanticCheckSummary(
+        tuple(violations), checked, deferred, tuple(unresolved), failed
+    )

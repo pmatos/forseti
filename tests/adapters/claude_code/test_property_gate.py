@@ -315,6 +315,53 @@ def test_tooling_failure_is_best_effort_not_raised(
 
     assert summary.checked == 0
     assert summary.violations == ()
+    # A unit that never produced any verdict at all is never silently
+    # indistinguishable from "nothing to report" (issue #95 review).
+    assert summary.failed == 1
+    assert not summary.empty
+
+
+def test_subprocess_timeout_scales_with_stored_property_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`forseti check` checks every stored property for the unit in one
+    process, but `--timeout` is esbmc's *per-attempt* budget -- a unit with
+    2+ properties needs more than one attempt's worth of wall clock or a
+    slow-but-legitimate check is dropped as a false timeout (issue #95
+    review)."""
+    source = tmp_path / "f.c"
+    unit_id = f"{source}::my_abs"
+    _add_candidate(tmp_path, unit_id, expression="result >= 0")
+    _add_candidate(tmp_path, unit_id, expression="result >= -1")
+    _add_candidate(tmp_path, unit_id, expression="result >= -2")
+    state = _state(_unit(str(source), "my_abs"))
+
+    captured: dict[str, Any] = {}
+
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured["timeout"] = kwargs.get("timeout")
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(_payload(unit_id, "held"))
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    property_gate.semantic_check_summary(str(tmp_path), state)
+
+    # 3 stored properties -> 3x the per-attempt CHECK_TIMEOUT_S, plus margin.
+    expected = 3 * property_gate.CHECK_TIMEOUT_S + property_gate._SUBPROCESS_MARGIN_S
+    assert captured["timeout"] == expected
+
+
+def test_failed_units_are_surfaced_in_the_stop_message() -> None:
+    from forseti.adapters.claude_code import stop_gate
+
+    summary = property_gate.SemanticCheckSummary((), checked=0, deferred=0, failed=2)
+
+    message = stop_gate._semantic_message(summary)
+
+    assert "2 unit(s)" in message
+    assert "could not be checked" in message
 
 
 def test_corrupt_store_is_best_effort_not_raised(
