@@ -128,6 +128,33 @@ def test_check_source_extra_flags_include_dir_wins_over_sibling_angle_bracket(
     assert run.counts()["held"] == 1
 
 
+def test_check_source_checks_a_helper_in_a_file_that_also_defines_main(
+    tmp_path: Path,
+) -> None:
+    """A normal executable TU (helper + its own `main`) is a legitimate check
+    target, not just a hand-written main-free kernel slice (issue #95 review:
+    `Unit.from_path` previously read the whole file verbatim, and the
+    generated harness's own `main` collided with it -> unconditional ERROR)."""
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    unit = src_dir / "prog.c"
+    unit.write_text(
+        "int my_double(int x) {\n    return x + x;\n}\n\n"
+        "int main(void) {\n    return my_double(2);\n}\n"
+    )
+
+    unit_id = f"{unit}::my_double"
+    root = tmp_path / ".forseti"
+    store = PropertyStore.open(root)
+    store.add(_semantic(unit_id, "result == x + x"))
+    store.close()
+
+    run = check_source(unit, function="my_double", store_root=root)
+
+    assert run.counts()["error"] == 0
+    assert run.counts()["held"] == 1
+
+
 def test_cli_check_exit_codes_and_json(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

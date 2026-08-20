@@ -16,12 +16,13 @@ live here so the driver need not import #62/#64 directly.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from forseti.esbmc import EsbmcResult, Violated
+from forseti.esbmc import EsbmcResult, Violated, find_definition_brace
 from forseti.properties import Property, PropertyStatus
 
 
@@ -61,8 +62,42 @@ class Unit:
 
     @classmethod
     def from_path(cls, path: Path, symbol: str) -> Unit:  # effect boundary
-        """Read `path` and build the unit keyed `path::symbol`."""
-        return cls(f"{path}::{symbol}", path, symbol, path.read_text())
+        """Read `path` and build the unit keyed `path::symbol`.
+
+        `path` need not already be main-free: a normal executable translation
+        unit (helper function + its own `main`) is a legitimate check target,
+        not just a hand-written `examples/*.c` kernel slice. `_rename_own_main`
+        renames a genuine `main` *definition* out of the way so `source_text`
+        satisfies this class's own main-free contract either way — a mere
+        prototype/declaration or a `main` appearing only in a call or comment
+        is left untouched (issue #95 review: `render_semantic_harness` rejects
+        any `unit_source` defining `main`, which previously made every stored
+        property for such a unit an unconditional `ERROR`).
+        """
+        return cls(
+            f"{path}::{symbol}", path, symbol, _rename_own_main(path.read_text())
+        )
+
+
+def _rename_own_main(source_text: str) -> str:
+    """`source_text` with a genuine `main` *definition* renamed out of the way.
+
+    Reuses `find_definition_brace` (RFC-0003 S3's own definition-shaped scan —
+    comment-aware, skips a prototype or a call site) to find the body brace of
+    an actual `main` definition, then renames the *last* `main` token before
+    that brace — the definition's own name, not an earlier prototype — leaving
+    return type, parameters, attributes, and body untouched. `None` (no
+    definition-shaped `main`) leaves `source_text` unchanged.
+    """
+    brace = find_definition_brace(source_text, "main")
+    if brace is None:
+        return source_text
+    matches = list(re.finditer(r"\bmain\b", source_text[:brace]))
+    if not matches:
+        return source_text
+    name_match = matches[-1]  # nearest to the brace is the definition's own name
+    start, end = name_match.span()
+    return f"{source_text[:start]}__forseti_unused_main{source_text[end:]}"
 
 
 @dataclass(frozen=True)
