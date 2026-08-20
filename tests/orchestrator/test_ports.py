@@ -32,6 +32,24 @@ def test_from_path_renames_colliding_main_definition(tmp_path: Path) -> None:
     assert "return helper(1);" in unit.source_text
 
 
+def test_from_path_renames_the_real_main_not_a_trailing_comment(
+    tmp_path: Path,
+) -> None:
+    """A comment mentioning `main` right before the brace must not be the
+    "last `main` before the brace" match -- that would rename comment text
+    (a no-op) and leave the actual identifier defining `main` untouched,
+    degrading back to the pre-fix ERROR."""
+    source = tmp_path / "prog.c"
+    source.write_text(
+        "int helper(int x) {\n    return x + 1;\n}\n\n"
+        "int main /* main */ (void) {\n    return helper(1);\n}\n"
+    )
+
+    unit = Unit.from_path(source, "helper")
+
+    assert "int __forseti_unused_main /* main */ (void)" in unit.source_text
+
+
 def test_from_path_leaves_main_free_source_unchanged(tmp_path: Path) -> None:
     source = tmp_path / "kernel.c"
     text = "int helper(int x) {\n    return x + 1;\n}\n"

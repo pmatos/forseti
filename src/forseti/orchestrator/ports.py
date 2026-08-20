@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from forseti.esbmc import EsbmcResult, Violated, find_definition_brace
+from forseti.esbmc import EsbmcResult, Violated, find_definition_brace, mask_comments
 from forseti.properties import Property, PropertyStatus
 
 
@@ -88,14 +88,22 @@ def _rename_own_main(source_text: str) -> str:
     that brace — the definition's own name, not an earlier prototype — leaving
     return type, parameters, attributes, and body untouched. `None` (no
     definition-shaped `main`) leaves `source_text` unchanged.
+
+    The token search itself runs over `mask_comments`' output, not the raw
+    text: `find_definition_brace` guarantees a *code* `main(` immediately
+    precedes `brace` (that's what "definition-shaped" means), so a comment
+    match is never the last one and a plain `matches` guard is dead code by
+    construction -- unless the search runs on the raw text, where a
+    `main`-shaped comment (``int main /* main */ (void) {``) sorts after the
+    real identifier and gets renamed instead of it, leaving the actual `main`
+    untouched. `mask_comments` is offset-preserving, so the span it finds
+    applies unchanged to the original `source_text`.
     """
     brace = find_definition_brace(source_text, "main")
     if brace is None:
         return source_text
-    matches = list(re.finditer(r"\bmain\b", source_text[:brace]))
-    if not matches:
-        return source_text
-    name_match = matches[-1]  # nearest to the brace is the definition's own name
+    masked = mask_comments(source_text)
+    name_match = list(re.finditer(r"\bmain\b", masked[:brace]))[-1]
     start, end = name_match.span()
     return f"{source_text[:start]}__forseti_unused_main{source_text[end:]}"
 
