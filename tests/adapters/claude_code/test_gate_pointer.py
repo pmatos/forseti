@@ -3244,6 +3244,30 @@ def test_wellformed_build_flags_still_parse(
     assert gate.build_flags_from_env() == ("-I/opt/my sdk", "-DX")
 
 
+def test_env_int_and_env_float_never_raise_on_a_malformed_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A malformed FORSETI_* numeric env var must not crash the hook process at
+    # import time (issue #95 review) -- the literal default is returned and
+    # the bad raw value is recorded instead of raising.
+    monkeypatch.setenv("FORSETI_UNWIND", "not-a-number")
+    assert gate.env_int("FORSETI_UNWIND", "1") == 1
+    assert "FORSETI_UNWIND" in gate.env_config_errors()[0]
+    assert "not-a-number" in gate.env_config_errors()[0]
+
+    monkeypatch.setenv("FORSETI_VERIFY_TIMEOUT_S", "")
+    assert gate.env_float("FORSETI_VERIFY_TIMEOUT_S", "110") == 110.0
+    assert len(gate.env_config_errors()) == 2
+
+
+def test_wellformed_numeric_env_var_records_no_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FORSETI_UNWIND", "8")
+    assert gate.env_int("FORSETI_UNWIND", "1") == 8
+    assert gate.env_config_errors() == ()
+
+
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
 def test_snapshot_enumeration_matches_the_in_place_parse(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

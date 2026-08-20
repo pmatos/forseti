@@ -195,6 +195,30 @@ def main() -> int:
     data = json.loads(raw) if raw.strip() else {}
     project_dir = gate.project_dir(data)
 
+    if errors := gate.env_config_errors():
+        # A malformed FORSETI_* numeric env var (`gate.env_int`/`env_float`,
+        # imported by every module below this point) never raises at import
+        # time -- it falls back to its literal default and records the bad
+        # raw value here instead, so the hook process itself never crashes.
+        # But that default is never load-bearing for an actual decision: this
+        # is the gate the whole v0 safety-verify loop blocks on, so a bad
+        # value blocks the turn loudly here, before any verify/check call
+        # downstream could silently run with it (issue #95 review; the same
+        # "fail closed, never silently coerce" spirit `build_flags_from_env`
+        # already holds itself to for `FORSETI_BUILD_FLAGS`).
+        event_log.log_event(
+            project_dir, event_log.STOP, decision="block", reason="env_config_error"
+        )
+        return _emit(
+            {
+                "decision": "block",
+                "reason": (
+                    "Forseti verify-gate: malformed configuration -- fix and "
+                    "retry:\n" + "\n".join(f"  - {e}" for e in errors)
+                ),
+            }
+        )
+
     # Discover C files changed out-of-band (Bash) that the gate has not verified.
     # This is an ESBMC-free, git-fast backstop — the heavy verify runs in the
     # `post_bash` PostToolUse hook (300 s budget), never here (120 s, kill = silent

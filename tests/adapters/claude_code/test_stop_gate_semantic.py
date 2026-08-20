@@ -153,6 +153,28 @@ def test_semantic_only_note_is_not_mislabeled_needs_contract(
     assert last["decision"] == "allow_semantic_check"
 
 
+def test_malformed_numeric_env_var_blocks_the_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A malformed FORSETI_* numeric env var must not silently fall back to
+    its default and let the turn proceed as if nothing were wrong (this
+    repo's fail-closed convention) -- it must BLOCK, the same "decision":
+    "block" shape every other blocking path in this hook uses, not merely
+    avoid a traceback (issue #95 review)."""
+    _git_init(tmp_path)
+    # Exercise the real parse path (not a simulated error) so this proves the
+    # actual failure mode: a bad env var reaching `env_int` records into the
+    # same list `stop_gate.main()`'s guard reads.
+    monkeypatch.setenv("FORSETI_UNWIND", "not-a-number")
+    gate.env_int("FORSETI_UNWIND", "1")
+
+    result = _run_and_capture(tmp_path, monkeypatch, capsys)
+
+    assert result["decision"] == "block"
+    assert "FORSETI_UNWIND" in result["reason"]
+    assert "not-a-number" in result["reason"]
+
+
 def test_deferred_only_is_still_reported(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -32,7 +32,6 @@ match is a follow-up, not a correctness bug in what this module does report.
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import subprocess
 from dataclasses import dataclass
@@ -53,8 +52,11 @@ _STORE_ROOT_NAME = ".forseti"
 # genuine loop property that needs more reports UNKNOWN here (loud, via
 # `forseti check`'s own contract) rather than eat the hook's budget escalating
 # on its own -- raise FORSETI_PROPERTY_UNWIND for a project that needs it.
-DEFAULT_UNWIND = int(os.environ.get("FORSETI_PROPERTY_UNWIND", "4"))
-CHECK_TIMEOUT_S = float(os.environ.get("FORSETI_PROPERTY_CHECK_TIMEOUT_S", "20"))
+# `gate.env_int`/`env_float` (not a bare `int`/`float`) -- a malformed value
+# must not crash the whole Stop-gate hook at import time over this opt-in
+# feature (issue #95 review); see `gate.env_config_errors`.
+DEFAULT_UNWIND = gate.env_int("FORSETI_PROPERTY_UNWIND", "4")
+CHECK_TIMEOUT_S = gate.env_float("FORSETI_PROPERTY_CHECK_TIMEOUT_S", "20")
 _SUBPROCESS_MARGIN_S = 10.0
 
 # How many units-with-candidates one Stop-gate call will actually shell out to
@@ -62,7 +64,7 @@ _SUBPROCESS_MARGIN_S = 10.0
 # unbounded count could exhaust the hook's timeout on a project with many
 # proposed units; excess units are counted (never silently dropped -- see
 # `SemanticCheckSummary.deferred`) rather than checked.
-MAX_UNITS_PER_TURN = int(os.environ.get("FORSETI_PROPERTY_MAX_UNITS", "3"))
+MAX_UNITS_PER_TURN = gate.env_int("FORSETI_PROPERTY_MAX_UNITS", "3")
 
 
 @dataclass(frozen=True)

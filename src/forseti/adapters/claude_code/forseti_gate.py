@@ -97,21 +97,66 @@ def build_flags_from_env() -> tuple[str, ...]:
         ) from exc
 
 
+_ENV_CONFIG_ERRORS: list[str] = []
+
+
+def env_int(name: str, default: str) -> int:
+    """`int(os.environ.get(name, default))`, never raising.
+
+    Every module-level constant these back is read by all four Claude Code
+    hooks (they all import `forseti_gate`, directly or via `property_gate`)
+    at *import* time -- a bare `ValueError` there would crash the hook process
+    before `main()` ever runs, over a misconfigured value for one knob
+    (issue #95 review). The literal `default` is used and the bad raw value
+    is recorded in `env_config_errors()` instead of raising -- never load-
+    bearing for an actual decision: `stop_gate.main()` blocks the turn loudly
+    before using any of these constants if that list is non-empty, the same
+    "fail closed, never silently coerce" spirit `build_flags_from_env`
+    already holds itself to for `FORSETI_BUILD_FLAGS`.
+    """
+    raw = os.environ.get(name, default)
+    try:
+        return int(raw)
+    except ValueError:
+        _ENV_CONFIG_ERRORS.append(f"{name}={raw!r} is not a valid integer")
+        return int(default)
+
+
+def env_float(name: str, default: str) -> float:
+    """`float(os.environ.get(name, default))`, never raising. See `env_int`."""
+    raw = os.environ.get(name, default)
+    try:
+        return float(raw)
+    except ValueError:
+        _ENV_CONFIG_ERRORS.append(f"{name}={raw!r} is not a valid number")
+        return float(default)
+
+
+def env_config_errors() -> tuple[str, ...]:
+    """Every malformed `FORSETI_*` numeric env var recorded since import.
+
+    Shared across every hook module that parses one this way (`property_gate`
+    reuses `env_int`/`env_float`, appending into this same list) -- empty when
+    every knob parsed cleanly.
+    """
+    return tuple(_ENV_CONFIG_ERRORS)
+
+
 # The default loop-unwind bound k. A VERIFIED is only ever "verified up to k".
 # Override per project with FORSETI_UNWIND; functions with loops need a higher k
 # (a k below the trip count can report a spurious verdict — roadmap Risk 1).
-DEFAULT_K = int(os.environ.get("FORSETI_UNWIND", "1"))
+DEFAULT_K = env_int("FORSETI_UNWIND", "1")
 
 # Per-function verify budget. Passed to `forseti verify --timeout` so ESBMC
 # itself honors it — without it the Core CLI falls back to its 30s default and
 # this knob is inert. The subprocess is bounded a little higher (below) so ESBMC
 # self-terminates with UNKNOWN before the hard kill.
-VERIFY_TIMEOUT_S = float(os.environ.get("FORSETI_VERIFY_TIMEOUT_S", "110"))
+VERIFY_TIMEOUT_S = env_float("FORSETI_VERIFY_TIMEOUT_S", "110")
 _SUBPROCESS_MARGIN_S = 15.0
 
 # Budget for the one `forseti list-units` parse per edited file. A `--parse-tree-only`
 # run does no solving, so it is fast; keep it well under the verify budget.
-LIST_UNITS_TIMEOUT_S = float(os.environ.get("FORSETI_LIST_UNITS_TIMEOUT_S", "30"))
+LIST_UNITS_TIMEOUT_S = env_float("FORSETI_LIST_UNITS_TIMEOUT_S", "30")
 
 # How many times the Stop-gate blocks before it gives up and lets the turn end
 # with a LOUD unverified residual (never a silent pass, but never an infinite
