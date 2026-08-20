@@ -420,3 +420,36 @@ def test_per_turn_budget_defers_excess_units(
     assert summary.checked == 1
     assert summary.deferred == 2
     assert not summary.empty  # deferred alone is still worth reporting
+
+
+def test_per_turn_selection_is_deterministic_not_insertion_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Checking never mutates a property's stored status, so an insertion-
+    order-dependent prefix would select the exact same units forever on a
+    project with more candidates than the budget -- worse, it would depend on
+    an incidental `dict` ordering nobody documents (issue #95 review). Insert
+    `state["units"]` in reverse order and confirm the selection doesn't
+    follow it."""
+    monkeypatch.setattr(property_gate, "MAX_UNITS_PER_TURN", 1)
+    units = []
+    for i in reversed(range(3)):  # inserted z, y, x -- NOT sorted order
+        source = tmp_path / f"f{i}.c"
+        unit_id = f"{source}::fn{i}"
+        _add_candidate(tmp_path, unit_id)
+        units.append(_unit(str(source), f"fn{i}"))
+    state = _state(*units)
+
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _fake_run(_payload("x", "held"), 0, captured),
+    )
+
+    property_gate.semantic_check_summary(str(tmp_path), state)
+
+    # f0.c sorts first regardless of state["units"]' insertion order.
+    assert captured["argv"][captured["argv"].index("check") + 1] == str(
+        tmp_path / "f0.c"
+    )

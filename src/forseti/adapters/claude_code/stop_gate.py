@@ -169,10 +169,18 @@ def _semantic_message(summary: property_gate.SemanticCheckSummary) -> str:
             "or the project's build flags."
         )
     if summary.deferred:
+        # NOT "rerun to cover them": checking never mutates a property's
+        # stored status, so the selection is the same deterministic prefix
+        # every turn (property_gate.semantic_check_summary) -- a project with
+        # more verified-and-candidate units than FORSETI_PROPERTY_MAX_UNITS
+        # has some units this hook will never check on its own (issue #95
+        # review). Raise the budget or `forseti check` the deferred units
+        # directly.
         lines.append(
             f"⚠ Forseti: {summary.deferred} unit(s) with stored properties were "
-            "not checked this turn (FORSETI_PROPERTY_MAX_UNITS budget) — rerun "
-            "to cover them."
+            "not checked this turn (FORSETI_PROPERTY_MAX_UNITS budget is a hard "
+            "per-turn cap, not a rotating window) — raise "
+            "FORSETI_PROPERTY_MAX_UNITS or `forseti check` them directly."
         )
     return "\n".join(lines)
 

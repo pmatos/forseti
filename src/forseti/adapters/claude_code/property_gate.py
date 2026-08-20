@@ -226,6 +226,14 @@ def semantic_check_summary(
     if not candidates:
         return empty
 
+    # Deterministic, not insertion-order: checking never mutates a property's
+    # stored status, so nothing changes which prefix `state["units"]`'s
+    # insertion order would hand back turn after turn -- an accidental
+    # dependency on edit order rather than a real, documented selection rule
+    # (issue #95 review; see MAX_UNITS_PER_TURN's own message below).
+    candidates.sort(
+        key=lambda pair: (pair[0].get("file", ""), pair[0].get("function", ""))
+    )
     to_check = candidates[:MAX_UNITS_PER_TURN]
     deferred = max(0, len(candidates) - MAX_UNITS_PER_TURN)
     violations: list[dict[str, Any]] = []
