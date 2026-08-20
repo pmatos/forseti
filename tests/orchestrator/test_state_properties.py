@@ -165,4 +165,5 @@ def test_run_loop_exhausts_budget_on_persistent_violation(max_iterations: int) -
     assert run.give_up_reason is GiveUpReason.MAX_ITERATIONS_EXCEEDED
     assert len(run.iterations) == max_iterations
     assert verify.calls == max_iterations
-    assert fix.calls == max_iterations
+    # no round remains to verify a fix on the final pass, so it is skipped.
+    assert fix.calls == max_iterations - 1

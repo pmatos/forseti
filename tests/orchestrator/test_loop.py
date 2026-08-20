@@ -103,9 +103,24 @@ def test_never_fixed_gives_up_at_budget() -> None:
     assert run.final_state is LoopState.GIVE_UP
     assert run.give_up_reason is GiveUpReason.MAX_ITERATIONS_EXCEEDED
     assert len(run.iterations) == 3
-    assert fix.calls == 3
+    # no round remains to verify a fix on the final pass, so it is skipped.
+    assert fix.calls == 2
     # the last recorded pass is still a FIX; GIVE_UP comes from exhaustion.
     assert run.iterations[-1].state is LoopState.FIX
+
+
+def test_final_pass_violation_skips_fix_entirely() -> None:
+    # max_iterations=1: the one permitted pass is also the last, so fix must
+    # never run — an unverified, possibly side-effecting edit with no
+    # remaining round to check it would contradict "fix and another pass".
+    fix = FakeFix()
+    sink = ListSink()
+    verify = FakeVerify([violated()])
+    run = run_loop(SRC, verify=verify, fix=fix, unwind=8, max_iterations=1, sink=sink)
+    assert run.final_state is LoopState.GIVE_UP
+    assert run.give_up_reason is GiveUpReason.MAX_ITERATIONS_EXCEEDED
+    assert fix.calls == 0
+    assert "fix.attempt" not in [e.type for e in sink.events]
 
 
 def test_unknown_halts_without_fixing() -> None:

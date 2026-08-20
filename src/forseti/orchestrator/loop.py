@@ -75,8 +75,10 @@ def run_loop(
 
     Two bounds. The **outer** loop is the fix budget: up to `max_iterations`
     rounds, each verifying the current source and, on `Violated`, calling `fix`
-    (on every round, incl. the last) before the next round; exhausting the budget
-    ends in `GIVE_UP`. Each round delegates the k-escalation to the shared
+    before the next round — except on the last round, where no next round
+    remains to verify a fix's output, so it goes straight to `GIVE_UP` instead
+    of performing an unverified (and possibly side-effecting) edit. Each round
+    delegates the k-escalation to the shared
     `verify_ladder`: on `Unknown` it re-verifies the *same* source at the
     next-higher unwind along `(unwind, *unwind_ladder)`, settling on the terminal
     `UNKNOWN` only once the ladder is exhausted (never a silent pass; roadmap
@@ -137,8 +139,12 @@ def run_loop(
                 emit("converged", index=index - 1)
                 return LoopRun(state, tuple(iterations))
             case Violated() as violation:
-                emit("fix.attempt", index=index - 1)
-                current = fix(current, violation)  # fix every round, incl. the last
+                if rounds < max_iterations:
+                    emit("fix.attempt", index=index - 1)
+                    current = fix(current, violation)
+                # else: no round remains to verify a fix's output — fall through
+                # to the budget-exhausted give-up below rather than perform an
+                # unverified (and possibly side-effecting) edit.
             case Unknown():
                 emit(
                     "unknown.policy.decision",
