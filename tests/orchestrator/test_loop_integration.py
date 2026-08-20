@@ -51,6 +51,19 @@ class RecordedFix:
         return self._mapping[source]
 
 
+def _staged_abs_fix(
+    tmp_path: Path,
+) -> tuple[Path, RecordedFixProvider, ProviderFixPort]:
+    # Staged into tmp_path, not examples/abs.c directly: ProviderFixPort writes
+    # its candidate beside `source`, and examples/ is tracked source, not a
+    # scratch directory.
+    unit = tmp_path / "abs.c"
+    shutil.copy(EXAMPLES / "abs.c", unit)
+    provider = RecordedFixProvider({unit: EXAMPLES / "abs_fixed.c"})
+    fix = ProviderFixPort(provider, original=unit, work_dir=unit.parent)
+    return unit, provider, fix
+
+
 def test_abs_int_min_loop_converges_to_verified() -> None:
     fix = RecordedFix({EXAMPLES / "abs.c": EXAMPLES / "abs_fixed.c"})
 
@@ -84,12 +97,9 @@ def test_abs_int_min_loop_converges_via_provider(tmp_path: Path) -> None:
     # RecordedFixProvider proposes abs_fixed.c's text and ProviderFixPort writes
     # + re-enters VERIFY. Proves the typed-cex parse and the applier write
     # compose across a real esbmc run, not just the fakes.
-    provider = RecordedFixProvider({EXAMPLES / "abs.c": EXAMPLES / "abs_fixed.c"})
-    fix = ProviderFixPort(provider, work_dir=tmp_path / "work")
+    unit, provider, fix = _staged_abs_fix(tmp_path)
 
-    run = run_loop(
-        EXAMPLES / "abs.c", verify=verify, fix=fix, unwind=1, max_iterations=2
-    )
+    run = run_loop(unit, verify=verify, fix=fix, unwind=1, max_iterations=2)
 
     assert run.final_state is LoopState.DONE
     assert isinstance(run.iterations[-1].result, Verified)
@@ -102,12 +112,11 @@ def test_abs_int_min_loop_converges_via_provider(tmp_path: Path) -> None:
 def test_abs_run_emits_telemetry_and_renders_transcript(tmp_path: Path) -> None:
     # Acceptance: the transcript is verified on the real #2 abs run, and the loop
     # emits a `converged` event through the pluggable sink.
-    provider = RecordedFixProvider({EXAMPLES / "abs.c": EXAMPLES / "abs_fixed.c"})
-    fix = ProviderFixPort(provider, work_dir=tmp_path / "work")
+    unit, _provider, fix = _staged_abs_fix(tmp_path)
     sink = ListSink()
 
     run = run_loop(
-        EXAMPLES / "abs.c",
+        unit,
         verify=verify,
         fix=fix,
         unwind=1,

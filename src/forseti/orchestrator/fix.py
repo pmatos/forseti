@@ -112,24 +112,88 @@ class ProviderFixPort:
 
     On each call it reads the current source, builds the `FixRequest`, asks the
     provider for patched text, and writes that text to a fresh versioned unit
-    (`<stem>.fix<N><suffix>`) under `work_dir`, returning its path. Writing a new
-    file per fix keeps every `Iteration.source` a distinct path and never mutates
-    the input. Because it returns the next path to verify, `run_loop`'s existing
-    "fix then re-verify" loop *is* the apply+re-enter — the driver is unchanged.
+    (`<stem>.fix<N><suffix>`) under `work_dir`, returning its path. `work_dir`
+    is caller-chosen and always writable by contract — unlike `original`,
+    which may live in a read-only checkout or mounted source tree (PR #207
+    review). Writing a new file per fix keeps every `Iteration.source` a
+    distinct path and never mutates `original`; exclusive creation means a
+    stale leftover from a previous run fails loud instead of being silently
+    overwritten. Because it returns the next path to verify, `run_loop`'s
+    existing "fix then re-verify" loop *is* the apply+re-enter — the driver is
+    unchanged.
+
+    Quoted-include resolution (issue #39) is a `work_dir` choice, not
+    something this class does for you. A non-self-contained C unit with
+    sibling quoted includes (`#include "harness.h"`) resolves those relative
+    to the including file's own directory:
+
+    - Pass `work_dir=original.parent` (same directory) when `original`'s
+      directory is writable and that's the simplest choice — sibling includes
+      then resolve for free, exactly as they did in place. The residual: a
+      unit that `#include`s itself by its own literal filename still reaches
+      the live original, since a fresh `.fixN` name can never occupy it.
+    - When `original`'s directory is read-only, pass a separate writable
+      `work_dir` and carry the original include directory into verification
+      instead, e.g. `functools.partial(verify, extra_flags=("-I",
+      str(original.parent)))` as the `VerifyPort` given to `run_loop` —
+      `forseti.esbmc.verify` already accepts `extra_flags`, so this needs no
+      change to `VerifyPort`'s protocol, just a closure at the call site.
+      Quoted-include search checks the including file's own directory
+      (`work_dir`) first and falls back to `-I` dirs, so this reproduces the
+      original resolution — including `../`-relative sibling includes,
+      resolved against the real `original.parent` — without mirroring any
+      files into `work_dir`. The residual: a same-named file already sitting
+      in `work_dir` would shadow the real header, so give each fix session
+      its own dedicated `work_dir`.
+
+    One instance is scoped to one unit, named explicitly by the `original`
+    constructor argument. Every `__call__` must pass either that same path or
+    one of this instance's own prior outputs (fed back in by `run_loop` on
+    round 2+) — an unrelated source fails loud instead of silently writing a
+    second unit's fix under the first unit's stem.
     """
 
-    def __init__(self, provider: FixProvider, *, work_dir: Path) -> None:
+    def __init__(
+        self, provider: FixProvider, *, original: Path, work_dir: Path
+    ) -> None:
         self._provider = provider
+        self._original = original
         self._work_dir = work_dir
         self._attempt = 0
         work_dir.mkdir(parents=True, exist_ok=True)
 
+    def _candidate(self, attempt: int) -> Path:
+        return (
+            self._work_dir
+            / f"{self._original.stem}.fix{attempt}{self._original.suffix}"
+        )
+
     def __call__(self, source: Path, violated: Violated) -> Path:
+        # `run_loop` only ever feeds back its own last output (`current = fix(
+        # current, violation)`), so this instance's last output is the only
+        # prior output that can legitimately reappear as `source` — derived
+        # from `_attempt` rather than tracked separately, since the two can
+        # never diverge.
+        last_output = self._candidate(self._attempt) if self._attempt else None
+        if source != self._original and source != last_output:
+            raise ValueError(
+                f"ProviderFixPort is bound to {self._original}; got unrelated "
+                f"source {source}. Use a separate ProviderFixPort per unit."
+            )
+        attempt = self._attempt + 1
+        dest = self._candidate(attempt)
+        if dest.exists():
+            raise FileExistsError(f"candidate already exists: {dest}")
         request = FixRequest.from_violation(source, source.read_text(), violated)
         patched = self._provider.propose_fix(request)
-        self._attempt += 1
-        dest = self._work_dir / f"{source.stem}.fix{self._attempt}{source.suffix}"
-        dest.write_text(patched)
+        # Burn the attempt number before writing, not before propose_fix: a
+        # propose_fix failure leaves no file behind and should stay retryable
+        # under the same number, but a write failure (e.g. disk full) after
+        # `open("x")` already created `dest` must not let the next call
+        # recompute and collide with that same `dest` forever.
+        self._attempt = attempt
+        with dest.open("x") as f:
+            f.write(patched)
         return dest
 
 

@@ -57,12 +57,19 @@ def _verify(source: Path, *, unwind: int) -> EsbmcResult:
     return verify(source, unwind=unwind, timeout_s=60)
 
 
-def _drive(bug: str, clean: str, k: int, *, work_dir: Path, sink: ListSink) -> LoopRun:
-    """Drive the loop bug -> recorded fix -> clean at bound k (no human, no LLM)."""
-    provider = RecordedFixProvider({EXAMPLES / bug: EXAMPLES / clean})
-    fix = ProviderFixPort(provider, work_dir=work_dir)
+def _drive(bug: str, clean: str, k: int, *, tmp_path: Path, sink: ListSink) -> LoopRun:
+    """Drive the loop bug -> recorded fix -> clean at bound k (no human, no LLM).
+
+    Driven from a tmp copy of the bug source, not examples/ directly:
+    ProviderFixPort writes its candidate beside `source`, and examples/ is
+    tracked source, not a scratch directory.
+    """
+    staged = tmp_path / bug
+    shutil.copy(EXAMPLES / bug, staged)
+    provider = RecordedFixProvider({staged: EXAMPLES / clean})
+    fix = ProviderFixPort(provider, original=staged, work_dir=staged.parent)
     return run_loop(
-        EXAMPLES / bug, verify=_verify, fix=fix, unwind=k, max_iterations=2, sink=sink
+        staged, verify=_verify, fix=fix, unwind=k, max_iterations=2, sink=sink
     )
 
 
@@ -71,7 +78,7 @@ def test_corpus_kernel_closes_to_verified(
     bug: str, clean: str, k: int, unit: str, tmp_path: Path
 ) -> None:
     sink = ListSink()
-    run = _drive(bug, clean, k, work_dir=tmp_path / "work", sink=sink)
+    run = _drive(bug, clean, k, tmp_path=tmp_path, sink=sink)
 
     assert run.final_state is LoopState.DONE
     assert run.give_up_reason is None

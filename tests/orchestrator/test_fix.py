@@ -7,6 +7,7 @@ in for a real ESBMC trace, and a recorded provider replays known-good source.
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
@@ -113,26 +114,122 @@ class StubProvider:
 
     def __init__(self, patch: str) -> None:
         self._patch = patch
+        self.calls = 0
 
     def propose_fix(self, request: FixRequest) -> str:
+        self.calls += 1
         return self._patch
 
 
 def test_provider_fix_port_writes_and_returns_versioned_path(tmp_path: Path) -> None:
     source = tmp_path / "kernel.c"
     source.write_text("orig\n")
-    work_dir = tmp_path / "work"
-    fix = ProviderFixPort(StubProvider("patched\n"), work_dir=work_dir)
+    fix = ProviderFixPort(
+        StubProvider("patched\n"), original=source, work_dir=source.parent
+    )
 
     dest1 = fix(source, violated())
 
-    assert work_dir.is_dir()
-    assert dest1.parent == work_dir
+    assert dest1.parent == source.parent
     assert dest1.name == "kernel.fix1.c"
     assert dest1.read_text() == "patched\n"
 
     dest2 = fix(source, violated())
     assert dest2.name == "kernel.fix2.c"
+
+
+def test_provider_fix_port_writes_to_work_dir_when_source_dir_is_read_only(
+    tmp_path: Path,
+) -> None:
+    # PR #207 review: the previous API could read from a read-only checkout
+    # and place candidates in a caller-provided writable work_dir; #39's
+    # same-directory-only write broke that. work_dir must be honoured even
+    # when the source directory itself can't be written to.
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permission bits")
+    source_dir = tmp_path / "readonly_source"
+    source_dir.mkdir()
+    source = source_dir / "kernel.c"
+    source.write_text("orig\n")
+    work_dir = tmp_path / "work"
+    original_mode = source_dir.stat().st_mode
+    source_dir.chmod(0o555)
+    try:
+        fix = ProviderFixPort(
+            StubProvider("patched\n"), original=source, work_dir=work_dir
+        )
+
+        dest = fix(source, violated())
+
+        assert dest.parent == work_dir
+        assert dest.read_text() == "patched\n"
+        # Nothing was ever written into the read-only source directory.
+        assert [p.name for p in source_dir.iterdir()] == ["kernel.c"]
+    finally:
+        source_dir.chmod(original_mode)
+
+
+def test_provider_fix_port_second_round_keeps_the_original_stem(
+    tmp_path: Path,
+) -> None:
+    # run_loop feeds round 1's dest back in as round 2's `source` (Iteration's
+    # `current = fix(current, violation)`). The applier must still derive the
+    # stem from the *original* source, not from that relocated path, or round
+    # 2 would be named kernel.fix1.fix2.c instead of kernel.fix2.c. work_dir is
+    # deliberately not source.parent here, so a regression that re-derives the
+    # write location from `source` (round 2's relocated path) instead of the
+    # fixed work_dir would show up as dest2.parent, not just dest2.name.
+    source = tmp_path / "kernel.c"
+    source.write_text("orig\n")
+    work_dir = tmp_path / "work"
+    fix = ProviderFixPort(StubProvider("patched\n"), original=source, work_dir=work_dir)
+
+    dest1 = fix(source, violated())
+    dest2 = fix(dest1, violated())
+
+    assert dest2.parent == work_dir
+    assert dest2.name == "kernel.fix2.c"
+
+
+def test_provider_fix_port_refuses_to_clobber_a_stale_candidate(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "kernel.c"
+    source.write_text("orig\n")
+    stale = tmp_path / "kernel.fix1.c"
+    stale.write_text("stale leftover\n")
+    provider = StubProvider("patched\n")
+    fix = ProviderFixPort(provider, original=source, work_dir=source.parent)
+
+    with pytest.raises(FileExistsError):
+        fix(source, violated())
+
+    assert stale.read_text() == "stale leftover\n"
+    # The collision check runs before propose_fix, so a stale leftover is
+    # caught without paying for a (possibly LLM-backed) fix proposal that
+    # would only be discarded.
+    assert provider.calls == 0
+
+
+def test_provider_fix_port_rejects_an_unrelated_source_from_a_reused_instance(
+    tmp_path: Path,
+) -> None:
+    # A ProviderFixPort instance is scoped to the first source it ever saw.
+    # Reusing one instance across two different units must fail loud instead
+    # of silently writing the second unit's fix into work_dir under the first
+    # unit's stem.
+    unit_a = tmp_path / "unit_a.c"
+    unit_a.write_text("orig a\n")
+    unit_b = tmp_path / "unit_b.c"
+    unit_b.write_text("orig b\n")
+    fix = ProviderFixPort(
+        StubProvider("patched\n"), original=unit_a, work_dir=unit_a.parent
+    )
+
+    fix(unit_a, violated())
+
+    with pytest.raises(ValueError, match="unrelated source"):
+        fix(unit_b, violated())
 
 
 class FakeVerify:
@@ -153,7 +250,7 @@ def test_scripted_provider_drives_loop_abs_to_fixed(tmp_path: Path) -> None:
     unit = tmp_path / "abs.c"
     shutil.copy(EXAMPLES / "abs.c", unit)
     provider = RecordedFixProvider({unit: EXAMPLES / "abs_fixed.c"})
-    fix = ProviderFixPort(provider, work_dir=tmp_path / "work")
+    fix = ProviderFixPort(provider, original=unit, work_dir=unit.parent)
     verify = FakeVerify([violated(), Verified(meta())])
 
     run = run_loop(unit, verify=verify, fix=fix, unwind=1, max_iterations=2)
@@ -161,6 +258,6 @@ def test_scripted_provider_drives_loop_abs_to_fixed(tmp_path: Path) -> None:
     assert run.final_state is LoopState.DONE
     assert provider.calls == 1
     # The path the final (VERIFIED) pass ran on is the applier's output; read it
-    # back from the run rather than guessing the work/abs.fix1.c filename.
+    # back from the run rather than guessing the abs.fix1.c filename.
     applied = run.iterations[-1].source
     assert applied.read_text() == (EXAMPLES / "abs_fixed.c").read_text()
