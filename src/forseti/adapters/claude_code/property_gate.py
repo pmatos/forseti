@@ -62,8 +62,8 @@ _STORE_ROOT_NAME = ".forseti"
 # `gate.env_int`/`env_float` (not a bare `int`/`float`) -- a malformed value
 # must not crash the whole Stop-gate hook at import time over this opt-in
 # feature (issue #95 review); see `gate.env_config_errors`.
-DEFAULT_UNWIND = gate.env_int("FORSETI_PROPERTY_UNWIND", "4")
-CHECK_TIMEOUT_S = gate.env_float("FORSETI_PROPERTY_CHECK_TIMEOUT_S", "20")
+DEFAULT_UNWIND = gate.env_int("FORSETI_PROPERTY_UNWIND", "4", minimum=1)
+CHECK_TIMEOUT_S = gate.env_float("FORSETI_PROPERTY_CHECK_TIMEOUT_S", "20", minimum=1.0)
 _SUBPROCESS_MARGIN_S = 10.0
 
 # How many units-with-candidates one Stop-gate call will actually shell out to
@@ -71,7 +71,7 @@ _SUBPROCESS_MARGIN_S = 10.0
 # unbounded count could exhaust the hook's timeout on a project with many
 # proposed units; excess units are counted (never silently dropped -- see
 # `SemanticCheckSummary.deferred`) rather than checked.
-MAX_UNITS_PER_TURN = gate.env_int("FORSETI_PROPERTY_MAX_UNITS", "3")
+MAX_UNITS_PER_TURN = gate.env_int("FORSETI_PROPERTY_MAX_UNITS", "3", minimum=0)
 
 # Aggregate wall-clock ceiling for the whole semantic-check loop (all units in
 # `to_check`, sequentially), not just one unit's own subprocess timeout. Half
@@ -89,7 +89,37 @@ MAX_UNITS_PER_TURN = gate.env_int("FORSETI_PROPERTY_MAX_UNITS", "3")
 # since a single unit with enough stored properties can need more wall clock
 # than one attempt's share of the ceiling by itself (issue #95 review,
 # thread a7NSB on the between-units-only version of this fix).
-MAX_TOTAL_CHECK_S = gate.env_float("FORSETI_PROPERTY_MAX_TOTAL_CHECK_S", "60")
+MAX_TOTAL_CHECK_S = gate.env_float(
+    "FORSETI_PROPERTY_MAX_TOTAL_CHECK_S", "60", minimum=1.0
+)
+
+
+def _check_min_attempt_budget_fits(
+    min_attempt_budget_s: float, max_total_check_s: float
+) -> None:
+    """Records an env-config error if `max_total_check_s` cannot cover even one
+    honest attempt at `min_attempt_budget_s`.
+
+    Neither `env_int`/`env_float` alone can catch this -- it is two knobs
+    interacting, not one out-of-range value. Left unchecked, a project that
+    raises FORSETI_PROPERTY_CHECK_TIMEOUT_S without a matching raise to
+    FORSETI_PROPERTY_MAX_TOTAL_CHECK_S would silently defer every unit, every
+    turn, forever -- `semantic_check_summary`'s `remaining <
+    _MIN_ATTEMPT_BUDGET_S` check never lets a single one start (issue #95
+    review). A plain function, not inline module-level code, so a test can
+    exercise the check directly with arbitrary values the same way
+    `env_int`/`env_float` already are, instead of needing a real module
+    reload to vary an import-time constant.
+    """
+    if min_attempt_budget_s > max_total_check_s:
+        gate.record_env_config_error(
+            "FORSETI_PROPERTY_CHECK_TIMEOUT_S needs at least "
+            f"{min_attempt_budget_s:.0f}s of FORSETI_PROPERTY_MAX_TOTAL_CHECK_S="
+            f"{max_total_check_s!r} for even one unit to start -- every unit "
+            "would be deferred forever; raise the total budget or lower the "
+            "per-check timeout"
+        )
+
 
 # The smallest remaining budget worth starting a fresh unit with: one esbmc
 # attempt's worst case (`CHECK_TIMEOUT_S + VERIFY_GRACE_S`) plus the
@@ -99,6 +129,7 @@ MAX_TOTAL_CHECK_S = gate.env_float("FORSETI_PROPERTY_MAX_TOTAL_CHECK_S", "60")
 # attempt; `deferred` (issue #95 review) is the honest bucket for "ran out of
 # turn budget", the same as a unit this loop never reaches at all.
 _MIN_ATTEMPT_BUDGET_S = CHECK_TIMEOUT_S + VERIFY_GRACE_S + _SUBPROCESS_MARGIN_S
+_check_min_attempt_budget_fits(_MIN_ATTEMPT_BUDGET_S, MAX_TOTAL_CHECK_S)
 
 
 @dataclass(frozen=True)
@@ -181,9 +212,24 @@ def _units_with_candidates(
         return out
 
 
+class _Clamped:
+    """Sentinel `_check_unit` returns when its subprocess timed out *and* that
+    timeout was clamped below what `n_props` actually needed (issue #95
+    review). Distinct from `None` (a genuine tooling failure) so the caller
+    can bucket it as `deferred` ("ran out of turn budget") rather than
+    `failed` ("this check itself broke") -- the same distinction
+    `_MIN_ATTEMPT_BUDGET_S` already draws for a unit clamped so hard it never
+    starts at all; this is the same failure mode for a unit that *did* start
+    but still ran out of its share of the budget partway through.
+    """
+
+
+_CLAMPED = _Clamped()
+
+
 def _check_unit(
     project_dir: str, unit: dict[str, Any], n_props: int, budget_s: float
-) -> list[Any] | None:
+) -> list[Any] | _Clamped | None:
     """Run `forseti check --json` for one unit; `None` on any tooling failure.
 
     Never raised: a broken check must surface as "nothing found" here, not
@@ -248,20 +294,25 @@ def _check_unit(
         return None
     if build_flags:
         argv += ["--", *build_flags]
+    natural_timeout = (
+        max(1, n_props) * (CHECK_TIMEOUT_S + VERIFY_GRACE_S) + _SUBPROCESS_MARGIN_S
+    )
+    timeout = min(natural_timeout, budget_s)
     try:
         proc = subprocess.run(
             argv,
             capture_output=True,
             text=True,
-            timeout=min(
-                max(1, n_props) * (CHECK_TIMEOUT_S + VERIFY_GRACE_S)
-                + _SUBPROCESS_MARGIN_S,
-                budget_s,
-            ),
+            timeout=timeout,
             cwd=project_dir,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError:
         return None
+    except subprocess.TimeoutExpired:
+        # `timeout < natural_timeout` means `n_props` genuinely needed more
+        # wall clock than this unit's share of the remaining aggregate budget
+        # could give it -- ran out of *turn* budget, not a broken subprocess.
+        return _CLAMPED if timeout < natural_timeout else None
     try:
         payload = json.loads(proc.stdout)
     except json.JSONDecodeError:
@@ -289,11 +340,18 @@ def semantic_check_summary(
         return empty
     try:
         candidates = _units_with_candidates(project_dir, verified)
-    except (PropertyStoreError, sqlite3.Error):
+    except (PropertyStoreError, sqlite3.Error, OSError):
         # A corrupt/unreadable forseti.db must not turn this best-effort surface
         # into a crashed Stop-gate hook (module docstring) -- unlike
         # `check_source`, which translates the same failure into a raised
-        # `PropertyStoreError` for a caller that *wants* to know.
+        # `PropertyStoreError` for a caller that *wants* to know. `OSError`
+        # (not just `PropertyStoreError`/`sqlite3.Error`) because
+        # `PropertyStore.open`'s `mkdir` can raise it directly -- the
+        # `.forseti/forseti.db` existence check just above is only a fast
+        # path, not a guarantee: another process can remove `.forseti/`
+        # between that check and `open()` a few lines below (issue #95
+        # review; `core/cli.py`'s `_run_check` already catches `OSError`
+        # around the equivalent `check_source` call for the same reason).
         return empty
     if not candidates:
         return empty
@@ -334,6 +392,12 @@ def semantic_check_summary(
             deferred += len(to_check) - i
             break
         verdicts = _check_unit(project_dir, unit, n_props, remaining)
+        if isinstance(verdicts, _Clamped):
+            # Started, but this unit's own share of the remaining aggregate
+            # budget ran out before `n_props` properties could finish -- ran
+            # out of turn budget, not a broken subprocess (issue #95 review).
+            deferred += 1
+            continue
         if verdicts is None:
             failed += 1
             continue

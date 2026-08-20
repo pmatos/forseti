@@ -111,6 +111,17 @@ def main() -> int:
     data = json.loads(raw) if raw.strip() else {}
     project_dir = gate.project_dir(data)
 
+    if errors := gate.env_config_errors():
+        # Same fail-closed check `stop_gate.main()` and `post_tool_use.main()`
+        # open with, and for the same reason: `_verify_file` below reads
+        # `gate.DEFAULT_K`/`VERIFY_TIMEOUT_S` via `verify_and_record`, and a
+        # malformed value silently falls back to its default instead of
+        # raising (issue #95 review) -- this hook would otherwise verify and
+        # durably record a verdict under that wrong value before the Stop hook
+        # ever gets a chance to block on the misconfiguration.
+        print(gate.env_config_error_message(errors), file=sys.stderr)
+        return 2
+
     # Read state once for the baseline HEAD (so the scan also catches C committed
     # in the same Bash command) and to pick the files that actually changed since
     # their last verify; verify_and_record re-locks per file, so we hold no lock.

@@ -1874,6 +1874,30 @@ def test_post_bash_non_git_is_traced_noop(
     assert any(e.get("decision") == "oob_scan_skipped" for e in events)
 
 
+def test_post_bash_blocks_on_malformed_env_var_before_verifying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Issue #95 review: `_verify_file` reads `gate.DEFAULT_K`/`VERIFY_TIMEOUT_S`
+    # (env_int/env_float-backed) via `verify_and_record` -- a malformed value
+    # must block here, before this hook could verify and durably record a
+    # verdict under the wrong value (the same fail-closed check
+    # `stop_gate.main()` opens with).
+    _git_init(tmp_path)
+    (tmp_path / "a.c").write_text("int a(void){return 0;}\n")
+    monkeypatch.setenv("FORSETI_UNWIND", "not-a-number")
+    gate.env_int("FORSETI_UNWIND", "1")  # exercise the real parse path
+
+    def _boom(*_a: object, **_kw: object) -> None:
+        raise AssertionError("must not verify with a malformed env config")
+
+    monkeypatch.setattr(gate, "verify_and_record", _boom)
+
+    assert _run(post_bash.main, tmp_path, monkeypatch) == 2
+    err = capsys.readouterr().err
+    assert "FORSETI_UNWIND" in err
+    assert "not-a-number" in err
+
+
 def test_post_bash_skips_unchanged_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -20,6 +20,7 @@ import fcntl
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -100,7 +101,7 @@ def build_flags_from_env() -> tuple[str, ...]:
 _ENV_CONFIG_ERRORS: list[str] = []
 
 
-def env_int(name: str, default: str) -> int:
+def env_int(name: str, default: str, *, minimum: int | None = None) -> int:
     """`int(os.environ.get(name, default))`, never raising.
 
     Every module-level constant these back is read by all four Claude Code
@@ -113,23 +114,50 @@ def env_int(name: str, default: str) -> int:
     before using any of these constants if that list is non-empty, the same
     "fail closed, never silently coerce" spirit `build_flags_from_env`
     already holds itself to for `FORSETI_BUILD_FLAGS`.
+
+    `minimum`, when given, rejects an otherwise-parseable value below it the
+    same way -- e.g. an unwind bound of 0 parses fine but is meaningless to
+    every consumer (`--unwind 0` errors out downstream with a message that
+    doesn't point back at this env var); catching it here keeps that "never
+    load-bearing" guarantee for values that parse but aren't sane, not just
+    values that don't parse at all.
     """
     raw = os.environ.get(name, default)
     try:
-        return int(raw)
+        value = int(raw)
     except ValueError:
         _ENV_CONFIG_ERRORS.append(f"{name}={raw!r} is not a valid integer")
         return int(default)
+    if minimum is not None and value < minimum:
+        _ENV_CONFIG_ERRORS.append(f"{name}={raw!r} must be >= {minimum}")
+        return int(default)
+    return value
 
 
-def env_float(name: str, default: str) -> float:
-    """`float(os.environ.get(name, default))`, never raising. See `env_int`."""
+def env_float(name: str, default: str, *, minimum: float | None = None) -> float:
+    """`float(os.environ.get(name, default))`, never raising. See `env_int`.
+
+    Also rejects non-finite values (`nan`, `inf`, `-inf`): Python's `float()`
+    parses those without raising, so a bare parseability check lets them
+    through the fail-closed guard -- and a NaN timeout never expires
+    (`subprocess.run(timeout=float("nan"))` never raises `TimeoutExpired`)
+    while other consumers crash outright on `int(nan)`. Both are silent
+    versions of the same "bad config wasn't caught" failure `env_config_errors`
+    exists to catch.
+    """
     raw = os.environ.get(name, default)
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         _ENV_CONFIG_ERRORS.append(f"{name}={raw!r} is not a valid number")
         return float(default)
+    if not math.isfinite(value):
+        _ENV_CONFIG_ERRORS.append(f"{name}={raw!r} must be finite")
+        return float(default)
+    if minimum is not None and value < minimum:
+        _ENV_CONFIG_ERRORS.append(f"{name}={raw!r} must be >= {minimum}")
+        return float(default)
+    return value
 
 
 def env_config_errors() -> tuple[str, ...]:
@@ -142,21 +170,51 @@ def env_config_errors() -> tuple[str, ...]:
     return tuple(_ENV_CONFIG_ERRORS)
 
 
+def record_env_config_error(message: str) -> None:
+    """Append `message` to what `env_config_errors()` reports.
+
+    For a misconfiguration `env_int`/`env_float` alone cannot catch because it
+    spans more than one env var -- e.g. `property_gate`'s cross-check that
+    `FORSETI_PROPERTY_MAX_TOTAL_CHECK_S` still leaves room for at least one
+    honest attempt under `FORSETI_PROPERTY_CHECK_TIMEOUT_S`. Goes through the
+    same list every single-variable check already uses, so it gets the same
+    fail-closed treatment (`stop_gate`/`post_tool_use`/`post_bash` all block
+    on it) for free.
+    """
+    _ENV_CONFIG_ERRORS.append(message)
+
+
+def env_config_error_message(errors: tuple[str, ...]) -> str:
+    """One shared, actionable message for a non-empty `env_config_errors()`.
+
+    Every hook that reads a `gate.env_int`/`env_float`-backed constant --
+    `stop_gate`, `post_tool_use`, `post_bash` -- must fail closed on this
+    *before* using any of those constants (issue #95 review): a value that
+    parsed but was quietly replaced by its literal default (unparseable,
+    non-finite, or below its `minimum`) is never load-bearing for an actual
+    verify/check decision anywhere in the gate.
+    """
+    return (
+        "Forseti verify-gate: malformed configuration -- fix and retry:\n"
+        + "\n".join(f"  - {e}" for e in errors)
+    )
+
+
 # The default loop-unwind bound k. A VERIFIED is only ever "verified up to k".
 # Override per project with FORSETI_UNWIND; functions with loops need a higher k
 # (a k below the trip count can report a spurious verdict — roadmap Risk 1).
-DEFAULT_K = env_int("FORSETI_UNWIND", "1")
+DEFAULT_K = env_int("FORSETI_UNWIND", "1", minimum=1)
 
 # Per-function verify budget. Passed to `forseti verify --timeout` so ESBMC
 # itself honors it — without it the Core CLI falls back to its 30s default and
 # this knob is inert. The subprocess is bounded a little higher (below) so ESBMC
 # self-terminates with UNKNOWN before the hard kill.
-VERIFY_TIMEOUT_S = env_float("FORSETI_VERIFY_TIMEOUT_S", "110")
+VERIFY_TIMEOUT_S = env_float("FORSETI_VERIFY_TIMEOUT_S", "110", minimum=1.0)
 _SUBPROCESS_MARGIN_S = 15.0
 
 # Budget for the one `forseti list-units` parse per edited file. A `--parse-tree-only`
 # run does no solving, so it is fast; keep it well under the verify budget.
-LIST_UNITS_TIMEOUT_S = env_float("FORSETI_LIST_UNITS_TIMEOUT_S", "30")
+LIST_UNITS_TIMEOUT_S = env_float("FORSETI_LIST_UNITS_TIMEOUT_S", "30", minimum=1.0)
 
 # How many times the Stop-gate blocks before it gives up and lets the turn end
 # with a LOUD unverified residual (never a silent pass, but never an infinite

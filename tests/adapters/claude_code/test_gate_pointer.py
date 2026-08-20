@@ -3268,6 +3268,43 @@ def test_wellformed_numeric_env_var_records_no_error(
     assert gate.env_config_errors() == ()
 
 
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "Infinity"])
+def test_env_float_rejects_non_finite_values(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    # Issue #95 review: `float()` parses "nan"/"inf" without raising, so a
+    # bare parseability check let them bypass the fail-closed guard entirely
+    # -- a NaN/inf timeout never expires and other consumers crash outright
+    # converting it to an int.
+    monkeypatch.setenv("FORSETI_VERIFY_TIMEOUT_S", raw)
+    assert gate.env_float("FORSETI_VERIFY_TIMEOUT_S", "110") == 110.0
+    assert "must be finite" in gate.env_config_errors()[0]
+
+
+def test_env_int_rejects_a_value_below_its_minimum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FORSETI_UNWIND", "0")
+    assert gate.env_int("FORSETI_UNWIND", "1", minimum=1) == 1
+    assert "must be >= 1" in gate.env_config_errors()[0]
+
+
+def test_env_int_accepts_a_value_at_its_minimum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FORSETI_UNWIND", "1")
+    assert gate.env_int("FORSETI_UNWIND", "4", minimum=1) == 1
+    assert gate.env_config_errors() == ()
+
+
+def test_env_float_rejects_a_value_below_its_minimum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FORSETI_PROPERTY_CHECK_TIMEOUT_S", "0")
+    assert gate.env_float("FORSETI_PROPERTY_CHECK_TIMEOUT_S", "20", minimum=1.0) == 20.0
+    assert "must be >= 1" in gate.env_config_errors()[0]
+
+
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")
 def test_snapshot_enumeration_matches_the_in_place_parse(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

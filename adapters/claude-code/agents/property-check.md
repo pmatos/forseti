@@ -57,12 +57,16 @@ following, in order:
    UNKNOWN (no VIOLATED), 3 if any ERROR (no VIOLATED/UNKNOWN). Parse the
    `--json` payload's `verdicts[]` — each has `property_id`, `outcome`
    (`held`/`violated`/`unknown`/`error`/`skipped`), `k`, and (for a settled
-   verdict) `result`, which carries the counterexample for a VIOLATED one.
+   verdict) `result`. For a VIOLATED one, `result.raw_counterexample` is
+   ESBMC's trace text — read that, not `result.counterexample`: this check
+   path serializes the *structured*, typed model there instead (a nested
+   dict, or `null` if trace-parsing failed), unlike the safety gate's own
+   `--json`, where `counterexample` really is the raw text.
 
 3. **Report back like a counterexample.** For every `violated` property, feed
    it back the same way the safety gate feeds an ESBMC counterexample: state
    the property's expression, the input that violates it (from
-   `result.counterexample` in the JSON payload), and ask that the unit be
+   `result.raw_counterexample` in the JSON payload), and ask that the unit be
    fixed so the property holds — then re-run step 2 (not step 1 — do not
    re-propose unless the function's contract genuinely changed) to confirm.
    For `unknown`, say so plainly and suggest raising `--unwind`/

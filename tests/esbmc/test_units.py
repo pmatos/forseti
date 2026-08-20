@@ -1524,6 +1524,49 @@ def test_rename_all_declarations_and_definitions_no_op_when_absent() -> None:
     )
 
 
+def test_rename_all_declarations_and_definitions_leaves_string_contents_alone() -> None:
+    # Issue #95 review: a string literal that happens to spell `main(` (a
+    # diagnostic like `printf("call main();\n")`) is not a reference to the
+    # function `main` -- comments and string/char literals are both masked
+    # before the occurrence scan, so this must not be rewritten in place.
+    source = (
+        'void helper(void) {\n    printf("call main();\\n");\n}\n\n'
+        "int main(void) {\n    return 0;\n}\n"
+    )
+    renamed = rename_all_declarations_and_definitions(source, "main", "__unused_main")
+    assert 'printf("call main();\\n");' in renamed
+    assert "int __unused_main(void)" in renamed
+    assert "int main(void)" not in renamed
+
+
+def test_rename_all_declarations_and_definitions_renames_an_expression_reference() -> (
+    None
+):
+    # Issue #95 review: the original scan only renamed an occurrence followed
+    # by `{` (a definition) or `;` (a declaration/bare call statement) --
+    # leaving a reference in expression position (`main() + x`) dangling,
+    # where it can collide with a harness's own injected `main` instead of
+    # erroring loudly.
+    source = "int main(void){ return 0; }\n\nint helper(int x){ return main() + x; }\n"
+    renamed = rename_all_declarations_and_definitions(source, "main", "__unused_main")
+    assert "return __unused_main() + x;" in renamed
+    assert "main()" not in renamed.replace("__unused_main()", "")
+
+
+def test_rename_all_declarations_and_definitions_leaves_member_access_alone() -> None:
+    # `s.main(`/`p->main(` can only be a struct/union member named `main` in
+    # C, never a reference to the free function of the same name -- renaming
+    # it would corrupt the member access while leaving the real collision.
+    source = (
+        "struct S { int (*main)(void); };\n"
+        "int use(struct S *s){ return s->main(); }\n"
+        "int main(void){ return 0; }\n"
+    )
+    renamed = rename_all_declarations_and_definitions(source, "main", "__unused_main")
+    assert "return s->main();" in renamed
+    assert "int __unused_main(void)" in renamed
+
+
 _HEADER_CALLER_AST = """\
 TranslationUnitDecl 0x3000 <<invalid sloc>> <invalid sloc>
 |-FunctionDecl 0x3001 </tmp/foo.c:1:1, col:40> col:6 leaf 'void (int *)'

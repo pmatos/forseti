@@ -613,6 +613,94 @@ def test_per_unit_timeout_is_clamped_to_the_remaining_aggregate_budget(
     assert captured["timeout"] == pytest.approx(max_total, abs=1.0)
 
 
+def test_clamped_timeout_is_deferred_not_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A unit whose subprocess timeout is clamped below what `n_props` needs
+    (`test_per_unit_timeout_is_clamped_to_the_remaining_aggregate_budget`) can
+    legitimately run out of that clamped time -- `deferred` ("ran out of turn
+    budget") is the honest bucket, not `failed` ("this check itself broke"),
+    the same distinction `_MIN_ATTEMPT_BUDGET_S` already draws for a unit
+    clamped so hard it never starts at all (issue #95 review)."""
+    monkeypatch.setattr(property_gate, "MAX_TOTAL_CHECK_S", 40.0)
+    source = tmp_path / "f.c"
+    unit_id = f"{source}::my_abs"
+    for i in range(6):  # 6 properties -> clamped well below their natural timeout
+        _add_candidate(tmp_path, unit_id, expression=f"result >= -{i}")
+    state = _state(_unit(str(source), "my_abs"))
+
+    def timing_out(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", timing_out)
+
+    summary = property_gate.semantic_check_summary(str(tmp_path), state)
+
+    assert summary.checked == 0
+    assert summary.failed == 0
+    assert summary.deferred == 1
+    assert not summary.empty
+
+
+def test_unclamped_timeout_is_still_failed_not_deferred(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A single-property unit's subprocess timeout is not clamped by the
+    aggregate budget (`test_tooling_failure_is_best_effort_not_raised`'s own
+    scenario) -- a `TimeoutExpired` there is a genuine tooling problem, not a
+    budget one, so it must stay `failed`."""
+    source = tmp_path / "f.c"
+    unit_id = f"{source}::my_abs"
+    _add_candidate(tmp_path, unit_id)
+    state = _state(_unit(str(source), "my_abs"))
+
+    def timing_out(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", timing_out)
+
+    summary = property_gate.semantic_check_summary(str(tmp_path), state)
+
+    assert summary.checked == 0
+    assert summary.deferred == 0
+    assert summary.failed == 1
+
+
+def test_negative_max_units_per_turn_is_rejected_not_slice_wrapped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Issue #95 review: `MAX_UNITS_PER_TURN` used to feed a bare `env_int` with
+    # no lower bound straight into `candidates[:MAX_UNITS_PER_TURN]` -- a
+    # negative value silently triggers Python's negative-slice semantics
+    # (drops the *last* N, not "process none") instead of erroring. The
+    # `minimum=0` bound on `env_int` now catches it at the source.
+    monkeypatch.setenv("FORSETI_PROPERTY_MAX_UNITS", "-1")
+    from forseti.adapters.claude_code import forseti_gate as gate
+
+    assert gate.env_int("FORSETI_PROPERTY_MAX_UNITS", "3", minimum=0) == 3
+    assert "must be >= 0" in gate.env_config_errors()[-1]
+
+
+def test_min_attempt_budget_exceeding_total_records_an_env_config_error() -> None:
+    # Issue #95 review: raising FORSETI_PROPERTY_CHECK_TIMEOUT_S without a
+    # matching raise to FORSETI_PROPERTY_MAX_TOTAL_CHECK_S would otherwise
+    # silently defer every unit, every turn, forever -- neither env var alone
+    # is out of range, so `env_int`/`env_float`'s own `minimum=` bound can't
+    # catch it; the cross-check must.
+    from forseti.adapters.claude_code import forseti_gate as gate
+
+    property_gate._check_min_attempt_budget_fits(65.0, 60.0)
+    assert "FORSETI_PROPERTY_CHECK_TIMEOUT_S" in gate.env_config_errors()[-1]
+    assert "65" in gate.env_config_errors()[-1]
+
+
+def test_min_attempt_budget_within_total_records_no_error() -> None:
+    from forseti.adapters.claude_code import forseti_gate as gate
+
+    property_gate._check_min_attempt_budget_fits(35.0, 60.0)
+    assert gate.env_config_errors() == ()
+
+
 def test_unit_is_deferred_not_started_when_budget_cannot_cover_one_attempt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

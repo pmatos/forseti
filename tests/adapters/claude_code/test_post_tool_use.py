@@ -69,6 +69,30 @@ def test_nonexistent_c_file_is_a_silent_pass(
     assert _run(tmp_path, monkeypatch, file_path="ghost.c") == 0
 
 
+def test_malformed_env_var_blocks_before_verifying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Issue #95 review: `verify_and_record` reads `gate.DEFAULT_K`/
+    # `VERIFY_TIMEOUT_S` (env_int/env_float-backed) -- a malformed value must
+    # block here, before this hook could silently verify and durably record a
+    # verdict under the wrong value (the same fail-closed check
+    # `stop_gate.main()` opens with).
+    src = tmp_path / "f.c"
+    src.write_text("int f(void){return 0;}\n")
+    monkeypatch.setenv("FORSETI_UNWIND", "not-a-number")
+    gate.env_int("FORSETI_UNWIND", "1")  # exercise the real parse path
+
+    def _boom(*_a: object, **_kw: object) -> None:
+        raise AssertionError("must not verify with a malformed env config")
+
+    monkeypatch.setattr(gate, "verify_and_record", _boom)
+
+    assert _run(tmp_path, monkeypatch, file_path=str(src)) == 2
+    err = capsys.readouterr().err
+    assert "FORSETI_UNWIND" in err
+    assert "not-a-number" in err
+
+
 def test_verified_c_file_prints_the_kernel_and_exits_zero(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

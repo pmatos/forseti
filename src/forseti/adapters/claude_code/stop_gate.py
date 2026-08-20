@@ -8,6 +8,13 @@ cannot be verified, it blocks at most MAX_STOP_ATTEMPTS consecutive times (the
 counter is reset by any fresh edit), then lets the turn end with a LOUD
 unverified residual — never a silent pass.
 
+That MAX_STOP_ATTEMPTS bound is scoped to a *unit* that cannot be verified. A
+malformed `FORSETI_*` env var (`gate.env_config_errors()`, checked first, below)
+blocks every attempt with no such escape hatch by design: the config is broken
+for every unit, not just one, and letting the turn end anyway would be exactly
+the silent-pass-on-bad-input this gate exists to prevent (`gate-fails-closed`).
+Fixing the env var, not editing code, is what ends that block.
+
 Also surfaces (never blocks on, issue #95): any stored semantic property whose
 `forseti check` verdict is VIOLATED for a unit the safety gate already verified
 — see `property_gate` for why this is loud-but-non-blocking rather than folded
@@ -227,13 +234,7 @@ def main() -> int:
             project_dir, event_log.STOP, decision="block", reason="env_config_error"
         )
         return _emit(
-            {
-                "decision": "block",
-                "reason": (
-                    "Forseti verify-gate: malformed configuration -- fix and "
-                    "retry:\n" + "\n".join(f"  - {e}" for e in errors)
-                ),
-            }
+            {"decision": "block", "reason": gate.env_config_error_message(errors)}
         )
 
     # Discover C files changed out-of-band (Bash) that the gate has not verified.
@@ -361,6 +362,11 @@ def main() -> int:
             n_oob=len(oob),
             n_blob=len(blob),
             attempt=attempts,
+            n_needs_contract=len(needs),
+            n_semantic_violations=len(semantic.violations),
+            n_semantic_unresolved=len(semantic.unresolved),
+            n_semantic_failed=semantic.failed,
+            n_semantic_skipped=len(semantic.skipped),
         )
         return _emit(
             {
@@ -380,6 +386,11 @@ def main() -> int:
         n_oob=len(oob),
         n_blob=len(blob),
         attempt=attempts,
+        n_needs_contract=len(needs),
+        n_semantic_violations=len(semantic.violations),
+        n_semantic_unresolved=len(semantic.unresolved),
+        n_semantic_failed=semantic.failed,
+        n_semantic_skipped=len(semantic.skipped),
     )
     return _emit(
         {

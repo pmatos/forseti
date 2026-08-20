@@ -27,6 +27,18 @@ def main() -> int:
         return 0
 
     project_dir = gate.project_dir(data)
+
+    if errors := gate.env_config_errors():
+        # Same fail-closed check `stop_gate.main()` opens with, and for the
+        # same reason: `verify_and_record` below reads `gate.DEFAULT_K`/
+        # `VERIFY_TIMEOUT_S` (env_int/env_float-backed), and those never raise
+        # -- a malformed value silently falls back to its default instead. Left
+        # unchecked here, this hook would verify and durably record a verdict
+        # under that silently-wrong value before the Stop hook ever gets a
+        # chance to block on the misconfiguration (issue #95 review).
+        print(gate.env_config_error_message(errors), file=sys.stderr)
+        return 2
+
     if not os.path.isabs(file_path):
         file_path = os.path.join(project_dir, file_path)
     if not os.path.exists(file_path):
