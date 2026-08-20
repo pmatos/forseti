@@ -81,11 +81,24 @@ MAX_UNITS_PER_TURN = gate.env_int("FORSETI_PROPERTY_MAX_UNITS", "3")
 # *before* calling `semantic_check_summary` (issue #95 review), so if this
 # loop itself runs past the hook's own timeout, Claude Code kills the whole
 # process before that already-decided verdict is ever emitted, silently
-# failing the turn open instead. Checked between units, never mid-subprocess
-# (a `_check_unit` call already in flight is allowed to finish or hit its own
-# per-unit timeout) -- remaining units are counted into `deferred`, the same
-# "never silently dropped" accounting `MAX_UNITS_PER_TURN` already gets.
+# failing the turn open instead. Enforced two ways: a unit not yet started is
+# `deferred` once the remaining budget can't cover one honest attempt
+# (`_MIN_ATTEMPT_BUDGET_S`), and a unit already starting has its own
+# subprocess timeout clamped to whatever budget remains (`_check_unit`'s
+# `budget_s`) -- a between-units check alone cannot bound total loop time,
+# since a single unit with enough stored properties can need more wall clock
+# than one attempt's share of the ceiling by itself (issue #95 review,
+# thread a7NSB on the between-units-only version of this fix).
 MAX_TOTAL_CHECK_S = gate.env_float("FORSETI_PROPERTY_MAX_TOTAL_CHECK_S", "60")
+
+# The smallest remaining budget worth starting a fresh unit with: one esbmc
+# attempt's worst case (`CHECK_TIMEOUT_S + VERIFY_GRACE_S`) plus the
+# subprocess margin. Below this, `_check_unit` would be clamped to a timeout
+# too small to complete even a single property honestly -- indistinguishable
+# from a real tooling failure (`failed`) even though it never got a fair
+# attempt; `deferred` (issue #95 review) is the honest bucket for "ran out of
+# turn budget", the same as a unit this loop never reaches at all.
+_MIN_ATTEMPT_BUDGET_S = CHECK_TIMEOUT_S + VERIFY_GRACE_S + _SUBPROCESS_MARGIN_S
 
 
 @dataclass(frozen=True)
@@ -168,7 +181,7 @@ def _units_with_candidates(
 
 
 def _check_unit(
-    project_dir: str, unit: dict[str, Any], n_props: int
+    project_dir: str, unit: dict[str, Any], n_props: int, budget_s: float
 ) -> list[Any] | None:
     """Run `forseti check --json` for one unit; `None` on any tooling failure.
 
@@ -185,6 +198,18 @@ def _check_unit(
     attempt here would let this subprocess time out before a legitimately-
     running child could, discarding every verdict already computed (issue #95
     review).
+
+    `budget_s` -- the caller's *remaining* slice of `MAX_TOTAL_CHECK_S` -- caps
+    the per-unit formula from above: a unit with enough stored properties can
+    legitimately need more wall clock than one attempt's share of the
+    aggregate ceiling (a unit with 6 candidates needs `6 * 25 + 10 = 160s`,
+    already past `MAX_TOTAL_CHECK_S`'s 60s default and the Stop hook's own
+    120s timeout on its own) -- the between-units deadline check in
+    `semantic_check_summary` only bounds *when* a unit starts, not how long
+    its own subprocess may then run (issue #95 review, a7NSB: the earlier
+    aggregate-deadline fix left exactly this gap). The caller is responsible
+    for not calling this at all once `budget_s` can no longer cover one
+    honest attempt -- see `_MIN_ATTEMPT_BUDGET_S`.
     """
     rel, function = unit["file"], unit["function"]
     # `rel`, unchanged: the subprocess already runs with `cwd=project_dir`, so
@@ -227,8 +252,11 @@ def _check_unit(
             argv,
             capture_output=True,
             text=True,
-            timeout=max(1, n_props) * (CHECK_TIMEOUT_S + VERIFY_GRACE_S)
-            + _SUBPROCESS_MARGIN_S,
+            timeout=min(
+                max(1, n_props) * (CHECK_TIMEOUT_S + VERIFY_GRACE_S)
+                + _SUBPROCESS_MARGIN_S,
+                budget_s,
+            ),
             cwd=project_dir,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -288,13 +316,22 @@ def semantic_check_summary(
     # units so a unit already in flight is never killed mid-subprocess. A unit
     # cut off this way is `deferred`, not `failed`: it was never attempted,
     # the same "never silently dropped" accounting the per-turn unit budget
-    # already gets.
+    # already gets. `_check_unit` is itself capped to the *remaining* slice
+    # of the budget (`min(..., budget_s)`), never just this loop's own
+    # between-units check alone -- a unit with enough stored properties can
+    # need more wall clock than one attempt's share of the ceiling on its
+    # own (issue #95 review, a7NSB), so the between-units check alone cannot
+    # bound total loop time. Below `_MIN_ATTEMPT_BUDGET_S` (one honest
+    # attempt's worth) a unit is deferred rather than started -- clamping it
+    # to a too-small timeout would misreport a real "ran out of budget" as a
+    # `failed` tooling error.
     start = time.monotonic()
     for i, (unit, n_props) in enumerate(to_check):
-        if time.monotonic() - start >= MAX_TOTAL_CHECK_S:
+        remaining = MAX_TOTAL_CHECK_S - (time.monotonic() - start)
+        if remaining < _MIN_ATTEMPT_BUDGET_S:
             deferred += len(to_check) - i
             break
-        verdicts = _check_unit(project_dir, unit, n_props)
+        verdicts = _check_unit(project_dir, unit, n_props, remaining)
         if verdicts is None:
             failed += 1
             continue

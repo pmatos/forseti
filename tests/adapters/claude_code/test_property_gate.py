@@ -425,7 +425,11 @@ def test_subprocess_timeout_scales_with_stored_property_count(
     review). Each attempt also gets `VERIFY_GRACE_S` -- the same wall-clock
     slack `verify` itself permits per esbmc attempt (`esbmc/runner.py`) --
     or a legitimately-running child could be killed by this parent before it
-    could time out on its own."""
+    could time out on its own. Tests the unclamped formula specifically --
+    `MAX_TOTAL_CHECK_S` is raised out of the way; its own clamping is a
+    separate concern covered by
+    `test_per_unit_timeout_is_clamped_to_the_remaining_aggregate_budget`."""
+    monkeypatch.setattr(property_gate, "MAX_TOTAL_CHECK_S", 1000.0)
     source = tmp_path / "f.c"
     unit_id = f"{source}::my_abs"
     _add_candidate(tmp_path, unit_id, expression="result >= 0")
@@ -461,7 +465,9 @@ def test_subprocess_timeout_counts_graded_properties_too(
     (`orchestrator.check._CHECKABLE_STATUSES`) -- a unit with 1 CANDIDATE + 2
     already-GRADED properties runs 3 esbmc attempts, so sizing the subprocess
     timeout off the CANDIDATE count alone would under-budget it (issue #95
-    review)."""
+    review). `MAX_TOTAL_CHECK_S` is raised out of the way, same reasoning as
+    `test_subprocess_timeout_scales_with_stored_property_count`."""
+    monkeypatch.setattr(property_gate, "MAX_TOTAL_CHECK_S", 1000.0)
     source = tmp_path / "f.c"
     unit_id = f"{source}::my_abs"
     _add_candidate(tmp_path, unit_id, expression="result >= 0")
@@ -542,6 +548,73 @@ def test_aggregate_deadline_defers_remaining_units(
     assert calls["n"] == 0  # the deadline was already elapsed before the first call
     assert summary.checked == 0
     assert summary.deferred == 3
+    assert not summary.empty
+
+
+def test_per_unit_timeout_is_clamped_to_the_remaining_aggregate_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A single unit with enough stored properties can need more wall clock
+    than the *whole* aggregate ceiling by itself -- the between-units deadline
+    check alone cannot bound that, since it only runs before a unit starts,
+    not while sizing that unit's own subprocess timeout (issue #95 review,
+    thread a7NSB). The per-unit formula must be clamped to whatever budget
+    remains."""
+    monkeypatch.setattr(property_gate, "MAX_TOTAL_CHECK_S", 40.0)
+    source = tmp_path / "f.c"
+    unit_id = f"{source}::my_abs"
+    for i in range(6):  # 6 properties -> 6*(20+5)+10=160s unclamped, way over 40s
+        _add_candidate(tmp_path, unit_id, expression=f"result >= -{i}")
+    state = _state(_unit(str(source), "my_abs"))
+
+    captured: dict[str, Any] = {}
+
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured["timeout"] = kwargs.get("timeout")
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(_payload(unit_id, "held"))
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    property_gate.semantic_check_summary(str(tmp_path), state)
+
+    unclamped = (
+        6 * (property_gate.CHECK_TIMEOUT_S + property_gate.VERIFY_GRACE_S)
+        + property_gate._SUBPROCESS_MARGIN_S
+    )
+    max_total = property_gate.MAX_TOTAL_CHECK_S
+    assert unclamped > max_total  # the case actually exercises clamping
+    assert captured["timeout"] <= max_total
+    assert captured["timeout"] == pytest.approx(max_total, abs=1.0)
+
+
+def test_unit_is_deferred_not_started_when_budget_cannot_cover_one_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Starting a unit with a remaining budget too small for even one honest
+    esbmc attempt would clamp its subprocess timeout down to something that
+    always looks like a tooling failure -- `deferred` ("ran out of turn
+    budget") is the honest bucket, not `failed` ("this check itself broke")
+    (issue #95 review)."""
+    monkeypatch.setattr(
+        property_gate, "MAX_TOTAL_CHECK_S", property_gate._MIN_ATTEMPT_BUDGET_S / 2
+    )
+    source = tmp_path / "f.c"
+    unit_id = f"{source}::my_abs"
+    _add_candidate(tmp_path, unit_id)
+    state = _state(_unit(str(source), "my_abs"))
+
+    def _boom(*_a: object, **_kw: object) -> None:
+        raise AssertionError("must not start a unit the remaining budget can't cover")
+
+    monkeypatch.setattr(subprocess, "run", _boom)
+
+    summary = property_gate.semantic_check_summary(str(tmp_path), state)
+
+    assert summary.checked == 0
+    assert summary.failed == 0
+    assert summary.deferred == 1
     assert not summary.empty
 
 
