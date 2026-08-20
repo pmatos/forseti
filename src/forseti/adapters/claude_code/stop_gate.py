@@ -174,13 +174,18 @@ def _semantic_message(summary: property_gate.SemanticCheckSummary) -> str:
         # every turn (property_gate.semantic_check_summary) -- a project with
         # more verified-and-candidate units than FORSETI_PROPERTY_MAX_UNITS
         # has some units this hook will never check on its own (issue #95
-        # review). Raise the budget or `forseti check` the deferred units
-        # directly.
+        # review). Two independent, hard caps can produce this count: the
+        # per-turn unit budget (FORSETI_PROPERTY_MAX_UNITS) and the aggregate
+        # wall-clock ceiling across the whole loop (FORSETI_PROPERTY_MAX_TOTAL_CHECK_S)
+        # -- naming only one here would misattribute a slow-property cutoff to
+        # too many units. Raise either budget or `forseti check` the deferred
+        # units directly.
         lines.append(
             f"⚠ Forseti: {summary.deferred} unit(s) with stored properties were "
-            "not checked this turn (FORSETI_PROPERTY_MAX_UNITS budget is a hard "
-            "per-turn cap, not a rotating window) — raise "
-            "FORSETI_PROPERTY_MAX_UNITS or `forseti check` them directly."
+            "not checked this turn (a hard per-turn unit cap or aggregate "
+            "wall-clock cap, not a rotating window) — raise "
+            "FORSETI_PROPERTY_MAX_UNITS / FORSETI_PROPERTY_MAX_TOTAL_CHECK_S or "
+            "`forseti check` them directly."
         )
     return "\n".join(lines)
 

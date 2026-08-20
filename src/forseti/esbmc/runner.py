@@ -97,7 +97,15 @@ def classify(meta: RunMeta, frontend: Frontend = Frontend.C) -> EsbmcResult:
 
 
 # Wall-clock slack added on top of esbmc's own --timeout before we hard-kill it.
-_GRACE_S = 5.0
+# Public (not `_`-prefixed): a caller that sizes its OWN outer subprocess budget
+# around one or more `verify` calls (e.g. the Claude Code adapter's property
+# gate, which shells out to a `forseti check` subprocess running one `verify`
+# per stored property) needs this same grace *per attempt* to avoid killing a
+# child before it can emit output that already finished legitimately within
+# esbmc's own `--timeout` (issue #95 review) -- a private module constant would
+# force that caller to either reach into `runner`'s internals or hardcode a
+# drifting duplicate.
+VERIFY_GRACE_S = 5.0
 _VERSION_RE = re.compile(r"ESBMC version (\S+)")
 
 
@@ -150,7 +158,7 @@ def _encode_timeout_s(timeout_s: float) -> str:
     bounded timeout. Plain truncation is the trap here — `int(0.5)` is `0`, and
     esbmc reads `--timeout 0s` as *no* timeout, silently turning a sub-second
     budget into an unbounded run. Rounding up also keeps esbmc's own timeout
-    strictly under the wall-clock backstop (`timeout_s + _GRACE_S`), so esbmc
+    strictly under the wall-clock backstop (`timeout_s + VERIFY_GRACE_S`), so esbmc
     still self-terminates with a clean `Timed out` before we hard-kill it.
     """
     return f"{max(1, math.ceil(timeout_s))}s"
@@ -230,7 +238,7 @@ def verify(
         esbmc_bin=esbmc_bin,
         no_unwinding_assertions=no_unwinding_assertions,
     )
-    proc_timeout = timeout_s + _GRACE_S if timeout_s is not None else None
+    proc_timeout = timeout_s + VERIFY_GRACE_S if timeout_s is not None else None
 
     start = time.monotonic()
     try:

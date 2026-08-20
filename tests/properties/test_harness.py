@@ -621,6 +621,28 @@ def test_unit_source_with_main_is_error() -> None:
         )
 
 
+def test_unit_source_with_main_prototype_is_not_error() -> None:
+    """A forward-declared `main` (no body) is not a definition -- it must not
+    trip the same guard a genuine `main` definition does (issue #95 review:
+    `Unit.from_path`'s `_rename_own_main` already deliberately leaves a bare
+    prototype untouched, so the renderer's own check must agree)."""
+    render_semantic_harness(
+        unit_source="void main(void);\n" + ABS_SLICE,
+        signature=ABS_SIG,
+        spec=SemanticSpec("result >= 0"),
+    )
+
+
+def test_unit_source_with_main_only_in_a_comment_is_not_error() -> None:
+    """A comment mentioning `main()` with no real definition must not trip the
+    guard either (issue #95 review)."""
+    render_semantic_harness(
+        unit_source="/* main() drives production */\n" + ABS_SLICE,
+        signature=ABS_SIG,
+        spec=SemanticSpec("result >= 0"),
+    )
+
+
 class _FakeParam:
     """Not a Scalar/BufferParam, but shaped enough to reach the subtype guard."""
 

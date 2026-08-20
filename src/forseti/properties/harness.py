@@ -22,6 +22,8 @@ import re
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 
+from forseti.esbmc import find_definition_brace
+
 from .cexpr import derefs_or_subscripts, identifiers, references
 from .model import Property, PropertyKind
 
@@ -598,7 +600,16 @@ def _split_assumptions(
 
 
 def _defines_main(source: str) -> bool:
-    return re.search(r"\bmain\s*\(", source) is not None
+    """Whether `source` has a genuine, definition-shaped `main`.
+
+    Reuses `find_definition_brace` (comment-aware; requires a `{` body, not
+    just the name) rather than a raw `\\bmain\\s*\\(` substring search — the
+    latter also matches a forward-declared prototype (no body) or a bare
+    comment mentioning `main`, either of which would otherwise make this
+    reject a genuinely main-free unit that `Unit.from_path`'s own
+    `_rename_own_main` already correctly left untouched (issue #95 review).
+    """
+    return find_definition_brace(source, "main") is not None
 
 
 @dataclass(frozen=True)

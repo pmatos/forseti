@@ -35,6 +35,16 @@ def _state(*units: dict[str, Any]) -> dict[str, Any]:
 
 
 def _add_candidate(root: Path, unit_id: str, expression: str = "result >= 0") -> None:
+    _add_property(root, unit_id, expression, status=PropertyStatus.CANDIDATE)
+
+
+def _add_property(
+    root: Path,
+    unit_id: str,
+    expression: str,
+    *,
+    status: PropertyStatus,
+) -> None:
     store = PropertyStore.open(root / ".forseti")
     store.add(
         Property(
@@ -42,7 +52,7 @@ def _add_candidate(root: Path, unit_id: str, expression: str = "result >= 0") ->
             unit_id=unit_id,
             kind=PropertyKind.SEMANTIC,
             expression=expression,
-            status=PropertyStatus.CANDIDATE,
+            status=status,
             provenance=Provenance("test", "v1"),
         )
     )
@@ -412,7 +422,10 @@ def test_subprocess_timeout_scales_with_stored_property_count(
     process, but `--timeout` is esbmc's *per-attempt* budget -- a unit with
     2+ properties needs more than one attempt's worth of wall clock or a
     slow-but-legitimate check is dropped as a false timeout (issue #95
-    review)."""
+    review). Each attempt also gets `VERIFY_GRACE_S` -- the same wall-clock
+    slack `verify` itself permits per esbmc attempt (`esbmc/runner.py`) --
+    or a legitimately-running child could be killed by this parent before it
+    could time out on its own."""
     source = tmp_path / "f.c"
     unit_id = f"{source}::my_abs"
     _add_candidate(tmp_path, unit_id, expression="result >= 0")
@@ -432,9 +445,104 @@ def test_subprocess_timeout_scales_with_stored_property_count(
 
     property_gate.semantic_check_summary(str(tmp_path), state)
 
-    # 3 stored properties -> 3x the per-attempt CHECK_TIMEOUT_S, plus margin.
-    expected = 3 * property_gate.CHECK_TIMEOUT_S + property_gate._SUBPROCESS_MARGIN_S
+    # 3 stored properties -> 3x (per-attempt CHECK_TIMEOUT_S + VERIFY_GRACE_S),
+    # plus margin.
+    expected = (
+        3 * (property_gate.CHECK_TIMEOUT_S + property_gate.VERIFY_GRACE_S)
+        + property_gate._SUBPROCESS_MARGIN_S
+    )
     assert captured["timeout"] == expected
+
+
+def test_subprocess_timeout_counts_graded_properties_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`forseti check` checks every non-terminal property, not just CANDIDATE
+    (`orchestrator.check._CHECKABLE_STATUSES`) -- a unit with 1 CANDIDATE + 2
+    already-GRADED properties runs 3 esbmc attempts, so sizing the subprocess
+    timeout off the CANDIDATE count alone would under-budget it (issue #95
+    review)."""
+    source = tmp_path / "f.c"
+    unit_id = f"{source}::my_abs"
+    _add_candidate(tmp_path, unit_id, expression="result >= 0")
+    _add_property(tmp_path, unit_id, "result >= -1", status=PropertyStatus.GRADED)
+    _add_property(tmp_path, unit_id, "result >= -2", status=PropertyStatus.GRADED)
+    state = _state(_unit(str(source), "my_abs"))
+
+    captured: dict[str, Any] = {}
+
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured["timeout"] = kwargs.get("timeout")
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(_payload(unit_id, "held"))
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    property_gate.semantic_check_summary(str(tmp_path), state)
+
+    expected = (
+        3 * (property_gate.CHECK_TIMEOUT_S + property_gate.VERIFY_GRACE_S)
+        + property_gate._SUBPROCESS_MARGIN_S
+    )
+    assert captured["timeout"] == expected
+
+
+def test_unit_with_only_graded_properties_is_not_a_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A unit with GRADED (but no fresh CANDIDATE) properties has nothing new
+    for this opt-in surface to report -- `_units_with_candidates` gates
+    presence on CANDIDATE specifically, even though the timeout sizing counts
+    every non-terminal status (issue #95 review)."""
+    source = tmp_path / "f.c"
+    unit_id = f"{source}::my_abs"
+    _add_property(tmp_path, unit_id, "result >= 0", status=PropertyStatus.GRADED)
+    state = _state(_unit(str(source), "my_abs"))
+
+    def _boom(*_a: object, **_kw: object) -> None:
+        raise AssertionError("must not check a unit with only GRADED properties")
+
+    monkeypatch.setattr(subprocess, "run", _boom)
+
+    summary = property_gate.semantic_check_summary(str(tmp_path), state)
+
+    assert summary.empty
+
+
+def test_aggregate_deadline_defers_remaining_units(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The per-turn unit budget alone does not bound wall clock -- three units
+    each near their own per-unit timeout can still blow past the Stop hook's
+    total budget (issue #95 review). An aggregate cap must defer whatever is
+    left rather than let the loop run unbounded."""
+    monkeypatch.setattr(property_gate, "MAX_UNITS_PER_TURN", 3)
+    monkeypatch.setattr(property_gate, "MAX_TOTAL_CHECK_S", 0.0)
+    units = []
+    for i in range(3):
+        source = tmp_path / f"f{i}.c"
+        unit_id = f"{source}::fn{i}"
+        _add_candidate(tmp_path, unit_id)
+        units.append(_unit(str(source), f"fn{i}"))
+    state = _state(*units)
+
+    calls = {"n": 0}
+
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls["n"] += 1
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(_payload("x", "held"))
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    summary = property_gate.semantic_check_summary(str(tmp_path), state)
+
+    assert calls["n"] == 0  # the deadline was already elapsed before the first call
+    assert summary.checked == 0
+    assert summary.deferred == 3
+    assert not summary.empty
 
 
 def test_failed_units_are_surfaced_in_the_stop_message() -> None:

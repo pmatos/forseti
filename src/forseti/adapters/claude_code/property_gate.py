@@ -34,11 +34,18 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from forseti.properties import PropertyStatus, PropertyStore, PropertyStoreError
+from forseti.esbmc import VERIFY_GRACE_S
+from forseti.properties import (
+    PropertyStatus,
+    PropertyStore,
+    PropertyStoreError,
+    is_terminal,
+)
 
 from . import forseti_gate as gate
 
@@ -65,6 +72,20 @@ _SUBPROCESS_MARGIN_S = 10.0
 # proposed units; excess units are counted (never silently dropped -- see
 # `SemanticCheckSummary.deferred`) rather than checked.
 MAX_UNITS_PER_TURN = gate.env_int("FORSETI_PROPERTY_MAX_UNITS", "3")
+
+# Aggregate wall-clock ceiling for the whole semantic-check loop (all units in
+# `to_check`, sequentially), not just one unit's own subprocess timeout. Half
+# of hooks.json's 120s Stop timeout, leaving the other half for the OOB/blob
+# git scans and the safety gate's own decision that already share that budget
+# (module docstring) -- `stop_gate.main` computes the block/allow decision
+# *before* calling `semantic_check_summary` (issue #95 review), so if this
+# loop itself runs past the hook's own timeout, Claude Code kills the whole
+# process before that already-decided verdict is ever emitted, silently
+# failing the turn open instead. Checked between units, never mid-subprocess
+# (a `_check_unit` call already in flight is allowed to finish or hit its own
+# per-unit timeout) -- remaining units are counted into `deferred`, the same
+# "never silently dropped" accounting `MAX_UNITS_PER_TURN` already gets.
+MAX_TOTAL_CHECK_S = gate.env_float("FORSETI_PROPERTY_MAX_TOTAL_CHECK_S", "60")
 
 
 @dataclass(frozen=True)
@@ -108,17 +129,30 @@ def _verified_units(state: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+# Mirrors `orchestrator.check._CHECKABLE_STATUSES` (not importable -- private):
+# every non-terminal status is a valid check input, not just CANDIDATE. Kept in
+# lockstep with that set the same way it is there -- derived from `is_terminal`,
+# not a hardcoded pair -- so a new terminal status is excluded here too.
+_CHECKABLE_STATUSES = frozenset(s for s in PropertyStatus if not is_terminal(s))
+
+
 def _units_with_candidates(
     project_dir: str, units: list[dict[str, Any]]
 ) -> list[tuple[dict[str, Any], int]]:
-    """`(unit, candidate_count)` for every `units` entry with >= 1 stored CANDIDATE.
+    """`(unit, checkable_count)` for every `units` entry with >= 1 stored CANDIDATE.
 
     A cheap, in-process SQLite read -- no subprocess, no esbmc -- so a project
     with properties for only one of ten edited units pays the expensive
-    `forseti check` subprocess exactly once. The count is a byproduct of the
-    same read, reused to size `_check_unit`'s subprocess timeout -- `forseti
-    check` checks every stored property for the unit in one process, so a
-    fixed per-unit budget under-covers a unit with 2+ properties.
+    `forseti check` subprocess exactly once. `checkable_count` -- every stored
+    non-terminal property, not just CANDIDATE -- is a byproduct of the same
+    read, reused to size `_check_unit`'s subprocess timeout: `forseti check`
+    itself checks every non-terminal property for the unit in one process
+    (`_CHECKABLE_STATUSES`, e.g. a unit with 1 CANDIDATE + 2 already-GRADED
+    properties runs 3 esbmc attempts, not 1), so counting CANDIDATE alone would
+    under-budget the subprocess for a unit with mixed statuses (issue #95
+    review). Presence is still gated on CANDIDATE specifically -- a unit with
+    only GRADED/other non-terminal properties and no fresh CANDIDATE has
+    nothing new for this opt-in surface to report.
     """
     with PropertyStore.open(Path(project_dir) / _STORE_ROOT_NAME) as store:
         out = []
@@ -127,9 +161,9 @@ def _units_with_candidates(
             if not rel or not function:
                 continue
             unit_id = f"{rel}::{function}"
-            candidates = store.list_for_unit(unit_id, {PropertyStatus.CANDIDATE})
-            if candidates:
-                out.append((unit, len(candidates)))
+            checkable = store.list_for_unit(unit_id, _CHECKABLE_STATUSES)
+            if any(p.status == PropertyStatus.CANDIDATE for p in checkable):
+                out.append((unit, len(checkable)))
         return out
 
 
@@ -140,10 +174,16 @@ def _check_unit(
 
     Never raised: a broken check must surface as "nothing found" here, not
     crash the Stop-gate over a best-effort feature (module docstring). `n_props`
-    (the unit's stored-candidate count) scales the subprocess's wall-clock
-    budget -- `--timeout` below is esbmc's *per-attempt* budget, but `forseti
-    check` runs it once per stored property for the unit, so a unit with 2+
-    properties needs more than one attempt's worth of wall clock (issue #95
+    (the unit's stored-checkable-property count, `_units_with_candidates`)
+    scales the subprocess's wall-clock budget -- `--timeout` below is esbmc's
+    *per-attempt* budget, but `forseti check` runs it once per stored
+    checkable property for the unit, so a unit with 2+ properties needs more
+    than one attempt's worth of wall clock. The subprocess timeout below adds
+    `VERIFY_GRACE_S` per attempt on top of `CHECK_TIMEOUT_S` -- `verify`
+    (`esbmc/runner.py`) itself permits `CHECK_TIMEOUT_S + VERIFY_GRACE_S`
+    before it hard-kills esbmc, so budgeting only `CHECK_TIMEOUT_S` per
+    attempt here would let this subprocess time out before a legitimately-
+    running child could, discarding every verdict already computed (issue #95
     review).
     """
     rel, function = unit["file"], unit["function"]
@@ -187,7 +227,8 @@ def _check_unit(
             argv,
             capture_output=True,
             text=True,
-            timeout=max(1, n_props) * CHECK_TIMEOUT_S + _SUBPROCESS_MARGIN_S,
+            timeout=max(1, n_props) * (CHECK_TIMEOUT_S + VERIFY_GRACE_S)
+            + _SUBPROCESS_MARGIN_S,
             cwd=project_dir,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -242,7 +283,17 @@ def semantic_check_summary(
     unresolved: list[dict[str, Any]] = []
     checked = 0
     failed = 0
-    for unit, n_props in to_check:
+    # Aggregate wall-clock cap across this whole loop, not just each unit's own
+    # subprocess timeout (MAX_TOTAL_CHECK_S's own comment) -- checked between
+    # units so a unit already in flight is never killed mid-subprocess. A unit
+    # cut off this way is `deferred`, not `failed`: it was never attempted,
+    # the same "never silently dropped" accounting the per-turn unit budget
+    # already gets.
+    start = time.monotonic()
+    for i, (unit, n_props) in enumerate(to_check):
+        if time.monotonic() - start >= MAX_TOTAL_CHECK_S:
+            deferred += len(to_check) - i
+            break
         verdicts = _check_unit(project_dir, unit, n_props)
         if verdicts is None:
             failed += 1

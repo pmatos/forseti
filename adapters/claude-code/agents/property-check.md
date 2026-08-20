@@ -36,10 +36,15 @@ following, in order:
    (`forseti propose` exits 1), report that plainly — there is nothing to
    check.
 
-2. **Check.** Run:
+2. **Check.** If the project sets `FORSETI_BUILD_FLAGS` (the same variable the
+   safety gate itself forwards to its verify calls — `-I`/`-D` flags the
+   translation unit needs), append its parsed words after a literal `--`, the
+   same way the Stop-gate's own automatic check does. Without it the harness
+   can fail to compile or verify a different preprocessor branch than the one
+   the safety gate actually verified. Run:
 
    ```console
-   $ forseti check <path> --function <symbol> --json
+   $ forseti check <path> --function <symbol> --json [-- <FORSETI_BUILD_FLAGS words>]
    ```
 
    This renders each stored candidate into a self-contained ESBMC harness and

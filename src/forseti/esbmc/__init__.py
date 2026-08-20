@@ -25,7 +25,7 @@ from .result import (
     Verified,
     Violated,
 )
-from .runner import build_argv, classify, verify
+from .runner import VERIFY_GRACE_S, build_argv, classify, verify
 from .units import (
     CallerOpenings,
     ListUnitsError,
@@ -56,6 +56,7 @@ from .verify_cli import (
 
 __all__ = [
     "EXIT_CODES",
+    "VERIFY_GRACE_S",
     "Assignment",
     "CallerOpenings",
     "Counterexample",
