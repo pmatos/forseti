@@ -1,12 +1,20 @@
 {
   "branches": ["main"],
+  "tagFormat": "v${version}",
   "plugins": [
     "@semantic-release/commit-analyzer",
     "@semantic-release/release-notes-generator",
     ["@semantic-release/changelog", { "changelogFile": "CHANGELOG.md" }],
-    "@semantic-release/github",
+    ["@semantic-release/exec", {
+      "prepareCmd": "bash .github/semantic-release/prepare.sh ${nextRelease.version}"
+    }],
+    ["@semantic-release/github", {
+      "assets": [
+        { "path": "dist/*.whl", "label": "Forseti Python wheel" }
+      ]
+    }],
     ["@semantic-release/git", {
-      "assets": ["CHANGELOG.md"],
+      "assets": ["CHANGELOG.md", "pyproject.toml"],
       "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
     }]
   ]
