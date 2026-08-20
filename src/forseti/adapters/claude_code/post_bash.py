@@ -25,19 +25,6 @@ import sys
 from . import event_log
 from . import forseti_gate as gate
 
-_CEX_CLIP = 1500
-
-
-def _needs_note(needs: list[gate.UnitVerdict]) -> str:
-    """A loud, non-fixable note for NEEDS_CONTRACT units (never a silent skip)."""
-    ids = ", ".join(v.unit_id for v in needs)
-    return (
-        f"Forseti: {len(needs)} unit(s) NOT gated — {ids}. They take pointer/array "
-        "parameter(s); function-level safety is unreliable without a memory "
-        "precondition/harness, so they were NOT verified (issue #122). This is not "
-        "a pass and not a source bug to 'fix' — leave them as is."
-    )
-
 
 def _verify_file(project_dir: str, file_path: str) -> list[gate.UnitVerdict]:
     """Verify one changed C file; trace the edit + each verify like the edit path."""
@@ -89,7 +76,7 @@ def _report(verdicts: list[gate.UnitVerdict]) -> int:
             oks = ", ".join(f"{v.unit_id} (k={v.k})" for v in verified)
             out.append(f"Forseti (out-of-band): VERIFIED up to k — {oks}")
         if needs:
-            out.append(_needs_note(needs))
+            out.append(gate.needs_note(needs))
         if out:
             print("\n".join(out))
         return 0
@@ -103,7 +90,7 @@ def _report(verdicts: list[gate.UnitVerdict]) -> int:
         lines.append(f"✗ {v.unit_id} — {v.verdict.upper()} (k={v.k})")
         if v.counterexample:
             lines.append("Counterexample:")
-            lines.append(v.counterexample.strip()[:_CEX_CLIP])
+            lines.append(v.counterexample.strip()[: gate.CEX_CLIP])
         elif v.detail:
             lines.append(f"  {v.detail}")
         lines.append("")
@@ -114,7 +101,7 @@ def _report(verdicts: list[gate.UnitVerdict]) -> int:
         "pass — raise k (FORSETI_UNWIND) or simplify the unit."
     )
     if needs:
-        lines += ["", _needs_note(needs)]
+        lines += ["", gate.needs_note(needs)]
     print("\n".join(lines), file=sys.stderr)
     return 2
 

@@ -81,3 +81,19 @@ def verify_ladder(
         yield LadderAttempt(k, result, escalate_to)
         if not isinstance(result, Unknown):
             return
+
+
+def climb_to_terminal(
+    source: Path, *, verify: VerifyPort, ladder: tuple[int, ...]
+) -> LadderAttempt:
+    """Climb `ladder`, discarding intermediate attempts, and return the terminal one.
+
+    For a caller with no need for per-rung telemetry (unlike `check_properties`/
+    `run_loop`, which emit an event on each escalation as they consume
+    `verify_ladder` themselves) — just the settled attempt the ladder ends at.
+    """
+    settled = None
+    for attempt in verify_ladder(source, verify=verify, ladder=ladder):
+        settled = attempt
+    assert settled is not None  # verify_ladder yields at least one attempt
+    return settled

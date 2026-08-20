@@ -462,7 +462,7 @@ def test_subprocess_timeout_counts_graded_properties_too(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`forseti check` checks every non-terminal property, not just CANDIDATE
-    (`orchestrator.check._CHECKABLE_STATUSES`) -- a unit with 1 CANDIDATE + 2
+    (`properties.CHECKABLE_STATUSES`) -- a unit with 1 CANDIDATE + 2
     already-GRADED properties runs 3 esbmc attempts, so sizing the subprocess
     timeout off the CANDIDATE count alone would under-budget it (issue #95
     review). `MAX_TOTAL_CHECK_S` is raised out of the way, same reasoning as

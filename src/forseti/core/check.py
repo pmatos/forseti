@@ -88,8 +88,8 @@ def check_source(
     """Check `source`::`function`'s stored, checkable properties with ESBMC.
 
     Opens `store_root`'s `PropertyStore`, reads the unit's non-terminal
-    properties (`check_properties`'s own `_CHECKABLE_STATUSES` — a candidate
-    proposed but not yet accepted/rejected), renders each semantic one to a
+    properties (`properties.CHECKABLE_STATUSES` — a candidate proposed but not
+    yet accepted/rejected), renders each semantic one to a
     self-contained harness via the real `SemanticHarnessWriter`, and verifies
     it along `(unwind, *unwind_ladder)` — escalating on `UNKNOWN`, never
     silently settling below the ladder's own terminal verdict. A reachability

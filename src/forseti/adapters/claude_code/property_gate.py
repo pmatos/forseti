@@ -41,10 +41,10 @@ from typing import Any
 
 from forseti.esbmc import VERIFY_GRACE_S
 from forseti.properties import (
+    CHECKABLE_STATUSES,
     PropertyStatus,
     PropertyStore,
     PropertyStoreError,
-    is_terminal,
 )
 
 from . import forseti_gate as gate
@@ -142,13 +142,6 @@ def _verified_units(state: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-# Mirrors `orchestrator.check._CHECKABLE_STATUSES` (not importable -- private):
-# every non-terminal status is a valid check input, not just CANDIDATE. Kept in
-# lockstep with that set the same way it is there -- derived from `is_terminal`,
-# not a hardcoded pair -- so a new terminal status is excluded here too.
-_CHECKABLE_STATUSES = frozenset(s for s in PropertyStatus if not is_terminal(s))
-
-
 def _units_with_candidates(
     project_dir: str, units: list[dict[str, Any]]
 ) -> list[tuple[dict[str, Any], int]]:
@@ -160,7 +153,7 @@ def _units_with_candidates(
     non-terminal property, not just CANDIDATE -- is a byproduct of the same
     read, reused to size `_check_unit`'s subprocess timeout: `forseti check`
     itself checks every non-terminal property for the unit in one process
-    (`_CHECKABLE_STATUSES`, e.g. a unit with 1 CANDIDATE + 2 already-GRADED
+    (`CHECKABLE_STATUSES`, e.g. a unit with 1 CANDIDATE + 2 already-GRADED
     properties runs 3 esbmc attempts, not 1), so counting CANDIDATE alone would
     under-budget the subprocess for a unit with mixed statuses (issue #95
     review). Presence is still gated on CANDIDATE specifically -- a unit with
@@ -174,7 +167,7 @@ def _units_with_candidates(
             if not rel or not function:
                 continue
             unit_id = f"{rel}::{function}"
-            checkable = store.list_for_unit(unit_id, _CHECKABLE_STATUSES)
+            checkable = store.list_for_unit(unit_id, CHECKABLE_STATUSES)
             if any(p.status == PropertyStatus.CANDIDATE for p in checkable):
                 out.append((unit, len(checkable)))
         return out

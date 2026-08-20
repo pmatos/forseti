@@ -273,6 +273,20 @@ class UnitVerdict:
         return self.verdict == "verified"
 
 
+CEX_CLIP = 1500
+
+
+def needs_note(needs: list[UnitVerdict]) -> str:
+    """A loud, non-fixable note for NEEDS_CONTRACT units (never a silent skip)."""
+    ids = ", ".join(v.unit_id for v in needs)
+    return (
+        f"Forseti: {len(needs)} unit(s) NOT gated — {ids}. They take pointer/array "
+        "parameter(s); function-level safety is unreliable without a memory "
+        "precondition/harness, so they were NOT verified (issue #122). This is not "
+        "a pass and not a source bug to 'fix' — leave them as is."
+    )
+
+
 def resolve_forseti_cmd() -> list[str]:
     """The command prefix for the Forseti CLI: the installed script, else the module."""
     found = shutil.which("forseti")
@@ -1709,20 +1723,7 @@ def gate_lock(project_dir: str) -> Iterator[None]:
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def load_state(project_dir: str) -> dict[str, Any]:
-    path = _gate_path(project_dir)
-    if path.exists():
-        try:
-            state: dict[str, Any] = json.loads(path.read_text())
-            state.setdefault("units", {})
-            state.setdefault("stop_attempts", 0)
-            state.setdefault("scanned", {})
-            state.setdefault("pending", {})
-            state.setdefault("baseline_blobs", {})
-            state.setdefault("baseline_head", None)
-            return state
-        except (json.JSONDecodeError, OSError):
-            pass
+def _fresh_state() -> dict[str, Any]:
     return {
         "units": {},
         "stop_attempts": 0,
@@ -1731,6 +1732,19 @@ def load_state(project_dir: str) -> dict[str, Any]:
         "baseline_blobs": {},
         "baseline_head": None,
     }
+
+
+def load_state(project_dir: str) -> dict[str, Any]:
+    path = _gate_path(project_dir)
+    if path.exists():
+        try:
+            state: dict[str, Any] = json.loads(path.read_text())
+            for key, default in _fresh_state().items():
+                state.setdefault(key, default)
+            return state
+        except (json.JSONDecodeError, OSError):
+            pass
+    return _fresh_state()
 
 
 def save_state(project_dir: str, state: dict[str, Any]) -> None:

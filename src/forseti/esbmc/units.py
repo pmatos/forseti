@@ -978,24 +978,22 @@ class _DefinitionMatch:
     name_start: int
 
 
-def _definition_candidates(
+def _paren_balanced_occurrences(
     source_no_comments: str, fn_name: str
-) -> list[_DefinitionMatch]:
-    """Every definition-shaped occurrence of `fn_name`, in textual order.
+) -> Iterator[tuple[re.Match[str], int, int]]:
+    """Every ``fn_name (`` occurrence, balanced-paren scanned to its matching ``)``.
 
-    Scans for ``fn_name (`` and balances parentheses to the matching ``)``; an
-    occurrence whose ``)`` is followed (past whitespace and any suffix attributes)
-    by ``{`` is *definition-shaped* — so a prototype (``);``) or a call site
-    (``) ;``, ``))``) is skipped. Deliberately narrow: clang already told us the
-    canonical types and which parameters are pointers, so this only has to isolate
-    the declarator text to harvest an array extent from, and the ``{`` to inject an
-    obligation after — never to classify a type.
+    Yields ``(match, close_idx, after_idx)``: `match` is the ``fn_name (`` regex
+    match, `close_idx` the matching ``)``'s index, and `after_idx` the first
+    index past it once whitespace and any suffix attributes are skipped. An
+    occurrence with no matching close is skipped (unbalanced — not a usable
+    signature).
 
-    The single scanner behind both `find_definition_brace` (S3 obligation
-    injection) and `_param_list_text` (extent harvesting): keeping one scan is what
-    stops the #145 anchor from reaching one caller and not the other.
+    The single scanner behind both `_definition_candidates` (filters on a
+    trailing ``{``) and `_declaration_name_starts` (filters on a trailing
+    ``;``) — keeping one scan is what stops the #145 anchor from reaching one
+    caller and not the other.
     """
-    matches: list[_DefinitionMatch] = []
     for match in re.finditer(rf"\b{re.escape(fn_name)}\s*\(", source_no_comments):
         depth = 0
         j = match.end() - 1  # index of the '('
@@ -1014,6 +1012,23 @@ def _definition_candidates(
         while k < len(source_no_comments) and source_no_comments[k].isspace():
             k += 1
         k = _skip_suffix_attributes(source_no_comments, k)
+        yield match, j, k
+
+
+def _definition_candidates(
+    source_no_comments: str, fn_name: str
+) -> list[_DefinitionMatch]:
+    """Every definition-shaped occurrence of `fn_name`, in textual order.
+
+    An occurrence whose ``)`` is followed (past whitespace and any suffix
+    attributes) by ``{`` is *definition-shaped* — so a prototype (``);``) or a
+    call site (``) ;``, ``))``) is skipped. Deliberately narrow: clang already
+    told us the canonical types and which parameters are pointers, so this only
+    has to isolate the declarator text to harvest an array extent from, and the
+    ``{`` to inject an obligation after — never to classify a type.
+    """
+    matches: list[_DefinitionMatch] = []
+    for match, j, k in _paren_balanced_occurrences(source_no_comments, fn_name):
         if k < len(source_no_comments) and source_no_comments[k] == "{":
             line = source_no_comments.count("\n", 0, match.start()) + 1
             matches.append(
@@ -1109,13 +1124,13 @@ def _declaration_name_starts(source_no_comments: str, fn_name: str) -> list[int]
     """Every declaration-shaped (prototype, or a bare call statement) `fn_name`'s
     own name-span start.
 
-    Mirrors `_definition_candidates`'s balanced-paren scan, but the opposite
-    filter: a `;` (not `{`) after the closing `)` and any suffix attributes —
-    ``int fn_name(...);`` or a standalone call ``fn_name(...);``. A separate,
-    smaller scanner rather than widening `_definition_candidates` itself: that
-    one anchors RFC-0003 S3's obligation injection and #145's `def_line`
-    disambiguation, both of which want *only* a definition — a prototype is
-    exactly what they must keep excluding.
+    Shares `_paren_balanced_occurrences` with `_definition_candidates`, but
+    applies the opposite filter: a `;` (not `{`) after the closing `)` and any
+    suffix attributes — ``int fn_name(...);`` or a standalone call
+    ``fn_name(...);``. A separate filter rather than widening
+    `_definition_candidates` itself: that one anchors RFC-0003 S3's obligation
+    injection and #145's `def_line` disambiguation, both of which want *only*
+    a definition — a prototype is exactly what they must keep excluding.
 
     Catching a plain call statement too (not just a genuine prototype) is
     deliberate, not just tolerated: renaming a same-file call site alongside
@@ -1127,24 +1142,7 @@ def _declaration_name_starts(source_no_comments: str, fn_name: str) -> list[int]
     either way.
     """
     starts: list[int] = []
-    for match in re.finditer(rf"\b{re.escape(fn_name)}\s*\(", source_no_comments):
-        depth = 0
-        j = match.end() - 1  # index of the '('
-        while j < len(source_no_comments):
-            char = source_no_comments[j]
-            if char == "(":
-                depth += 1
-            elif char == ")":
-                depth -= 1
-                if depth == 0:
-                    break
-            j += 1
-        else:
-            continue  # unbalanced — not a usable signature
-        k = j + 1
-        while k < len(source_no_comments) and source_no_comments[k].isspace():
-            k += 1
-        k = _skip_suffix_attributes(source_no_comments, k)
+    for match, _j, k in _paren_balanced_occurrences(source_no_comments, fn_name):
         if k < len(source_no_comments) and source_no_comments[k] == ";":
             starts.append(match.start())
     return starts
@@ -1509,105 +1507,12 @@ def _parse_tree(
     return proc.stdout + "\n" + proc.stderr
 
 
-def list_external_callers(
-    source: Path,
-    symbol: str,
-    *,
-    esbmc_bin: str = "esbmc",
-    timeout_s: float = 30.0,
-    extra_flags: Sequence[str] = (),
-) -> tuple[str, ...]:
-    """Names of definitions *outside* `source` that reference `symbol`.
-
-    The complement of `list_units` over the same translation unit — see
-    `parse_external_callers` for why compositional discharge needs it. Raises
-    `ListUnitsError` on the same conditions as `list_units`.
-    """
-    ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
-    return parse_external_callers(ast_text, source, symbol)
-
-
-def list_address_escapes(
-    source: Path,
-    symbol: str,
-    *,
-    esbmc_bin: str = "esbmc",
-    timeout_s: float = 30.0,
-    extra_flags: Sequence[str] = (),
-) -> tuple[str, ...]:
-    """Sites in `source`'s translation unit that take `symbol`'s address.
-
-    The other way the caller enumeration can be incomplete — see
-    `parse_address_escapes`. Raises `ListUnitsError` on the same conditions as
-    `list_units`.
-    """
-    ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
-    return parse_address_escapes(ast_text, symbol)
-
-
-def list_symbol_aliases(
-    source: Path,
-    symbol: str,
-    *,
-    esbmc_bin: str = "esbmc",
-    timeout_s: float = 30.0,
-    extra_flags: Sequence[str] = (),
-) -> tuple[str, ...]:
-    """Declarations in `source`'s translation unit that alias `symbol`.
-
-    The third way the caller enumeration can be incomplete — see
-    `parse_symbol_aliases`. This single-question form runs its own parse;
-    `list_caller_openings` shares one dump across all five questions (without
-    fusing them) and is what the discharge driver uses. Raises `ListUnitsError`
-    on the same conditions as `list_units`.
-    """
-    ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
-    return parse_symbol_aliases(ast_text, symbol)
-
-
-def list_implicit_invocations(
-    source: Path,
-    symbol: str,
-    *,
-    esbmc_bin: str = "esbmc",
-    timeout_s: float = 30.0,
-    extra_flags: Sequence[str] = (),
-) -> tuple[str, ...]:
-    """Constructor/destructor attributes on `symbol`'s own declaration.
-
-    The fourth way the caller enumeration can be incomplete — see
-    `parse_implicit_invocations`. Raises `ListUnitsError` on the same conditions
-    as `list_units`.
-    """
-    ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
-    return parse_implicit_invocations(ast_text, symbol)
-
-
-def list_asm_statements(
-    source: Path,
-    symbol: str,
-    *,
-    esbmc_bin: str = "esbmc",
-    timeout_s: float = 30.0,
-    extra_flags: Sequence[str] = (),
-) -> tuple[str, ...]:
-    """Sites in `source`'s translation unit that GNU asm might route to `symbol`.
-
-    The fifth way the caller enumeration can be incomplete — see
-    `parse_asm_statements`. Raises `ListUnitsError` on the same conditions as
-    `list_units`.
-    """
-    ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
-    return parse_asm_statements(ast_text, symbol)
-
-
 @dataclass(frozen=True)
 class CallerOpenings:
     """The five ways `list_units`'s caller enumeration can under-report `symbol`.
 
     Each field is the result of one caller-completeness pass over a *single*
-    ``esbmc --parse-tree-only`` dump, in the order the five `list_*` functions
-    above declare them:
+    ``esbmc --parse-tree-only`` dump, produced by `list_caller_openings`:
 
     - `foreign`   — definitions outside `source` naming `symbol`
       (`parse_external_callers`)
@@ -1621,8 +1526,7 @@ class CallerOpenings:
       (`parse_asm_statements`)
 
     The questions stay distinct — one field, one `parse_*` pass each — they only
-    share the dump, which is what `list_caller_openings` buys over the five
-    single-question `list_*` calls.
+    share the dump.
     """
 
     foreign: tuple[str, ...]
@@ -1642,10 +1546,8 @@ def list_caller_openings(
 ) -> CallerOpenings:
     """All five caller-completeness listings for `symbol`, from one shared dump.
 
-    The five `list_*` functions above each run their own
-    ``esbmc --parse-tree-only`` over the same translation unit, so enumerating a
-    callee's openings parsed the TU five times. This parses once and runs the
-    five `parse_*` passes over that single dump — the seam `find_open_callers`
+    Parses `source` once with ``esbmc --parse-tree-only`` and runs all five
+    `parse_*` passes over that single dump — the seam `find_open_callers`
     crosses. Each pass keeps its own semantics (e.g. `parse_external_callers`
     still takes `source`, to exclude in-file definitions). Raises `ListUnitsError`
     on the same conditions as `list_units`, so an unparseable TU never reads as

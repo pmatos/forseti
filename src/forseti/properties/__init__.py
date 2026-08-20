@@ -28,6 +28,7 @@ from .harness import (
 )
 from .llm import ClaudeCliClient, LLMClient, LLMError
 from .model import (
+    CHECKABLE_STATUSES,
     Grading,
     GradingVerdict,
     InvalidStatusTransition,
@@ -67,6 +68,7 @@ from .store import (
 )
 
 __all__ = [
+    "CHECKABLE_STATUSES",
     "DEFAULT_INCLUDES",
     "DEFAULT_PROMPT",
     "HARNESS_MACROS",

@@ -153,6 +153,18 @@ def is_terminal(status: PropertyStatus) -> bool:
     return not _ALLOWED[status]
 
 
+# Valid check inputs = non-terminal statuses only. Excludes ACCEPTED/REJECTED so a
+# property whose lifecycle is already settled is not re-verified back into the
+# counts()/held() set grading (#4) consumes (#84 — the discarded-REJECTED case
+# #66 flagged, and the already-decided ACCEPTED case the title generalizes to).
+# Which statuses are valid check inputs is genuinely open until #4 lands
+# (re-check GRADED? only CANDIDATE?); revisit this set there. Derived from
+# `is_terminal` (not a hardcoded pair) so a new terminal state is excluded too.
+# Shared by `orchestrator.check` and the claude-code adapter's `property_gate`,
+# which both need the same "what's still checkable" set.
+CHECKABLE_STATUSES = frozenset(s for s in PropertyStatus if not is_terminal(s))
+
+
 def make_property_id(
     unit_id: str,
     kind: PropertyKind,
