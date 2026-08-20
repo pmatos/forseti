@@ -24,7 +24,7 @@ _WHEEL_URL = (
 
 
 class _Response:
-    def __init__(self, payload: dict[str, object]) -> None:
+    def __init__(self, payload: object) -> None:
         self._body = json.dumps(payload).encode()
 
     def __enter__(self) -> Self:
@@ -198,6 +198,89 @@ def test_http_protocol_failure_is_silent_and_throttled(
     assert capsys.readouterr().err == ""
 
 
+def test_uninstalled_source_tree_does_not_check_for_updates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+
+    def not_installed(_name: str) -> str:
+        raise importlib.metadata.PackageNotFoundError
+
+    monkeypatch.setattr(importlib.metadata, "version", not_installed)
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda _request, *, timeout: pytest.fail(
+            "an uninstalled source tree checked for updates"
+        ),
+    )
+
+    assert main(["enable-project", str(tmp_path / "project")]) == 0
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {"tag_name": 123, "assets": []},
+        {"tag_name": "v1.8.0", "assets": "not-a-list"},
+        {"tag_name": "v1.x.0", "assets": []},
+    ],
+)
+def test_malformed_github_release_payload_does_not_warn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    payload: object,
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "1.7.5")
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda _request, *, timeout: _Response(payload),
+    )
+
+    assert main(["enable-project", str(tmp_path / "project")]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_release_with_unrelated_assets_still_finds_the_wheel(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "1.7.5")
+    payload: dict[str, object] = {
+        "tag_name": "v1.8.0",
+        "assets": [
+            {
+                "name": "forseti-1.8.0.tar.gz",
+                "browser_download_url": (
+                    "https://github.com/pmatos/forseti/releases/download/"
+                    "v1.8.0/forseti-1.8.0.tar.gz"
+                ),
+            },
+            {
+                "name": "forseti-1.8.0-py3-none-any.whl",
+                "browser_download_url": _WHEEL_URL,
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda _request, *, timeout: _Response(payload),
+    )
+
+    assert main(["enable-project", str(tmp_path / "project")]) == 0
+    assert capsys.readouterr().err == _expected_banner()
+
+
 def test_release_without_a_stable_v_tag_does_not_warn(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -283,6 +366,61 @@ def test_malformed_cache_timestamp_is_ignored(
                 },
             }
         )
+    )
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache_home))
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "1.7.5")
+    monkeypatch.setattr(time, "time", lambda: 2.0)
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda _request, *, timeout: _Response({"tag_name": "v1.7.5", "assets": []}),
+    )
+
+    assert main(["enable-project", str(tmp_path / "project")]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_non_dict_cache_is_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cache_home = tmp_path / "cache"
+    cache_file = cache_home / "forseti/update-check.json"
+    cache_file.parent.mkdir(parents=True)
+    cache_file.write_text("[]")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache_home))
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "1.7.5")
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda _request, *, timeout: _Response({"tag_name": "v1.7.5", "assets": []}),
+    )
+
+    assert main(["enable-project", str(tmp_path / "project")]) == 0
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    "candidate_payload",
+    [
+        {"version": 123, "wheel_url": "https://example.invalid/x.whl"},
+        {"version": "9.9.9", "wheel_url": 123},
+        "not-a-dict-or-none",
+        42,
+    ],
+)
+def test_cache_with_malformed_candidate_is_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    candidate_payload: object,
+) -> None:
+    cache_home = tmp_path / "cache"
+    cache_file = cache_home / "forseti/update-check.json"
+    cache_file.parent.mkdir(parents=True)
+    cache_file.write_text(
+        json.dumps({"checked_at": 2.0, "candidate": candidate_payload})
     )
     monkeypatch.setenv("XDG_CACHE_HOME", str(cache_home))
     monkeypatch.setattr(importlib.metadata, "version", lambda _name: "1.7.5")
