@@ -133,6 +133,29 @@ def test_non_verified_units_are_never_candidates_for_checking(
     assert summary.empty
 
 
+def test_malformed_verified_unit_missing_file_or_function_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `state["units"]` entry missing `file`/`function` (a hand-corrupted or
+    partially-written gate_state.json) must not crash the candidate scan --
+    it just can't be looked up in the property store, so it's skipped."""
+    PropertyStore.open(tmp_path / ".forseti").close()  # creates forseti.db, no rows
+
+    def _boom(*_a: object, **_kw: object) -> None:
+        raise AssertionError("subprocess.run must not run for a malformed unit")
+
+    monkeypatch.setattr(subprocess, "run", _boom)
+    state = {
+        "units": {
+            "bad": {"verdict": "verified", "k": 4}  # no file/function
+        }
+    }
+
+    summary = property_gate.semantic_check_summary(str(tmp_path), state)
+
+    assert summary.empty
+
+
 def test_candidate_for_a_verified_unit_shells_to_forseti_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -257,6 +280,67 @@ def test_malformed_build_flags_is_best_effort_not_raised(
     summary = property_gate.semantic_check_summary(str(tmp_path), state)
 
     assert summary.checked == 0  # best-effort: dropped, not raised
+
+
+def test_non_json_stdout_is_best_effort_not_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "f.c"
+    unit_id = f"{source}::my_abs"
+    _add_candidate(tmp_path, unit_id)
+    state = _state(_unit(str(source), "my_abs"))
+
+    def fake_run(argv: list[str], **_kw: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 1, stdout="not json")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    summary = property_gate.semantic_check_summary(str(tmp_path), state)
+
+    assert summary.checked == 0
+    assert summary.failed == 1
+
+
+def test_malformed_payload_shape_is_best_effort_not_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "f.c"
+    unit_id = f"{source}::my_abs"
+    _add_candidate(tmp_path, unit_id)
+    state = _state(_unit(str(source), "my_abs"))
+
+    def fake_run(argv: list[str], **_kw: Any) -> subprocess.CompletedProcess[str]:
+        # Valid JSON, but not the {"verdicts": [...]} shape `forseti check
+        # --json` promises.
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"oops": True}))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    summary = property_gate.semantic_check_summary(str(tmp_path), state)
+
+    assert summary.checked == 0
+    assert summary.failed == 1
+
+
+def test_non_dict_verdict_entries_are_skipped_not_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "f.c"
+    unit_id = f"{source}::my_abs"
+    _add_candidate(tmp_path, unit_id)
+    state = _state(_unit(str(source), "my_abs"))
+
+    def fake_run(argv: list[str], **_kw: Any) -> subprocess.CompletedProcess[str]:
+        payload = {"unit_id": unit_id, "counts": {}, "verdicts": ["not-a-dict"]}
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(payload))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    summary = property_gate.semantic_check_summary(str(tmp_path), state)
+
+    assert summary.checked == 1  # the unit itself was checked...
+    assert summary.violations == ()  # ...but the malformed entry is ignored
+    assert summary.unresolved == ()
 
 
 def test_unresolved_outcomes_are_reported_not_dropped(

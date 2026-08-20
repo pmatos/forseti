@@ -18,7 +18,16 @@ import pytest
 
 from forseti.core import check_source
 from forseti.core.cli import main
-from forseti.esbmc import EsbmcResult, RunMeta, Unknown, UnknownReason, Verified
+from forseti.esbmc import (
+    EXIT_CODES,
+    Error,
+    EsbmcResult,
+    RunMeta,
+    Unknown,
+    UnknownReason,
+    Verdict,
+    Verified,
+)
 from forseti.properties import (
     Property,
     PropertyKind,
@@ -215,6 +224,107 @@ def test_cli_check_json_ok(
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["counts"]["held"] == 1
+
+
+def test_cli_check_explicit_empty_ladder_parses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--unwind-ladder ""` (explicit, not the derived default) must still
+    parse to `()`, exactly like the property_gate adapter's own single-run
+    budget already relies on."""
+    source = _write_unit(tmp_path)
+    unit_id = f"{source}::my_abs"
+    root = tmp_path / ".forseti"
+    _seed_store(root, _semantic(unit_id, "result >= 0", ("x > INT64_MIN",)))
+
+    fake = FakeVerify([Verified(_meta(4))])
+    monkeypatch.setattr(
+        "forseti.core.cli.check_source", partial(check_source, verify_port=fake)
+    )
+    code = main(
+        [
+            "check",
+            str(source),
+            "--function",
+            "my_abs",
+            "--store-root",
+            str(root),
+            "--unwind-ladder",
+            "",
+        ]
+    )
+    assert code == 0
+    assert fake.unwinds == [4]  # no escalation rungs
+
+
+def test_cli_check_exit_code_unknown_when_worst_is_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _write_unit(tmp_path)
+    unit_id = f"{source}::my_abs"
+    root = tmp_path / ".forseti"
+    _seed_store(root, _semantic(unit_id, "result >= 0", ("x > INT64_MIN",)))
+
+    fake = FakeVerify([Unknown(_meta(4), UnknownReason.TIMEOUT)])
+    monkeypatch.setattr(
+        "forseti.core.cli.check_source", partial(check_source, verify_port=fake)
+    )
+    code = main(
+        [
+            "check",
+            str(source),
+            "--function",
+            "my_abs",
+            "--store-root",
+            str(root),
+            "--unwind-ladder",
+            "",  # settle at k=4, no escalation -- terminal UNKNOWN
+        ]
+    )
+    assert code == EXIT_CODES[Verdict.UNKNOWN]
+
+
+def test_cli_check_exit_code_error_when_worst_is_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _write_unit(tmp_path)
+    unit_id = f"{source}::my_abs"
+    root = tmp_path / ".forseti"
+    _seed_store(root, _semantic(unit_id, "result >= 0", ("x > INT64_MIN",)))
+
+    fake = FakeVerify([Error(_meta(4), "esbmc: parse error")])
+    monkeypatch.setattr(
+        "forseti.core.cli.check_source", partial(check_source, verify_port=fake)
+    )
+    code = main(
+        ["check", str(source), "--function", "my_abs", "--store-root", str(root)]
+    )
+    assert code == EXIT_CODES[Verdict.ERROR]
+
+
+def test_cli_check_all_reachability_names_nothing_semantic_was_checked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Every stored property present but reachability-kind (SKIPPED, ADR-0009
+    D2, never verified) must not read as a quiet "nothing to report" --
+    CLAUDE.md "never silently pass" applies to the CLI's own report, not just
+    the exit code."""
+    source = _write_unit(tmp_path)
+    unit_id = f"{source}::my_abs"
+    root = tmp_path / ".forseti"
+    _seed_store(root, _reachability(unit_id))
+
+    fake = FakeVerify([])  # reachability is SKIPPED, never verified
+    monkeypatch.setattr(
+        "forseti.core.cli.check_source", partial(check_source, verify_port=fake)
+    )
+    code = main(
+        ["check", str(source), "--function", "my_abs", "--store-root", str(root)]
+    )
+    assert code == EXIT_CODES[Verdict.VERIFIED]
+    out = capsys.readouterr().out
+    assert "all reachability-kind" in out
+    assert "no semantic property was actually checked" in out
 
 
 def test_cli_check_unwind_above_default_ladder_floor_does_not_crash(

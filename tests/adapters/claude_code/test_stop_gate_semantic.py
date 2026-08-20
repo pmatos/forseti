@@ -88,6 +88,64 @@ def test_semantic_violation_reports_but_does_not_block(
     assert "p1" in message
 
 
+_UNRESOLVED = {
+    "unit_id": "f.c::my_abs",
+    "property_id": "p2",
+    "kind": "semantic",
+    "outcome": "unknown",
+    "k": 4,
+}
+
+
+def test_semantic_unresolved_is_reported_but_does_not_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    _patch_summary(
+        monkeypatch,
+        property_gate.SemanticCheckSummary(
+            (), checked=1, deferred=0, unresolved=(_UNRESOLVED,)
+        ),
+    )
+
+    result = _run_and_capture(tmp_path, monkeypatch, capsys)
+
+    assert "decision" not in result  # never blocks on its own
+    message = result["systemMessage"]
+    assert "could not be resolved" in message
+    assert "f.c::my_abs" in message
+    assert "p2" in message
+
+
+def test_needs_contract_unit_note_is_folded_into_the_block_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A NEEDS_CONTRACT unit is honestly-unverified (module docstring), so it
+    blocks like any other outstanding unit -- but gets its own "not gated,
+    needs no source fix" note (`_needs_message`) rather than reading like a
+    counterexample the agent should try to fix."""
+    _git_init(tmp_path)
+    (tmp_path / "ptr.c").write_text("int f(int *p) { return *p; }\n")
+    with gate.gate_lock(str(tmp_path)):
+        state = gate.load_state(str(tmp_path))
+        state["units"]["ptr.c::f"] = {
+            "unit_id": "ptr.c::f",
+            "file": "ptr.c",
+            "function": "f",
+            "verdict": "needs_contract",
+            "k": 4,
+        }
+        gate.save_state(str(tmp_path), state)
+    _patch_summary(monkeypatch, property_gate.SemanticCheckSummary((), 0, 0))
+
+    result = _run_and_capture(tmp_path, monkeypatch, capsys)
+
+    assert result["decision"] == "block"
+    assert "NOT gated" in result["reason"]
+    assert "need no source fix" in result["reason"]
+    assert "ptr.c::f" in result["reason"]
+
+
 def test_no_semantic_violation_is_a_quiet_allow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
