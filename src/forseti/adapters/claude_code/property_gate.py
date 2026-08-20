@@ -70,19 +70,22 @@ class SemanticCheckSummary:
     """What one Stop-gate pass over the property store found.
 
     `violations` are per-property VIOLATED verdict dicts (`forseti check
-    --json`'s own `verdicts[]` shape, plus `unit_id`). `checked`/`deferred`
-    count units-with-candidates actually checked vs. held back by
-    `MAX_UNITS_PER_TURN` -- so a project with more proposed units than one
-    turn's budget is told it, rather than reading as fully covered.
+    --json`'s own `verdicts[]` shape, plus `unit_id`). `unresolved` are the
+    same shape for UNKNOWN/ERROR outcomes -- CLAUDE.md's "never silently pass
+    UNKNOWN" applies here too, so those are reported rather than dropped.
+    `checked`/`deferred` count units-with-candidates actually checked vs. held
+    back by `MAX_UNITS_PER_TURN` -- so a project with more proposed units than
+    one turn's budget is told it, rather than reading as fully covered.
     """
 
     violations: tuple[dict[str, Any], ...]
     checked: int
     deferred: int
+    unresolved: tuple[dict[str, Any], ...] = ()
 
     @property
     def empty(self) -> bool:
-        return not self.violations and not self.deferred
+        return not self.violations and not self.deferred and not self.unresolved
 
 
 def _verified_units(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -123,11 +126,16 @@ def _check_unit(project_dir: str, unit: dict[str, Any]) -> dict[str, Any] | None
     crash the Stop-gate over a best-effort feature (module docstring).
     """
     rel, function = unit["file"], unit["function"]
-    abspath = os.path.join(project_dir, rel)
+    # `rel`, unchanged: the subprocess already runs with `cwd=project_dir`, so
+    # `Unit.from_path` there builds `unit_id = f"{rel}::{function}"` -- the same
+    # spelling `_units_with_candidates` just proved has a stored candidate.
+    # Resolving to an absolute path here would key the check's store lookup
+    # under a different string than the one that selected this unit, making
+    # `forseti check` silently find nothing (issue #95 review).
     argv = [
         *gate.resolve_forseti_cmd(),
         "check",
-        abspath,
+        rel,
         "--function",
         function,
         "--store-root",
@@ -137,7 +145,7 @@ def _check_unit(project_dir: str, unit: dict[str, Any]) -> dict[str, Any] | None
         "--unwind-ladder",
         "",  # no escalation -- see module docstring on the budget
         "--timeout",
-        str(int(CHECK_TIMEOUT_S)),
+        str(max(1, round(CHECK_TIMEOUT_S))),
         "--json",
     ]
     try:
@@ -190,6 +198,7 @@ def semantic_check_summary(
         candidates[MAX_UNITS_PER_TURN:],
     )
     violations: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
     checked = 0
     for unit in to_check:
         payload = _check_unit(project_dir, unit)
@@ -197,6 +206,13 @@ def semantic_check_summary(
             continue
         checked += 1
         for verdict in payload["verdicts"]:
-            if isinstance(verdict, dict) and verdict.get("outcome") == "violated":
+            if not isinstance(verdict, dict):
+                continue
+            outcome = verdict.get("outcome")
+            if outcome == "violated":
                 violations.append(verdict)
-    return SemanticCheckSummary(tuple(violations), checked, len(deferred))
+            elif outcome in ("unknown", "error"):
+                unresolved.append(verdict)
+    return SemanticCheckSummary(
+        tuple(violations), checked, len(deferred), tuple(unresolved)
+    )

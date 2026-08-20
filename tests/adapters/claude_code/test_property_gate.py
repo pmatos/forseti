@@ -146,6 +146,97 @@ def test_candidate_for_a_verified_unit_shells_to_forseti_check(
     assert captured["cwd"] == str(tmp_path)
 
 
+def test_relative_unit_file_is_matched_by_the_check_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Production `state["units"]` stores `file` project-relative (`gate.unit_id`),
+    not absolute -- unlike every other fixture here. `_check_unit` must pass that
+    same relative spelling through to `forseti check --json` (relying on the
+    subprocess's own `cwd=project_dir`), or the check's store lookup builds a
+    different `unit_id` than the one `_units_with_candidates` just proved has a
+    candidate, and it silently finds nothing (issue #95 review).
+    """
+    (tmp_path / "src").mkdir()
+    source = tmp_path / "src" / "f.c"
+    source.write_text("int my_abs(int x) { return x; }\n")
+    rel = "src/f.c"
+    unit_id = f"{rel}::my_abs"
+    _add_candidate(tmp_path, unit_id)
+    state = _state(_unit(rel, "my_abs"))
+
+    captured: dict[str, Any] = {}
+    violated_payload = {
+        "unit_id": unit_id,
+        "counts": {"held": 0, "violated": 1, "unknown": 0, "error": 0, "skipped": 0},
+        "verdicts": [
+            {
+                "property_id": "p1",
+                "unit_id": unit_id,
+                "kind": "semantic",
+                "outcome": "violated",
+                "k": 4,
+            }
+        ],
+    }
+
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(argv, 1, stdout=json.dumps(violated_payload))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    summary = property_gate.semantic_check_summary(str(tmp_path), state)
+
+    assert summary.checked == 1
+    assert len(summary.violations) == 1
+    argv = captured["argv"]
+    # The positional `source` arg (right after "check") must be the exact
+    # relative spelling `_units_with_candidates` matched -- not project_dir-
+    # joined into an absolute path (the store-root arg legitimately is one).
+    assert argv[argv.index("check") + 1] == rel
+
+
+def test_unresolved_outcomes_are_reported_not_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLAUDE.md: "never silently pass" UNKNOWN -- ERROR gets the same treatment
+    here, since both mean `forseti check` could not settle the property either
+    way, distinct from HELD/VIOLATED.
+    """
+    source = tmp_path / "f.c"
+    unit_id = f"{source}::my_abs"
+    _add_candidate(tmp_path, unit_id)
+    state = _state(_unit(str(source), "my_abs"))
+
+    unresolved_payload = {
+        "unit_id": unit_id,
+        "counts": {"held": 0, "violated": 0, "unknown": 1, "error": 0, "skipped": 0},
+        "verdicts": [
+            {
+                "property_id": "p1",
+                "unit_id": unit_id,
+                "kind": "semantic",
+                "outcome": "unknown",
+                "k": 4,
+            }
+        ],
+    }
+
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(unresolved_payload)
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    summary = property_gate.semantic_check_summary(str(tmp_path), state)
+
+    assert summary.violations == ()
+    assert len(summary.unresolved) == 1
+    assert summary.unresolved[0]["outcome"] == "unknown"
+    assert not summary.empty  # never a silent pass
+
+
 def test_held_property_reports_no_violation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

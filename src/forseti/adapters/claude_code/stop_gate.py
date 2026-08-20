@@ -131,6 +131,18 @@ def _semantic_message(summary: property_gate.SemanticCheckSummary) -> str:
             lines.append(
                 f"  ✗ {v.get('unit_id')} [{v.get('property_id')}] (k={v.get('k')})"
             )
+    if summary.unresolved:
+        lines.append(
+            f"⚠ Forseti: {len(summary.unresolved)} generated semantic propert"
+            f"{'y' if len(summary.unresolved) == 1 else 'ies'} could not be resolved "
+            "(`forseti check` returned unknown/error, issue #95) — never a silent "
+            "pass (CLAUDE.md); raise the unwind bound or investigate the failure:"
+        )
+        for v in summary.unresolved:
+            lines.append(
+                f"  ? {v.get('unit_id')} [{v.get('property_id')}] "
+                f"({v.get('outcome')}, k={v.get('k')})"
+            )
     if summary.deferred:
         lines.append(
             f"⚠ Forseti: {summary.deferred} unit(s) with stored properties were "
@@ -225,12 +237,18 @@ def main() -> int:
         if not semantic.empty:
             notes.append(_semantic_message(semantic))
         if notes:
+            # "allow_needs_contract" only when a NEEDS_CONTRACT unit is actually
+            # among the notes -- a turn with zero of those but a semantic-only
+            # note must not be mislabeled as one, or anything filtering
+            # events.jsonl by decision gets a false positive (issue #95 review).
+            decision = "allow_needs_contract" if needs else "allow_semantic_check"
             event_log.log_event(
                 project_dir,
                 event_log.STOP,
-                decision="allow_needs_contract",
+                decision=decision,
                 n_needs_contract=len(needs),
                 n_semantic_violations=len(semantic.violations),
+                n_semantic_unresolved=len(semantic.unresolved),
                 attempt=0,
             )
             return _emit({"systemMessage": "\n\n".join(notes)})

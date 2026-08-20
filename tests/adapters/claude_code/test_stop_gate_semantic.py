@@ -134,6 +134,30 @@ def test_semantic_violation_folds_into_a_real_blocking_residual(
     assert "f.c::my_abs" in reason
 
 
+def test_semantic_only_note_is_not_mislabeled_needs_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A turn with zero NEEDS_CONTRACT units but a semantic-property note must
+    not log `decision="allow_needs_contract"` -- that label is a proxy other
+    tooling reads as "pointer/array units present", and a purely semantic note
+    would give it a false positive (issue #95 review).
+    """
+    _git_init(tmp_path)
+    monkeypatch.setattr(
+        property_gate,
+        "semantic_check_summary",
+        lambda project_dir, state: property_gate.SemanticCheckSummary(
+            (_VIOLATION,), checked=1, deferred=0
+        ),
+    )
+
+    _run_and_capture(tmp_path, monkeypatch, capsys)
+
+    events = (tmp_path / ".forseti" / "events.jsonl").read_text().strip().splitlines()
+    last = json.loads(events[-1])
+    assert last["decision"] == "allow_semantic_check"
+
+
 def test_deferred_only_is_still_reported(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
