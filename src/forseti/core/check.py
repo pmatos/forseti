@@ -40,6 +40,7 @@ from forseti.orchestrator import (
     VerifyPort,
     check_properties,
 )
+from forseti.precond.verify import escalating_port
 from forseti.properties import PropertyStore, PropertyStoreError
 
 # The CLI's own default: a human or a subagent invoking `forseti check`
@@ -78,6 +79,20 @@ def check_source(
     silently settling below the ladder's own terminal verdict. A reachability
     property is `SKIPPED` (deferred, ADR-0009 D2), never verified.
 
+    Verifies with unwinding assertions ON (`no_unwinding_assertions=False`,
+    wrapped in `precond.verify.escalating_port` — the same combination S2's
+    memory-precondition sidecar already uses), unlike `forseti.esbmc.verify`'s
+    own default: with assertions off, an under-unwound loop is silently
+    *assumed* to have exited, so a postcondition past the loop can settle
+    `Verified` — reported HELD — without the ladder ever seeing the `Unknown`
+    that would have escalated it (issue #95 review). `escalating_port` turns
+    that specific failure mode (an "unwinding assertion" violation, distinct
+    from a real postcondition counterexample) into `Unknown(UNDER_UNWOUND)`
+    instead, so the ladder climbs `unwind_ladder` on it like any other
+    inconclusive verdict — a real `Violated` still surfaces as one.
+
+    Passing `verify_port` bypasses `escalating_port` and this default outright.
+
     Harnesses are written under `store_root/"check-work"` (module docstring:
     never beside `source`); `-I<source's resolved parent>` is appended *after*
     any caller-supplied `extra_flags` so a quoted include in the inlined unit
@@ -98,11 +113,14 @@ def check_source(
     an esbmc binary on PATH.
     """
     unit = Unit.from_path(source, function)
-    verify_fn = verify_port or partial(
-        verify,
-        timeout_s=timeout_s,
-        esbmc_bin=esbmc_bin,
-        extra_flags=(*extra_flags, f"-I{source.resolve().parent}"),
+    verify_fn = verify_port or escalating_port(
+        partial(
+            verify,
+            timeout_s=timeout_s,
+            esbmc_bin=esbmc_bin,
+            extra_flags=(*extra_flags, f"-I{source.resolve().parent}"),
+            no_unwinding_assertions=False,
+        )
     )
     try:
         with PropertyStore.open(store_root) as store:

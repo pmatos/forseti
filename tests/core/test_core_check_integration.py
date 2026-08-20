@@ -155,6 +155,44 @@ def test_check_source_checks_a_helper_in_a_file_that_also_defines_main(
     assert run.counts()["held"] == 1
 
 
+def test_check_source_detects_violation_past_the_default_unwind_bound(
+    tmp_path: Path,
+) -> None:
+    """`sum_to_n(6)` needs a loop bound of 7 (N+1) to fully unwind, past
+    check_source's own DEFAULT_UNWIND=4. With unwinding assertions off (the
+    plain `verify` default), esbmc silently assumes the loop exits by k=4 and
+    the post-loop assert path is UNREACHABLE -- a spurious HELD for a
+    postcondition that is actually FALSE (issue #95 review). With them on
+    (`escalating_port`, this fix), the under-unwound loop is a distinct
+    `Unknown(UNDER_UNWOUND)` at k=4 that escalates the ladder to k=8 (>= 7),
+    where the loop fully unwinds and the real violation is caught."""
+    unit = tmp_path / "loop.c"
+    unit.write_text(
+        "int sum_to_n(int n) {\n"
+        "    int i = 0, s = 0;\n"
+        "    while (i < n) {\n"
+        "        s = s + 1;\n"
+        "        i = i + 1;\n"
+        "    }\n"
+        "    return s;\n"
+        "}\n"
+    )
+    unit_id = f"{unit}::sum_to_n"
+    root = tmp_path / ".forseti"
+    store = PropertyStore.open(root)
+    # sum_to_n(6) == 6 always -- this postcondition is FALSE and must be
+    # caught once the loop is fully explored.
+    store.add(_semantic(unit_id, "result != 6", domain=("n == 6",)))
+    store.close()
+
+    run = check_source(unit, function="sum_to_n", store_root=root)
+
+    assert run.counts()["error"] == 0
+    assert run.counts()["held"] == 0  # never a spurious pass
+    assert run.counts()["violated"] == 1
+    assert run.verdicts[0].k == 8  # settled past the default unwind, on escalation
+
+
 def test_cli_check_exit_codes_and_json(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
