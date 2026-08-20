@@ -7,7 +7,8 @@
   is total and deterministic;
 * `run_loop` records `next_state(result)` as the state of every iteration (the
   "single source of truth" claim in `state.py`), always halts in a terminal
-  state, and calls `fix` exactly once per `Violated` round.
+  state, and calls `fix` once per `Violated` round except the last one the
+  budget permits, which skips straight to `GIVE_UP` (issue #32).
 
 The verify/fix ports are faked — no esbmc binary, no disk.
 """

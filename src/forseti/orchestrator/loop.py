@@ -39,6 +39,10 @@ class Iteration:
     loop has; a structured diff handle arrives with #28. `k` is the unwind bound
     this pass ran at — the loop's own escalation decision along the k-ladder,
     carried as data so the report never has to read it back from the esbmc argv.
+    `state` is `next_state(result)` — the verdict's *implied* next phase, not a
+    record of what the driver actually did next; a `Violated` pass on the final
+    budgeted round is still labeled `FIX` even though the loop skips calling
+    `fix` there (issue #32) and goes straight to `GIVE_UP`.
     """
 
     index: int
