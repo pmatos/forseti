@@ -3241,7 +3241,7 @@ def test_wellformed_build_flags_still_parse(
 ) -> None:
     # The guard must not swallow valid config: balanced quoting still splits.
     monkeypatch.setenv("FORSETI_BUILD_FLAGS", "'-I/opt/my sdk' -DX")
-    assert gate._build_flags() == ("-I/opt/my sdk", "-DX")
+    assert gate.build_flags_from_env() == ("-I/opt/my sdk", "-DX")
 
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc + forseti on PATH")

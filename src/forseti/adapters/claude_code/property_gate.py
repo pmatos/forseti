@@ -145,6 +145,19 @@ def _check_unit(project_dir: str, unit: dict[str, Any]) -> list[Any] | None:
         str(CHECK_TIMEOUT_S),
         "--json",
     ]
+    # Same `FORSETI_BUILD_FLAGS` the safety gate forwards to its own verify
+    # and `list-units` calls (`forseti_gate.build_flags_from_env`) -- without
+    # them the semantic harness can compile a different preprocessor branch or
+    # fail to resolve a project header, reporting held/violated for code the
+    # safety gate never actually verified (issue #95 review). Unparseable
+    # quoting degrades this best-effort unit to "nothing found", the same as
+    # any other tooling failure here -- never a crash.
+    try:
+        build_flags = gate.build_flags_from_env()
+    except gate.UnitsUnavailable:
+        return None
+    if build_flags:
+        argv += ["--", *build_flags]
     try:
         proc = subprocess.run(
             argv,

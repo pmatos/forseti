@@ -197,6 +197,68 @@ def test_relative_unit_file_is_matched_by_the_check_subprocess(
     assert argv[argv.index("check") + 1] == rel
 
 
+def test_forseti_build_flags_reach_the_check_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The safety gate forwards `FORSETI_BUILD_FLAGS` to its own verify/
+    list-units calls; this subprocess must get the same flags after `--`, or
+    the semantic harness can compile a different preprocessor branch than the
+    safety gate verified (issue #95 review)."""
+    source = tmp_path / "f.c"
+    unit_id = f"{source}::my_abs"
+    _add_candidate(tmp_path, unit_id)
+    state = _state(_unit(str(source), "my_abs"))
+    monkeypatch.setenv("FORSETI_BUILD_FLAGS", "-Iinclude -DNDEBUG")
+
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        subprocess, "run", _fake_run(_payload(unit_id, "held"), 0, captured)
+    )
+
+    property_gate.semantic_check_summary(str(tmp_path), state)
+
+    argv = captured["argv"]
+    assert argv[-3:] == ["--", "-Iinclude", "-DNDEBUG"]
+
+
+def test_no_build_flags_adds_no_separator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "f.c"
+    unit_id = f"{source}::my_abs"
+    _add_candidate(tmp_path, unit_id)
+    state = _state(_unit(str(source), "my_abs"))
+    monkeypatch.delenv("FORSETI_BUILD_FLAGS", raising=False)
+
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        subprocess, "run", _fake_run(_payload(unit_id, "held"), 0, captured)
+    )
+
+    property_gate.semantic_check_summary(str(tmp_path), state)
+
+    assert "--" not in captured["argv"]
+
+
+def test_malformed_build_flags_is_best_effort_not_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "f.c"
+    unit_id = f"{source}::my_abs"
+    _add_candidate(tmp_path, unit_id)
+    state = _state(_unit(str(source), "my_abs"))
+    monkeypatch.setenv("FORSETI_BUILD_FLAGS", "'-I/opt/my sdk")  # unbalanced quote
+
+    def _boom(*_a: object, **_kw: object) -> None:
+        raise AssertionError("must never reach a check call with bad build flags")
+
+    monkeypatch.setattr(subprocess, "run", _boom)
+
+    summary = property_gate.semantic_check_summary(str(tmp_path), state)
+
+    assert summary.checked == 0  # best-effort: dropped, not raised
+
+
 def test_unresolved_outcomes_are_reported_not_dropped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

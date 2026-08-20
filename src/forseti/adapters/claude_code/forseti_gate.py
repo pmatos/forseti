@@ -63,7 +63,7 @@ class UnitsUnavailable(RuntimeError):
     """
 
 
-def _build_flags() -> tuple[str, ...]:
+def build_flags_from_env() -> tuple[str, ...]:
     """The project's build flags (`-I`, `-D`, ...) from ``FORSETI_BUILD_FLAGS``.
 
     Read per call, not once at import, so a hook process that sets the variable
@@ -704,7 +704,7 @@ def _list_units(source: str, *, project_dir: str) -> list[FuncDef]:
     # `--parse-tree-only` run is at best inert. Nothing is added for a snapshot —
     # `_enumerable_source` stages it beside the source itself, so the search
     # paths stay identical to the in-place parse.
-    build_flags = _build_flags()
+    build_flags = build_flags_from_env()
     if build_flags:
         argv += ["--", *build_flags]
     try:
@@ -1550,7 +1550,7 @@ def verify_function(
         # becomes this unit's `error` verdict rather than a hook traceback — a
         # direct caller (not coming through `verify_and_record`, which fails at
         # enumeration first) must still get a verdict back.
-        build_flags = _build_flags()
+        build_flags = build_flags_from_env()
     except UnitsUnavailable as exc:
         return UnitVerdict(uid, rel, function, "error", k, detail=str(exc))
     argv = [
