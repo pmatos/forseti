@@ -17,19 +17,6 @@ import sys
 from . import event_log
 from . import forseti_gate as gate
 
-_CEX_CLIP = 1500
-
-
-def _needs_note(needs: list[gate.UnitVerdict]) -> str:
-    """A loud, non-fixable note for NEEDS_CONTRACT units (never a silent skip)."""
-    ids = ", ".join(v.unit_id for v in needs)
-    return (
-        f"Forseti: {len(needs)} unit(s) NOT gated — {ids}. They take pointer/array "
-        "parameter(s); function-level safety is unreliable without a memory "
-        "precondition/harness, so they were NOT verified (issue #122). This is not "
-        "a pass and not a source bug to 'fix' — leave them as is."
-    )
-
 
 def main() -> int:
     raw = sys.stdin.read()
@@ -40,6 +27,18 @@ def main() -> int:
         return 0
 
     project_dir = gate.project_dir(data)
+
+    if errors := gate.env_config_errors():
+        # Same fail-closed check `stop_gate.main()` opens with, and for the
+        # same reason: `verify_and_record` below reads `gate.DEFAULT_K`/
+        # `VERIFY_TIMEOUT_S` (env_int/env_float-backed), and those never raise
+        # -- a malformed value silently falls back to its default instead. Left
+        # unchecked here, this hook would verify and durably record a verdict
+        # under that silently-wrong value before the Stop hook ever gets a
+        # chance to block on the misconfiguration (issue #95 review).
+        print(gate.env_config_error_message(errors), file=sys.stderr)
+        return 2
+
     if not os.path.isabs(file_path):
         file_path = os.path.join(project_dir, file_path)
     if not os.path.exists(file_path):
@@ -108,7 +107,7 @@ def main() -> int:
             oks = ", ".join(f"{v.unit_id} (k={v.k})" for v in verified)
             out.append(f"Forseti: VERIFIED up to k — {oks}")
         if needs:
-            out.append(_needs_note(needs))
+            out.append(gate.needs_note(needs))
         if out:
             print("\n".join(out))
         return 0
@@ -122,7 +121,7 @@ def main() -> int:
         lines.append(f"✗ {v.unit_id} — {v.verdict.upper()} (k={v.k})")
         if v.counterexample:
             lines.append("Counterexample:")
-            lines.append(v.counterexample.strip()[:_CEX_CLIP])
+            lines.append(v.counterexample.strip()[: gate.CEX_CLIP])
         elif v.detail:
             lines.append(f"  {v.detail}")
         lines.append("")
@@ -133,7 +132,7 @@ def main() -> int:
         "raise k (FORSETI_UNWIND) or simplify the unit."
     )
     if needs:
-        lines += ["", _needs_note(needs)]
+        lines += ["", gate.needs_note(needs)]
     event_log.log_event(
         project_dir,
         event_log.GATE,

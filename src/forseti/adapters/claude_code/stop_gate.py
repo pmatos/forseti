@@ -7,6 +7,18 @@ back — the emulated Stop-gate. To avoid an unbounded loop when a unit genuinel
 cannot be verified, it blocks at most MAX_STOP_ATTEMPTS consecutive times (the
 counter is reset by any fresh edit), then lets the turn end with a LOUD
 unverified residual — never a silent pass.
+
+That MAX_STOP_ATTEMPTS bound is scoped to a *unit* that cannot be verified. A
+malformed `FORSETI_*` env var (`gate.env_config_errors()`, checked first, below)
+blocks every attempt with no such escape hatch by design: the config is broken
+for every unit, not just one, and letting the turn end anyway would be exactly
+the silent-pass-on-bad-input this gate exists to prevent (`gate-fails-closed`).
+Fixing the env var, not editing code, is what ends that block.
+
+Also surfaces (never blocks on, issue #95): any stored semantic property whose
+`forseti check` verdict is VIOLATED for a unit the safety gate already verified
+— see `property_gate` for why this is loud-but-non-blocking rather than folded
+into `blocking_units`.
 """
 
 from __future__ import annotations
@@ -15,7 +27,7 @@ import json
 import sys
 from typing import Any
 
-from . import event_log
+from . import event_log, property_gate
 from . import forseti_gate as gate
 
 _CEX_CLIP = 1200
@@ -104,6 +116,99 @@ def _blob_note(blob: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _plural(n: int) -> str:
+    return "y" if n == 1 else "ies"
+
+
+def _property_lines(
+    header: str,
+    verdicts: tuple[dict[str, Any], ...],
+    marker: str,
+    detail: Any,
+) -> list[str]:
+    lines = [header]
+    for v in verdicts:
+        lines.append(
+            f"  {marker} {v.get('unit_id')} [{v.get('property_id')}] {detail(v)}"
+        )
+    return lines
+
+
+def _semantic_message(summary: property_gate.SemanticCheckSummary) -> str:
+    """Loud, NON-blocking note for VIOLATED generated semantic properties.
+
+    Distinct from `_residual`: a violated *semantic* property (issue #95) is a
+    subagent-proposed contract failing, not the built-in safety check the
+    turn actually blocks on (`property_gate` module docstring — this needs
+    the same prune/reconciliation machinery blocking_units already has before
+    it can safely gate the turn). Reported here so it is never silently
+    dropped even though it never contributes to `outstanding`.
+    """
+    lines: list[str] = []
+    if summary.violations:
+        n = len(summary.violations)
+        lines += _property_lines(
+            f"⚠ Forseti: {n} generated semantic propert{_plural(n)} did NOT hold "
+            "(`forseti check`, issue #95) — a subagent-proposed property failed "
+            "against real code. This is NOT currently blocking the turn:",
+            summary.violations,
+            "✗",
+            lambda v: f"(k={v.get('k')})",
+        )
+    if summary.unresolved:
+        n = len(summary.unresolved)
+        lines += _property_lines(
+            f"⚠ Forseti: {n} generated semantic propert{_plural(n)} could not be "
+            "resolved (`forseti check` returned unknown/error, issue #95) — never a "
+            "silent pass (CLAUDE.md); raise the unwind bound or investigate the "
+            "failure:",
+            summary.unresolved,
+            "?",
+            lambda v: f"({v.get('outcome')}, k={v.get('k')})",
+        )
+    if summary.failed:
+        n = summary.failed
+        lines.append(
+            f"⚠ Forseti: {n} unit(s) with stored properties could not be checked "
+            "this turn at all (`forseti check` subprocess timeout, unparseable "
+            "FORSETI_BUILD_FLAGS, or a crashed/malformed invocation) — never a "
+            "silent pass (CLAUDE.md); investigate FORSETI_PROPERTY_CHECK_TIMEOUT_S "
+            "or the project's build flags."
+        )
+    if summary.skipped:
+        n = len(summary.skipped)
+        verb = "was" if n == 1 else "were"
+        lines += _property_lines(
+            f"⚠ Forseti: {n} generated propert{_plural(n)} {verb} skipped "
+            "(`forseti check` deferred a reachability-kind property, ADR-0009 "
+            "D2) — not a failure, but not actually checked either; never a "
+            "silent pass (CLAUDE.md):",
+            summary.skipped,
+            "•",
+            lambda v: f"({v.get('skip_reason')})",
+        )
+    if summary.deferred:
+        # NOT "rerun to cover them": checking never mutates a property's
+        # stored status, so the selection is the same deterministic prefix
+        # every turn (property_gate.semantic_check_summary) -- a project with
+        # more verified-and-candidate units than FORSETI_PROPERTY_MAX_UNITS
+        # has some units this hook will never check on its own (issue #95
+        # review). Two independent, hard caps can produce this count: the
+        # per-turn unit budget (FORSETI_PROPERTY_MAX_UNITS) and the aggregate
+        # wall-clock ceiling across the whole loop (FORSETI_PROPERTY_MAX_TOTAL_CHECK_S)
+        # -- naming only one here would misattribute a slow-property cutoff to
+        # too many units. Raise either budget or `forseti check` the deferred
+        # units directly.
+        lines.append(
+            f"⚠ Forseti: {summary.deferred} unit(s) with stored properties were "
+            "not checked this turn (a hard per-turn unit cap or aggregate "
+            "wall-clock cap, not a rotating window) — raise "
+            "FORSETI_PROPERTY_MAX_UNITS / FORSETI_PROPERTY_MAX_TOTAL_CHECK_S or "
+            "`forseti check` them directly."
+        )
+    return "\n".join(lines)
+
+
 def _emit(obj: dict[str, Any]) -> int:
     print(json.dumps(obj))
     return 0
@@ -113,6 +218,24 @@ def main() -> int:
     raw = sys.stdin.read()
     data = json.loads(raw) if raw.strip() else {}
     project_dir = gate.project_dir(data)
+
+    if errors := gate.env_config_errors():
+        # A malformed FORSETI_* numeric env var (`gate.env_int`/`env_float`,
+        # imported by every module below this point) never raises at import
+        # time -- it falls back to its literal default and records the bad
+        # raw value here instead, so the hook process itself never crashes.
+        # But that default is never load-bearing for an actual decision: this
+        # is the gate the whole v0 safety-verify loop blocks on, so a bad
+        # value blocks the turn loudly here, before any verify/check call
+        # downstream could silently run with it (issue #95 review; the same
+        # "fail closed, never silently coerce" spirit `build_flags_from_env`
+        # already holds itself to for `FORSETI_BUILD_FLAGS`).
+        event_log.log_event(
+            project_dir, event_log.STOP, decision="block", reason="env_config_error"
+        )
+        return _emit(
+            {"decision": "block", "reason": gate.env_config_error_message(errors)}
+        )
 
     # Discover C files changed out-of-band (Bash) that the gate has not verified.
     # This is an ESBMC-free, git-fast backstop — the heavy verify runs in the
@@ -172,27 +295,50 @@ def main() -> int:
             reason="not a git repository",
         )
 
+    # Best-effort, git-free, and never blocking on its own (module docstring):
+    # any stored semantic property for a unit the safety gate already verified.
+    # Computed once, outside the lock (it may shell out to esbmc), and folded
+    # into whichever message this call ends up emitting — allow or block.
+    semantic = property_gate.semantic_check_summary(project_dir, state)
+
+    # NEEDS_CONTRACT units (pointer/array, no harness yet) are honestly-unverified
+    # but a source fix can't resolve them, and a VIOLATED semantic property is a
+    # subagent-proposed contract failing rather than the built-in safety check
+    # (issue #95) — both are reported loudly here regardless of outstanding, never
+    # folded silently into either message.
+    notes = []
+    if needs:
+        notes.append(_needs_message(needs))
+    if not semantic.empty:
+        notes.append(_semantic_message(semantic))
+
     if not outstanding:
-        # Nothing blocks. NEEDS_CONTRACT units (pointer/array, no harness yet) are
-        # honestly-unverified but a source fix can't resolve them, so let the turn
-        # end — loudly if any are outstanding, never silently.
-        if needs:
+        if notes:
+            # "allow_needs_contract" only when a NEEDS_CONTRACT unit is actually
+            # among the notes -- a turn with zero of those but a semantic-only
+            # note must not be mislabeled as one, or anything filtering
+            # events.jsonl by decision gets a false positive (issue #95 review).
+            decision = "allow_needs_contract" if needs else "allow_semantic_check"
             event_log.log_event(
                 project_dir,
                 event_log.STOP,
-                decision="allow_needs_contract",
+                decision=decision,
                 n_needs_contract=len(needs),
+                n_semantic_violations=len(semantic.violations),
+                n_semantic_unresolved=len(semantic.unresolved),
+                n_semantic_failed=semantic.failed,
+                n_semantic_skipped=len(semantic.skipped),
                 attempt=0,
             )
-            return _emit({"systemMessage": _needs_message(needs)})
+            return _emit({"systemMessage": "\n\n".join(notes)})
         event_log.log_event(
             project_dir, event_log.STOP, decision="allow", n_unverified=0, attempt=0
         )
         return 0  # nothing outstanding — allow the turn to end
 
     # Fold the recorded-blocking residual, any out-of-band files, any divergent
-    # staged/committed blobs, and any NEEDS_CONTRACT note into one message. Only
-    # blocking + oob + blob drive the block.
+    # staged/committed blobs, any NEEDS_CONTRACT note, and any semantic-property
+    # note into one message. Only blocking + oob + blob drive the block.
     sections = []
     if blocking:
         sections.append(_residual(blocking))
@@ -200,8 +346,7 @@ def main() -> int:
         sections.append(_oob_note(project_dir, oob))
     if blob:
         sections.append(_blob_note(blob))
-    if needs:
-        sections.append(_needs_message(needs))
+    sections += notes
     detail = "\n\n".join(sections)
     n_out = len(blocking) + len(oob) + len(blob)
 
@@ -217,6 +362,11 @@ def main() -> int:
             n_oob=len(oob),
             n_blob=len(blob),
             attempt=attempts,
+            n_needs_contract=len(needs),
+            n_semantic_violations=len(semantic.violations),
+            n_semantic_unresolved=len(semantic.unresolved),
+            n_semantic_failed=semantic.failed,
+            n_semantic_skipped=len(semantic.skipped),
         )
         return _emit(
             {
@@ -236,6 +386,11 @@ def main() -> int:
         n_oob=len(oob),
         n_blob=len(blob),
         attempt=attempts,
+        n_needs_contract=len(needs),
+        n_semantic_violations=len(semantic.violations),
+        n_semantic_unresolved=len(semantic.unresolved),
+        n_semantic_failed=semantic.failed,
+        n_semantic_skipped=len(semantic.skipped),
     )
     return _emit(
         {

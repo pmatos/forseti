@@ -25,6 +25,13 @@ Subcommands:
   for candidate properties over that unit and persist the survivors (``--json``
   emits the same payload the MCP tool returns). Exit 0 on a completed run,
   1 when the run itself fails (LLM/parse/store/IO) — never a silent empty run.
+- ``forseti check <source> --function NAME`` — check that unit's stored,
+  checkable properties (#66) against ESBMC, one verdict each (``--json`` emits
+  the ``PropertyCheckRun`` payload). Exit follows worst-outcome-wins over every
+  checked property (:data:`EXIT_CODES`, VIOLATED > UNKNOWN > ERROR > VERIFIED);
+  a run with nothing checkable (no stored properties, or every stored property
+  is reachability-kind and deferred per ADR-0009 D2) says so loudly rather than
+  reading as a clean pass.
 - ``forseti claude-code-hook <name>`` — dispatch to one of the Claude Code
   adapter's verify-gate hooks (RFC-0004). Internal: wired into a project's
   settings file by ``enable-project``, not meant to be run by hand.
@@ -54,6 +61,7 @@ from forseti.adapters.claude_code.install import (
 )
 from forseti.esbmc import (
     ListUnitsError,
+    Verdict,
     Violated,
     add_esbmc_invocation_arguments,
     add_verify_arguments,
@@ -61,6 +69,7 @@ from forseti.esbmc import (
     render_result,
     verify_kwargs,
 )
+from forseti.orchestrator import PropertyCheckRun, property_check_transcript
 from forseti.precond import (
     ASSESSMENT_EXIT_CODES,
     DEFAULT_MAX_LEN,
@@ -83,6 +92,16 @@ from forseti.properties import (
 from forseti.update_notice import installed_version, update_notice
 
 from . import EXIT_CODES
+from .check import (
+    DEFAULT_TIMEOUT_S as CHECK_TIMEOUT_S,
+)
+from .check import (
+    DEFAULT_UNWIND as CHECK_DEFAULT_UNWIND,
+)
+from .check import (
+    DEFAULT_UNWIND_LADDER as CHECK_DEFAULT_UNWIND_LADDER,
+)
+from .check import check_source
 from .propose import (
     DEFAULT_MAX_CANDIDATES,
     DEFAULT_MODEL,
@@ -363,6 +382,24 @@ def _run_discharge(args: argparse.Namespace) -> int:
     return ASSESSMENT_EXIT_CODES[result.assessment]
 
 
+def _add_unit_store_arguments(p: argparse.ArgumentParser) -> None:
+    """`<source> --function NAME [--store-root DIR]`, shared by propose/check."""
+    p.add_argument("source", type=Path, help="source file defining the unit")
+    p.add_argument(
+        "--function",
+        required=True,
+        metavar="NAME",
+        help="the function under test (the `symbol` of `path::symbol`)",
+    )
+    p.add_argument(
+        "--store-root",
+        type=Path,
+        default=DEFAULT_STORE_ROOT,
+        metavar="DIR",
+        help=f"the .forseti store directory (default: {DEFAULT_STORE_ROOT})",
+    )
+
+
 def _add_propose_parser(
     sub: argparse._SubParsersAction[argparse.ArgumentParser],
 ) -> None:
@@ -375,24 +412,11 @@ def _add_propose_parser(
             "survivors as CANDIDATE."
         ),
     )
-    p.add_argument("source", type=Path, help="source file defining the unit")
-    p.add_argument(
-        "--function",
-        required=True,
-        metavar="NAME",
-        help="the function under test (the `symbol` of `path::symbol`)",
-    )
+    _add_unit_store_arguments(p)
     p.add_argument(
         "--no-store",
         action="store_true",
         help="dry run: propose and validate without writing to the store",
-    )
-    p.add_argument(
-        "--store-root",
-        type=Path,
-        default=DEFAULT_STORE_ROOT,
-        metavar="DIR",
-        help=f"the .forseti store directory (default: {DEFAULT_STORE_ROOT})",
     )
     p.add_argument(
         "--model",
@@ -465,6 +489,151 @@ def _run_propose(args: argparse.Namespace) -> int:
     else:
         print(_render_proposal(result))
     return 0
+
+
+def _parse_ladder(value: str) -> tuple[int, ...]:
+    """``"8,16"`` -> ``(8, 16)``; ``""`` -> ``()``. Raises on a non-int token."""
+    if not value.strip():
+        return ()
+    try:
+        return tuple(int(tok) for tok in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--unwind-ladder must be a comma-separated list of ints, got {value!r}"
+        ) from exc
+
+
+def _add_check_parser(
+    sub: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    p = sub.add_parser(
+        "check",
+        help="check a unit's stored properties with ESBMC, one verdict each",
+        description=(
+            "Read <source>::<function>'s stored, checkable properties (proposed by "
+            "`forseti propose`), render each semantic one to a self-contained ESBMC "
+            "harness, and verify it: held | violated | unknown | error, plus "
+            "skipped for a deferred reachability property (ADR-0009 D2)."
+        ),
+    )
+    _add_unit_store_arguments(p)
+    p.add_argument(
+        "-k",
+        "--unwind",
+        type=int,
+        default=CHECK_DEFAULT_UNWIND,
+        help=f"loop unwind bound k (default: {CHECK_DEFAULT_UNWIND})",
+    )
+    p.add_argument(
+        "--unwind-ladder",
+        type=_parse_ladder,
+        default=None,
+        metavar="K1,K2,...",
+        help=(
+            "comma-separated bounds tried after --unwind on an UNKNOWN verdict "
+            f"(default: whichever of {','.join(map(str, CHECK_DEFAULT_UNWIND_LADDER))} "
+            "exceed --unwind, so raising -k/--unwind alone still works)"
+        ),
+    )
+    p.add_argument(
+        "-t",
+        "--timeout",
+        type=float,
+        default=CHECK_TIMEOUT_S,
+        metavar="SECONDS",
+        help=f"per-attempt esbmc timeout in seconds (default: {CHECK_TIMEOUT_S:g})",
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the check run as a JSON object",
+    )
+    add_esbmc_invocation_arguments(
+        p,
+        passthrough_help=(
+            "flags forwarded verbatim to esbmc; place them after a `--` separator, "
+            "e.g. `... file.c --function f -- -DNDEBUG`"
+        ),
+    )
+    p.set_defaults(func=_run_check)
+
+
+def _check_exit_code(run: PropertyCheckRun) -> int:
+    """Worst-outcome-wins over every checked property, mirroring `EXIT_CODES`.
+
+    `violated` beats `unknown` beats `error` beats a clean run (`held`/`skipped`
+    only) — the same VIOLATED > UNKNOWN > ERROR > VERIFIED severity ordering a
+    single-unit `forseti verify` uses, extended to "worst verdict across every
+    property this run checked" rather than one. A run makes exactly one of the
+    four counts decisive, in that order, so it can never under-report a
+    violation because an unrelated property also came back unknown/error.
+    """
+    counts = run.counts()
+    if counts["violated"]:
+        return EXIT_CODES[Verdict.VIOLATED]
+    if counts["unknown"]:
+        return EXIT_CODES[Verdict.UNKNOWN]
+    if counts["error"]:
+        return EXIT_CODES[Verdict.ERROR]
+    return EXIT_CODES[Verdict.VERIFIED]
+
+
+def _render_check(run: PropertyCheckRun) -> str:
+    """Human-readable check output: a loud headline for "nothing was actually
+    semantically checked", then the full per-property transcript.
+
+    An empty run (no stored properties at all) and an all-`skipped` run (every
+    stored property is reachability-kind, deferred per ADR-0009 D2) both read as
+    a clean 0 counts otherwise indistinguishable from "every property held" —
+    CLAUDE.md "never silently pass" applies to the report, not just the exit
+    code.
+    """
+    counts = run.counts()
+    total = len(run.verdicts)
+    checked = total - counts["skipped"]
+    lines: list[str] = []
+    if total == 0:
+        lines.append(
+            f"No properties stored for {run.unit_id} -- nothing was checked. "
+            "Run `forseti propose` first."
+        )
+    elif checked == 0:
+        lines.append(
+            f"{total} stored propert{'y' if total == 1 else 'ies'} for "
+            f"{run.unit_id} -- all reachability-kind (deferred, ADR-0009 D2); "
+            "no semantic property was actually checked."
+        )
+    lines.append(property_check_transcript(run))
+    return "\n".join(lines)
+
+
+def _run_check(args: argparse.Namespace) -> int:
+    unwind_ladder = args.unwind_ladder
+    if unwind_ladder is None:
+        # --unwind-ladder wasn't given: derive it from the chosen --unwind so
+        # `-k 8` (or higher) doesn't collide with the fixed default rungs and
+        # raise ValueError below (issue #95 review) -- an explicit
+        # --unwind-ladder (including "" -> ()) always passes through as-is.
+        unwind_ladder = tuple(k for k in CHECK_DEFAULT_UNWIND_LADDER if k > args.unwind)
+    try:
+        result = check_source(
+            args.source,
+            function=args.function,
+            store_root=args.store_root,
+            unwind=args.unwind,
+            unwind_ladder=unwind_ladder,
+            timeout_s=args.timeout,
+            extra_flags=tuple(args.esbmc_args),
+            esbmc_bin=args.esbmc_bin,
+        )
+    except (PropertyStoreError, OSError, ValueError) as exc:
+        print(f"forseti check: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(result.to_dict()))
+    else:
+        print(_render_check(result))
+    return _check_exit_code(result)
 
 
 def _add_claude_code_hook_parser(
@@ -596,6 +765,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_synth_parser(sub)
     _add_discharge_parser(sub)
     _add_propose_parser(sub)
+    _add_check_parser(sub)
     _add_claude_code_hook_parser(sub)
     _add_enable_project_parser(sub)
     _add_mcp_parser(sub)

@@ -38,7 +38,7 @@ from forseti.esbmc import (
     list_units,
     verify,
 )
-from forseti.orchestrator.ladder import validated_ladder, verify_ladder
+from forseti.orchestrator.ladder import climb_to_terminal, validated_ladder
 from forseti.orchestrator.ports import VerifyPort
 
 from .synth import (
@@ -326,10 +326,7 @@ def _run(
 
     ladder = precondition_ladder(max_len, ladder_cap)
     port = escalating_port(raw)
-    settled = None
-    for attempt in verify_ladder(primary, verify=port, ladder=ladder):
-        settled = attempt
-    assert settled is not None  # verify_ladder yields at least one attempt
+    settled = climb_to_terminal(primary, verify=port, ladder=ladder)
 
     result, k = settled.result, settled.k
 

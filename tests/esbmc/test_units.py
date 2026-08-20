@@ -29,6 +29,7 @@ from forseti.esbmc.units import (
     parse_implicit_invocations,
     parse_symbol_aliases,
     parse_units,
+    rename_all_declarations_and_definitions,
 )
 
 # A clang textual AST in ESBMC's `--parse-tree-only` shape, exercising: an
@@ -1441,6 +1442,129 @@ def test_find_definition_brace_without_an_anchor_keeps_the_first_match() -> None
     first = find_definition_brace(_IF0_DUP_DEF, "f")
     assert first is not None
     assert _IF0_DUP_DEF[:first].count("\n") == 1
+
+
+def test_rename_all_declarations_and_definitions_renames_a_single_definition() -> None:
+    source = (
+        "int helper(int x) {\n    return x + 1;\n}\n\n"
+        "int main(void) {\n    return helper(1);\n}\n"
+    )
+    renamed = rename_all_declarations_and_definitions(source, "main", "__unused_main")
+    assert "int __unused_main(void)" in renamed
+    assert "int main(void)" not in renamed
+    assert "return helper(1);" in renamed  # call site untouched
+
+
+def test_rename_all_declarations_and_definitions_leaves_mentions_alone() -> None:
+    # A `main`-like substring (not a `\b`-bounded match) and a comment mention
+    # are neither declaration- nor definition-shaped -- left untouched.
+    source = (
+        "int helper(int x) {\n    return x;\n}\n\n"
+        "int mainframe(int x) {\n    return x;\n}\n"
+        "/* main() is mentioned here too */\n"
+    )
+    assert (
+        rename_all_declarations_and_definitions(source, "main", "__unused_main")
+        == source
+    )
+
+
+def test_rename_all_declarations_and_definitions_renames_a_prototype_too() -> None:
+    # Issue #95 review: a forward-declared prototype is not a *definition*, so
+    # find_definition_brace correctly leaves it alone -- but a signature
+    # mismatch between a left-behind prototype and whatever the definition
+    # gets renamed to (or the harness's own generated entry point) is a hard
+    # esbmc parse error ("conflicting types"), verified against a live esbmc
+    # run. Renaming the declaration too sidesteps the signature question
+    # rather than trying to answer it.
+    source = (
+        "void main(void);  // forward-declared, deliberately mismatched\n\n"
+        "int helper(int x) {\n    return x;\n}\n\n"
+        "int main(void) {\n    return helper(1);\n}\n"
+    )
+    renamed = rename_all_declarations_and_definitions(source, "main", "__unused_main")
+    assert renamed.count("__unused_main(void)") == 2
+    assert "void main(void);" not in renamed  # the mismatched prototype is gone
+    assert "int main(void) {" not in renamed  # the definition is gone
+
+
+def test_rename_all_declarations_and_defs_renames_every_alternative() -> None:
+    # Issue #95 review: an inactive `#if 0` definition of `main` ahead of the
+    # active one is just as definition-shaped to this textual scan (no
+    # preprocessor) as the real one -- `find_definition_brace`/
+    # `_select_definition` pick only one (the first, absent a `def_line`
+    # anchor), so a caller renaming to avoid a name collision must rename
+    # *every* one or the untouched alternative still collides.
+    source = (
+        "#if 0\nint main(void) { return -1; }\n#endif\nint main(void) { return 0; }\n"
+    )
+    renamed = rename_all_declarations_and_definitions(source, "main", "__unused_main")
+    assert renamed.count("int __unused_main(void)") == 2
+    assert "int main(void)" not in renamed
+
+
+def test_rename_all_declarations_and_definitions_uses_the_matched_name_span() -> None:
+    # Issue #95 review: a suffix attribute mentioning the name in a string
+    # literal (`__attribute__((annotate("main")))`) sits textually *after*
+    # the real identifier. A rename that re-searches raw/comment-masked text
+    # for the last bare "main" token would rename the string content instead
+    # of the identifier and leave the actual definition uncollided; renaming
+    # off the definitional match's own name span cannot make that mistake.
+    source = 'int main(void) __attribute__((annotate("main"))) {\n    return 0;\n}\n'
+    renamed = rename_all_declarations_and_definitions(source, "main", "__unused_main")
+    assert '__unused_main(void) __attribute__((annotate("main")))' in renamed
+    assert "int main(void)" not in renamed
+
+
+def test_rename_all_declarations_and_definitions_no_op_when_absent() -> None:
+    source = "int helper(int x) {\n    return x + 1;\n}\n"
+    assert (
+        rename_all_declarations_and_definitions(source, "main", "__unused_main")
+        == source
+    )
+
+
+def test_rename_all_declarations_and_definitions_leaves_string_contents_alone() -> None:
+    # Issue #95 review: a string literal that happens to spell `main(` (a
+    # diagnostic like `printf("call main();\n")`) is not a reference to the
+    # function `main` -- comments and string/char literals are both masked
+    # before the occurrence scan, so this must not be rewritten in place.
+    source = (
+        'void helper(void) {\n    printf("call main();\\n");\n}\n\n'
+        "int main(void) {\n    return 0;\n}\n"
+    )
+    renamed = rename_all_declarations_and_definitions(source, "main", "__unused_main")
+    assert 'printf("call main();\\n");' in renamed
+    assert "int __unused_main(void)" in renamed
+    assert "int main(void)" not in renamed
+
+
+def test_rename_all_declarations_and_definitions_renames_an_expression_reference() -> (
+    None
+):
+    # Issue #95 review: the original scan only renamed an occurrence followed
+    # by `{` (a definition) or `;` (a declaration/bare call statement) --
+    # leaving a reference in expression position (`main() + x`) dangling,
+    # where it can collide with a harness's own injected `main` instead of
+    # erroring loudly.
+    source = "int main(void){ return 0; }\n\nint helper(int x){ return main() + x; }\n"
+    renamed = rename_all_declarations_and_definitions(source, "main", "__unused_main")
+    assert "return __unused_main() + x;" in renamed
+    assert "main()" not in renamed.replace("__unused_main()", "")
+
+
+def test_rename_all_declarations_and_definitions_leaves_member_access_alone() -> None:
+    # `s.main(`/`p->main(` can only be a struct/union member named `main` in
+    # C, never a reference to the free function of the same name -- renaming
+    # it would corrupt the member access while leaving the real collision.
+    source = (
+        "struct S { int (*main)(void); };\n"
+        "int use(struct S *s){ return s->main(); }\n"
+        "int main(void){ return 0; }\n"
+    )
+    renamed = rename_all_declarations_and_definitions(source, "main", "__unused_main")
+    assert "return s->main();" in renamed
+    assert "int __unused_main(void)" in renamed
 
 
 _HEADER_CALLER_AST = """\

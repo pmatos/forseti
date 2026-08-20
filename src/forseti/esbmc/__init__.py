@@ -25,19 +25,14 @@ from .result import (
     Verified,
     Violated,
 )
-from .runner import build_argv, classify, verify
+from .runner import VERIFY_GRACE_S, build_argv, classify, verify
 from .units import (
     CallerOpenings,
     ListUnitsError,
     Param,
     Unit,
     find_definition_brace,
-    list_address_escapes,
-    list_asm_statements,
     list_caller_openings,
-    list_external_callers,
-    list_implicit_invocations,
-    list_symbol_aliases,
     list_units,
     mask_comments,
     parse_address_escapes,
@@ -47,6 +42,7 @@ from .units import (
     parse_implicit_invocations,
     parse_symbol_aliases,
     parse_units,
+    rename_all_declarations_and_definitions,
 )
 from .verify_cli import (
     add_esbmc_invocation_arguments,
@@ -56,6 +52,7 @@ from .verify_cli import (
 
 __all__ = [
     "EXIT_CODES",
+    "VERIFY_GRACE_S",
     "Assignment",
     "CallerOpenings",
     "Counterexample",
@@ -79,12 +76,7 @@ __all__ = [
     "build_argv",
     "classify",
     "find_definition_brace",
-    "list_address_escapes",
-    "list_asm_statements",
     "list_caller_openings",
-    "list_external_callers",
-    "list_implicit_invocations",
-    "list_symbol_aliases",
     "list_units",
     "mask_comments",
     "parse_address_escapes",
@@ -95,6 +87,7 @@ __all__ = [
     "parse_implicit_invocations",
     "parse_symbol_aliases",
     "parse_units",
+    "rename_all_declarations_and_definitions",
     "render_result",
     "result_to_dict",
     "verify",

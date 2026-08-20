@@ -21,8 +21,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from forseti.esbmc import EsbmcResult, Violated
+from forseti.esbmc import (
+    EsbmcResult,
+    Violated,
+    rename_all_declarations_and_definitions,
+)
 from forseti.properties import Property, PropertyStatus
+
+_RENAMED_MAIN = "__forseti_unused_main"
 
 
 class VerifyPort(Protocol):
@@ -52,17 +58,53 @@ class Unit:
     disk-free (mirrors `FixRequest.source_text`). Passing the slice, not the
     `examples/*.c` file, is what keeps a hand-written property (the example's own
     `main`/`assert`) out of the checked path.
+
+    `symbol` is the identifier `source_text` actually defines — not necessarily
+    the one `from_path` was asked for (see its docstring on checking `main`
+    itself); `unit_id` always keeps the *requested* spelling, since that is the
+    store's own lookup key.
     """
 
-    unit_id: str  # "path::symbol"
+    unit_id: str  # "path::symbol", the requested spelling
     path: Path  # file defining `symbol`
-    symbol: str  # function under test
+    symbol: str  # function under test, as it actually appears in `source_text`
     source_text: str
 
     @classmethod
     def from_path(cls, path: Path, symbol: str) -> Unit:  # effect boundary
-        """Read `path` and build the unit keyed `path::symbol`."""
-        return cls(f"{path}::{symbol}", path, symbol, path.read_text())
+        """Read `path` and build the unit keyed `path::symbol`.
+
+        `path` need not already be main-free: a normal executable translation
+        unit (helper function + its own `main`) is a legitimate check target,
+        not just a hand-written `examples/*.c` kernel slice.
+        `rename_all_declarations_and_definitions` renames every genuine `main`
+        declaration or definition out of the way (every textual alternative,
+        e.g. an inactive ``#if 0`` definition, and any forward-declared
+        prototype regardless of whether its signature happens to match —
+        issue #95 review) so `source_text` satisfies this class's own
+        main-free contract either way — a `main` appearing only in a comment
+        is left untouched (issue #95 review: `render_semantic_harness` rejects
+        any `unit_source` defining `main`, which previously made every stored
+        property for such a unit an unconditional `ERROR`; a *left-behind*
+        prototype with a signature that doesn't match the harness's own
+        generated ``int main(void)`` is a hard esbmc parse error, not merely
+        an `ERROR` verdict, so it has to go too rather than being merely
+        tolerated by a looser "is this a definition?" check).
+
+        When `symbol` itself is `"main"` — checking `main`'s own semantic
+        properties is a legitimate request — it gets renamed right along with
+        every other declaration/definition, so `Unit.symbol` tracks the
+        renamed identifier instead of the now-absent `"main"`: otherwise
+        `SemanticHarnessWriter` would look up a symbol the rename just erased
+        and report every property an `ERROR` (issue #95 review). `unit_id`
+        still uses the originally requested `symbol`, matching how the
+        property store already keys this unit.
+        """
+        source_text = rename_all_declarations_and_definitions(
+            path.read_text(), "main", _RENAMED_MAIN
+        )
+        effective_symbol = _RENAMED_MAIN if symbol == "main" else symbol
+        return cls(f"{path}::{symbol}", path, effective_symbol, source_text)
 
 
 @dataclass(frozen=True)

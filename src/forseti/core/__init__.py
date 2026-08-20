@@ -1,9 +1,9 @@
 """Forseti Core — the harness-neutral surface (RFC-0001).
 
 Push *all logic* into a Core the harnesses share, then keep each harness's glue
-thin. This package is that Core's public face: the `verify` and `propose`
-operations plus their JSON wire shapes, exposed as a unified `forseti` CLI
-(:mod:`forseti.core.cli`) and an MCP server (:mod:`forseti.core.mcp_server`).
+thin. This package is that Core's public face: the `verify`, `propose`, and
+`check` operations plus their JSON wire shapes, exposed as a unified `forseti`
+CLI (:mod:`forseti.core.cli`) and an MCP server (:mod:`forseti.core.mcp_server`).
 The loop orchestration lands here next (tracked under epic #14).
 """
 
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from forseti.esbmc import EXIT_CODES
 
+from .check import check_source
 from .propose import propose_source
 from .verify import Payload, result_to_payload, verify_source
 
@@ -21,6 +22,7 @@ from .verify import Payload, result_to_payload, verify_source
 __all__ = [
     "EXIT_CODES",
     "Payload",
+    "check_source",
     "propose_source",
     "result_to_payload",
     "verify_source",

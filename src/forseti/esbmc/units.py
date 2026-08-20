@@ -78,6 +78,20 @@ _TYPE_RE = re.compile(r"'([^']*)'")
 # match here would already be gone by the time that exclusion could see it).
 _COMMENT_RE = re.compile(r"//(?:\\\r?\n|[^\n])*|/\*.*?\*/", re.DOTALL)
 
+# String (`"..."`) and char (`'...'`) literals, blanked the same way and for the
+# same reason as comments (below): a literal can spell `fn_name(` — a diagnostic
+# like `printf("call main();\n")` — without that being a real occurrence of
+# `fn_name`, and every `_paren_balanced_occurrences` consumer (`find_definition_brace`,
+# `annotate_array_extents`, `rename_all_declarations_and_definitions`) must not
+# mistake it for one (issue #95 review) — the last of which would otherwise
+# silently rewrite the literal's own byte content instead of leaving it alone.
+# `\\.` (not `[^\\]`) is what lets an escaped quote (`\"`) or backslash (`\\`)
+# stay inside the literal instead of ending the match early; stopping at an
+# unescaped newline is deliberate, like `_COMMENT_RE`'s `//` alternative — a
+# literal genuinely never spans one without cpp's line-splicing, which this
+# textual scan does not perform.
+_STRING_RE = re.compile(r'"(?:\\.|[^"\\\n])*"' r"|'(?:\\.|[^'\\\n])*'")
+
 # A `DeclRefExpr` naming a function: clang prints `Function 0x<addr> '<name>'`.
 # Matches a direct call's callee and an address-of, which is why `Unit.calls` is
 # documented as *referenced*, not *called* — an over-approximation.
@@ -902,6 +916,17 @@ def parse_asm_statements(ast_text: str, symbol: str) -> tuple[str, ...]:
     return tuple(sites)
 
 
+def _blank_preserving_newlines(match: re.Match[str]) -> str:
+    """`match`'s text with every character replaced by a space, newlines kept.
+
+    Shared by `mask_comments` and `mask_string_literals`: both blank a matched
+    span to the *same length* (so an offset found in the masked text stays
+    usable against the original) and keep any embedded newline (so line
+    numbering stays untouched).
+    """
+    return "".join("\n" if ch == "\n" else " " for ch in match.group(0))
+
+
 def mask_comments(source_text: str) -> str:
     """`source_text` with every comment blanked out, **preserving every offset**.
 
@@ -911,11 +936,24 @@ def mask_comments(source_text: str) -> str:
     against the original — which `find_definition_brace` relies on to inject
     text at an exact position in the user's source.
     """
+    return _COMMENT_RE.sub(_blank_preserving_newlines, source_text)
 
-    def blank(match: re.Match[str]) -> str:
-        return "".join("\n" if ch == "\n" else " " for ch in match.group(0))
 
-    return _COMMENT_RE.sub(blank, source_text)
+def mask_string_literals(source_text: str) -> str:
+    """`source_text` with every string/char literal blanked out, same contract
+    as `mask_comments` — see `_STRING_RE` for why this exists."""
+    return _STRING_RE.sub(_blank_preserving_newlines, source_text)
+
+
+def _stripped_for_scan(source_text: str) -> str:
+    """`source_text` with comments and string/char literals both blanked out,
+    offsets preserved — the masked view every `_paren_balanced_occurrences`
+    consumer scans against, so an `fn_name(`-shaped occurrence *inside* a
+    comment or a literal cannot be mistaken for a real one (issue #95 review).
+    Order doesn't matter: each pass only ever blanks to spaces, so neither can
+    uncover or hide a span the other would have matched.
+    """
+    return mask_string_literals(mask_comments(source_text))
 
 
 def _skip_suffix_attributes(text: str, pos: int) -> int:
@@ -964,34 +1002,58 @@ class _DefinitionMatch:
     ``line`` is the 1-based *physical* line of the ``fn_name (`` token, which
     `_select_definition` translates to a presumed coordinate before it anchors on
     `def_line`. ``brace`` indexes the body's ``{``; ``params`` is the declarator
-    text between ``(`` and its matching ``)``. A body opener and a parameter list
-    are the same occurrence seen two ways, so both entry points read them off this.
+    text between ``(`` and its matching ``)``. ``name_start`` indexes the ``fn_name``
+    token itself (the regex match's own start -- not re-derived by a later,
+    independent search, which is what let a string literal mentioning `fn_name`
+    after the real token, e.g. an ``__attribute__((annotate("main")))`` suffix,
+    get renamed instead of it). A body opener and a parameter list are the same
+    occurrence seen two ways, so both entry points read them off this.
     """
 
     line: int
     brace: int
     params: str
+    name_start: int
 
 
-def _definition_candidates(
-    source_no_comments: str, fn_name: str
-) -> list[_DefinitionMatch]:
-    """Every definition-shaped occurrence of `fn_name`, in textual order.
+def _preceded_by_member_access(text: str, start: int) -> bool:
+    """True if `text[start:]` (an identifier) is immediately preceded, past
+    whitespace, by ``.`` or ``->``.
 
-    Scans for ``fn_name (`` and balances parentheses to the matching ``)``; an
-    occurrence whose ``)`` is followed (past whitespace and any suffix attributes)
-    by ``{`` is *definition-shaped* — so a prototype (``);``) or a call site
-    (``) ;``, ``))``) is skipped. Deliberately narrow: clang already told us the
-    canonical types and which parameters are pointers, so this only has to isolate
-    the declarator text to harvest an array extent from, and the ``{`` to inject an
-    obligation after — never to classify a type.
-
-    The single scanner behind both `find_definition_brace` (S3 obligation
-    injection) and `_param_list_text` (extent harvesting): keeping one scan is what
-    stops the #145 anchor from reaching one caller and not the other.
+    C has no syntax that puts a name-qualifying operator directly before a
+    call other than struct/union member access or a pointer-to-struct
+    dereference — so ``s.main(`` or ``p->main(`` can only be a member named
+    `fn_name`, never a reference to the free function of the same name, and
+    must not be treated like one by `_paren_balanced_occurrences`'s callers.
     """
-    matches: list[_DefinitionMatch] = []
+    i = start
+    while i > 0 and text[i - 1].isspace():
+        i -= 1
+    if i > 0 and text[i - 1] == ".":
+        return True
+    return i > 1 and text[i - 2 : i] == "->"
+
+
+def _paren_balanced_occurrences(
+    source_no_comments: str, fn_name: str
+) -> Iterator[tuple[re.Match[str], int, int]]:
+    """Every ``fn_name (`` occurrence, balanced-paren scanned to its matching ``)``.
+
+    Yields ``(match, close_idx, after_idx)``: `match` is the ``fn_name (`` regex
+    match, `close_idx` the matching ``)``'s index, and `after_idx` the first
+    index past it once whitespace and any suffix attributes are skipped. An
+    occurrence with no matching close is skipped (unbalanced — not a usable
+    signature), and so is one that is a struct/pointer member access
+    (`_preceded_by_member_access`) — never a reference to `fn_name` itself.
+
+    The single scanner behind both `_definition_candidates` (filters on a
+    trailing ``{``) and `_declaration_name_starts` (filters on anything else,
+    including a bare reference in expression position) — keeping one scan is
+    what stops the #145 anchor from reaching one caller and not the other.
+    """
     for match in re.finditer(rf"\b{re.escape(fn_name)}\s*\(", source_no_comments):
+        if _preceded_by_member_access(source_no_comments, match.start()):
+            continue
         depth = 0
         j = match.end() - 1  # index of the '('
         while j < len(source_no_comments):
@@ -1009,10 +1071,29 @@ def _definition_candidates(
         while k < len(source_no_comments) and source_no_comments[k].isspace():
             k += 1
         k = _skip_suffix_attributes(source_no_comments, k)
+        yield match, j, k
+
+
+def _definition_candidates(
+    source_no_comments: str, fn_name: str
+) -> list[_DefinitionMatch]:
+    """Every definition-shaped occurrence of `fn_name`, in textual order.
+
+    An occurrence whose ``)`` is followed (past whitespace and any suffix
+    attributes) by ``{`` is *definition-shaped* — so a prototype (``);``) or a
+    call site (``) ;``, ``))``) is skipped. Deliberately narrow: clang already
+    told us the canonical types and which parameters are pointers, so this only
+    has to isolate the declarator text to harvest an array extent from, and the
+    ``{`` to inject an obligation after — never to classify a type.
+    """
+    matches: list[_DefinitionMatch] = []
+    for match, j, k in _paren_balanced_occurrences(source_no_comments, fn_name):
         if k < len(source_no_comments) and source_no_comments[k] == "{":
             line = source_no_comments.count("\n", 0, match.start()) + 1
             matches.append(
-                _DefinitionMatch(line, k, source_no_comments[match.end() : j])
+                _DefinitionMatch(
+                    line, k, source_no_comments[match.end() : j], match.start()
+                )
             )
     return matches
 
@@ -1091,11 +1172,95 @@ def find_definition_brace(
     injection point, or an obligation would land in dead code cpp deletes and go
     unchecked (issue #145; the anchor lives in `_select_definition`).
     """
-    masked = mask_comments(source_text)
+    masked = _stripped_for_scan(source_text)
     chosen = _select_definition(
         _definition_candidates(masked, fn_name), masked, def_line
     )
     return None if chosen is None else chosen.brace
+
+
+def _declaration_name_starts(source_no_comments: str, fn_name: str) -> list[int]:
+    """Every non-definition (prototype, bare call statement, or a reference in
+    expression position) `fn_name`'s own name-span start.
+
+    Shares `_paren_balanced_occurrences` with `_definition_candidates`, but
+    applies the opposite filter: anything *other* than a `{` (not just a `;`)
+    after the closing `)` and any suffix attributes — ``int fn_name(...);``,
+    a standalone call ``fn_name(...);``, or a reference in expression position
+    like ``return fn_name() + 1;`` or ``int x = fn_name();`` (issue #95
+    review: the original `;`-only filter left an expression-position
+    reference to a renamed definition dangling, which can silently collide
+    with a harness's own injected same-named entry point instead of erroring
+    loudly). A separate filter rather than widening `_definition_candidates`
+    itself: that one anchors RFC-0003 S3's obligation injection and #145's
+    `def_line` disambiguation, both of which want *only* a definition — a
+    prototype or reference is exactly what they must keep excluding.
+
+    Catching a plain call statement or expression-position reference too (not
+    just a genuine prototype) is deliberate, not just tolerated: renaming a
+    same-file reference alongside every definition of the same name keeps
+    both consistent (a reference renamed without its definition, or vice
+    versa, would be the real bug) — `rename_all_declarations_and_definitions`'s
+    caller only ever runs this against a single translation unit, so any
+    non-definition occurrence of `fn_name(...)` refers to the one declaration
+    this scan is renaming away either way.
+    """
+    starts: list[int] = []
+    for match, _j, k in _paren_balanced_occurrences(source_no_comments, fn_name):
+        if k >= len(source_no_comments) or source_no_comments[k] != "{":
+            starts.append(match.start())
+    return starts
+
+
+def rename_all_declarations_and_definitions(
+    source_text: str, fn_name: str, new_name: str
+) -> str:
+    """`source_text` with **every** declaration or definition of `fn_name`
+    renamed to `new_name`.
+
+    `find_definition_brace`/`_select_definition` pick *one* occurrence (the one
+    `def_line` anchors to, or the textually-first) — the right choice for
+    injecting an obligation into the compiled definition. Renaming to avoid a
+    name collision is a different problem, on two fronts (issue #95 review):
+
+    - An inactive ``#if 0`` alternative ahead of the real definition is
+      textually just as definition-shaped (this scan has no preprocessor), so
+      renaming only the first occurrence can rename the dead one and leave
+      the real, colliding definition untouched. There is no compiled
+      `def_line` to anchor on for this caller's purpose anyway, so every
+      definition-shaped occurrence is renamed — dead code included, which is
+      harmless to touch.
+    - A *declaration* (prototype) is not itself a collision the way a second
+      definition is — a matching-signature ``int main(void);`` ahead of
+      ``int main(void) { ... }`` is legal C — but this scan cannot verify the
+      prototype's signature actually matches whatever the caller renames the
+      definition to become (a mismatched-type prototype left behind, e.g.
+      ``void main(void);`` ahead of an ``int main(void)`` definition, is a
+      hard `conflicting types` parse error, verified against a live esbmc
+      run). Renaming every declaration alongside every definition sidesteps
+      the signature question entirely rather than trying to answer it.
+
+    Each occurrence's own name span (`_DefinitionMatch.name_start` /
+    `_declaration_name_starts`, from the same regex match the respective scan
+    already isolated) is what gets replaced — never a fresh, independent
+    search for `fn_name` in the surrounding text, which a string literal or
+    attribute mentioning the name after the real token could shadow (an
+    ``__attribute__((annotate("main")))`` suffix). Comments *and* string/char
+    literals are masked before scanning (`_stripped_for_scan`), so a literal
+    that happens to spell `fn_name(` — e.g. a diagnostic like
+    ``printf("call main();\n")`` — is never mistaken for a reference and
+    rewritten in place (issue #95 review). Occurrences are rewritten
+    last-to-first so each replacement's offset stays valid for the ones still
+    to come.
+    """
+    masked = _stripped_for_scan(source_text)
+    starts = {m.name_start for m in _definition_candidates(masked, fn_name)}
+    starts.update(_declaration_name_starts(masked, fn_name))
+    result = source_text
+    for start in sorted(starts, reverse=True):
+        end = start + len(fn_name)
+        result = result[:start] + new_name + result[end:]
+    return result
 
 
 @dataclass(frozen=True)
@@ -1366,9 +1531,12 @@ def annotate_array_extents(units: list[Unit], source_text: str) -> list[Unit]:
 
     The declarator search is anchored to `Unit.def_line` (`_param_list_text`), so
     a same-named definition excluded by `#if 0`/`#ifdef` cannot donate its extent
-    to the one clang actually compiled (issue #145).
+    to the one clang actually compiled (issue #145). String/char literals are
+    stripped alongside comments (`_stripped_for_scan`) for the same reason
+    `rename_all_declarations_and_definitions` does: a literal spelling
+    `name(...)` is not a parameter list to isolate.
     """
-    stripped = mask_comments(source_text)
+    stripped = _stripped_for_scan(source_text)
     annotated: list[Unit] = []
     for unit in units:
         param_list = _param_list_text(stripped, unit.name, unit.def_line)
@@ -1410,105 +1578,12 @@ def _parse_tree(
     return proc.stdout + "\n" + proc.stderr
 
 
-def list_external_callers(
-    source: Path,
-    symbol: str,
-    *,
-    esbmc_bin: str = "esbmc",
-    timeout_s: float = 30.0,
-    extra_flags: Sequence[str] = (),
-) -> tuple[str, ...]:
-    """Names of definitions *outside* `source` that reference `symbol`.
-
-    The complement of `list_units` over the same translation unit — see
-    `parse_external_callers` for why compositional discharge needs it. Raises
-    `ListUnitsError` on the same conditions as `list_units`.
-    """
-    ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
-    return parse_external_callers(ast_text, source, symbol)
-
-
-def list_address_escapes(
-    source: Path,
-    symbol: str,
-    *,
-    esbmc_bin: str = "esbmc",
-    timeout_s: float = 30.0,
-    extra_flags: Sequence[str] = (),
-) -> tuple[str, ...]:
-    """Sites in `source`'s translation unit that take `symbol`'s address.
-
-    The other way the caller enumeration can be incomplete — see
-    `parse_address_escapes`. Raises `ListUnitsError` on the same conditions as
-    `list_units`.
-    """
-    ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
-    return parse_address_escapes(ast_text, symbol)
-
-
-def list_symbol_aliases(
-    source: Path,
-    symbol: str,
-    *,
-    esbmc_bin: str = "esbmc",
-    timeout_s: float = 30.0,
-    extra_flags: Sequence[str] = (),
-) -> tuple[str, ...]:
-    """Declarations in `source`'s translation unit that alias `symbol`.
-
-    The third way the caller enumeration can be incomplete — see
-    `parse_symbol_aliases`. This single-question form runs its own parse;
-    `list_caller_openings` shares one dump across all five questions (without
-    fusing them) and is what the discharge driver uses. Raises `ListUnitsError`
-    on the same conditions as `list_units`.
-    """
-    ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
-    return parse_symbol_aliases(ast_text, symbol)
-
-
-def list_implicit_invocations(
-    source: Path,
-    symbol: str,
-    *,
-    esbmc_bin: str = "esbmc",
-    timeout_s: float = 30.0,
-    extra_flags: Sequence[str] = (),
-) -> tuple[str, ...]:
-    """Constructor/destructor attributes on `symbol`'s own declaration.
-
-    The fourth way the caller enumeration can be incomplete — see
-    `parse_implicit_invocations`. Raises `ListUnitsError` on the same conditions
-    as `list_units`.
-    """
-    ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
-    return parse_implicit_invocations(ast_text, symbol)
-
-
-def list_asm_statements(
-    source: Path,
-    symbol: str,
-    *,
-    esbmc_bin: str = "esbmc",
-    timeout_s: float = 30.0,
-    extra_flags: Sequence[str] = (),
-) -> tuple[str, ...]:
-    """Sites in `source`'s translation unit that GNU asm might route to `symbol`.
-
-    The fifth way the caller enumeration can be incomplete — see
-    `parse_asm_statements`. Raises `ListUnitsError` on the same conditions as
-    `list_units`.
-    """
-    ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
-    return parse_asm_statements(ast_text, symbol)
-
-
 @dataclass(frozen=True)
 class CallerOpenings:
     """The five ways `list_units`'s caller enumeration can under-report `symbol`.
 
     Each field is the result of one caller-completeness pass over a *single*
-    ``esbmc --parse-tree-only`` dump, in the order the five `list_*` functions
-    above declare them:
+    ``esbmc --parse-tree-only`` dump, produced by `list_caller_openings`:
 
     - `foreign`   — definitions outside `source` naming `symbol`
       (`parse_external_callers`)
@@ -1522,8 +1597,7 @@ class CallerOpenings:
       (`parse_asm_statements`)
 
     The questions stay distinct — one field, one `parse_*` pass each — they only
-    share the dump, which is what `list_caller_openings` buys over the five
-    single-question `list_*` calls.
+    share the dump.
     """
 
     foreign: tuple[str, ...]
@@ -1543,10 +1617,8 @@ def list_caller_openings(
 ) -> CallerOpenings:
     """All five caller-completeness listings for `symbol`, from one shared dump.
 
-    The five `list_*` functions above each run their own
-    ``esbmc --parse-tree-only`` over the same translation unit, so enumerating a
-    callee's openings parsed the TU five times. This parses once and runs the
-    five `parse_*` passes over that single dump — the seam `find_open_callers`
+    Parses `source` once with ``esbmc --parse-tree-only`` and runs all five
+    `parse_*` passes over that single dump — the seam `find_open_callers`
     crosses. Each pass keeps its own semantics (e.g. `parse_external_callers`
     still takes `source`, to exclude in-file definitions). Raises `ListUnitsError`
     on the same conditions as `list_units`, so an unparseable TU never reads as

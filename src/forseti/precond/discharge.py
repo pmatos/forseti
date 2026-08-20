@@ -175,7 +175,7 @@ from forseti.esbmc import (
     list_caller_openings,
     list_units,
 )
-from forseti.orchestrator.ladder import verify_ladder
+from forseti.orchestrator.ladder import climb_to_terminal
 from forseti.orchestrator.ports import VerifyPort
 
 from .synth import (
@@ -709,14 +709,11 @@ def _check_caller(
     harness = work_dir / f"{caller.name}__discharge.c"
     harness.write_text(render_sidecar(plan, str(obligations), max_len=max_len))
 
-    settled = None
-    for attempt in verify_ladder(
+    settled = climb_to_terminal(
         harness,
         verify=escalating_port(raw),
         ladder=precondition_ladder(max_len, ladder_cap),
-    ):
-        settled = attempt
-    assert settled is not None  # verify_ladder yields at least one attempt
+    )
     result, k = settled.result, settled.k
 
     if isinstance(result, Violated):

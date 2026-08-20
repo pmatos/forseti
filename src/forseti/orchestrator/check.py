@@ -40,11 +40,10 @@ from forseti.esbmc import (
     result_to_dict,
 )
 from forseti.properties import (
+    CHECKABLE_STATUSES,
     HarnessError,
     Property,
     PropertyKind,
-    PropertyStatus,
-    is_terminal,
     render_property_harness,
 )
 
@@ -57,15 +56,6 @@ from .ports import (
     VerifyPort,
 )
 from .telemetry import EventEmitter, EventSink
-
-# Valid check inputs = non-terminal statuses only. Excludes ACCEPTED/REJECTED so
-# a property whose lifecycle is already settled is not re-verified back into the
-# counts()/held() set grading (#4) consumes (#84 — the discarded-REJECTED case
-# #66 flagged, and the already-decided ACCEPTED case the title generalizes to).
-# Which statuses are valid check inputs is genuinely open until #4 lands
-# (re-check GRADED? only CANDIDATE?); revisit this set there. Derived from
-# `is_terminal` (not a hardcoded pair) so a new terminal state is excluded too.
-_CHECKABLE_STATUSES = frozenset(s for s in PropertyStatus if not is_terminal(s))
 
 
 class PropertyOutcome(Enum):
@@ -248,7 +238,7 @@ def check_properties(
 ) -> PropertyCheckRun:
     """Check the checkable stored properties for `unit`, one verdict each.
 
-    Only non-terminal properties are checked (`_CHECKABLE_STATUSES`): a terminal
+    Only non-terminal properties are checked (`CHECKABLE_STATUSES`): a terminal
     `ACCEPTED`/`REJECTED` row is settled, so it is never rendered, verified, or
     counted into the `counts()`/`held()` set grading (#4) consumes (#84).
 
@@ -266,7 +256,7 @@ def check_properties(
 
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    props = store.list_for_unit(unit.unit_id, _CHECKABLE_STATUSES)
+    props = store.list_for_unit(unit.unit_id, CHECKABLE_STATUSES)
     emit("properties.loaded", detail={"unit": unit.unit_id, "count": len(props)})
 
     verdicts: list[PropertyVerdict] = []
