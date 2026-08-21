@@ -1187,7 +1187,12 @@ def test_line_breakpoints_forgets_definedness_at_a_pragma_operator_pop() -> None
     # `W` while it was undefined, so the pop restores it to undefined and the
     # `#ifndef W` arm *is* compiled. Without `_PRAGMA_OPERATOR_POP_RE` the stale
     # `True` from line 3 decides that arm dead and deletes its real `#line`.
-    source = (
+    #
+    # Run through `_stripped_for_scan`, the way production reaches this function:
+    # that pass blanks the operator's string argument to `_Pragma( )`, so a
+    # pattern that insisted on reading `pop_macro` out of it would match nothing
+    # here while still passing on raw text (PR #225 review).
+    source = _stripped_for_scan(
         '#undef W\n_Pragma("push_macro(\\"W\\")")\n#define W 1\n'
         '_Pragma("pop_macro(\\"W\\")")\n'
         "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
@@ -1204,7 +1209,7 @@ def test_line_breakpoints_stops_proving_after_a_pragma_operator_pop() -> None:
     # would let the `#define W 1` on line 4 establish `True` again and decide
     # the arm dead. The latch is sound because the operator's *text* always
     # precedes every firing — a macro must be defined before it is used.
-    source = (
+    source = _stripped_for_scan(
         '#define RESTORE _Pragma("pop_macro(\\"W\\")")\n#undef W\n'
         '_Pragma("push_macro(\\"W\\")")\n#define W 1\nRESTORE\n'
         "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
@@ -1221,7 +1226,7 @@ def test_line_breakpoints_latch_gives_up_a_decidable_define_deliberately() -> No
     # assumed live, exactly as before #157), and giving it up is what buys the
     # sound answer for the macro-body case above, which no text position can
     # distinguish from this one.
-    source = (
+    source = _stripped_for_scan(
         '_Pragma("pop_macro(\\"W\\")")\n#define W 1\n'
         "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
     )
@@ -1322,6 +1327,37 @@ def test_line_breakpoints_splices_before_reading_a_digraph_directive() -> None:
         'char *s = "abc\\\n%:define W 1";\n#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n'
     )
     assert _line_breakpoints(source) == [(4, 5), (7, 9)]
+
+
+def test_line_breakpoints_does_not_truncate_a_ucn_macro_name() -> None:
+    # The other compiler-accepted identifier spelling (PR #225 review): a
+    # universal character name. `#define Wé 1` defines `Wé` and leaves `W`
+    # undefined -- verified against clang and `esbmc --parse-tree-only`, both of
+    # which compile the `#ifndef W` arm. The backslash satisfies a plain
+    # "no more word characters" boundary, so without UCNs in the grammar the
+    # name truncates to `W` and that arm is decided dead.
+    source = "#define W\\u00E9 1\n#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(3, 5), (6, 9)]
+
+
+def test_line_breakpoints_resolves_an_ifdef_of_a_ucn_macro_name() -> None:
+    # And the complete name still resolves, so the gain is not traded away:
+    # clang takes the `#ifdef Wé` arm here.
+    source = "#define W\\u00E9 1\n#ifndef W\\u00E9\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(6, 9)]
+
+
+def test_line_breakpoints_masks_a_comment_created_by_splicing() -> None:
+    # Phase 2 can *create* a comment delimiter that phase 3 then honours: `/\`
+    # + newline + `*` is an ordinary `/*` to cpp, so the `#define W 1` inside is
+    # never executed (verified against clang). The caller's own masking pass runs
+    # before splicing and so cannot have seen it; `_line_breakpoints` re-masks
+    # the spliced text for exactly this. Without that, the commented-out
+    # `#define` proves `W` defined and the active `#ifndef W` arm is decided dead.
+    source = _stripped_for_scan(
+        "int a;\n/\\\n*\n#define W 1\n*/\n#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(7, 5), (10, 9)]
 
 
 def test_line_breakpoints_does_not_truncate_a_dollar_line_macro_name() -> None:

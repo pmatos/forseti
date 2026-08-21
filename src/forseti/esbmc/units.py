@@ -181,16 +181,22 @@ _STATIC_MIN_RE = re.compile(r"\bstatic\b")
 #                 `??=define W 1`), and gcc/clang honour them only under a
 #                 strict `-std=c*`, never the `gnu*` default. Reading one as a
 #                 directive would disagree with esbmc in the costly direction.
-#   `_MACRO_NAME` A *complete* preprocessing identifier, `$` included: all three
-#                 accept `$` in identifiers by default, so `#define W$ 1`
-#                 defines `W$` and leaves `W` undefined. Capturing only the
-#                 `\w` prefix would record a definition of `W` and decide a
+#   `_MACRO_NAME` A *complete* preprocessing identifier: `$` included (all three
+#                 accept it by default, so `#define W$ 1` defines `W$` and
+#                 leaves `W` undefined), and `\uXXXX`/`\UXXXXXXXX` universal
+#                 character names too (`#define W\u00E9 1` likewise defines
+#                 `Wé`, not `W`). A literal UTF-8 spelling needs no rule of its
+#                 own — Python's `\w` is Unicode-aware. Capturing only the
+#                 leading `\w` run would record a definition of `W` and decide a
 #                 later `#ifndef W` dead on the arm cpp actually takes.
-#   `_NAME_END`   The end of such an identifier. Greedy `[\w$]*` already reaches
-#                 it, so this restates that rather than constraining it — but it
-#                 restates it explicitly, so a later edit that appends anything
-#                 after a name capture cannot silently reintroduce the
-#                 truncation above.
+#   `_NAME_END`   The end of such an identifier — no further identifier
+#                 character, and no backslash that could open a UCN. Greedy
+#                 repetition already reaches that point, so this mostly restates
+#                 it; stating it explicitly is what stops a later edit that
+#                 appends anything after a name capture from silently
+#                 reintroducing the truncation above. Applying it to directive
+#                 *keywords* as well is deliberate: `#endif\u00E9` is not
+#                 `#endif` — clang rejects it as an invalid directive outright.
 #
 # None of them mention the backslash-continuation cpp splices out in translation
 # phase 2: `_line_breakpoints` runs every pattern over already-spliced text (see
@@ -198,8 +204,9 @@ _STATIC_MIN_RE = re.compile(r"\bstatic\b")
 # form cpp itself reads.
 _PP_SPACE = r"[ \t\v\f]"
 _DIRECTIVE = rf"^{_PP_SPACE}*(?:#|%:){_PP_SPACE}*"
-_MACRO_NAME = r"[A-Za-z_$][\w$]*"
-_NAME_END = r"(?![\w$])"
+_UCN = r"\\u[0-9A-Fa-f]{4}|\\U[0-9A-Fa-f]{8}"
+_MACRO_NAME = rf"(?:[A-Za-z_$]|{_UCN})(?:[\w$]|{_UCN})*"
+_NAME_END = r"(?![\w$\\])"
 
 # A `#line N` (ISO C) or GNU linemarker `# N "file" flags...` directive, in its
 # literal-digit-sequence form. Matches right after the prologue, so
@@ -414,28 +421,32 @@ _PRAGMA_MACRO_RE = re.compile(
     re.MULTILINE,
 )
 
-# The operator spelling of the same restore, `_Pragma("pop_macro(\"W\")")`,
-# which is *not* a directive line and so is invisible to `_PRAGMA_MACRO_RE`
-# (PR #225 review). It is handled differently on purpose, because its firing
-# position is not knowable from text alone: the operator may sit in a
-# function-like macro's replacement list and fire at every later *use* of that
-# macro, not where it is written. What is knowable is that the text always
-# precedes every firing — a macro must be defined before it is used — so
-# `_line_breakpoints` treats this as a latch: from the match onwards it drops
-# every fact it holds and stops *establishing* new ones, leaving every later
-# guard in the file opaque. That is the assumed-live default, which costs
-# nothing, and it is the only stance that stays sound whether the operator
-# fires here or a thousand lines below.
+# The `_Pragma` operator, which can spell the same restore as `#pragma
+# pop_macro` without being a directive line — so `_PRAGMA_MACRO_RE` cannot see
+# it (PR #225 review). Two things make it unlike every other pattern here.
 #
-# Only `pop_macro` is matched — a `push_macro` changes no definition — and the
-# match deliberately does not try to read the saved name out of the escaped
-# string literal: clearing the whole table is already the fail-closed answer, so
-# parsing `\"W\"` (or a raw string, or a stringified argument) would buy
-# precision in exchange for a second way to be wrong. The residual is a
-# `pop_macro` assembled by token pasting, where the literal text never appears.
-_PRAGMA_OPERATOR_POP_RE = re.compile(
-    rf"(?<![\w$])_Pragma{_NAME_END}{_PP_SPACE}*\([^\n)]*(?<![\w$])pop_macro{_NAME_END}"
-)
+# Its firing *position* is not knowable from text: the operator may sit in a
+# macro's replacement list and fire at every later use of that macro, not where
+# it is written. What is knowable is that its text always precedes every firing
+# — a macro must be defined before it is used — so `_line_breakpoints` treats
+# it as a latch: from the match onwards it drops every fact it holds and stops
+# *establishing* new ones, leaving every later guard in the file opaque. That is
+# the assumed-live default, which costs nothing, and it is the only stance that
+# stays sound whether the operator fires here or a thousand lines below.
+#
+# Its *operand* is not knowable either, which is why this deliberately matches
+# every `_Pragma`, not just a `pop_macro` one. `_line_breakpoints`' callers hand
+# it text with string literals already blanked (`_stripped_for_scan`), so by the
+# time this pattern runs `_Pragma("pop_macro(\"W\")")` reads as `_Pragma( )` —
+# a narrower pattern matches nothing at all in production, which is exactly the
+# silent no-op a first attempt at this shipped. Widening to the operator itself
+# is sound because a `_Pragma` whose text we cannot read *might* be a
+# `pop_macro`. The precision it costs is small and bounded: only definedness
+# proof, only below the match, and only in files using the operator at all — 146
+# of the 54,204 headers under `/usr/include`, and rarer still in the `.c` files
+# this scan actually reads. The residual is a `pop_macro` reached without the
+# `_Pragma` token appearing, e.g. assembled by token pasting.
+_PRAGMA_OPERATOR_RE = re.compile(rf"(?<![\w$])_Pragma{_NAME_END}{_PP_SPACE}*\(")
 
 # `#elif`'s condition is captured separately from `#if`'s: a literal `#elif 0`
 # does not reactivate a dead branch the way `#else` does — its own condition is
@@ -520,6 +531,10 @@ def _splice_continuations(source: str) -> tuple[str, list[int]]:
 
     Splices inside a ``//`` comment never reach here: `_COMMENT_RE` absorbs the
     backslash into the comment and `mask_comments` blanks it (see its comment).
+    The reverse — a splice that *creates* a delimiter, ``/\\`` + newline +
+    ``*`` — is real (verified against clang: the ``#define`` inside such a
+    comment is not executed) and is why the caller re-masks the text this
+    returns.
     """
     parts: list[str] = []
     physical_line_of: list[int] = [1]
@@ -1681,6 +1696,11 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
     `_strip_literal_parens`), the same issue's second follow-up.
     """
     spliced, physical_line_of = _splice_continuations(source_no_comments)
+    # Again, on the *spliced* text: phase 2 can create a delimiter phase 3 then
+    # honours (`/\` + newline + `*`), which the caller's own pass — run before
+    # splicing, as it must be — cannot have seen. Blanking preserves offsets and
+    # newlines, so `physical_line_of` still holds (PR #225 review).
+    spliced = mask_comments(spliced)
 
     def _events(
         pattern: re.Pattern[str], kind: str
@@ -1724,7 +1744,7 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
         + _events(_ENDIF_RE, "endif")
         + _events(_INCLUDE_RE, "include")
         + _events(_PRAGMA_MACRO_RE, "pragma_macro")
-        + _events(_PRAGMA_OPERATOR_POP_RE, "pragma_operator_pop")
+        + _events(_PRAGMA_OPERATOR_RE, "pragma_operator")
         + _events(_LINE_DIRECTIVE_RE, "line")
         + _events(_LINE_DIRECTIVE_MACRO_RE, "line_macro")
         + _events(_DEFINE_RE, "define")
@@ -1755,10 +1775,10 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
     # establishment for the rest of the file on the same terms. See `_IFDEF_RE`
     # for why absence of a `#define` is never read as "undefined" (issue #157).
     known_defined: dict[str, bool] = {}
-    # Latched by the `_Pragma("pop_macro(...)")` operator spelling, which can
-    # fire anywhere at or below its own text (`_PRAGMA_OPERATOR_POP_RE`): once
-    # set, no `#define`/`#undef` may *establish* a fact again, so every later
-    # guard in the file falls back to the assumed-live opaque default.
+    # Latched by the `_Pragma` operator, which can spell a `pop_macro` and fire
+    # anywhere at or below its own text (`_PRAGMA_OPERATOR_RE`): once set, no
+    # `#define`/`#undef` may *establish* a fact again, so every later guard in
+    # the file falls back to the assumed-live opaque default.
     macro_stack_opaque = False
     breakpoints: list[tuple[int, int]] = []
 
@@ -1818,11 +1838,12 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
                     known_defined.clear()
                 else:
                     known_defined.pop(name, None)
-        elif kind == "pragma_operator_pop":
-            # Not position-precise and not name-precise, on purpose: the
-            # operator can fire at every later use of the macro holding it, so
-            # the only sound answer is to stop proving anything from here on
-            # (`_PRAGMA_OPERATOR_POP_RE`). Unlike every other event this one is
+        elif kind == "pragma_operator":
+            # Neither position-precise nor operand-precise, on purpose: the
+            # operator can fire at every later use of the macro holding it, and
+            # its string argument is already blanked by the time this scan runs,
+            # so the only sound answer is to stop proving anything from here on
+            # (`_PRAGMA_OPERATOR_RE`). Unlike every other event this one is
             # honoured even inside a branch proven dead — the text is what makes
             # the *later* firings possible, and a dead branch's macro body is
             # still a macro body cpp can expand somewhere live.
