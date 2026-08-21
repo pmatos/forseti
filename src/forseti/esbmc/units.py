@@ -211,9 +211,10 @@ _LINE_DIRECTIVE_MACRO_RE = re.compile(
 # this module already has for `#include`d macro state, but worth naming here
 # since this is the first place that state can produce a wrong *value*
 # instead of just a missed opaque condition. The definedness half does *not*
-# carry that residual: `_INCLUDE_RE` clears it at every `#include`, because
-# there the fallback is a merely-opaque conditional rather than a dropped
-# breakpoint (issue #157).
+# carry that residual: `_INCLUDE_RE` clears it at every `#include` cpp can
+# actually reach (one inside a branch already proven dead is skipped, exactly
+# as a `#define` there is), because there the fallback is a merely-opaque
+# conditional rather than a dropped breakpoint (issue #157).
 _DEFINE_RE = re.compile(
     r"^[ \t]*#[ \t]*define[ \t]+(\w+)((?:\\\r?\n|[^\n])*)$", re.MULTILINE
 )
@@ -278,7 +279,14 @@ _INT_LITERAL_RE = re.compile(r"[0-9]+")
 # balance nesting and to know whether an *earlier* arm in its own chain already
 # decided it (matching `_param_list_text`'s own stance on such bodies: it leaves
 # picking the *right* one to `def_line`, not to evaluating the condition).
-_IF_RE = re.compile(r"^[ \t]*#[ \t]*if[ \t]+((?:\\\r?\n|[^\n])*)$", re.MULTILINE)
+# The condition is separated from ``if`` by *optional* whitespace, not required
+# whitespace: `#if(FOO)` and `#if!defined(X)` are legal directives, and a
+# conditional this scan fails to see is far worse than one it cannot evaluate —
+# it opens a nesting level whose `#endif` then pops somebody else's entry, so a
+# `#define` inside it looks top-level to `known_defined` and can decide a later
+# `#ifdef` *dead* on a branch cpp never took. `(?!\w)` keeps `#ifdef`/`#ifndef`
+# out (they are `_IFDEF_RE`'s, and matching both would push the level twice).
+_IF_RE = re.compile(r"^[ \t]*#[ \t]*if(?!\w)[ \t]*((?:\\\r?\n|[^\n])*)$", re.MULTILINE)
 
 # `#ifdef`/`#ifndef`, exposing the same `negated`/`name` groups as `_DEFINED_RES`
 # so `_line_breakpoints` reads both spellings of the predicate through one code
@@ -286,10 +294,11 @@ _IF_RE = re.compile(r"^[ \t]*#[ \t]*if[ \t]+((?:\\\r?\n|[^\n])*)$", re.MULTILINE
 # but cpp still opens a nesting level a later `#endif` closes, and dropping the
 # event would unbalance every conditional after it — a nameless match simply
 # resolves to opaque, exactly like a name this scan knows nothing about. A
-# leading backslash-continuation is tolerated before the name, mirroring
-# `_LINE_DIRECTIVE_MACRO_RE`.
+# backslash-continuation before the name is tolerated, interleaved with ordinary
+# whitespace so the spliced line's own indentation (`#ifdef \\` + newline +
+# `    NAME`) does not push an otherwise-decidable guard back to opaque.
 _IFDEF_RE = re.compile(
-    r"^[ \t]*#[ \t]*if(?P<negated>n)?def\b[ \t]*(?:\\\r?\n)*(?P<name>[A-Za-z_]\w*)?",
+    r"^[ \t]*#[ \t]*if(?P<negated>n)?def\b(?:\\\r?\n|[ \t])*(?P<name>[A-Za-z_]\w*)?",
     re.MULTILINE,
 )
 
@@ -307,16 +316,21 @@ _DEFINED_RES = (
     re.compile(r"(?P<negated>!)?\s*defined\s+(?P<name>\w+)"),
 )
 
-# `#include`/`#include_next`, tracked for one purpose: to make `_line_breakpoints`
-# forget every definedness fact it had proven (see `_IFDEF_RE`). A header may
-# `#define` or `#undef` any name, so nothing this file proved before the include
-# still holds after it. The `#line NAME` *value* table (`_DEFINE_RE`) is
-# deliberately left alone by the same asymmetry: forgetting a definedness fact
-# only falls back to opaque — the assumed-live default that predates issue #157,
-# which costs nothing — whereas forgetting a value binding would silently drop a
-# real breakpoint this scan can otherwise resolve. `_DEFINE_RE`'s own comment
-# names the residual that leaves.
-_INCLUDE_RE = re.compile(r"^[ \t]*#[ \t]*include(?:_next)?\b", re.MULTILINE)
+# `#include`/`#include_next`/`#import`, tracked for one purpose: to make
+# `_line_breakpoints` forget every definedness fact it had proven (see
+# `_IFDEF_RE`). A header may `#define` or `#undef` any name, so nothing this file
+# proved before the include still holds after it. `#import` counts because
+# GCC/clang accept it in C too, and it reads a header exactly like `#include`
+# does. The `#line NAME` *value* table (`_DEFINE_RE`) is deliberately left alone
+# by the same asymmetry: forgetting a definedness fact only falls back to opaque
+# — the assumed-live default that predates issue #157, which costs nothing —
+# whereas forgetting a value binding would silently drop a real breakpoint this
+# scan can otherwise resolve. `_DEFINE_RE`'s own comment names the residual that
+# leaves.
+_INCLUDE_RE = re.compile(
+    r"^[ \t]*#[ \t]*(?:include(?:_next)?|import)\b",
+    re.MULTILINE,
+)
 
 # `#elif`'s condition is captured separately from `#if`'s: a literal `#elif 0`
 # does not reactivate a dead branch the way `#else` does — its own condition is
@@ -328,7 +342,21 @@ _INCLUDE_RE = re.compile(r"^[ \t]*#[ \t]*include(?:_next)?\b", re.MULTILINE)
 # its own condition being `1`. Like `_IF_RE`, the captured group consumes an
 # embedded backslash-continuation so a split condition still classifies
 # correctly.
-_ELIF_RE = re.compile(r"^[ \t]*#[ \t]*elif[ \t]+((?:\\\r?\n|[^\n])*)$", re.MULTILINE)
+_ELIF_RE = re.compile(
+    r"^[ \t]*#[ \t]*elif(?!\w)[ \t]*((?:\\\r?\n|[^\n])*)$", re.MULTILINE
+)
+
+# C23's `#elifdef`/`#elifndef` — the `#elif` spelling of `_IFDEF_RE`'s predicate,
+# with the same `negated`/`name` groups so it resolves through the same code
+# path. `_ELIF_RE`'s `(?!\w)` keeps the two from both matching one directive.
+# Tracked for the same reason `_IFDEF_RE`'s operand-less form is: an arm this
+# scan never sees leaves the chain carrying the *previous* arm's state, and once
+# `#ifdef` can prove that arm dead (issue #157) that silently deletes every real
+# breakpoint in the unseen arm.
+_ELIFDEF_RE = re.compile(
+    r"^[ \t]*#[ \t]*elif(?P<negated>n)?def\b(?:\\\r?\n|[ \t])*(?P<name>[A-Za-z_]\w*)?",
+    re.MULTILINE,
+)
 
 # A bare `#else` has no condition of its own to read: it is taken whenever cpp
 # reaches it, which happens whenever nothing before it was. This scan can
@@ -1448,7 +1476,7 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
     `known_defined`). The proof is one-directional on purpose: a name this file
     never mentions stays *unknown*, never "undefined", because a command-line
     ``-D``, a compiler builtin, or an ``#include``d header can define it — and
-    an ``#include`` anywhere drops every fact proven above it. `_IFDEF_RE`
+    any ``#include`` cpp can reach drops every fact proven above it. `_IFDEF_RE`
     carries the full rationale; the short version is that a wrong *live* verdict
     only reproduces the opaque default, while a wrong *dead* verdict deletes a
     real breakpoint.
@@ -1527,6 +1555,7 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
         _cond_events(_IF_RE, "if")
         + _events(_IFDEF_RE, "ifdef", keep_match=True)
         + _cond_events(_ELIF_RE, "elif")
+        + _events(_ELIFDEF_RE, "elifdef", keep_match=True)
         + _events(_ELSE_RE, "else")
         + _events(_ENDIF_RE, "endif")
         + _events(_INCLUDE_RE, "include")

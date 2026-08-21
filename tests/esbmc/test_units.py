@@ -1033,6 +1033,84 @@ def test_line_breakpoints_joins_a_spliced_ifdef_operand() -> None:
     assert _line_breakpoints(source) == [(9, 9)]
 
 
+def test_line_breakpoints_joins_a_spliced_ifdef_operand_over_indentation() -> None:
+    # Same splice, but the continuation line is indented — cpp splices first and
+    # only then reads tokens, so the operand still resolves. Before `_IFDEF_RE`
+    # interleaved whitespace with the continuation this degraded to opaque.
+    source = "#define W\n#ifdef \\\n    W\nx\n#else\n#line 5\ny\n#endif\n#line 9\nz\n"
+    assert _line_breakpoints(source) == [(9, 9)]
+
+
+def test_line_breakpoints_opens_a_level_for_a_conditional_without_a_space() -> None:
+    # `#if(FOO)` needs no whitespace before its condition. A conditional this
+    # scan does not see is strictly worse than one it cannot evaluate: its
+    # `#endif` pops somebody else's entry, and the `#define` it guards then looks
+    # top-level to `known_defined` — which, since #157, can decide the `#ifndef`
+    # below *dead* and delete a `#line` cpp really does process.
+    source = (
+        "#if(FOO)\n#define WIDE 1\n#endif\n"
+        "#ifndef WIDE\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(5, 5), (8, 9)]
+
+
+def test_line_breakpoints_treats_a_spaceless_parenthesized_zero_as_known_dead() -> None:
+    # The other half of that widening: `#if(0)` is still resolved, not merely
+    # balanced (`_strip_literal_parens` peels it exactly as it does `#if (0)`).
+    source = "#if(0)\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(5, 9)]
+
+
+def test_line_breakpoints_reads_a_defined_test_without_a_leading_space() -> None:
+    source = "#define W\n#if!defined(W)\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(6, 9)]
+
+
+def test_line_breakpoints_decides_an_elif_without_a_space() -> None:
+    # `#elif(1)` likewise: unseen, it would leave the chain carrying the
+    # `#ifdef`'s own now-provable dead state and drop the `#line 5` below it.
+    source = "#undef W\n#ifdef W\nx\n#elif(1)\n#line 5\ny\n#endif\n#line 9\nz\n"
+    assert _line_breakpoints(source) == [(5, 5), (8, 9)]
+
+
+def test_line_breakpoints_keeps_a_c23_elifdef_arm_reachable() -> None:
+    # C23 `#elifdef`/`#elifndef` are their own directives — neither `_ELIF_RE`
+    # nor `_IFDEF_RE` spells them. `Q` is unmentioned, so this arm is opaque and
+    # its `#line 5` must keep counting even though the `#ifdef W` before it is
+    # now provably dead.
+    source = "#undef W\n#ifdef W\nx\n#elifdef Q\n#line 5\ny\n#endif\n#line 9\nz\n"
+    assert _line_breakpoints(source) == [(5, 5), (8, 9)]
+
+
+def test_line_breakpoints_decides_a_c23_elifndef_arm() -> None:
+    # And it resolves through the same `known_defined` lookup as `#ifndef`: `Q`
+    # is proven defined, so `#elifndef Q` is dead and so is the arm's `#line 5`.
+    source = (
+        "#undef W\n#define Q 1\n#ifdef W\nx\n#elifndef Q\n#line 5\ny\n#endif\n"
+        "#line 9\nz\n"
+    )
+    assert _line_breakpoints(source) == [(9, 9)]
+
+
+def test_line_breakpoints_kills_the_else_of_a_decided_c23_elifdef() -> None:
+    # The load-bearing arm: a `#elifdef` this scan proves *live* wins the chain,
+    # so the `#else` after it is dead. This is the only path where the new
+    # directive itself produces a new dead verdict, which is the class issue
+    # #157's asymmetry argument says has to be proven rather than assumed.
+    source = (
+        "#undef W\n#define Q 1\n#ifdef W\nx\n#elifdef Q\ny\n#else\n#line 5\nz\n"
+        "#endif\n#line 9\nq\n"
+    )
+    assert _line_breakpoints(source) == [(11, 9)]
+
+
+def test_line_breakpoints_forgets_definedness_across_an_import() -> None:
+    # `#import` is a GCC/clang-accepted include spelling, so it drops proven
+    # definedness exactly as `#include` does.
+    source = "#define W\n#import <a.h>\n#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(4, 5), (7, 9)]
+
+
 def test_annotate_array_extents_ignores_a_line_directive_in_a_dead_ifndef_body() -> (
     None
 ):
