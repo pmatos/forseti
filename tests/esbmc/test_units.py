@@ -900,9 +900,14 @@ def test_line_breakpoints_treats_a_negated_defined_test_as_dead() -> None:
 
 
 def test_line_breakpoints_treats_a_bare_defined_test_as_live() -> None:
-    # `defined NAME` without parens is the same predicate.
-    source = "#define W\n#if defined W\n#line 5\nx\n#endif\n#line 9\ny\n"
-    assert _line_breakpoints(source) == [(3, 5), (6, 9)]
+    # `defined NAME` without parens is the same predicate. Asserted through an
+    # `#else` arm, not the guarded body: a *live* body counts its `#line` and so
+    # does an *opaque* one, so only the `#else` — dead when the test resolves,
+    # assumed live when it does not — tells the two apart. Without this shape
+    # `_DEFINED_RES`'s unparenthesized pattern could be deleted outright and the
+    # whole file would still pass.
+    source = "#define W\n#if defined W\nx\n#else\n#line 5\ny\n#endif\n#line 9\nz\n"
+    assert _line_breakpoints(source) == [(8, 9)]
 
 
 def test_line_breakpoints_reads_a_spaced_defined_call_as_its_operand() -> None:
@@ -944,7 +949,15 @@ def test_line_breakpoints_decides_a_defined_test_in_an_elif() -> None:
 
 
 @pytest.mark.parametrize(
-    "directive", ["#include <a.h>", '#include "a.h"', "#include_next <a.h>"]
+    "directive",
+    [
+        "#include <a.h>",
+        '#include "a.h"',
+        "#include_next <a.h>",
+        # `#import` is a GCC/clang-accepted include spelling, so it drops proven
+        # definedness exactly as `#include` does.
+        "#import <a.h>",
+    ],
 )
 def test_line_breakpoints_forgets_definedness_across_an_include(directive: str) -> None:
     # A header may `#define`/`#undef` anything, so the `#define W` above it no
@@ -1102,13 +1115,6 @@ def test_line_breakpoints_kills_the_else_of_a_decided_c23_elifdef() -> None:
         "#endif\n#line 9\nq\n"
     )
     assert _line_breakpoints(source) == [(11, 9)]
-
-
-def test_line_breakpoints_forgets_definedness_across_an_import() -> None:
-    # `#import` is a GCC/clang-accepted include spelling, so it drops proven
-    # definedness exactly as `#include` does.
-    source = "#define W\n#import <a.h>\n#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
-    assert _line_breakpoints(source) == [(4, 5), (7, 9)]
 
 
 def test_line_breakpoints_forgets_definedness_across_a_pop_macro() -> None:

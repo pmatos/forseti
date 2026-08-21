@@ -286,7 +286,18 @@ _INT_LITERAL_RE = re.compile(r"[0-9]+")
 # `#define` inside it looks top-level to `known_defined` and can decide a later
 # `#ifdef` *dead* on a branch cpp never took. `(?!\w)` keeps `#ifdef`/`#ifndef`
 # out (they are `_IFDEF_RE`'s, and matching both would push the level twice).
-_IF_RE = re.compile(r"^[ \t]*#[ \t]*if(?!\w)[ \t]*((?:\\\r?\n|[^\n])*)$", re.MULTILINE)
+#
+# The `if`/`elif` spellings of each shape are built from one fragment apiece
+# rather than written out twice: `#elif`'s pattern has to stay character-for-
+# character in step with `#if`'s (this change alone had to add `(?!\w)` and
+# widen `[ \t]+` to `[ \t]*` in both), and a widening applied to only one of a
+# pair is silent — `_macro_verdict` reads the same `negated`/`name` groups off
+# `_IFDEF_RE` and `_ELIFDEF_RE` alike. Same `rf""` idiom as `_BRACKET_QUALIFIER`.
+_DIRECTIVE = r"^[ \t]*#[ \t]*"
+_CONDITION_TAIL = r"(?!\w)[ \t]*((?:\\\r?\n|[^\n])*)$"
+_DEF_OPERAND_TAIL = r"(?P<negated>n)?def\b(?:\\\r?\n|[ \t])*(?P<name>[A-Za-z_]\w*)?"
+
+_IF_RE = re.compile(rf"{_DIRECTIVE}if{_CONDITION_TAIL}", re.MULTILINE)
 
 # `#ifdef`/`#ifndef`, exposing the same `negated`/`name` groups as `_DEFINED_RES`
 # so `_line_breakpoints` reads both spellings of the predicate through one code
@@ -297,10 +308,7 @@ _IF_RE = re.compile(r"^[ \t]*#[ \t]*if(?!\w)[ \t]*((?:\\\r?\n|[^\n])*)$", re.MUL
 # backslash-continuation before the name is tolerated, interleaved with ordinary
 # whitespace so the spliced line's own indentation (`#ifdef \\` + newline +
 # `    NAME`) does not push an otherwise-decidable guard back to opaque.
-_IFDEF_RE = re.compile(
-    r"^[ \t]*#[ \t]*if(?P<negated>n)?def\b(?:\\\r?\n|[ \t])*(?P<name>[A-Za-z_]\w*)?",
-    re.MULTILINE,
-)
+_IFDEF_RE = re.compile(rf"{_DIRECTIVE}if{_DEF_OPERAND_TAIL}", re.MULTILINE)
 
 # `defined NAME` / `defined(NAME)`, optionally negated — matched against an
 # `#if`/`#elif`'s *entire* condition (`fullmatch`, for the same reason
@@ -311,9 +319,10 @@ _IFDEF_RE = re.compile(
 # bare `(X)`. `_strip_literal_parens` runs before both, so `#if (defined(X))`
 # arrives already peeled — while `#if !(defined(X))`, whose parens wrap only
 # `!`'s operand, does not and correctly stays opaque.
+_DEFINED_PREFIX = r"(?P<negated>!)?\s*defined"
 _DEFINED_RES = (
-    re.compile(r"(?P<negated>!)?\s*defined\s*\(\s*(?P<name>\w+)\s*\)"),
-    re.compile(r"(?P<negated>!)?\s*defined\s+(?P<name>\w+)"),
+    re.compile(rf"{_DEFINED_PREFIX}\s*\(\s*(?P<name>\w+)\s*\)"),
+    re.compile(rf"{_DEFINED_PREFIX}\s+(?P<name>\w+)"),
 )
 
 # `#include`/`#include_next`/`#import`, tracked for one purpose: to make
@@ -361,9 +370,7 @@ _PRAGMA_MACRO_RE = re.compile(
 # its own condition being `1`. Like `_IF_RE`, the captured group consumes an
 # embedded backslash-continuation so a split condition still classifies
 # correctly.
-_ELIF_RE = re.compile(
-    r"^[ \t]*#[ \t]*elif(?!\w)[ \t]*((?:\\\r?\n|[^\n])*)$", re.MULTILINE
-)
+_ELIF_RE = re.compile(rf"{_DIRECTIVE}elif{_CONDITION_TAIL}", re.MULTILINE)
 
 # C23's `#elifdef`/`#elifndef` — the `#elif` spelling of `_IFDEF_RE`'s predicate,
 # with the same `negated`/`name` groups so it resolves through the same code
@@ -372,10 +379,7 @@ _ELIF_RE = re.compile(
 # scan never sees leaves the chain carrying the *previous* arm's state, and once
 # `#ifdef` can prove that arm dead (issue #157) that silently deletes every real
 # breakpoint in the unseen arm.
-_ELIFDEF_RE = re.compile(
-    r"^[ \t]*#[ \t]*elif(?P<negated>n)?def\b(?:\\\r?\n|[ \t])*(?P<name>[A-Za-z_]\w*)?",
-    re.MULTILINE,
-)
+_ELIFDEF_RE = re.compile(rf"{_DIRECTIVE}elif{_DEF_OPERAND_TAIL}", re.MULTILINE)
 
 # A bare `#else` has no condition of its own to read: it is taken whenever cpp
 # reaches it, which happens whenever nothing before it was. This scan can
@@ -456,15 +460,21 @@ def _macro_test(condition: str) -> re.Match[str] | None:
     return None
 
 
-def _macro_verdict(match: re.Match[str], known_defined: dict[str, bool]) -> str:
+def _macro_verdict(match: re.Match[str] | None, known_defined: dict[str, bool]) -> str:
     """``"1"`` (live), ``"0"`` (dead), or ``"op"`` (opaque) for `match`'s macro test.
 
     `match` is a `_IFDEF_RE` or `_DEFINED_RES` match — both spell the predicate
     with the same ``negated``/``name`` groups. The verdict is ``"op"`` whenever
-    the operand is missing (an operand-less, malformed ``#ifdef``) or its
-    definedness is not in `known_defined`; see `_IFDEF_RE` for why a name simply
-    never ``#define``d in this file lands there rather than reading as undefined.
+    there is no predicate to read at all: no `match`, or an operand-less,
+    malformed ``#ifdef``. It is also ``"op"`` when the operand's definedness is
+    not in `known_defined`; see `_IFDEF_RE` for why a name simply never
+    ``#define``d in this file lands there rather than reading as undefined.
+
+    The three return values are exactly `_RESOLVED_IFDEF_KINDS`' inner keys —
+    that mapping, not this function, names the kind each verdict resolves to.
     """
+    if match is None:
+        return "op"
     name = match.group("name")
     if name is None:
         return "op"
@@ -472,6 +482,18 @@ def _macro_verdict(match: re.Match[str], known_defined: dict[str, bool]) -> str:
     if defined is None:
         return "op"
     return "1" if defined != (match.group("negated") is not None) else "0"
+
+
+# The kind an unresolved `#ifdef`-shaped event becomes once `_macro_verdict` has
+# read it against the macro state at its own position. Written out rather than
+# assembled from the pieces so every kind `_line_breakpoints`' walk dispatches on
+# is greppable at both ends: a `#ifdef` that resolves live is the *same* `"if1"`
+# a literal `#if 1` produces, and reduces into the same three-state vocabulary
+# the walk already had — the resolution adds no branch to it.
+_RESOLVED_IFDEF_KINDS = {
+    "ifdef": {"1": "if1", "0": "if0", "op": "ifop"},
+    "elifdef": {"1": "elif1", "0": "elif0", "op": "elifop"},
+}
 
 
 @dataclass(frozen=True)
@@ -1537,52 +1559,63 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
         m.end() for m in _CONTINUATION_RE.finditer(source_no_comments)
     }
 
+    def _directives(pattern: re.Pattern[str]) -> Iterator[re.Match[str]]:
+        """`pattern`'s matches that are really directives.
+
+        A match starting where a backslash-continuation ended is not one: cpp
+        spliced that line onto the previous one, so its `#` is mid-line text
+        (PR #156 follow-up to issue #145). Stated once, for both builders.
+        """
+        for m in pattern.finditer(source_no_comments):
+            if m.start() not in continuation_starts:
+                yield m
+
     def _events(
-        pattern: re.Pattern[str], kind: str, *, keep_match: bool = False
-    ) -> list[tuple[int, str, re.Match[str] | None]]:
-        return [
-            (m.start(), kind, m if keep_match else None)
-            for m in pattern.finditer(source_no_comments)
-            if m.start() not in continuation_starts
-        ]
+        pattern: re.Pattern[str], kind: str
+    ) -> list[tuple[int, str, re.Match[str]]]:
+        return [(m.start(), kind, m) for m in _directives(pattern)]
 
     def _cond_events(
-        pattern: re.Pattern[str], prefix: str
-    ) -> list[tuple[int, str, re.Match[str] | None]]:
-        """`pattern`'s conditionals as ``<prefix>0``/``1``/``def``/``op`` events.
+        pattern: re.Pattern[str],
+        kinds_by_literal: dict[str, str],
+        opaque_kind: str,
+        defined_kind: str,
+    ) -> list[tuple[int, str, re.Match[str]]]:
+        """`pattern`'s conditionals, classified by what their condition says.
 
-        A literal `0`/`1` classifies here and for good; a ``defined``-shaped
-        condition classifies as ``<prefix>def`` and carries its match, because
-        its verdict depends on macro state the forward walk has not built yet.
+        A literal `0`/`1` classifies here and for good, into `kinds_by_literal`.
+        A ``defined``-shaped condition classifies as `defined_kind`, which is
+        deliberately *not* yet a verdict: it stays unresolved until the walk
+        reaches it, because its answer depends on macro state built along the
+        way (`_RESOLVED_IFDEF_KINDS`). Anything else is `opaque_kind`.
         """
-        found: list[tuple[int, str, re.Match[str] | None]] = []
-        for m in pattern.finditer(source_no_comments):
-            if m.start() in continuation_starts:
-                continue
+        found: list[tuple[int, str, re.Match[str]]] = []
+        for m in _directives(pattern):
             condition = _strip_literal_parens(_CONTINUATION_RE.sub("", m.group(1)))
-            if condition in ("0", "1"):
-                found.append((m.start(), prefix + condition, None))
+            kind = kinds_by_literal.get(condition)
+            if kind is not None:
+                found.append((m.start(), kind, m))
                 continue
             test = _macro_test(condition)
             if test is None:
-                found.append((m.start(), prefix + "op", None))
+                found.append((m.start(), opaque_kind, m))
             else:
-                found.append((m.start(), prefix + "def", test))
+                found.append((m.start(), defined_kind, test))
         return found
 
     events = sorted(
-        _cond_events(_IF_RE, "if")
-        + _events(_IFDEF_RE, "ifdef", keep_match=True)
-        + _cond_events(_ELIF_RE, "elif")
-        + _events(_ELIFDEF_RE, "elifdef", keep_match=True)
+        _cond_events(_IF_RE, {"0": "if0", "1": "if1"}, "ifop", "ifdef")
+        + _events(_IFDEF_RE, "ifdef")
+        + _cond_events(_ELIF_RE, {"0": "elif0", "1": "elif1"}, "elifop", "elifdef")
+        + _events(_ELIFDEF_RE, "elifdef")
         + _events(_ELSE_RE, "else")
         + _events(_ENDIF_RE, "endif")
         + _events(_INCLUDE_RE, "include")
-        + _events(_PRAGMA_MACRO_RE, "pragma_macro", keep_match=True)
-        + _events(_LINE_DIRECTIVE_RE, "line", keep_match=True)
-        + _events(_LINE_DIRECTIVE_MACRO_RE, "line_macro", keep_match=True)
-        + _events(_DEFINE_RE, "define", keep_match=True)
-        + _events(_UNDEF_RE, "undef", keep_match=True),
+        + _events(_PRAGMA_MACRO_RE, "pragma_macro")
+        + _events(_LINE_DIRECTIVE_RE, "line")
+        + _events(_LINE_DIRECTIVE_MACRO_RE, "line_macro")
+        + _events(_DEFINE_RE, "define")
+        + _events(_UNDEF_RE, "undef"),
         key=lambda event: event[0],
     )
     # One `(dead, decided)` pair per open conditional. `dead` is whether the
@@ -1611,10 +1644,10 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
     breakpoints: list[tuple[int, int]] = []
     for pos, kind, match in events:
         dead = any(is_dead for is_dead, _ in stack)
-        if kind in ("ifdef", "elifdef") and match is not None:
+        if kind in _RESOLVED_IFDEF_KINDS:
             # Resolved here, not when the event was built: a `#ifdef`'s verdict
             # is a function of the macro state at *its* position in the walk.
-            kind = kind.removesuffix("def") + _macro_verdict(match, known_defined)
+            kind = _RESOLVED_IFDEF_KINDS[kind][_macro_verdict(match, known_defined)]
         if kind == "if0":
             stack.append((True, False))
         elif kind == "if1":
@@ -1650,14 +1683,14 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
             # so whatever it proved about that name stops holding here
             # (`_PRAGMA_MACRO_RE`). `push_macro` is treated the same way for a
             # name it cannot read.
-            if match is not None and not dead:
+            if not dead:
                 name = match.group("name")
                 if name is None:
                     known_defined.clear()
                 else:
                     known_defined.pop(name, None)
         elif kind == "define":
-            if match is not None and not dead:
+            if not dead:
                 name = match.group(1)
                 if stack:
                     # Some enclosing branch is not provably dead but also not
@@ -1683,7 +1716,7 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
                     else:
                         macros.pop(name, None)
         elif kind == "undef":
-            if match is not None and not dead:
+            if not dead:
                 name = match.group(1)
                 macros.pop(name, None)
                 if stack:
@@ -1691,12 +1724,12 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
                 else:
                     known_defined[name] = False
         elif kind == "line_macro":
-            if match is not None and not dead:
+            if not dead:
                 name = _CONTINUATION_RE.sub("", match.group(1))
                 if name in macros:
                     physical = source_no_comments.count("\n", 0, pos) + 1
                     breakpoints.append((physical, macros[name]))
-        elif match is not None and not dead:
+        elif kind == "line" and not dead:
             physical = source_no_comments.count("\n", 0, pos) + 1
             presumed = int(_CONTINUATION_RE.sub("", match.group(1)))
             breakpoints.append((physical, presumed))
