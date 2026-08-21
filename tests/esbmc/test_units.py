@@ -17,6 +17,7 @@ from forseti.esbmc.units import (
     Param,
     Unit,
     _line_breakpoints,
+    _stripped_for_scan,
     annotate_array_extents,
     find_definition_brace,
     list_caller_openings,
@@ -840,6 +841,592 @@ def test_annotate_array_extents_ignores_a_parenthesized_zero_if_body() -> None:
     assert (out.array_extent, out.array_extent_unresolved) == (None, False)
 
 
+# Issue #157: `#ifdef`/`#ifndef` (and the `#if defined(...)` spelling of the same
+# predicate) resolved against the definedness this file's own `#define`/`#undef`
+# directives prove — one-directionally, so a name this file never mentions stays
+# opaque rather than being read as undefined.
+
+
+def test_line_breakpoints_treats_an_ifndef_of_a_defined_macro_as_dead() -> None:
+    # The issue's own "single build-flag macro" shape: `DEBUG` is defined right
+    # here, so cpp never enters the `#ifndef` and its `#line 5` never resets the
+    # counter. Note `#define DEBUG` has no replacement text at all — definedness
+    # does not need one, even though `#line DEBUG` would still be unresolvable.
+    source = "#define DEBUG\n#ifndef DEBUG\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(6, 9)]
+
+
+def test_line_breakpoints_treats_an_ifdef_of_a_defined_macro_as_live() -> None:
+    source = "#define DEBUG 1\n#ifdef DEBUG\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(3, 5), (6, 9)]
+
+
+def test_line_breakpoints_decides_an_ifdef_from_a_function_like_define() -> None:
+    # `#define L(x) (x)` leaves `macros` unbound (`#line L` cannot expand it —
+    # see `test_line_breakpoints_ignores_a_function_like_macro_in_a_line_directive`)
+    # but still proves `L` *defined*: the two tables read the same directive on
+    # different terms.
+    source = "#define L(x) (x)\n#ifndef L\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(6, 9)]
+
+
+def test_line_breakpoints_treats_an_ifdef_of_an_undefd_macro_as_dead() -> None:
+    # The mirror direction: a top-level `#undef` proves the name undefined from
+    # there on, whatever a command-line `-D` did before the file was read.
+    source = "#undef W\n#ifdef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(6, 9)]
+
+
+def test_line_breakpoints_leaves_an_unmentioned_ifdef_opaque() -> None:
+    # The load-bearing soundness case (see `_IFDEF_RE`): `W` is never `#define`d
+    # *in this file*, which proves nothing — `list_units` forwards `-D` flags,
+    # and a builtin or an `#include`d header could define it too. So the branch
+    # stays opaque and its `#line 5` keeps counting, exactly as before #157.
+    # Reading absence as "undefined" here would delete a real breakpoint.
+    source = "#ifdef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(2, 5), (5, 9)]
+
+
+def test_line_breakpoints_kills_the_else_of_a_known_live_ifdef() -> None:
+    # A resolved `#ifdef` decides its whole chain, the same way a literal
+    # `#if 1` does (see
+    # `test_line_breakpoints_excludes_a_directive_inside_a_dead_if1_else_body`).
+    source = "#define W 1\n#ifdef W\nx\n#else\n#line 5\ny\n#endif\n#line 9\nz\n"
+    assert _line_breakpoints(source) == [(8, 9)]
+
+
+def test_line_breakpoints_treats_a_negated_defined_test_as_dead() -> None:
+    source = "#define W\n#if !defined(W)\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(6, 9)]
+
+
+def test_line_breakpoints_treats_a_bare_defined_test_as_live() -> None:
+    # `defined NAME` without parens is the same predicate. Asserted through an
+    # `#else` arm, not the guarded body: a *live* body counts its `#line` and so
+    # does an *opaque* one, so only the `#else` — dead when the test resolves,
+    # assumed live when it does not — tells the two apart. Without this shape
+    # `_DEFINED_RES`'s unparenthesized pattern could be deleted outright and the
+    # whole file would still pass.
+    source = "#define W\n#if defined W\nx\n#else\n#line 5\ny\n#endif\n#line 9\nz\n"
+    assert _line_breakpoints(source) == [(8, 9)]
+
+
+def test_line_breakpoints_reads_a_spaced_defined_call_as_its_operand() -> None:
+    # `defined (W)` must resolve to `W`, not be read as a bare operand `(W)` —
+    # which is why `_DEFINED_RES` tries the parenthesized pattern first.
+    source = "#define W\n#if ! defined ( W )\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(6, 9)]
+
+
+def test_line_breakpoints_peels_whole_condition_parens_off_a_defined_test() -> None:
+    # `_strip_literal_parens` runs first, so `#if (defined(W))` arrives peeled.
+    source = "#define W\n#if (!defined(W))\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(6, 9)]
+
+
+def test_line_breakpoints_leaves_a_compound_defined_condition_opaque() -> None:
+    # `fullmatch`, so a condition that merely *contains* a `defined` test needs
+    # a real expression evaluator and stays opaque — even though `W` is known.
+    source = "#define W\n#if defined(W) && defined(Z)\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(3, 5), (6, 9)]
+
+
+def test_line_breakpoints_leaves_a_negation_around_parens_opaque() -> None:
+    # `!(defined(W))`: the parens wrap only `!`'s operand, so
+    # `_strip_literal_parens` correctly leaves them and no `_DEFINED_RES`
+    # pattern matches end to end. Conservative — the arm really is dead — but
+    # an opaque verdict only ever over-counts breakpoints, never deletes one.
+    source = "#define W\n#if !(defined(W))\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(3, 5), (6, 9)]
+
+
+def test_line_breakpoints_decides_a_defined_test_in_an_elif() -> None:
+    # `#elif defined(W)` wins the chain, so the `#else` after it is dead.
+    source = (
+        "#define W\n#if 0\nx\n#elif defined(W)\ny\n#else\n#line 5\nz\n#endif\n"
+        "#line 9\nq\n"
+    )
+    assert _line_breakpoints(source) == [(10, 9)]
+
+
+@pytest.mark.parametrize(
+    "directive",
+    [
+        "#include <a.h>",
+        '#include "a.h"',
+        "#include_next <a.h>",
+        # `#import` is a GCC/clang-accepted include spelling, so it drops proven
+        # definedness exactly as `#include` does.
+        "#import <a.h>",
+    ],
+)
+def test_line_breakpoints_forgets_definedness_across_an_include(directive: str) -> None:
+    # A header may `#define`/`#undef` anything, so the `#define W` above it no
+    # longer proves `W` defined below it (`_INCLUDE_RE`) — the `#ifndef` falls
+    # back to opaque and its `#line 5` counts again.
+    source = f"#define W\n{directive}\n#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(4, 5), (7, 9)]
+
+
+def test_line_breakpoints_ignores_an_include_inside_a_dead_branch() -> None:
+    # cpp never reads this header, so it cannot disturb what `W` was already
+    # proven to be — the same dead-branch exclusion `#define`/`#undef` get.
+    source = (
+        "#define W\n#if 0\n#include <a.h>\n#endif\n"
+        "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(9, 9)]
+
+
+def test_line_breakpoints_keeps_a_line_macro_value_across_an_include() -> None:
+    # The other half of that asymmetry: clearing the `#line NAME` *value* table
+    # at an `#include` would drop a breakpoint this scan can resolve, which is a
+    # strictly worse outcome than the opaque fallback definedness gets. #165's
+    # behaviour is deliberately unchanged here.
+    source = "#define L 11\n#include <a.h>\n#line L\nx\n"
+    assert _line_breakpoints(source) == [(3, 11)]
+
+
+def test_line_breakpoints_balances_an_operandless_ifdef() -> None:
+    # A malformed `#ifdef` with no name is still a nesting level cpp closes with
+    # the `#endif` below it. Dropping the event would leave that `#endif`
+    # unbalanced and misclassify everything after it, so it is kept — as opaque.
+    source = "#ifdef\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(2, 5), (5, 9)]
+
+
+def test_line_breakpoints_does_not_prove_definedness_from_an_opaque_branch() -> None:
+    # `#define W` sits inside an opaque `#ifdef Q`, so whether cpp ever executes
+    # it is unknown — it may not *establish* `W` as defined, only leave it
+    # unknown. Mirrors, for the definedness table,
+    # `test_line_breakpoints_does_not_guess_a_macro_defined_in_an_ifdef_branch`.
+    source = "#ifdef Q\n#define W\n#endif\n#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(5, 5), (8, 9)]
+
+
+def test_line_breakpoints_does_not_prove_definedness_in_a_known_live_branch() -> None:
+    # `#ifdef W` resolves *live* here, yet the `#define D` inside it still only
+    # unbinds rather than establishing: `stack` records whether an arm is known
+    # dead, never whether it is known entered, so nothing distinguishes this
+    # branch from an opaque one when a `#define` is placed. The later `#ifndef
+    # D` therefore stays opaque and its `#line 5` counts. Conservative, and the
+    # same stance #165 already takes for the `#line NAME` value table.
+    source = (
+        "#define W 1\n#ifdef W\n#define D\n#endif\n"
+        "#ifndef D\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(6, 5), (9, 9)]
+
+
+def test_line_breakpoints_unbinds_definedness_touched_in_an_opaque_branch() -> None:
+    # The dropping half: `W` was proven defined at top level, but an `#undef`
+    # cpp may or may not reach makes that proof stale, so the later `#ifndef`
+    # must fall back to opaque rather than keep the pre-branch answer.
+    source = (
+        "#define W\n#ifdef Q\n#undef W\n#endif\n#ifndef W\n#line 5\nx\n#endif\n"
+        "#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(6, 5), (9, 9)]
+
+
+def test_line_breakpoints_ignores_an_undef_in_a_dead_branch_for_an_ifdef() -> None:
+    # PR #156's dead-branch exclusion applies to the definedness table too: cpp
+    # never processes this `#undef`, so `W` is still defined at the `#ifndef`.
+    source = (
+        "#define W\n#if 0\n#undef W\n#endif\n"
+        "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(9, 9)]
+
+
+def test_line_breakpoints_joins_a_spliced_ifdef_operand() -> None:
+    # `#ifdef \` + newline + `W` is one logical `#ifdef W` to cpp, so the
+    # operand must still resolve (mirrors `_LINE_DIRECTIVE_MACRO_RE`'s own
+    # leading-continuation tolerance).
+    source = "#define W\n#ifdef \\\nW\nx\n#else\n#line 5\ny\n#endif\n#line 9\nz\n"
+    assert _line_breakpoints(source) == [(9, 9)]
+
+
+def test_line_breakpoints_joins_a_spliced_ifdef_operand_over_indentation() -> None:
+    # Same splice, but the continuation line is indented — cpp splices first and
+    # only then reads tokens, so the operand still resolves. Before `_IFDEF_RE`
+    # interleaved whitespace with the continuation this degraded to opaque.
+    source = "#define W\n#ifdef \\\n    W\nx\n#else\n#line 5\ny\n#endif\n#line 9\nz\n"
+    assert _line_breakpoints(source) == [(9, 9)]
+
+
+def test_line_breakpoints_opens_a_level_for_a_conditional_without_a_space() -> None:
+    # `#if(FOO)` needs no whitespace before its condition. A conditional this
+    # scan does not see is strictly worse than one it cannot evaluate: its
+    # `#endif` pops somebody else's entry, and the `#define` it guards then looks
+    # top-level to `known_defined` — which, since #157, can decide the `#ifndef`
+    # below *dead* and delete a `#line` cpp really does process.
+    source = (
+        "#if(FOO)\n#define WIDE 1\n#endif\n"
+        "#ifndef WIDE\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(5, 5), (8, 9)]
+
+
+def test_line_breakpoints_treats_a_spaceless_parenthesized_zero_as_known_dead() -> None:
+    # The other half of that widening: `#if(0)` is still resolved, not merely
+    # balanced (`_strip_literal_parens` peels it exactly as it does `#if (0)`).
+    source = "#if(0)\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(5, 9)]
+
+
+def test_line_breakpoints_reads_a_defined_test_without_a_leading_space() -> None:
+    source = "#define W\n#if!defined(W)\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(6, 9)]
+
+
+def test_line_breakpoints_decides_an_elif_without_a_space() -> None:
+    # `#elif(1)` likewise: unseen, it would leave the chain carrying the
+    # `#ifdef`'s own now-provable dead state and drop the `#line 5` below it.
+    source = "#undef W\n#ifdef W\nx\n#elif(1)\n#line 5\ny\n#endif\n#line 9\nz\n"
+    assert _line_breakpoints(source) == [(5, 5), (8, 9)]
+
+
+def test_line_breakpoints_keeps_a_c23_elifdef_arm_reachable() -> None:
+    # C23 `#elifdef`/`#elifndef` are their own directives — neither `_ELIF_RE`
+    # nor `_IFDEF_RE` spells them. `Q` is unmentioned, so this arm is opaque and
+    # its `#line 5` must keep counting even though the `#ifdef W` before it is
+    # now provably dead.
+    source = "#undef W\n#ifdef W\nx\n#elifdef Q\n#line 5\ny\n#endif\n#line 9\nz\n"
+    assert _line_breakpoints(source) == [(5, 5), (8, 9)]
+
+
+def test_line_breakpoints_decides_a_c23_elifndef_arm() -> None:
+    # And it resolves through the same `known_defined` lookup as `#ifndef`: `Q`
+    # is proven defined, so `#elifndef Q` is dead and so is the arm's `#line 5`.
+    source = (
+        "#undef W\n#define Q 1\n#ifdef W\nx\n#elifndef Q\n#line 5\ny\n#endif\n"
+        "#line 9\nz\n"
+    )
+    assert _line_breakpoints(source) == [(9, 9)]
+
+
+def test_line_breakpoints_kills_the_else_of_a_decided_c23_elifdef() -> None:
+    # The load-bearing arm: a `#elifdef` this scan proves *live* wins the chain,
+    # so the `#else` after it is dead. This is the only path where the new
+    # directive itself produces a new dead verdict, which is the class issue
+    # #157's asymmetry argument says has to be proven rather than assumed.
+    source = (
+        "#undef W\n#define Q 1\n#ifdef W\nx\n#elifdef Q\ny\n#else\n#line 5\nz\n"
+        "#endif\n#line 9\nq\n"
+    )
+    assert _line_breakpoints(source) == [(11, 9)]
+
+
+def test_line_breakpoints_forgets_definedness_across_a_pop_macro() -> None:
+    # `#pragma pop_macro("W")` restores whatever the matching `push_macro`
+    # saved. This scan does not model the stack, so the `#undef W` above stops
+    # proving anything here — without that the stale `False` decides `#ifdef W`
+    # dead and deletes a `#line` cpp really does process.
+    source = _stripped_for_scan(
+        '#define W 1\n#pragma push_macro("W")\n#undef W\n#pragma pop_macro("W")\n'
+        "#ifdef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(6, 5), (9, 9)]
+
+
+def test_line_breakpoints_forgets_undefinedness_across_a_pop_macro() -> None:
+    # The mirror direction: a `pop_macro` can just as well restore a name to
+    # *undefined*, so a proven-defined fact is equally stale.
+    source = _stripped_for_scan(
+        '#undef W\n#pragma push_macro("W")\n#define W 1\n#pragma pop_macro("W")\n'
+        "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(6, 5), (9, 9)]
+
+
+def test_line_breakpoints_drops_every_fact_at_a_pop_macro() -> None:
+    # A pop drops the whole table, not just the named macro'"'"'s fact: by the time
+    # this scan runs, string literals are blanked (`_stripped_for_scan`), so
+    # `pop_macro("W")` reads as `pop_macro(   )` and the operand cannot be read
+    # at all (PR #225 review). Here the pop names `V`, yet the proof about `W`
+    # goes too -- clearing more facts only means more opaque conditionals, which
+    # is the assumed-live default and the free direction.
+    source = _stripped_for_scan(
+        '#undef W\n#pragma pop_macro("V")\n#ifdef W\n#line 5\nx\n#endif\n#line 9\ny\n'
+    )
+    assert _line_breakpoints(source) == [(4, 5), (7, 9)]
+
+
+def test_line_breakpoints_ignores_a_pop_macro_inside_a_dead_branch() -> None:
+    # cpp never executes it, so it cannot invalidate anything — the same
+    # `not dead` gate `#include` and `#define` already sit behind.
+    source = _stripped_for_scan(
+        '#undef W\n#if 0\n#pragma pop_macro("W")\n#endif\n'
+        "#ifdef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(9, 9)]
+
+
+def test_line_breakpoints_keeps_a_line_macro_value_across_a_pop_macro() -> None:
+    # Only `known_defined` is dropped. Dropping `macros` too would delete this
+    # `#line W` breakpoint outright, which is the costly direction `_DEFINE_RE`
+    # and `_INCLUDE_RE` both spell out.
+    source = _stripped_for_scan(
+        '#define W 5\n#pragma pop_macro("W")\n#line W\nx\n#line 9\ny\n'
+    )
+    assert _line_breakpoints(source) == [(3, 5), (5, 9)]
+
+
+def test_line_breakpoints_keeps_definedness_across_a_push_macro() -> None:
+    # PR #225 review: `push_macro` *saves* the current definition and leaves it
+    # in place, so it invalidates nothing — only `pop_macro` restores a state
+    # this scan never recorded. Treating the pair alike left `#ifndef W` opaque
+    # and kept a `#line` in an arm cpp never takes.
+    source = _stripped_for_scan(
+        '#define W 1\n#pragma push_macro("W")\n'
+        "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(7, 9)]
+
+
+def test_line_breakpoints_forgets_definedness_at_a_pragma_operator_pop() -> None:
+    # The `_Pragma` operator spelling of `pop_macro` is not a directive line, so
+    # `_PRAGMA_MACRO_RE` cannot see it — but clang honours it exactly the same
+    # way. Verified against clang on this very source: the `push_macro` saved
+    # `W` while it was undefined, so the pop restores it to undefined and the
+    # `#ifndef W` arm *is* compiled. Without `_PRAGMA_OPERATOR_POP_RE` the stale
+    # `True` from line 3 decides that arm dead and deletes its real `#line`.
+    #
+    # Run through `_stripped_for_scan`, the way production reaches this function:
+    # that pass blanks the operator's string argument to `_Pragma( )`, so a
+    # pattern that insisted on reading `pop_macro` out of it would match nothing
+    # here while still passing on raw text (PR #225 review).
+    source = _stripped_for_scan(
+        '#undef W\n_Pragma("push_macro(\\"W\\")")\n#define W 1\n'
+        '_Pragma("pop_macro(\\"W\\")")\n'
+        "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(6, 5), (9, 9)]
+
+
+def test_line_breakpoints_stops_proving_after_a_pragma_operator_pop() -> None:
+    # Why that event latches rather than just clearing: the operator can sit in
+    # a macro's replacement list and fire at every later *use* of that macro,
+    # far below where its text sits. Verified against clang on this source —
+    # `RESTORE` on line 5 really does leave `W` undefined at the `#ifndef`, so
+    # that arm's `#line` is real. Only a latch survives it: a clear at line 1
+    # would let the `#define W 1` on line 4 establish `True` again and decide
+    # the arm dead. The latch is sound because the operator's *text* always
+    # precedes every firing — a macro must be defined before it is used.
+    source = _stripped_for_scan(
+        '#define RESTORE _Pragma("pop_macro(\\"W\\")")\n#undef W\n'
+        '_Pragma("push_macro(\\"W\\")")\n#define W 1\nRESTORE\n'
+        "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(7, 5), (10, 9)]
+
+
+def test_line_breakpoints_latch_gives_up_a_decidable_define_deliberately() -> None:
+    # The price of that latch, recorded rather than left to be rediscovered: a
+    # `#define` *below* a directly-written, immediately-firing `_Pragma` pop is
+    # in fact decidable — clang really does leave `W` defined here, so it never
+    # compiles the `#ifndef W` arm and this `#line 5` is a phantom. The scan
+    # keeps it anyway. That is the free direction (an opaque conditional is
+    # assumed live, exactly as before #157), and giving it up is what buys the
+    # sound answer for the macro-body case above, which no text position can
+    # distinguish from this one.
+    source = _stripped_for_scan(
+        '_Pragma("pop_macro(\\"W\\")")\n#define W 1\n'
+        "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(4, 5), (7, 9)]
+
+
+def test_line_breakpoints_joins_a_spliced_directive_keyword() -> None:
+    # PR #225 review: `#ifde\` + newline + `f UNSEEN` is an ordinary
+    # `#ifdef UNSEEN` to cpp (verified against gcc), so it opens a nesting level
+    # and the `#define W 1` inside it is *not* top-level. Missing the frame made
+    # that `#define` look top-level, which proved `W` defined and decided the
+    # later `#ifndef W` dead — deleting a `#line` cpp really processes.
+    source = (
+        "#ifde\\\nf UNSEEN\n#define W 1\n#endif\n"
+        "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(6, 5), (9, 9)]
+
+
+def test_line_breakpoints_joins_a_spliced_macro_operand() -> None:
+    # The mirror within one directive: `#ifdef W\` + newline + `IDE` tests
+    # `WIDE`, not `W` (verified against gcc and clang, whose `#else` arm is the
+    # live one). Capturing only the `W` decided the guard taken and its active
+    # `#else` dead.
+    source = "#define W 1\n#ifdef W\\\nIDE\nx\n#else\n#line 5\ny\n#endif\n#line 9\nz\n"
+    assert _line_breakpoints(source) == [(6, 5), (9, 9)]
+
+
+@pytest.mark.parametrize("prologue", ["#", "%:", " # ", "\t#\t", "#\v", "\f#\f"])
+def test_line_breakpoints_reads_every_directive_prologue_spelling(
+    prologue: str,
+) -> None:
+    # PR #225 review: `%:` is C's digraph spelling of `#`, and vertical tab and
+    # form feed are preprocessing whitespace exactly as space and tab are — gcc,
+    # clang and `esbmc --parse-tree-only` all take every spelling here. A
+    # conditional this scan cannot see is the costly failure: its `#endif` pops
+    # somebody else's frame, the `#define W 1` inside looks top-level, and the
+    # later `#ifndef W` is decided dead on the arm cpp actually takes.
+    source = (
+        f"{prologue}if 0\n{prologue}define W 1\n{prologue}endif\n"
+        f"{prologue}ifndef W\n{prologue}line 5\nx\n{prologue}endif\n"
+        f"{prologue}line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(5, 5), (8, 9)]
+
+
+def test_line_breakpoints_does_not_read_a_trigraph_as_a_directive() -> None:
+    # The deliberate non-widening (see `_DIRECTIVE`): `esbmc --parse-tree-only`
+    # does not honour trigraphs at all — it fails to parse `??=define W 1` — and
+    # gcc/clang honour them only under a strict `-std=c*`, never the `gnu*`
+    # default. So `W` is *not* defined here, `#ifndef W` is taken, and reading
+    # the trigraph as a `#define` would delete this `#line 5`.
+    source = "??=define W 1\n#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(3, 5), (6, 9)]
+
+
+def test_line_breakpoints_does_not_truncate_a_dollar_define_name() -> None:
+    # PR #225 review: gcc, clang and esbmc all accept `$` in identifiers by
+    # default, so `#define W$ 1` defines `W$` and leaves `W` undefined
+    # (verified against all three). Capturing only the `\w` prefix recorded a
+    # definition of `W` and decided `#ifndef W` dead on the arm cpp takes.
+    source = "#define W$ 1\n#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(3, 5), (6, 9)]
+
+
+def test_line_breakpoints_resolves_an_ifdef_of_a_dollar_macro_name() -> None:
+    # The other half of the same fix: the complete name is still *proven*, so
+    # `#ifndef W$` is decided dead rather than merely left opaque.
+    source = "#define W$ 1\n#ifndef W$\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(6, 9)]
+
+
+def test_line_breakpoints_does_not_truncate_a_dollar_undef_name() -> None:
+    # The `#undef` twin the review did not name: `#undef W$` undefines `W$` and
+    # leaves `W` alone (verified against clang and esbmc — `W` is still defined
+    # after it). Reading it as `#undef W` proved `W` undefined and decided
+    # `#ifdef W` dead, deleting the `#line 5` cpp really processes.
+    source = "#define W 1\n#undef W$\n#ifdef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(4, 5), (7, 9)]
+
+
+def test_line_breakpoints_does_not_truncate_a_dollar_ifdef_operand() -> None:
+    # The read side of the same truncation: `#ifdef W$` tests `W$`, which
+    # nothing here defines, so cpp takes the `#else`. Capturing only the `W`
+    # resolved the guard from a name the directive never spelled.
+    source = "#define W 1\n#ifdef W$\nx\n#else\n#line 5\ny\n#endif\n#line 9\nz\n"
+    assert _line_breakpoints(source) == [(5, 5), (8, 9)]
+
+
+def test_line_breakpoints_splices_before_reading_a_digraph_directive() -> None:
+    # The ordering `_splice_continuations` depends on: a string literal split
+    # across a continuation is *not* blanked by `_stripped_for_scan`
+    # (`_STRING_RE` stops at an unescaped newline), so its tail would read as a
+    # line-leading `%:define` and prove `W` defined from inside a string.
+    # Splicing first moves it mid-line, exactly as it is to cpp — verified
+    # against clang, which leaves `W` undefined here.
+    source = _stripped_for_scan(
+        'char *s = "abc\\\n%:define W 1";\n#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n'
+    )
+    assert _line_breakpoints(source) == [(4, 5), (7, 9)]
+
+
+def test_line_breakpoints_does_not_truncate_a_ucn_macro_name() -> None:
+    # The other compiler-accepted identifier spelling (PR #225 review): a
+    # universal character name. `#define Wé 1` defines `Wé` and leaves `W`
+    # undefined -- verified against clang and `esbmc --parse-tree-only`, both of
+    # which compile the `#ifndef W` arm. The backslash satisfies a plain
+    # "no more word characters" boundary, so without UCNs in the grammar the
+    # name truncates to `W` and that arm is decided dead.
+    source = "#define W\\u00E9 1\n#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(3, 5), (6, 9)]
+
+
+def test_line_breakpoints_resolves_an_ifdef_of_a_ucn_macro_name() -> None:
+    # And the complete name still resolves, so the gain is not traded away:
+    # clang takes the `#ifdef Wé` arm here.
+    source = "#define W\\u00E9 1\n#ifndef W\\u00E9\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(6, 9)]
+
+
+def test_line_breakpoints_masks_a_comment_created_by_splicing() -> None:
+    # Phase 2 can *create* a comment delimiter that phase 3 then honours: `/\`
+    # + newline + `*` is an ordinary `/*` to cpp, so the `#define W 1` inside is
+    # never executed (verified against clang). The caller's own masking pass runs
+    # before splicing and so cannot have seen it; `_line_breakpoints` re-masks
+    # the spliced text for exactly this. Without that, the commented-out
+    # `#define` proves `W` defined and the active `#ifndef W` arm is decided dead.
+    source = _stripped_for_scan(
+        "int a;\n/\\\n*\n#define W 1\n*/\n#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(7, 5), (10, 9)]
+
+
+def test_line_breakpoints_ignores_a_pragma_operator_named_in_a_string() -> None:
+    # `_PRAGMA_OPERATOR_RE` matches the operator rather than its (already
+    # blanked) argument, so it must not fire on a `_Pragma(` that is only
+    # *mentioned* -- inside a string literal here. `_line_breakpoints` blanks
+    # string literals on the spliced text for exactly this; without that step the
+    # mention latches and the decidable `#ifndef W` is given up.
+    source = (
+        'char *doc = "use _Pragma(...) here";\n#define W 1\n'
+        "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(7, 9)]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        '#define W 1\n#pragma pop_macro("W")\n#ifndef W\n#line 5\nx\n#endif\n',
+        '#define W 1\n_Pragma("pop_macro(\\"W\\")")\n#ifndef W\n#line 5\nx\n#endif\n',
+        'char *s = "_Pragma( /* %:define W 1";\n#ifndef W\n#line 5\nx\n#endif\n',
+        '#define W 1\nchar *s = "abc\\\n%:define V 1";\n'
+        "#ifndef W\n#line 5\nx\n#endif\n",
+        "int a;\n/\\\n*\n#define W 1\n*/\n#ifndef W\n#line 5\nx\n#endif\n",
+    ],
+)
+def test_line_breakpoints_reads_pre_masked_and_raw_source_alike(source: str) -> None:
+    # The invariant that would have caught the `_Pragma` latch shipping as a
+    # production no-op (PR #225 review): this function masks the spliced text
+    # with the same pass its callers use, so its answer cannot depend on whether
+    # the caller pre-masked. A pattern that reads anything but a line-leading
+    # directive can otherwise pass every test on raw source and match nothing on
+    # the text `annotate_array_extents` actually hands it.
+    assert _line_breakpoints(source) == _line_breakpoints(_stripped_for_scan(source))
+
+
+def test_line_breakpoints_does_not_truncate_a_dollar_line_macro_name() -> None:
+    # And the `#line NAME` side, where truncation produces a wrong *value*
+    # rather than a missing breakpoint: clang resolves `#line W$` to 7, not to
+    # `W`'s 5 (verified).
+    source = "#define W 5\n#define W$ 7\n#line W$\nx\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(3, 7), (5, 9)]
+
+
+def test_annotate_array_extents_ignores_a_line_directive_in_a_dead_ifndef_body() -> (
+    None
+):
+    # End-to-end at the unit level, in the physical ordering the `-c[0]`
+    # tiebreak gets *wrong* (issue #157): the active definition comes first and
+    # the inactive `#ifndef`-guarded one second, so a surviving tie would prefer
+    # the later, array-shaped candidate. Confirmed against esbmc's own parse
+    # tree, which reports the single compiled `f` as `void (int *)` at presumed
+    # line 11. Before this fix both candidates translated to presumed line 11
+    # and the plain `int *p` was silently backed by a 20-element object — the
+    # dangerous, violation-masking direction issue #145 closed for `#if 0`.
+    source = (
+        "#define WIDE 1\n#line 11\nvoid f(int *p) { *p = 1; }\n"
+        "#ifndef WIDE\n#line 11\nvoid f(int p[20]) { }\n#endif\n"
+    )
+    unit = Unit("f", (Param("p", "int *"),), def_line=11)
+    out = annotate_array_extents([unit], source)[0].params[0]
+    assert (out.array_extent, out.array_extent_unresolved) == (None, False)
+
+
 def test_blank_comment_preserves_line_numbers_across_a_multiline_comment() -> None:
     # `_param_list_text` compares byte-offset-derived line numbers in the
     # comment-stripped text against `Unit.def_line`, which clang reports against
@@ -1060,6 +1647,26 @@ def test_list_units_ignores_a_line_directive_inside_a_dead_if0_body(
         "#line 11\nvoid f(int *p) { *p = 1; }\n"
     )
     f = next(u for u in list_units(src) if u.name == "f")
+    assert f.params[0].array_extent is None
+    assert f.params[0].array_extent_unresolved is False
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_ignores_a_line_directive_inside_a_dead_ifndef_body(
+    tmp_path: Path,
+) -> None:
+    # End-to-end (issue #157): the same duplicate-`#line 11` tie as the `#if 0`
+    # test above, but guarded by a `#ifndef` this file's own `#define` decides —
+    # and written in the ordering the physical-line tiebreak gets wrong, active
+    # definition first. With the dead branch's directive excluded, the inactive
+    # array-shaped candidate translates to presumed line 14 and never ties.
+    src = tmp_path / "sig.c"
+    src.write_text(
+        "#define WIDE 1\n#line 11\nvoid f(int *p) { *p = 1; }\n"
+        "#ifndef WIDE\n#line 11\nvoid f(int p[20]) { }\n#endif\n"
+    )
+    f = next(u for u in list_units(src) if u.name == "f")
+    assert f.def_line == 11
     assert f.params[0].array_extent is None
     assert f.params[0].array_extent_unresolved is False
 
