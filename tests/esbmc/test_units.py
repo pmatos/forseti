@@ -1111,6 +1111,56 @@ def test_line_breakpoints_forgets_definedness_across_an_import() -> None:
     assert _line_breakpoints(source) == [(4, 5), (7, 9)]
 
 
+def test_line_breakpoints_forgets_definedness_across_a_pop_macro() -> None:
+    # `#pragma pop_macro("W")` restores whatever the matching `push_macro`
+    # saved. This scan does not model the stack, so the `#undef W` above stops
+    # proving anything here — without that the stale `False` decides `#ifdef W`
+    # dead and deletes a `#line` cpp really does process.
+    source = (
+        '#define W 1\n#pragma push_macro("W")\n#undef W\n#pragma pop_macro("W")\n'
+        "#ifdef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(6, 5), (9, 9)]
+
+
+def test_line_breakpoints_forgets_undefinedness_across_a_pop_macro() -> None:
+    # The mirror direction: a `pop_macro` can just as well restore a name to
+    # *undefined*, so a proven-defined fact is equally stale.
+    source = (
+        '#undef W\n#pragma push_macro("W")\n#define W 1\n#pragma pop_macro("W")\n'
+        "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(6, 5), (9, 9)]
+
+
+def test_line_breakpoints_drops_every_fact_for_an_unreadable_pop_macro() -> None:
+    # A macro-expanded operand leaves the affected name unknown, so no fact is
+    # safe — the whole table goes, exactly as at an `#include`.
+    source = (
+        "#undef W\n#pragma pop_macro(SOMEMACRO)\n"
+        "#ifdef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(4, 5), (7, 9)]
+
+
+def test_line_breakpoints_ignores_a_pop_macro_inside_a_dead_branch() -> None:
+    # cpp never executes it, so it cannot invalidate anything — the same
+    # `not dead` gate `#include` and `#define` already sit behind.
+    source = (
+        '#undef W\n#if 0\n#pragma pop_macro("W")\n#endif\n'
+        "#ifdef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(9, 9)]
+
+
+def test_line_breakpoints_keeps_a_line_macro_value_across_a_pop_macro() -> None:
+    # Only `known_defined` is dropped. Dropping `macros` too would delete this
+    # `#line W` breakpoint outright, which is the costly direction `_DEFINE_RE`
+    # and `_INCLUDE_RE` both spell out.
+    source = '#define W 5\n#pragma pop_macro("W")\n#line W\nx\n#line 9\ny\n'
+    assert _line_breakpoints(source) == [(3, 5), (5, 9)]
+
+
 def test_annotate_array_extents_ignores_a_line_directive_in_a_dead_ifndef_body() -> (
     None
 ):

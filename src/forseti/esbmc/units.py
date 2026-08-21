@@ -332,6 +332,25 @@ _INCLUDE_RE = re.compile(
     re.MULTILINE,
 )
 
+# `#pragma push_macro("W")`/`#pragma pop_macro("W")` (clang/GCC), tracked for
+# exactly the reason `_INCLUDE_RE` is: a `pop_macro` restores whatever the
+# matching `push_macro` saved, which this scan does not model — so a top-level
+# `#undef W` above it stops proving `W` undefined, and a `#define W` above it
+# stops proving it defined. Without this the stale fact survives and a later
+# `#ifdef W` is decided *dead* on a branch cpp really takes, deleting a real
+# breakpoint (issue #157's asymmetry). Modelling the push/pop stack itself is
+# not needed for that: dropping the fact falls back to opaque, which is the
+# assumed-live default and costs nothing. Only `known_defined` is dropped, never
+# `macros` — the same asymmetry `_INCLUDE_RE` spells out. An unparenthesized or
+# macro-expanded operand leaves `name` unset and drops the whole table, since the
+# affected name is then unknown. The residual is `_Pragma("push_macro(\"W\")")`,
+# the operator spelling, which is not a directive line and is not scanned.
+_PRAGMA_MACRO_RE = re.compile(
+    r"^[ \t]*#[ \t]*pragma[ \t]+(?:push|pop)_macro\b"
+    r"(?:[ \t]*\([ \t]*\"(?P<name>\w+)\")?",
+    re.MULTILINE,
+)
+
 # `#elif`'s condition is captured separately from `#if`'s: a literal `#elif 0`
 # does not reactivate a dead branch the way `#else` does — its own condition is
 # still false, so the branch it introduces stays dead regardless of what came
@@ -1559,6 +1578,7 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
         + _events(_ELSE_RE, "else")
         + _events(_ENDIF_RE, "endif")
         + _events(_INCLUDE_RE, "include")
+        + _events(_PRAGMA_MACRO_RE, "pragma_macro", keep_match=True)
         + _events(_LINE_DIRECTIVE_RE, "line", keep_match=True)
         + _events(_LINE_DIRECTIVE_MACRO_RE, "line_macro", keep_match=True)
         + _events(_DEFINE_RE, "define", keep_match=True)
@@ -1625,6 +1645,17 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
             # fact proven above it stops holding below it (`_INCLUDE_RE`).
             if not dead:
                 known_defined.clear()
+        elif kind == "pragma_macro":
+            # `pop_macro` restores a saved definition this scan never recorded,
+            # so whatever it proved about that name stops holding here
+            # (`_PRAGMA_MACRO_RE`). `push_macro` is treated the same way for a
+            # name it cannot read.
+            if match is not None and not dead:
+                name = match.group("name")
+                if name is None:
+                    known_defined.clear()
+                else:
+                    known_defined.pop(name, None)
         elif kind == "define":
             if match is not None and not dead:
                 name = match.group(1)
