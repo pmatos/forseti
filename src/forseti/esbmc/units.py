@@ -73,9 +73,10 @@ _TYPE_RE = re.compile(r"'([^']*)'")
 # splices lines (translation phase 2) before it ever recognizes a comment
 # (phase 3), so `// text \` continued onto a `#line`/`#if`-looking next line is,
 # to cpp, one comment spanning both physical lines — not a directive (PR #156
-# follow-up to issue #145: `_line_breakpoints`' own continuation exclusion runs
-# on this already-blanked text, so a backslash swallowed by an *unspliced* `//`
-# match here would already be gone by the time that exclusion could see it).
+# follow-up to issue #145). Swallowing the backslash *here* is what keeps
+# `_splice_continuations` from later joining that next line onto the comment's
+# own: this pass blanks the backslash, so by the time the splicer runs there is
+# no continuation left to act on.
 _COMMENT_RE = re.compile(r"//(?:\\\r?\n|[^\n])*|/\*.*?\*/", re.DOTALL)
 
 # String (`"..."`) and char (`'...'`) literals, blanked the same way and for the
@@ -89,7 +90,9 @@ _COMMENT_RE = re.compile(r"//(?:\\\r?\n|[^\n])*|/\*.*?\*/", re.DOTALL)
 # stay inside the literal instead of ending the match early; stopping at an
 # unescaped newline is deliberate, like `_COMMENT_RE`'s `//` alternative — a
 # literal genuinely never spans one without cpp's line-splicing, which this
-# textual scan does not perform.
+# masking pass does not perform. `_line_breakpoints` splices its own copy
+# afterwards (`_splice_continuations`), which is what keeps the unmasked tail of
+# a *spliced* literal from reading as a line-leading directive there.
 _STRING_RE = re.compile(r'"(?:\\.|[^"\\\n])*"' r"|'(?:\\.|[^'\\\n])*'")
 
 # A `DeclRefExpr` naming a function: clang prints `Function 0x<addr> '<name>'`.
@@ -152,33 +155,72 @@ _QUALIFIER_ONLY_RE = re.compile(
 # even when N itself is not (`[static SHA_DIGEST_LENGTH]`).
 _STATIC_MIN_RE = re.compile(r"\bstatic\b")
 
+# Every directive pattern below is built from these four shared fragments, each
+# written once because a widening applied to one spelling and not another is
+# silent. cpp accepts the same prologue and the same identifier grammar in
+# *every* directive, so a pattern that sees `#ifdef` but not `%:ifdef` leaves a
+# conditional unbalanced — its `#endif` then pops somebody else's frame, and a
+# `#define` inside it looks top-level — while a pattern that reads `#define W$`
+# as defining `W` proves a definedness fact cpp never established. Both end in
+# the same place: a guard decided *dead* on an arm cpp really takes, which
+# deletes a real `#line` breakpoint (the asymmetry `_IF_RE` spells out).
+#
+# Every claim below was checked against gcc 16.2.1, clang 22.1.8 *and* `esbmc
+# --parse-tree-only` (8.3.0), the last because esbmc's own frontend is the only
+# line numbering this scan has to agree with (PR #225 review):
+#
+#   `_PP_SPACE`   The whitespace cpp allows before `#` and between `#` and the
+#                 directive keyword. Vertical tab and form feed are
+#                 preprocessing whitespace exactly as space and tab are — all
+#                 three tools take `#\vif 0` and `#\fdefine FF 1`. Newline is
+#                 excluded: it ends the directive.
+#   `_DIRECTIVE`  That whitespace plus `#` — or `%:`, C's digraph spelling of
+#                 it. `%:define W 1` and `%:if 0` are ordinary directives to all
+#                 three. Trigraphs (`??=define`) are deliberately *not*
+#                 accepted: esbmc does not honour them at all (it fails to parse
+#                 `??=define W 1`), and gcc/clang honour them only under a
+#                 strict `-std=c*`, never the `gnu*` default. Reading one as a
+#                 directive would disagree with esbmc in the costly direction.
+#   `_MACRO_NAME` A *complete* preprocessing identifier, `$` included: all three
+#                 accept `$` in identifiers by default, so `#define W$ 1`
+#                 defines `W$` and leaves `W` undefined. Capturing only the
+#                 `\w` prefix would record a definition of `W` and decide a
+#                 later `#ifndef W` dead on the arm cpp actually takes.
+#   `_NAME_END`   The end of such an identifier. Greedy `[\w$]*` already reaches
+#                 it, so this restates that rather than constraining it — but it
+#                 restates it explicitly, so a later edit that appends anything
+#                 after a name capture cannot silently reintroduce the
+#                 truncation above.
+#
+# None of them mention the backslash-continuation cpp splices out in translation
+# phase 2: `_line_breakpoints` runs every pattern over already-spliced text (see
+# `_splice_continuations`), so each directive is matched in the single logical
+# form cpp itself reads.
+_PP_SPACE = r"[ \t\v\f]"
+_DIRECTIVE = rf"^{_PP_SPACE}*(?:#|%:){_PP_SPACE}*"
+_MACRO_NAME = r"[A-Za-z_$][\w$]*"
+_NAME_END = r"(?![\w$])"
+
 # A `#line N` (ISO C) or GNU linemarker `# N "file" flags...` directive, in its
-# literal-digit-sequence form. Matches right after `#`, so `#define`/`#if`/...
-# (which start with a non-digit, non-"line" word) never do. The captured digit
-# run also tolerates an embedded backslash-continuation (PR #156 follow-up to
-# issue #145: cpp splices `#line \` + newline + `11` into one logical `#line
-# 11` before ever reading it, so a breakpoint recorded here must be too — the
-# same splicing hazard `_IF_RE`/`_ELIF_RE` already guard against for a
-# conditional's own text). The continuation is stripped from the captured
-# group — via `_CONTINUATION_RE` — before the digits are read as an `int`, in
-# `_line_breakpoints`.
+# literal-digit-sequence form. Matches right after the prologue, so
+# `#define`/`#if`/... (which start with a non-digit, non-"line" word) never do.
 _LINE_DIRECTIVE_RE = re.compile(
-    r"^[ \t]*#[ \t]*(?:line[ \t]+)?((?:\\\r?\n)*\d(?:\\\r?\n|\d)*)\b", re.MULTILINE
+    rf"{_DIRECTIVE}(?:line{_PP_SPACE}+)?(\d+){_NAME_END}", re.MULTILINE
 )
 
 # A macro-valued `#line NAME` (issue #165 follow-up to #156/#157): GNU's
 # linemarker form is always digits (never a macro), so only the ISO `line`
 # spelling is matched here — the `\d` case above already owns the digit form,
-# and requiring the first non-continuation character to be a letter/underscore
-# keeps the two regexes mutually exclusive at the same start position. The
-# named macro is resolved against `_line_breakpoints`' own tiny macro-value
+# and requiring the first character to be a letter/underscore/`$` keeps the two
+# regexes mutually exclusive at the same start position. The named macro is
+# resolved against `_line_breakpoints`' own tiny macro-value
 # table (see `_DEFINE_RE`), which only ever tracks a plain integer literal — a
 # `#line` naming anything else (an unknown identifier, a function-like macro,
 # one bound to a non-literal expression) stays unresolved, the same graceful
 # no-breakpoint fallback this scan already uses for every condition it cannot
 # evaluate.
 _LINE_DIRECTIVE_MACRO_RE = re.compile(
-    r"^[ \t]*#[ \t]*line[ \t]+((?:\\\r?\n)*[A-Za-z_]\w*)\b", re.MULTILINE
+    rf"{_DIRECTIVE}line{_PP_SPACE}+({_MACRO_NAME}){_NAME_END}", re.MULTILINE
 )
 
 # `#define NAME <rest of line>` and `#undef NAME`, tracked for exactly two
@@ -187,17 +229,20 @@ _LINE_DIRECTIVE_MACRO_RE = re.compile(
 # table. The two read different things off the same directives: the `#line`
 # value table needs an integer-literal replacement, while definedness needs only
 # that the `#define` happened, so an empty or function-like `#define` decides a
-# `#ifdef` while leaving `#line NAME` unresolved. `_DEFINE_RE`'s second group
-# is the *entire* remainder of the line, exactly like `_IF_RE`'s condition
-# group: `_line_breakpoints` strips its continuation and whitespace, then
-# accepts it only if what is left is a bare unsigned-integer literal (see
+# `#ifdef` while leaving `#line NAME` unresolved. The name is `_MACRO_NAME`, a
+# complete identifier: `#define W$ 1` defines `W$`, never `W`, and reading it as
+# `W` would prove a fact cpp never established (PR #225 review). `_DEFINE_RE`'s
+# second group is the *entire* remainder of the line, exactly like `_IF_RE`'s
+# condition group: `_line_breakpoints` strips its whitespace, then accepts it
+# only if what is left is a bare unsigned-integer literal (see
 # `_INT_LITERAL_RE`) — a function-like macro's `(params) body`, an empty
 # replacement (`#define DEBUG`), or any non-literal expression all fail that
 # check and simply drop any existing binding for the name, exactly as an
 # explicit `#undef` would. A binding is *never* established while a
 # `#define`/`#undef` cannot itself be proven live or dead (`_line_breakpoints`'
-# own `stack` is non-empty) — only ever unbound: this scan does not have the
-# macro state to know which of an `#ifdef`'s two arms cpp actually takes, so
+# own `stack` is non-empty, or its `macro_stack_opaque` latch is set) — only
+# ever unbound: this scan does not have the macro state to know which of an
+# `#ifdef`'s two arms cpp actually takes, so
 # recording whichever arm happened to run last would risk resolving `#line
 # NAME` to a value cpp itself would never produce, the same failure mode
 # `_IF_RE`'s own comment names as the reason `#ifdef`/non-literal `#if` stay
@@ -216,14 +261,17 @@ _LINE_DIRECTIVE_MACRO_RE = re.compile(
 # as a `#define` there is), because there the fallback is a merely-opaque
 # conditional rather than a dropped breakpoint (issue #157).
 _DEFINE_RE = re.compile(
-    r"^[ \t]*#[ \t]*define[ \t]+(\w+)((?:\\\r?\n|[^\n])*)$", re.MULTILINE
+    rf"{_DIRECTIVE}define{_PP_SPACE}+({_MACRO_NAME}){_NAME_END}([^\n]*)$",
+    re.MULTILINE,
 )
-_UNDEF_RE = re.compile(r"^[ \t]*#[ \t]*undef[ \t]+(\w+)\b", re.MULTILINE)
+_UNDEF_RE = re.compile(
+    rf"{_DIRECTIVE}undef{_PP_SPACE}+({_MACRO_NAME}){_NAME_END}", re.MULTILINE
+)
 
 # A bare unsigned-integer literal, nothing else — what `_DEFINE_RE`'s captured
-# replacement text must reduce to (after continuation-stripping and
-# whitespace-trimming) for `_line_breakpoints` to trust it as a `#line`-usable
-# value. `fullmatch` so a stray trailing character can never slip through.
+# replacement text must reduce to (after whitespace-trimming) for
+# `_line_breakpoints` to trust it as a `#line`-usable value. `fullmatch` so a
+# stray trailing character can never slip through.
 _INT_LITERAL_RE = re.compile(r"[0-9]+")
 
 # A literal `#if 0`/`#elif 0` or `#if 1`/`#elif 1` (the complete condition is
@@ -238,13 +286,11 @@ _INT_LITERAL_RE = re.compile(r"[0-9]+")
 # with `0`/`1` — `#if 0 || FEATURE` — is not misread as known either way: such
 # a branch genuinely might go either way, and disagreeing with cpp's own
 # evaluation would corrupt the presumed-line translation for the real code
-# after it, the same failure mode this whole exclusion exists to avoid. The
-# captured group also consumes an embedded backslash-continuation (PR #156
-# follow-up to issue #145: cpp splices a condition written as `#if \` +
-# newline + `0` into one logical `#if 0` before ever evaluating it, so
-# `_cond_events` strips any spliced newline out of the captured text — via
-# `_CONTINUATION_RE` — before comparing it to the literal `"0"`/`"1"`). A
-# condition wrapped in balanced parens spanning its *entire* text — `(0)`,
+# after it, the same failure mode this whole exclusion exists to avoid. A
+# condition split across a backslash-continuation — `#if \` + newline + `0`,
+# one logical `#if 0` to cpp — arrives already joined, since every pattern here
+# runs over spliced text (`_splice_continuations`). A condition wrapped in
+# balanced parens spanning its *entire* text — `(0)`,
 # `((1))` — is peeled down to the bare digit first, via
 # `_strip_literal_parens` (issue #165 follow-up to #156: cpp always evaluates
 # `#if (0)` as false, so leaving the parens in place and missing the exact
@@ -284,18 +330,19 @@ _INT_LITERAL_RE = re.compile(r"[0-9]+")
 # conditional this scan fails to see is far worse than one it cannot evaluate —
 # it opens a nesting level whose `#endif` then pops somebody else's entry, so a
 # `#define` inside it looks top-level to `known_defined` and can decide a later
-# `#ifdef` *dead* on a branch cpp never took. `(?!\w)` keeps `#ifdef`/`#ifndef`
-# out (they are `_IFDEF_RE`'s, and matching both would push the level twice).
+# `#ifdef` *dead* on a branch cpp never took. `_NAME_END` keeps `#ifdef` and
+# `#ifndef` out (they are `_IFDEF_RE`'s, and matching both would push the level
+# twice), and `#if$X` too — `if$X` is one identifier to cpp, not a directive.
 #
 # The `if`/`elif` spellings of each shape are built from one fragment apiece
 # rather than written out twice: `#elif`'s pattern has to stay character-for-
-# character in step with `#if`'s (this change alone had to add `(?!\w)` and
-# widen `[ \t]+` to `[ \t]*` in both), and a widening applied to only one of a
-# pair is silent — `_macro_verdict` reads the same `negated`/`name` groups off
+# character in step with `#if`'s, and a widening applied to only one of a pair
+# is silent — `_macro_verdict` reads the same `negated`/`name` groups off
 # `_IFDEF_RE` and `_ELIFDEF_RE` alike. Same `rf""` idiom as `_BRACKET_QUALIFIER`.
-_DIRECTIVE = r"^[ \t]*#[ \t]*"
-_CONDITION_TAIL = r"(?!\w)[ \t]*((?:\\\r?\n|[^\n])*)$"
-_DEF_OPERAND_TAIL = r"(?P<negated>n)?def\b(?:\\\r?\n|[ \t])*(?P<name>[A-Za-z_]\w*)?"
+_CONDITION_TAIL = rf"{_NAME_END}{_PP_SPACE}*([^\n]*)$"
+_DEF_OPERAND_TAIL = (
+    rf"(?P<negated>n)?def{_NAME_END}{_PP_SPACE}*(?P<name>{_MACRO_NAME}{_NAME_END})?"
+)
 
 _IF_RE = re.compile(rf"{_DIRECTIVE}if{_CONDITION_TAIL}", re.MULTILINE)
 
@@ -304,10 +351,10 @@ _IF_RE = re.compile(rf"{_DIRECTIVE}if{_CONDITION_TAIL}", re.MULTILINE)
 # path. `name` is deliberately *optional*: an operand-less `#ifdef` is malformed,
 # but cpp still opens a nesting level a later `#endif` closes, and dropping the
 # event would unbalance every conditional after it — a nameless match simply
-# resolves to opaque, exactly like a name this scan knows nothing about. A
-# backslash-continuation before the name is tolerated, interleaved with ordinary
-# whitespace so the spliced line's own indentation (`#ifdef \\` + newline +
-# `    NAME`) does not push an otherwise-decidable guard back to opaque.
+# resolves to opaque, exactly like a name this scan knows nothing about. `name`
+# ends at `_NAME_END`, so a spliced operand reaches this pattern whole: `#ifdef
+# W\` + newline + `IDE` tests `WIDE`, and capturing only its `W` would decide
+# the guard from the wrong name entirely (PR #225 review).
 _IFDEF_RE = re.compile(rf"{_DIRECTIVE}if{_DEF_OPERAND_TAIL}", re.MULTILINE)
 
 # `defined NAME` / `defined(NAME)`, optionally negated — matched against an
@@ -321,8 +368,8 @@ _IFDEF_RE = re.compile(rf"{_DIRECTIVE}if{_DEF_OPERAND_TAIL}", re.MULTILINE)
 # `!`'s operand, does not and correctly stays opaque.
 _DEFINED_PREFIX = r"(?P<negated>!)?\s*defined"
 _DEFINED_RES = (
-    re.compile(rf"{_DEFINED_PREFIX}\s*\(\s*(?P<name>\w+)\s*\)"),
-    re.compile(rf"{_DEFINED_PREFIX}\s+(?P<name>\w+)"),
+    re.compile(rf"{_DEFINED_PREFIX}\s*\(\s*(?P<name>{_MACRO_NAME})\s*\)"),
+    re.compile(rf"{_DEFINED_PREFIX}\s+(?P<name>{_MACRO_NAME})"),
 )
 
 # `#include`/`#include_next`/`#import`, tracked for one purpose: to make
@@ -337,7 +384,7 @@ _DEFINED_RES = (
 # scan can otherwise resolve. `_DEFINE_RE`'s own comment names the residual that
 # leaves.
 _INCLUDE_RE = re.compile(
-    r"^[ \t]*#[ \t]*(?:include(?:_next)?|import)\b",
+    rf"{_DIRECTIVE}(?:include(?:_next)?|import){_NAME_END}",
     re.MULTILINE,
 )
 
@@ -352,12 +399,42 @@ _INCLUDE_RE = re.compile(
 # assumed-live default and costs nothing. Only `known_defined` is dropped, never
 # `macros` — the same asymmetry `_INCLUDE_RE` spells out. An unparenthesized or
 # macro-expanded operand leaves `name` unset and drops the whole table, since the
-# affected name is then unknown. The residual is `_Pragma("push_macro(\"W\")")`,
-# the operator spelling, which is not a directive line and is not scanned.
+# affected name is then unknown.
+#
+# The two operations are told apart by the `op` group, because only one of them
+# changes anything (PR #225 review): `push_macro` *saves* the current definition
+# and leaves it in place, so every fact proven above it still holds below it,
+# while `pop_macro` is the one that restores an unrecorded state. Dropping the
+# fact on a push too would make `#define W` / `#pragma push_macro("W")` /
+# `#ifndef W` opaque rather than dead, retaining a `#line` breakpoint in an arm
+# cpp never takes.
 _PRAGMA_MACRO_RE = re.compile(
-    r"^[ \t]*#[ \t]*pragma[ \t]+(?:push|pop)_macro\b"
-    r"(?:[ \t]*\([ \t]*\"(?P<name>\w+)\")?",
+    rf"{_DIRECTIVE}pragma{_PP_SPACE}+(?P<op>push|pop)_macro{_NAME_END}"
+    rf"(?:{_PP_SPACE}*\({_PP_SPACE}*\"(?P<name>{_MACRO_NAME})\")?",
     re.MULTILINE,
+)
+
+# The operator spelling of the same restore, `_Pragma("pop_macro(\"W\")")`,
+# which is *not* a directive line and so is invisible to `_PRAGMA_MACRO_RE`
+# (PR #225 review). It is handled differently on purpose, because its firing
+# position is not knowable from text alone: the operator may sit in a
+# function-like macro's replacement list and fire at every later *use* of that
+# macro, not where it is written. What is knowable is that the text always
+# precedes every firing — a macro must be defined before it is used — so
+# `_line_breakpoints` treats this as a latch: from the match onwards it drops
+# every fact it holds and stops *establishing* new ones, leaving every later
+# guard in the file opaque. That is the assumed-live default, which costs
+# nothing, and it is the only stance that stays sound whether the operator
+# fires here or a thousand lines below.
+#
+# Only `pop_macro` is matched — a `push_macro` changes no definition — and the
+# match deliberately does not try to read the saved name out of the escaped
+# string literal: clearing the whole table is already the fail-closed answer, so
+# parsing `\"W\"` (or a raw string, or a stringified argument) would buy
+# precision in exchange for a second way to be wrong. The residual is a
+# `pop_macro` assembled by token pasting, where the literal text never appears.
+_PRAGMA_OPERATOR_POP_RE = re.compile(
+    rf"(?<![\w$])_Pragma{_NAME_END}{_PP_SPACE}*\([^\n)]*(?<![\w$])pop_macro{_NAME_END}"
 )
 
 # `#elif`'s condition is captured separately from `#if`'s: a literal `#elif 0`
@@ -367,9 +444,8 @@ _PRAGMA_MACRO_RE = re.compile(
 # unconditional `#else` let a still-dead `#elif 0` branch's `#line` count). A
 # literal `#elif 1` is its mirror: it is live only if no earlier arm in the
 # chain was already known-taken — otherwise cpp never reaches it regardless of
-# its own condition being `1`. Like `_IF_RE`, the captured group consumes an
-# embedded backslash-continuation so a split condition still classifies
-# correctly.
+# its own condition being `1`. Like `_IF_RE`, it reads an already-spliced
+# condition, so a split one still classifies correctly.
 _ELIF_RE = re.compile(rf"{_DIRECTIVE}elif{_CONDITION_TAIL}", re.MULTILINE)
 
 # C23's `#elifdef`/`#elifndef` — the `#elif` spelling of `_IFDEF_RE`'s predicate,
@@ -389,19 +465,13 @@ _ELIFDEF_RE = re.compile(rf"{_DIRECTIVE}elif{_DEF_OPERAND_TAIL}", re.MULTILINE)
 # it must assume a still-unproven earlier arm might not be taken at all (PR
 # #156 follow-up to issue #145: previously `#else` was unconditionally marked
 # live even after a known-taken `#if 1`).
-_ELSE_RE = re.compile(r"^[ \t]*#[ \t]*else\b", re.MULTILINE)
-_ENDIF_RE = re.compile(r"^[ \t]*#[ \t]*endif\b", re.MULTILINE)
+_ELSE_RE = re.compile(rf"{_DIRECTIVE}else{_NAME_END}", re.MULTILINE)
+_ENDIF_RE = re.compile(rf"{_DIRECTIVE}endif{_NAME_END}", re.MULTILINE)
 
 # A backslash immediately before a newline splices the following physical line
-# onto this one (translation phase 2) — cpp decides whether a logical line is
-# a directive *after* splicing, so a physical line that only looks like a
-# directive because it follows a `\`-continued line (e.g. a multi-line
-# `#define`'s replacement text spilling a `#line`-shaped token onto its own
-# line) is not a directive at all and must not feed any of the `^`-anchored
-# regexes above (PR #156 follow-up to issue #145). `\r?` tolerates a CRLF
-# source even though `list_units` itself reads via `Path.read_text()`
-# (universal newlines), since `annotate_array_extents` is also callable
-# directly on arbitrary text.
+# onto this one (translation phase 2). `\r?` tolerates a CRLF source even
+# though `list_units` itself reads via `Path.read_text()` (universal newlines),
+# since `annotate_array_extents` is also callable directly on arbitrary text.
 _CONTINUATION_RE = re.compile(r"\\\r?\n")
 
 # A GNU suffix attribute's opening: ``__attribute__`` then its own ``(``. A
@@ -412,6 +482,65 @@ _CONTINUATION_RE = re.compile(r"\\\r?\n")
 # it opens so `_skip_suffix_attributes` can balance that parenthesis on its
 # own — its argument list can itself nest parens (``__attribute__((aligned(8)))``).
 _ATTRIBUTE_RE = re.compile(r"__attribute__\s*\(")
+
+
+def _splice_continuations(source: str) -> tuple[str, list[int]]:
+    """`source` with every backslash-continuation spliced out, plus a line map.
+
+    Returns the spliced text and a list whose *i*-th entry is the 1-based
+    physical line of `source` on which spliced line *i* (0-based) begins —
+    enough to recover a physical line from any position in the spliced text,
+    since splicing only ever merges a *contiguous* run of physical lines into
+    one. Byte offsets are never mapped back: `_line_breakpoints` needs a
+    position only to order events (which any monotonic mapping preserves) and
+    to name a physical line (which this map answers directly).
+
+    This runs first, before any directive pattern sees the text, because cpp
+    decides what a logical line *is* in translation phase 2 — before phase 3
+    ever looks for a leading ``#``. Doing it here rather than tolerating
+    ``\\``-newline inside each pattern is what makes the whole family of
+    splice hazards go away at once instead of one spelling at a time (PR #225
+    review): a directive whose *keyword* is split (``#ifde\\`` + newline +
+    ``f Q`` is an ordinary ``#ifdef Q`` to cpp) and one whose *operand* is
+    split (``#ifdef W\\`` + newline + ``IDE`` tests ``WIDE``, not ``W``) both
+    arrive whole, and the mirror case needs no filtering at all — a physical
+    line that only looks like a directive because it was spliced onto the
+    previous one (a multi-line ``#define``'s replacement text spilling a
+    ``#line``-shaped token onto its own line) is no longer at the start of a
+    line, so the ``^``-anchored patterns simply cannot match it (PR #156
+    follow-up to issue #145, which used an explicit exclusion list instead).
+
+    The ordering is load-bearing in one more way. `_DIRECTIVE` accepts C's
+    ``%:`` digraph, and while `source` normally arrives with its string
+    literals blanked too (`_stripped_for_scan`), a literal split across a
+    continuation is *not* blanked — `_STRING_RE` stops at an unescaped newline
+    by design. So ``char *s = "abc\\`` + newline + ``%:define W 1";`` would
+    otherwise present a line-leading ``%:define`` and prove ``W`` defined from
+    inside a string. Splicing first moves it mid-line, exactly as it is to cpp.
+
+    Splices inside a ``//`` comment never reach here: `_COMMENT_RE` absorbs the
+    backslash into the comment and `mask_comments` blanks it (see its comment).
+    """
+    parts: list[str] = []
+    physical_line_of: list[int] = [1]
+    physical = 1
+    last = 0
+    for continuation in _CONTINUATION_RE.finditer(source):
+        chunk = source[last : continuation.start()]
+        parts.append(chunk)
+        for _ in range(chunk.count("\n")):
+            physical += 1
+            physical_line_of.append(physical)
+        # The spliced-out newline advances the physical line without starting a
+        # new logical one — which is exactly the offset this map exists to hold.
+        physical += 1
+        last = continuation.end()
+    tail = source[last:]
+    parts.append(tail)
+    for _ in range(tail.count("\n")):
+        physical += 1
+        physical_line_of.append(physical)
+    return "".join(parts), physical_line_of
 
 
 def _strip_literal_parens(text: str) -> str:
@@ -1530,22 +1659,18 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
     `_param_list_text` itself leaves picking the right branch to `def_line`,
     not to evaluating the condition.
 
-    A physical line that is itself the *continuation* of a backslash-
-    terminated previous line is never treated as a directive: cpp splices such
-    a line onto the one above (translation phase 2) before it ever looks for a
-    leading ``#``, so a ``#line``/``#if``/...-shaped token spliced in from,
-    say, a multi-line ``#define``'s replacement text is just macro-body text
-    to cpp, not a directive this module should react to (PR #156 follow-up to
-    issue #145). Splicing inside a comment is handled earlier, by
-    `_COMMENT_RE`/`mask_comments`, before this function ever sees the text —
-    the exclusion here only concerns a whole *directive-shaped line* starting
-    on a continuation. A *token within* a directive that is itself split
-    across a splice — an ``#if``/``#elif`` condition (``#if \\`` + newline +
-    ``0``), or a ``#line``'s own digit sequence (``#line \\`` + newline +
-    ``11``) — is a separate case: each is captured with the splice tolerated
-    inline (see `_IF_RE`/`_ELIF_RE`/`_LINE_DIRECTIVE_RE`) and stripped via
-    `_CONTINUATION_RE` before the captured text is read, not handled by this
-    exclusion.
+    Every pattern runs over *spliced* text: `_splice_continuations` joins each
+    backslash-continued physical line into the single logical line cpp reads in
+    translation phase 2, before phase 3 ever looks for a leading ``#``. So a
+    directive split anywhere — in its keyword (``#ifde\\`` + newline + ``f Q``),
+    its operand (``#ifdef W\\`` + newline + ``IDE``, which tests ``WIDE``), its
+    condition (``#if \\`` + newline + ``0``) or its digit sequence (``#line \\``
+    + newline + ``11``) — is seen whole, and a physical line that only *looks*
+    like a directive because it was spliced onto the one above (a multi-line
+    ``#define``'s replacement text spilling a ``#line``-shaped token onto its
+    own line) is mid-line by then and cannot match at all. A breakpoint is
+    still recorded against the physical line the directive *starts* on, which
+    is what clang — and so esbmc — counts from (gcc differs here).
 
     A ``#line`` naming a macro (``#line NAME``) resolves against a tiny
     ``#define``/``#undef``-tracking table this scan builds as it walks
@@ -1555,25 +1680,12 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
     is normalized to the bare digit before the ``"0"``/``"1"`` comparison (see
     `_strip_literal_parens`), the same issue's second follow-up.
     """
-    continuation_starts = {
-        m.end() for m in _CONTINUATION_RE.finditer(source_no_comments)
-    }
-
-    def _directives(pattern: re.Pattern[str]) -> Iterator[re.Match[str]]:
-        """`pattern`'s matches that are really directives.
-
-        A match starting where a backslash-continuation ended is not one: cpp
-        spliced that line onto the previous one, so its `#` is mid-line text
-        (PR #156 follow-up to issue #145). Stated once, for both builders.
-        """
-        for m in pattern.finditer(source_no_comments):
-            if m.start() not in continuation_starts:
-                yield m
+    spliced, physical_line_of = _splice_continuations(source_no_comments)
 
     def _events(
         pattern: re.Pattern[str], kind: str
     ) -> list[tuple[int, str, re.Match[str]]]:
-        return [(m.start(), kind, m) for m in _directives(pattern)]
+        return [(m.start(), kind, m) for m in pattern.finditer(spliced)]
 
     def _cond_events(
         pattern: re.Pattern[str],
@@ -1590,8 +1702,8 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
         way (`_RESOLVED_IFDEF_KINDS`). Anything else is `opaque_kind`.
         """
         found: list[tuple[int, str, re.Match[str]]] = []
-        for m in _directives(pattern):
-            condition = _strip_literal_parens(_CONTINUATION_RE.sub("", m.group(1)))
+        for m in pattern.finditer(spliced):
+            condition = _strip_literal_parens(m.group(1))
             kind = kinds_by_literal.get(condition)
             if kind is not None:
                 found.append((m.start(), kind, m))
@@ -1612,6 +1724,7 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
         + _events(_ENDIF_RE, "endif")
         + _events(_INCLUDE_RE, "include")
         + _events(_PRAGMA_MACRO_RE, "pragma_macro")
+        + _events(_PRAGMA_OPERATOR_POP_RE, "pragma_operator_pop")
         + _events(_LINE_DIRECTIVE_RE, "line")
         + _events(_LINE_DIRECTIVE_MACRO_RE, "line_macro")
         + _events(_DEFINE_RE, "define")
@@ -1638,10 +1751,26 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
     # only whether an arm is known *dead*, not whether it is known *entered*.
     # Reading a `#define` there as certain would need per-arm certainty this
     # walk does not track, so it is conservatively treated as "may or may not
-    # happen", exactly as #165 already did. See `_IFDEF_RE` for why absence of
-    # a `#define` is never read as "undefined" (issue #157).
+    # happen", exactly as #165 already did. `macro_stack_opaque` below suspends
+    # establishment for the rest of the file on the same terms. See `_IFDEF_RE`
+    # for why absence of a `#define` is never read as "undefined" (issue #157).
     known_defined: dict[str, bool] = {}
+    # Latched by the `_Pragma("pop_macro(...)")` operator spelling, which can
+    # fire anywhere at or below its own text (`_PRAGMA_OPERATOR_POP_RE`): once
+    # set, no `#define`/`#undef` may *establish* a fact again, so every later
+    # guard in the file falls back to the assumed-live opaque default.
+    macro_stack_opaque = False
     breakpoints: list[tuple[int, int]] = []
+
+    def _physical(pos: int) -> int:
+        """The 1-based physical line of `source_no_comments` holding `pos`.
+
+        `pos` indexes the *spliced* text, so the line it sits on there may span
+        several physical lines — this names the one the logical line starts on
+        (see `_splice_continuations`).
+        """
+        return physical_line_of[spliced.count("\n", 0, pos)]
+
     for pos, kind, match in events:
         dead = any(is_dead for is_dead, _ in stack)
         if kind in _RESOLVED_IFDEF_KINDS:
@@ -1680,19 +1809,29 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
                 known_defined.clear()
         elif kind == "pragma_macro":
             # `pop_macro` restores a saved definition this scan never recorded,
-            # so whatever it proved about that name stops holding here
-            # (`_PRAGMA_MACRO_RE`). `push_macro` is treated the same way for a
-            # name it cannot read.
-            if not dead:
+            # so whatever it proved about that name stops holding here.
+            # `push_macro` saves the *current* definition without changing it,
+            # so it invalidates nothing (`_PRAGMA_MACRO_RE`).
+            if not dead and match.group("op") == "pop":
                 name = match.group("name")
                 if name is None:
                     known_defined.clear()
                 else:
                     known_defined.pop(name, None)
+        elif kind == "pragma_operator_pop":
+            # Not position-precise and not name-precise, on purpose: the
+            # operator can fire at every later use of the macro holding it, so
+            # the only sound answer is to stop proving anything from here on
+            # (`_PRAGMA_OPERATOR_POP_RE`). Unlike every other event this one is
+            # honoured even inside a branch proven dead — the text is what makes
+            # the *later* firings possible, and a dead branch's macro body is
+            # still a macro body cpp can expand somewhere live.
+            known_defined.clear()
+            macro_stack_opaque = True
         elif kind == "define":
             if not dead:
                 name = match.group(1)
-                if stack:
+                if stack or macro_stack_opaque:
                     # Some enclosing branch is not provably dead but also not
                     # provably the chain's only reachable arm — this scan
                     # cannot tell whether cpp ever executes this `#define`, so
@@ -1710,7 +1849,7 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
                     # `#define L(x) (x)` still decides a `#ifdef` even though it
                     # leaves `macros` unbound (issue #157).
                     known_defined[name] = True
-                    value_text = _CONTINUATION_RE.sub("", match.group(2)).strip()
+                    value_text = match.group(2).strip()
                     if _INT_LITERAL_RE.fullmatch(value_text):
                         macros[name] = int(value_text)
                     else:
@@ -1719,20 +1858,17 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
             if not dead:
                 name = match.group(1)
                 macros.pop(name, None)
-                if stack:
+                if stack or macro_stack_opaque:
                     known_defined.pop(name, None)
                 else:
                     known_defined[name] = False
         elif kind == "line_macro":
             if not dead:
-                name = _CONTINUATION_RE.sub("", match.group(1))
+                name = match.group(1)
                 if name in macros:
-                    physical = source_no_comments.count("\n", 0, pos) + 1
-                    breakpoints.append((physical, macros[name]))
+                    breakpoints.append((_physical(pos), macros[name]))
         elif kind == "line" and not dead:
-            physical = source_no_comments.count("\n", 0, pos) + 1
-            presumed = int(_CONTINUATION_RE.sub("", match.group(1)))
-            breakpoints.append((physical, presumed))
+            breakpoints.append((_physical(pos), int(match.group(1))))
     return breakpoints
 
 

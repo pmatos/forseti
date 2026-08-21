@@ -17,6 +17,7 @@ from forseti.esbmc.units import (
     Param,
     Unit,
     _line_breakpoints,
+    _stripped_for_scan,
     annotate_array_extents,
     find_definition_brace,
     list_caller_openings,
@@ -1165,6 +1166,149 @@ def test_line_breakpoints_keeps_a_line_macro_value_across_a_pop_macro() -> None:
     # and `_INCLUDE_RE` both spell out.
     source = '#define W 5\n#pragma pop_macro("W")\n#line W\nx\n#line 9\ny\n'
     assert _line_breakpoints(source) == [(3, 5), (5, 9)]
+
+
+def test_line_breakpoints_keeps_definedness_across_a_push_macro() -> None:
+    # PR #225 review: `push_macro` *saves* the current definition and leaves it
+    # in place, so it invalidates nothing — only `pop_macro` restores a state
+    # this scan never recorded. Treating the pair alike left `#ifndef W` opaque
+    # and kept a `#line` in an arm cpp never takes.
+    source = (
+        '#define W 1\n#pragma push_macro("W")\n'
+        "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(7, 9)]
+
+
+def test_line_breakpoints_forgets_definedness_at_a_pragma_operator_pop() -> None:
+    # The `_Pragma` operator spelling of `pop_macro` is not a directive line, so
+    # `_PRAGMA_MACRO_RE` cannot see it — but clang honours it exactly the same
+    # way (verified: `#undef W`, push, `#define W 1`, `_Pragma("pop_macro(...)")`
+    # leaves `W` undefined). Without `_PRAGMA_OPERATOR_POP_RE` the stale `True`
+    # decides `#ifndef W` dead and deletes a `#line` cpp really processes.
+    source = (
+        '#define W 1\n_Pragma("pop_macro(\\"W\\")")\n'
+        "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(4, 5), (7, 9)]
+
+
+def test_line_breakpoints_stops_proving_after_a_pragma_operator_pop() -> None:
+    # Why that event latches rather than just clearing: the operator can sit in
+    # a function-like macro's replacement list and fire at every later *use* of
+    # that macro (verified against clang — `RESTORE` below really does leave `W`
+    # undefined at the `#ifndef`). Its firing position is unknowable from text,
+    # but its text always precedes every firing, so from the match onwards no
+    # `#define` may establish a fact again.
+    source = (
+        '#define RESTORE _Pragma("pop_macro(\\"W\\")")\n#define W 1\nRESTORE\n'
+        "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(5, 5), (8, 9)]
+
+
+def test_line_breakpoints_joins_a_spliced_directive_keyword() -> None:
+    # PR #225 review: `#ifde\` + newline + `f UNSEEN` is an ordinary
+    # `#ifdef UNSEEN` to cpp (verified against gcc), so it opens a nesting level
+    # and the `#define W 1` inside it is *not* top-level. Missing the frame made
+    # that `#define` look top-level, which proved `W` defined and decided the
+    # later `#ifndef W` dead — deleting a `#line` cpp really processes.
+    source = (
+        "#ifde\\\nf UNSEEN\n#define W 1\n#endif\n"
+        "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(6, 5), (9, 9)]
+
+
+def test_line_breakpoints_joins_a_spliced_macro_operand() -> None:
+    # The mirror within one directive: `#ifdef W\` + newline + `IDE` tests
+    # `WIDE`, not `W` (verified against gcc and clang, whose `#else` arm is the
+    # live one). Capturing only the `W` decided the guard taken and its active
+    # `#else` dead.
+    source = "#define W 1\n#ifdef W\\\nIDE\nx\n#else\n#line 5\ny\n#endif\n#line 9\nz\n"
+    assert _line_breakpoints(source) == [(6, 5), (9, 9)]
+
+
+@pytest.mark.parametrize("prologue", ["#", "%:", " # ", "\t#\t", "#\v", "\f#\f"])
+def test_line_breakpoints_reads_every_directive_prologue_spelling(
+    prologue: str,
+) -> None:
+    # PR #225 review: `%:` is C's digraph spelling of `#`, and vertical tab and
+    # form feed are preprocessing whitespace exactly as space and tab are — gcc,
+    # clang and `esbmc --parse-tree-only` all take every spelling here. A
+    # conditional this scan cannot see is the costly failure: its `#endif` pops
+    # somebody else's frame, the `#define W 1` inside looks top-level, and the
+    # later `#ifndef W` is decided dead on the arm cpp actually takes.
+    source = (
+        f"{prologue}if 0\n{prologue}define W 1\n{prologue}endif\n"
+        f"{prologue}ifndef W\n{prologue}line 5\nx\n{prologue}endif\n"
+        f"{prologue}line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(5, 5), (8, 9)]
+
+
+def test_line_breakpoints_does_not_read_a_trigraph_as_a_directive() -> None:
+    # The deliberate non-widening (see `_DIRECTIVE`): `esbmc --parse-tree-only`
+    # does not honour trigraphs at all — it fails to parse `??=define W 1` — and
+    # gcc/clang honour them only under a strict `-std=c*`, never the `gnu*`
+    # default. So `W` is *not* defined here, `#ifndef W` is taken, and reading
+    # the trigraph as a `#define` would delete this `#line 5`.
+    source = "??=define W 1\n#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(3, 5), (6, 9)]
+
+
+def test_line_breakpoints_does_not_truncate_a_dollar_define_name() -> None:
+    # PR #225 review: gcc, clang and esbmc all accept `$` in identifiers by
+    # default, so `#define W$ 1` defines `W$` and leaves `W` undefined
+    # (verified against all three). Capturing only the `\w` prefix recorded a
+    # definition of `W` and decided `#ifndef W` dead on the arm cpp takes.
+    source = "#define W$ 1\n#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(3, 5), (6, 9)]
+
+
+def test_line_breakpoints_resolves_an_ifdef_of_a_dollar_macro_name() -> None:
+    # The other half of the same fix: the complete name is still *proven*, so
+    # `#ifndef W$` is decided dead rather than merely left opaque.
+    source = "#define W$ 1\n#ifndef W$\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(6, 9)]
+
+
+def test_line_breakpoints_does_not_truncate_a_dollar_undef_name() -> None:
+    # The `#undef` twin the review did not name: `#undef W$` undefines `W$` and
+    # leaves `W` alone (verified against clang and esbmc — `W` is still defined
+    # after it). Reading it as `#undef W` proved `W` undefined and decided
+    # `#ifdef W` dead, deleting the `#line 5` cpp really processes.
+    source = "#define W 1\n#undef W$\n#ifdef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(4, 5), (7, 9)]
+
+
+def test_line_breakpoints_does_not_truncate_a_dollar_ifdef_operand() -> None:
+    # The read side of the same truncation: `#ifdef W$` tests `W$`, which
+    # nothing here defines, so cpp takes the `#else`. Capturing only the `W`
+    # resolved the guard from a name the directive never spelled.
+    source = "#define W 1\n#ifdef W$\nx\n#else\n#line 5\ny\n#endif\n#line 9\nz\n"
+    assert _line_breakpoints(source) == [(5, 5), (8, 9)]
+
+
+def test_line_breakpoints_splices_before_reading_a_digraph_directive() -> None:
+    # The ordering `_splice_continuations` depends on: a string literal split
+    # across a continuation is *not* blanked by `_stripped_for_scan`
+    # (`_STRING_RE` stops at an unescaped newline), so its tail would read as a
+    # line-leading `%:define` and prove `W` defined from inside a string.
+    # Splicing first moves it mid-line, exactly as it is to cpp — verified
+    # against clang, which leaves `W` undefined here.
+    source = _stripped_for_scan(
+        'char *s = "abc\\\n%:define W 1";\n#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n'
+    )
+    assert _line_breakpoints(source) == [(4, 5), (7, 9)]
+
+
+def test_line_breakpoints_does_not_truncate_a_dollar_line_macro_name() -> None:
+    # And the `#line NAME` side, where truncation produces a wrong *value*
+    # rather than a missing breakpoint: clang resolves `#line W$` to 7, not to
+    # `W`'s 5 (verified).
+    source = "#define W 5\n#define W$ 7\n#line W$\nx\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(3, 7), (5, 9)]
 
 
 def test_annotate_array_extents_ignores_a_line_directive_in_a_dead_ifndef_body() -> (
