@@ -181,9 +181,13 @@ _LINE_DIRECTIVE_MACRO_RE = re.compile(
     r"^[ \t]*#[ \t]*line[ \t]+((?:\\\r?\n)*[A-Za-z_]\w*)\b", re.MULTILINE
 )
 
-# `#define NAME <rest of line>` and `#undef NAME`, tracked only so a
-# macro-valued `#line NAME` (`_LINE_DIRECTIVE_MACRO_RE`) can be resolved —
-# this is deliberately not a general macro table. `_DEFINE_RE`'s second group
+# `#define NAME <rest of line>` and `#undef NAME`, tracked for exactly two
+# lookups — a macro-valued `#line NAME` (`_LINE_DIRECTIVE_MACRO_RE`) and a
+# `#ifdef`/`defined` test (`_IFDEF_RE`) — and deliberately not a general macro
+# table. The two read different things off the same directives: the `#line`
+# value table needs an integer-literal replacement, while definedness needs only
+# that the `#define` happened, so an empty or function-like `#define` decides a
+# `#ifdef` while leaving `#line NAME` unresolved. `_DEFINE_RE`'s second group
 # is the *entire* remainder of the line, exactly like `_IF_RE`'s condition
 # group: `_line_breakpoints` strips its continuation and whitespace, then
 # accepts it only if what is left is a bare unsigned-integer literal (see
@@ -206,7 +210,10 @@ _LINE_DIRECTIVE_MACRO_RE = re.compile(
 # and can leave a stale value in the table — no worse than every other gap
 # this module already has for `#include`d macro state, but worth naming here
 # since this is the first place that state can produce a wrong *value*
-# instead of just a missed opaque condition.
+# instead of just a missed opaque condition. The definedness half does *not*
+# carry that residual: `_INCLUDE_RE` clears it at every `#include`, because
+# there the fallback is a merely-opaque conditional rather than a dropped
+# breakpoint (issue #157).
 _DEFINE_RE = re.compile(
     r"^[ \t]*#[ \t]*define[ \t]+(\w+)((?:\\\r?\n|[^\n])*)$", re.MULTILINE
 )
@@ -245,14 +252,71 @@ _INT_LITERAL_RE = re.compile(r"[0-9]+")
 # alone by that same whole-span check and still falls through to opaque,
 # exactly like the unparenthesized `0 || FEATURE` case above.
 #
-# `#ifdef`/`#ifndef` and any other `#if`/`#elif <expr>` stay opaque — their
-# condition needs macro state this scan does not have — so they are tracked
-# only to balance nesting and to know whether an *earlier* arm in their own
-# chain already decided it (matching `_param_list_text`'s own stance on such
-# bodies: it leaves picking the *right* one to `def_line`, not to evaluating
-# the condition).
+# A `#ifdef NAME`/`#ifndef NAME` — and the `#if defined NAME`/`#if
+# !defined(NAME)` spelling of the same predicate — resolves whenever this file's
+# own directives have already *proven* whether `NAME` is defined at that point
+# (issue #157: every such conditional used to be opaque, so a `#line` guarding
+# an inactive alternative definition still donated a phantom breakpoint and left
+# `_select_definition` with a presumed-line tie only its `-m.line` physical-order
+# guess could break). Proof runs in one direction only: a `#define NAME`/`#undef
+# NAME` this scan can itself place (see `known_defined` in `_line_breakpoints`)
+# establishes defined/undefined, and nothing else does. In particular the
+# *absence* of any `#define NAME` proves nothing — a command-line `-D NAME`, a
+# compiler builtin, or an `#include`d header can each define a name this file
+# never mentions, and `list_units` really does forward `-D` flags.
+#
+# That one-directional rule is what the cost asymmetry demands, and the same
+# asymmetry is what `_INCLUDE_RE` below rests on: a wrongly *live* verdict costs
+# nothing, since an opaque conditional is already assumed live and so lands on
+# exactly today's behaviour, whereas a wrongly *dead* verdict deletes a real
+# breakpoint and corrupts the presumed-line translation of every live line after
+# it. Only the dead verdict is new here, so only the dead verdict has to be
+# proven — and it is proven from this file's text or not at all.
+#
+# Any other `#if`/`#elif <expr>` still stays opaque — `defined(A) && defined(B)`
+# needs a real expression evaluator, not a lookup — so it is tracked only to
+# balance nesting and to know whether an *earlier* arm in its own chain already
+# decided it (matching `_param_list_text`'s own stance on such bodies: it leaves
+# picking the *right* one to `def_line`, not to evaluating the condition).
 _IF_RE = re.compile(r"^[ \t]*#[ \t]*if[ \t]+((?:\\\r?\n|[^\n])*)$", re.MULTILINE)
-_IFDEF_RE = re.compile(r"^[ \t]*#[ \t]*(?:ifdef|ifndef)\b", re.MULTILINE)
+
+# `#ifdef`/`#ifndef`, exposing the same `negated`/`name` groups as `_DEFINED_RES`
+# so `_line_breakpoints` reads both spellings of the predicate through one code
+# path. `name` is deliberately *optional*: an operand-less `#ifdef` is malformed,
+# but cpp still opens a nesting level a later `#endif` closes, and dropping the
+# event would unbalance every conditional after it — a nameless match simply
+# resolves to opaque, exactly like a name this scan knows nothing about. A
+# leading backslash-continuation is tolerated before the name, mirroring
+# `_LINE_DIRECTIVE_MACRO_RE`.
+_IFDEF_RE = re.compile(
+    r"^[ \t]*#[ \t]*if(?P<negated>n)?def\b[ \t]*(?:\\\r?\n)*(?P<name>[A-Za-z_]\w*)?",
+    re.MULTILINE,
+)
+
+# `defined NAME` / `defined(NAME)`, optionally negated — matched against an
+# `#if`/`#elif`'s *entire* condition (`fullmatch`, for the same reason
+# `_INT_LITERAL_RE` is one: a trailing operand must never slip through as a
+# decided condition). Two patterns rather than one alternation because Python's
+# `re` cannot reuse the `name` group name across alternatives; the parenthesized
+# form is tried first so `defined (X)` is read as its operand rather than as a
+# bare `(X)`. `_strip_literal_parens` runs before both, so `#if (defined(X))`
+# arrives already peeled — while `#if !(defined(X))`, whose parens wrap only
+# `!`'s operand, does not and correctly stays opaque.
+_DEFINED_RES = (
+    re.compile(r"(?P<negated>!)?\s*defined\s*\(\s*(?P<name>\w+)\s*\)"),
+    re.compile(r"(?P<negated>!)?\s*defined\s+(?P<name>\w+)"),
+)
+
+# `#include`/`#include_next`, tracked for one purpose: to make `_line_breakpoints`
+# forget every definedness fact it had proven (see `_IFDEF_RE`). A header may
+# `#define` or `#undef` any name, so nothing this file proved before the include
+# still holds after it. The `#line NAME` *value* table (`_DEFINE_RE`) is
+# deliberately left alone by the same asymmetry: forgetting a definedness fact
+# only falls back to opaque — the assumed-live default that predates issue #157,
+# which costs nothing — whereas forgetting a value binding would silently drop a
+# real breakpoint this scan can otherwise resolve. `_DEFINE_RE`'s own comment
+# names the residual that leaves.
+_INCLUDE_RE = re.compile(r"^[ \t]*#[ \t]*include(?:_next)?\b", re.MULTILINE)
 
 # `#elif`'s condition is captured separately from `#if`'s: a literal `#elif 0`
 # does not reactivate a dead branch the way `#else` does — its own condition is
@@ -329,6 +393,38 @@ def _strip_literal_parens(text: str) -> str:
             break
         text = text[1:-1].strip()
     return text
+
+
+def _macro_test(condition: str) -> re.Match[str] | None:
+    """`condition` read as a whole-text ``defined``/``!defined`` test, or ``None``.
+
+    ``None`` means "not that shape at all" — a bare `0`/`1` (already handled by
+    the caller), a compound expression, or anything else `_DEFINED_RES` does not
+    match end to end — which the caller turns into an opaque conditional.
+    """
+    for pattern in _DEFINED_RES:
+        match = pattern.fullmatch(condition)
+        if match is not None:
+            return match
+    return None
+
+
+def _macro_verdict(match: re.Match[str], known_defined: dict[str, bool]) -> str:
+    """``"1"`` (live), ``"0"`` (dead), or ``"op"`` (opaque) for `match`'s macro test.
+
+    `match` is a `_IFDEF_RE` or `_DEFINED_RES` match — both spell the predicate
+    with the same ``negated``/``name`` groups. The verdict is ``"op"`` whenever
+    the operand is missing (an operand-less, malformed ``#ifdef``) or its
+    definedness is not in `known_defined`; see `_IFDEF_RE` for why a name simply
+    never ``#define``d in this file lands there rather than reading as undefined.
+    """
+    name = match.group("name")
+    if name is None:
+        return "op"
+    defined = known_defined.get(name)
+    if defined is None:
+        return "op"
+    return "1" if defined != (match.group("negated") is not None) else "0"
 
 
 @dataclass(frozen=True)
@@ -1130,10 +1226,15 @@ def _select_definition(
     consistent with this anchor's own default assumption (issue #145): an
     inactive alternative more often sits *before* the active one than after.
 
-    A duplicate directive inside an *opaque* conditional (``#ifdef``) is not this
-    case: this textual scan cannot tell which branch cpp took, so nothing here —
-    this tiebreak included — can pick the right candidate in both compiles of
-    such an input; it is a residual, not a target.
+    A duplicate directive inside a ``#ifdef``/``#ifndef``/``#if defined(...)``
+    is only sometimes this case. `_line_breakpoints` now excludes it whenever
+    this file's own ``#define``/``#undef`` directives prove the guard's state
+    (issue #157), so the common single-build-flag shape no longer reaches the
+    tiebreak at all. What stays a residual is a guard this file never decides —
+    one defined on the command line with ``-D``, by a compiler builtin, or in an
+    ``#include``d header: there the scan cannot tell which branch cpp took, so
+    nothing here, this tiebreak included, can pick the right candidate in both
+    compiles of such an input.
     """
     if not matches:
         return None
@@ -1338,13 +1439,27 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
     ``#line`` there never resets the counter either (PR #156 follow-up to
     issue #145: previously such a sibling was always assumed live). Nesting is
     tracked (an ``#if``/``#ifdef``/``#ifndef`` inside a dead branch stays dead
-    regardless of its own condition), but any branch whose own condition is
-    not the complete literal ``0`` or ``1`` is opaque — its condition needs
+    regardless of its own condition).
+
+    A ``#ifdef NAME``/``#ifndef NAME`` — or the ``#if defined NAME``/``#if
+    !defined(NAME)`` spelling of the same predicate — is decided too, but only
+    when this file's own ``#define``/``#undef`` directives already proved
+    whether ``NAME`` is defined at that point (issue #157, tracked in
+    `known_defined`). The proof is one-directional on purpose: a name this file
+    never mentions stays *unknown*, never "undefined", because a command-line
+    ``-D``, a compiler builtin, or an ``#include``d header can define it — and
+    an ``#include`` anywhere drops every fact proven above it. `_IFDEF_RE`
+    carries the full rationale; the short version is that a wrong *live* verdict
+    only reproduces the opaque default, while a wrong *dead* verdict deletes a
+    real breakpoint.
+
+    Every other branch whose own condition is not the complete literal ``0`` or
+    ``1`` and not a decidable ``defined`` test stays opaque — its condition needs
     macro state this textual scan does not have, or (for ``#elif``/``#else``)
     needs knowing whether an earlier arm in its own chain was already
     known-taken — and is assumed live absent that proof, exactly as
-    `_param_list_text` itself leaves picking the right ``#ifdef`` branch to
-    `def_line`, not to evaluating the condition.
+    `_param_list_text` itself leaves picking the right branch to `def_line`,
+    not to evaluating the condition.
 
     A physical line that is itself the *continuation* of a backslash-
     terminated previous line is never treated as a directive: cpp splices such
@@ -1385,27 +1500,36 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
         ]
 
     def _cond_events(
-        pattern: re.Pattern[str], kinds_by_literal: dict[str, str], opaque_kind: str
-    ) -> list[tuple[int, str, None]]:
-        return [
-            (
-                m.start(),
-                kinds_by_literal.get(
-                    _strip_literal_parens(_CONTINUATION_RE.sub("", m.group(1))),
-                    opaque_kind,
-                ),
-                None,
-            )
-            for m in pattern.finditer(source_no_comments)
-            if m.start() not in continuation_starts
-        ]
+        pattern: re.Pattern[str], prefix: str
+    ) -> list[tuple[int, str, re.Match[str] | None]]:
+        """`pattern`'s conditionals as ``<prefix>0``/``1``/``def``/``op`` events.
+
+        A literal `0`/`1` classifies here and for good; a ``defined``-shaped
+        condition classifies as ``<prefix>def`` and carries its match, because
+        its verdict depends on macro state the forward walk has not built yet.
+        """
+        found: list[tuple[int, str, re.Match[str] | None]] = []
+        for m in pattern.finditer(source_no_comments):
+            if m.start() in continuation_starts:
+                continue
+            condition = _strip_literal_parens(_CONTINUATION_RE.sub("", m.group(1)))
+            if condition in ("0", "1"):
+                found.append((m.start(), prefix + condition, None))
+                continue
+            test = _macro_test(condition)
+            if test is None:
+                found.append((m.start(), prefix + "op", None))
+            else:
+                found.append((m.start(), prefix + "def", test))
+        return found
 
     events = sorted(
-        _cond_events(_IF_RE, {"0": "if0", "1": "if1"}, "ifop")
-        + _events(_IFDEF_RE, "ifop")
-        + _cond_events(_ELIF_RE, {"0": "elif0", "1": "elif1"}, "elifop")
+        _cond_events(_IF_RE, "if")
+        + _events(_IFDEF_RE, "ifdef", keep_match=True)
+        + _cond_events(_ELIF_RE, "elif")
         + _events(_ELSE_RE, "else")
         + _events(_ENDIF_RE, "endif")
+        + _events(_INCLUDE_RE, "include")
         + _events(_LINE_DIRECTIVE_RE, "line", keep_match=True)
         + _events(_LINE_DIRECTIVE_MACRO_RE, "line_macro", keep_match=True)
         + _events(_DEFINE_RE, "define", keep_match=True)
@@ -1422,9 +1546,21 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
     # populated by `#define`/emptied by `#undef` as the scan walks forward —
     # see `_DEFINE_RE`.
     macros: dict[str, int] = {}
+    # What this file's own directives have *proven* about each name's
+    # definedness at the current position: `True` defined, `False` undefined,
+    # absent unknown. Populated under the same fail-closed rule as `macros` —
+    # only a `#define`/`#undef` the walk can place (top level, and not inside a
+    # branch it cannot prove taken) ever establishes an entry; anything less
+    # only removes one. See `_IFDEF_RE` for why absence is never read as
+    # "undefined" (issue #157).
+    known_defined: dict[str, bool] = {}
     breakpoints: list[tuple[int, int]] = []
     for pos, kind, match in events:
         dead = any(is_dead for is_dead, _ in stack)
+        if kind in ("ifdef", "elifdef") and match is not None:
+            # Resolved here, not when the event was built: a `#ifdef`'s verdict
+            # is a function of the macro state at *its* position in the walk.
+            kind = kind.removesuffix("def") + _macro_verdict(match, known_defined)
         if kind == "if0":
             stack.append((True, False))
         elif kind == "if1":
@@ -1450,6 +1586,11 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
         elif kind == "endif":
             if stack:
                 stack.pop()
+        elif kind == "include":
+            # A header can `#define`/`#undef` anything, so every definedness
+            # fact proven above it stops holding below it (`_INCLUDE_RE`).
+            if not dead:
+                known_defined.clear()
         elif kind == "define":
             if match is not None and not dead:
                 name = match.group(1)
@@ -1462,7 +1603,15 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
                     # fail-closed stance `_IF_RE`'s own comment gives for
                     # `#ifdef`).
                     macros.pop(name, None)
+                    known_defined.pop(name, None)
                 else:
+                    # Definedness and value are established on different terms:
+                    # *any* top-level `#define` proves the name defined, while
+                    # only an integer-literal replacement is usable as a `#line`
+                    # value — so an empty `#define DEBUG` or a function-like
+                    # `#define L(x) (x)` still decides a `#ifdef` even though it
+                    # leaves `macros` unbound (issue #157).
+                    known_defined[name] = True
                     value_text = _CONTINUATION_RE.sub("", match.group(2)).strip()
                     if _INT_LITERAL_RE.fullmatch(value_text):
                         macros[name] = int(value_text)
@@ -1470,7 +1619,12 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
                         macros.pop(name, None)
         elif kind == "undef":
             if match is not None and not dead:
-                macros.pop(match.group(1), None)
+                name = match.group(1)
+                macros.pop(name, None)
+                if stack:
+                    known_defined.pop(name, None)
+                else:
+                    known_defined[name] = False
         elif kind == "line_macro":
             if match is not None and not dead:
                 name = _CONTINUATION_RE.sub("", match.group(1))
