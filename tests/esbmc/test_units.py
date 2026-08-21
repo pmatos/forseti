@@ -1183,28 +1183,49 @@ def test_line_breakpoints_keeps_definedness_across_a_push_macro() -> None:
 def test_line_breakpoints_forgets_definedness_at_a_pragma_operator_pop() -> None:
     # The `_Pragma` operator spelling of `pop_macro` is not a directive line, so
     # `_PRAGMA_MACRO_RE` cannot see it — but clang honours it exactly the same
-    # way (verified: `#undef W`, push, `#define W 1`, `_Pragma("pop_macro(...)")`
-    # leaves `W` undefined). Without `_PRAGMA_OPERATOR_POP_RE` the stale `True`
-    # decides `#ifndef W` dead and deletes a `#line` cpp really processes.
+    # way. Verified against clang on this very source: the `push_macro` saved
+    # `W` while it was undefined, so the pop restores it to undefined and the
+    # `#ifndef W` arm *is* compiled. Without `_PRAGMA_OPERATOR_POP_RE` the stale
+    # `True` from line 3 decides that arm dead and deletes its real `#line`.
     source = (
-        '#define W 1\n_Pragma("pop_macro(\\"W\\")")\n'
+        '#undef W\n_Pragma("push_macro(\\"W\\")")\n#define W 1\n'
+        '_Pragma("pop_macro(\\"W\\")")\n'
         "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
     )
-    assert _line_breakpoints(source) == [(4, 5), (7, 9)]
+    assert _line_breakpoints(source) == [(6, 5), (9, 9)]
 
 
 def test_line_breakpoints_stops_proving_after_a_pragma_operator_pop() -> None:
     # Why that event latches rather than just clearing: the operator can sit in
-    # a function-like macro's replacement list and fire at every later *use* of
-    # that macro (verified against clang — `RESTORE` below really does leave `W`
-    # undefined at the `#ifndef`). Its firing position is unknowable from text,
-    # but its text always precedes every firing, so from the match onwards no
-    # `#define` may establish a fact again.
+    # a macro's replacement list and fire at every later *use* of that macro,
+    # far below where its text sits. Verified against clang on this source —
+    # `RESTORE` on line 5 really does leave `W` undefined at the `#ifndef`, so
+    # that arm's `#line` is real. Only a latch survives it: a clear at line 1
+    # would let the `#define W 1` on line 4 establish `True` again and decide
+    # the arm dead. The latch is sound because the operator's *text* always
+    # precedes every firing — a macro must be defined before it is used.
     source = (
-        '#define RESTORE _Pragma("pop_macro(\\"W\\")")\n#define W 1\nRESTORE\n'
+        '#define RESTORE _Pragma("pop_macro(\\"W\\")")\n#undef W\n'
+        '_Pragma("push_macro(\\"W\\")")\n#define W 1\nRESTORE\n'
         "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
     )
-    assert _line_breakpoints(source) == [(5, 5), (8, 9)]
+    assert _line_breakpoints(source) == [(7, 5), (10, 9)]
+
+
+def test_line_breakpoints_latch_gives_up_a_decidable_define_deliberately() -> None:
+    # The price of that latch, recorded rather than left to be rediscovered: a
+    # `#define` *below* a directly-written, immediately-firing `_Pragma` pop is
+    # in fact decidable — clang really does leave `W` defined here, so it never
+    # compiles the `#ifndef W` arm and this `#line 5` is a phantom. The scan
+    # keeps it anyway. That is the free direction (an opaque conditional is
+    # assumed live, exactly as before #157), and giving it up is what buys the
+    # sound answer for the macro-body case above, which no text position can
+    # distinguish from this one.
+    source = (
+        '_Pragma("pop_macro(\\"W\\")")\n#define W 1\n'
+        "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(4, 5), (7, 9)]
 
 
 def test_line_breakpoints_joins_a_spliced_directive_keyword() -> None:
