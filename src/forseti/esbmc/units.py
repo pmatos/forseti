@@ -1548,11 +1548,16 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
     macros: dict[str, int] = {}
     # What this file's own directives have *proven* about each name's
     # definedness at the current position: `True` defined, `False` undefined,
-    # absent unknown. Populated under the same fail-closed rule as `macros` —
-    # only a `#define`/`#undef` the walk can place (top level, and not inside a
-    # branch it cannot prove taken) ever establishes an entry; anything less
-    # only removes one. See `_IFDEF_RE` for why absence is never read as
-    # "undefined" (issue #157).
+    # absent unknown. Populated under the same fail-closed rule as `macros`:
+    # only a `#define`/`#undef` outside every open conditional establishes an
+    # entry, and one inside any conditional merely removes an existing one.
+    # "Every" is literal — a branch this walk now proves taken (a literal
+    # `#if 1`, or a resolved `#ifdef`) is no exception, because `stack` records
+    # only whether an arm is known *dead*, not whether it is known *entered*.
+    # Reading a `#define` there as certain would need per-arm certainty this
+    # walk does not track, so it is conservatively treated as "may or may not
+    # happen", exactly as #165 already did. See `_IFDEF_RE` for why absence of
+    # a `#define` is never read as "undefined" (issue #157).
     known_defined: dict[str, bool] = {}
     breakpoints: list[tuple[int, int]] = []
     for pos, kind, match in events:

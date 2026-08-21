@@ -990,6 +990,20 @@ def test_line_breakpoints_does_not_prove_definedness_from_an_opaque_branch() -> 
     assert _line_breakpoints(source) == [(5, 5), (8, 9)]
 
 
+def test_line_breakpoints_does_not_prove_definedness_in_a_known_live_branch() -> None:
+    # `#ifdef W` resolves *live* here, yet the `#define D` inside it still only
+    # unbinds rather than establishing: `stack` records whether an arm is known
+    # dead, never whether it is known entered, so nothing distinguishes this
+    # branch from an opaque one when a `#define` is placed. The later `#ifndef
+    # D` therefore stays opaque and its `#line 5` counts. Conservative, and the
+    # same stance #165 already takes for the `#line NAME` value table.
+    source = (
+        "#define W 1\n#ifdef W\n#define D\n#endif\n"
+        "#ifndef D\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(6, 5), (9, 9)]
+
+
 def test_line_breakpoints_unbinds_definedness_touched_in_an_opaque_branch() -> None:
     # The dropping half: `W` was proven defined at top level, but an `#undef`
     # cpp may or may not reach makes that proof stale, so the later `#ifndef`
