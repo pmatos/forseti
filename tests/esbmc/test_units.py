@@ -1123,7 +1123,7 @@ def test_line_breakpoints_forgets_definedness_across_a_pop_macro() -> None:
     # saved. This scan does not model the stack, so the `#undef W` above stops
     # proving anything here — without that the stale `False` decides `#ifdef W`
     # dead and deletes a `#line` cpp really does process.
-    source = (
+    source = _stripped_for_scan(
         '#define W 1\n#pragma push_macro("W")\n#undef W\n#pragma pop_macro("W")\n'
         "#ifdef W\n#line 5\nx\n#endif\n#line 9\ny\n"
     )
@@ -1133,19 +1133,22 @@ def test_line_breakpoints_forgets_definedness_across_a_pop_macro() -> None:
 def test_line_breakpoints_forgets_undefinedness_across_a_pop_macro() -> None:
     # The mirror direction: a `pop_macro` can just as well restore a name to
     # *undefined*, so a proven-defined fact is equally stale.
-    source = (
+    source = _stripped_for_scan(
         '#undef W\n#pragma push_macro("W")\n#define W 1\n#pragma pop_macro("W")\n'
         "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
     )
     assert _line_breakpoints(source) == [(6, 5), (9, 9)]
 
 
-def test_line_breakpoints_drops_every_fact_for_an_unreadable_pop_macro() -> None:
-    # A macro-expanded operand leaves the affected name unknown, so no fact is
-    # safe — the whole table goes, exactly as at an `#include`.
-    source = (
-        "#undef W\n#pragma pop_macro(SOMEMACRO)\n"
-        "#ifdef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+def test_line_breakpoints_drops_every_fact_at_a_pop_macro() -> None:
+    # A pop drops the whole table, not just the named macro'"'"'s fact: by the time
+    # this scan runs, string literals are blanked (`_stripped_for_scan`), so
+    # `pop_macro("W")` reads as `pop_macro(   )` and the operand cannot be read
+    # at all (PR #225 review). Here the pop names `V`, yet the proof about `W`
+    # goes too -- clearing more facts only means more opaque conditionals, which
+    # is the assumed-live default and the free direction.
+    source = _stripped_for_scan(
+        '#undef W\n#pragma pop_macro("V")\n#ifdef W\n#line 5\nx\n#endif\n#line 9\ny\n'
     )
     assert _line_breakpoints(source) == [(4, 5), (7, 9)]
 
@@ -1153,7 +1156,7 @@ def test_line_breakpoints_drops_every_fact_for_an_unreadable_pop_macro() -> None
 def test_line_breakpoints_ignores_a_pop_macro_inside_a_dead_branch() -> None:
     # cpp never executes it, so it cannot invalidate anything — the same
     # `not dead` gate `#include` and `#define` already sit behind.
-    source = (
+    source = _stripped_for_scan(
         '#undef W\n#if 0\n#pragma pop_macro("W")\n#endif\n'
         "#ifdef W\n#line 5\nx\n#endif\n#line 9\ny\n"
     )
@@ -1164,7 +1167,9 @@ def test_line_breakpoints_keeps_a_line_macro_value_across_a_pop_macro() -> None:
     # Only `known_defined` is dropped. Dropping `macros` too would delete this
     # `#line W` breakpoint outright, which is the costly direction `_DEFINE_RE`
     # and `_INCLUDE_RE` both spell out.
-    source = '#define W 5\n#pragma pop_macro("W")\n#line W\nx\n#line 9\ny\n'
+    source = _stripped_for_scan(
+        '#define W 5\n#pragma pop_macro("W")\n#line W\nx\n#line 9\ny\n'
+    )
     assert _line_breakpoints(source) == [(3, 5), (5, 9)]
 
 
@@ -1173,7 +1178,7 @@ def test_line_breakpoints_keeps_definedness_across_a_push_macro() -> None:
     # in place, so it invalidates nothing — only `pop_macro` restores a state
     # this scan never recorded. Treating the pair alike left `#ifndef W` opaque
     # and kept a `#line` in an arm cpp never takes.
-    source = (
+    source = _stripped_for_scan(
         '#define W 1\n#pragma push_macro("W")\n'
         "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
     )
@@ -1358,6 +1363,40 @@ def test_line_breakpoints_masks_a_comment_created_by_splicing() -> None:
         "int a;\n/\\\n*\n#define W 1\n*/\n#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
     )
     assert _line_breakpoints(source) == [(7, 5), (10, 9)]
+
+
+def test_line_breakpoints_ignores_a_pragma_operator_named_in_a_string() -> None:
+    # `_PRAGMA_OPERATOR_RE` matches the operator rather than its (already
+    # blanked) argument, so it must not fire on a `_Pragma(` that is only
+    # *mentioned* -- inside a string literal here. `_line_breakpoints` blanks
+    # string literals on the spliced text for exactly this; without that step the
+    # mention latches and the decidable `#ifndef W` is given up.
+    source = (
+        'char *doc = "use _Pragma(...) here";\n#define W 1\n'
+        "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    )
+    assert _line_breakpoints(source) == [(7, 9)]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        '#define W 1\n#pragma pop_macro("W")\n#ifndef W\n#line 5\nx\n#endif\n',
+        '#define W 1\n_Pragma("pop_macro(\\"W\\")")\n#ifndef W\n#line 5\nx\n#endif\n',
+        'char *s = "_Pragma( /* %:define W 1";\n#ifndef W\n#line 5\nx\n#endif\n',
+        '#define W 1\nchar *s = "abc\\\n%:define V 1";\n'
+        "#ifndef W\n#line 5\nx\n#endif\n",
+        "int a;\n/\\\n*\n#define W 1\n*/\n#ifndef W\n#line 5\nx\n#endif\n",
+    ],
+)
+def test_line_breakpoints_reads_pre_masked_and_raw_source_alike(source: str) -> None:
+    # The invariant that would have caught the `_Pragma` latch shipping as a
+    # production no-op (PR #225 review): this function masks the spliced text
+    # with the same pass its callers use, so its answer cannot depend on whether
+    # the caller pre-masked. A pattern that reads anything but a line-leading
+    # directive can otherwise pass every test on raw source and match nothing on
+    # the text `annotate_array_extents` actually hands it.
+    assert _line_breakpoints(source) == _line_breakpoints(_stripped_for_scan(source))
 
 
 def test_line_breakpoints_does_not_truncate_a_dollar_line_macro_name() -> None:

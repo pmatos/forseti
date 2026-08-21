@@ -404,9 +404,15 @@ _INCLUDE_RE = re.compile(
 # breakpoint (issue #157's asymmetry). Modelling the push/pop stack itself is
 # not needed for that: dropping the fact falls back to opaque, which is the
 # assumed-live default and costs nothing. Only `known_defined` is dropped, never
-# `macros` — the same asymmetry `_INCLUDE_RE` spells out. An unparenthesized or
-# macro-expanded operand leaves `name` unset and drops the whole table, since the
-# affected name is then unknown.
+# `macros` — the same asymmetry `_INCLUDE_RE` spells out.
+#
+# The operand is deliberately not read. By the time `_line_breakpoints` scans,
+# string literals are blanked, so `#pragma pop_macro("W")` reads as `#pragma
+# pop_macro(   )` — a `name` group here would be `None` on every real input, a
+# dead branch asserting a precision production does not have (PR #225 review).
+# A pop therefore drops the whole `known_defined` table, which is where an
+# unreadable operand landed anyway: clearing more facts only means more opaque
+# conditionals, the assumed-live default.
 #
 # The two operations are told apart by the `op` group, because only one of them
 # changes anything (PR #225 review): `push_macro` *saves* the current definition
@@ -416,8 +422,7 @@ _INCLUDE_RE = re.compile(
 # `#ifndef W` opaque rather than dead, retaining a `#line` breakpoint in an arm
 # cpp never takes.
 _PRAGMA_MACRO_RE = re.compile(
-    rf"{_DIRECTIVE}pragma{_PP_SPACE}+(?P<op>push|pop)_macro{_NAME_END}"
-    rf"(?:{_PP_SPACE}*\({_PP_SPACE}*\"(?P<name>{_MACRO_NAME})\")?",
+    rf"{_DIRECTIVE}pragma{_PP_SPACE}+(?P<op>push|pop)_macro{_NAME_END}",
     re.MULTILINE,
 )
 
@@ -1696,11 +1701,19 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
     `_strip_literal_parens`), the same issue's second follow-up.
     """
     spliced, physical_line_of = _splice_continuations(source_no_comments)
-    # Again, on the *spliced* text: phase 2 can create a delimiter phase 3 then
-    # honours (`/\` + newline + `*`), which the caller's own pass — run before
-    # splicing, as it must be — cannot have seen. Blanking preserves offsets and
-    # newlines, so `physical_line_of` still holds (PR #225 review).
-    spliced = mask_comments(spliced)
+    # Masked again, on the *spliced* text and with exactly the pass the callers
+    # use. Two reasons (PR #225 review). Phase 2 can *create* a delimiter phase 3
+    # then honours — `/\` + newline + `*`, and its string-literal twin — which
+    # the caller's own pass, run before splicing as it must be, cannot have seen.
+    # And running the *same* pass the callers do means this function sees one
+    # text whether its caller pre-masked or not, so a pattern cannot pass its
+    # tests on raw source while matching nothing in production — exactly how the
+    # `_Pragma` latch first shipped as a no-op. That is not only a guard rail:
+    # blanking literals is what stops a `_Pragma(` merely *mentioned* in a string
+    # from latching, since `_PRAGMA_OPERATOR_RE` matches the operator rather than
+    # its (already unreadable) argument. Blanking preserves offsets and newlines,
+    # so `physical_line_of` still holds.
+    spliced = _stripped_for_scan(spliced)
 
     def _events(
         pattern: re.Pattern[str], kind: str
@@ -1829,15 +1842,12 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
                 known_defined.clear()
         elif kind == "pragma_macro":
             # `pop_macro` restores a saved definition this scan never recorded,
-            # so whatever it proved about that name stops holding here.
+            # so whatever was proven about the affected name stops holding here —
+            # and which name that is cannot be read, so every fact goes.
             # `push_macro` saves the *current* definition without changing it,
             # so it invalidates nothing (`_PRAGMA_MACRO_RE`).
             if not dead and match.group("op") == "pop":
-                name = match.group("name")
-                if name is None:
-                    known_defined.clear()
-                else:
-                    known_defined.pop(name, None)
+                known_defined.clear()
         elif kind == "pragma_operator":
             # Neither position-precise nor operand-precise, on purpose: the
             # operator can fire at every later use of the macro holding it, and
