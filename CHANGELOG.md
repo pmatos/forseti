@@ -1,3 +1,20 @@
+# [1.8.0](https://github.com/pmatos/forseti/compare/v1.7.5...v1.8.0) (2026-08-23)
+
+
+### Bug Fixes
+
+* **orchestrator:** skip fix() on the final budgeted verify pass ([#214](https://github.com/pmatos/forseti/issues/214)) ([b95230e](https://github.com/pmatos/forseti/commit/b95230e79244bff85feaef28a607c7c2a02a18f8))
+* **orchestrator:** write fix candidates beside the original source ([#39](https://github.com/pmatos/forseti/issues/39)) ([#207](https://github.com/pmatos/forseti/issues/207)) ([a7de324](https://github.com/pmatos/forseti/commit/a7de324b42fd905edef17d7d367c7fd894c4c9bf))
+* **precond:** anchor S3 obligation injection to the compiled definition ([#191](https://github.com/pmatos/forseti/issues/191)) ([2195c54](https://github.com/pmatos/forseti/commit/2195c540e53234cf72d89477fb5d9611338974a3))
+* **properties:** bump proposer LLM timeout default from 120s to 240s ([#200](https://github.com/pmatos/forseti/issues/200)) ([f24b0ac](https://github.com/pmatos/forseti/commit/f24b0ac82f25e255ba45fc761b6509750b9916df))
+* **release:** publish versioned wheels and notify on updates ([#208](https://github.com/pmatos/forseti/issues/208)) ([dc6259b](https://github.com/pmatos/forseti/commit/dc6259bed129c97599916e9fafd3d86b33132eb4))
+
+
+### Features
+
+* **adapters:** add forseti enable-project to install Claude Code hooks ([#201](https://github.com/pmatos/forseti/issues/201)) ([55b0e11](https://github.com/pmatos/forseti/commit/55b0e1197b19840631dd45589e1dad4cd794f3da))
+* **claude-code:** v1 semantic-property verify-gate (propose -> check -> gate) ([#215](https://github.com/pmatos/forseti/issues/215)) ([ed20706](https://github.com/pmatos/forseti/commit/ed207069c9c55b652197bf5f5ed7e596f2e83a90))
+
 ## [1.7.5](https://github.com/pmatos/forseti/compare/v1.7.4...v1.7.5) (2026-07-28)
 
 
