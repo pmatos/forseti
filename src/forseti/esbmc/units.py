@@ -2139,10 +2139,14 @@ def _parse_tree(
     return proc.stdout + "\n" + proc.stderr
 
 
-# The probe translation unit `probe_predefined_guards` compiles: one
+# The probe translation unit `probe_predefined_guards` compiles: a leading
+# `#undef` of every identifier it is about to declare, then one
 # `int <prefix><i>;` per guard name, emitted only inside `#ifdef NAME`, so the
 # declarations that survive into the dump name exactly the guards the
-# preprocessor considered defined. `sentinel` is unconditional and so must
+# preprocessor considered defined. The `#undef`s are what make that reading
+# true under any `extra_flags`: the declarations name themselves, so without
+# them a `-D` of one of these identifiers rewrites its declaration before the
+# AST and the guard reads `False`. `sentinel` is unconditional and so must
 # always survive — its absence means the dump is not a dump of this probe (a
 # flag that broke the run, an ESBMC that printed something else) and the whole
 # reading is discarded rather than read as "nothing was defined".
@@ -2209,6 +2213,11 @@ def probe_predefined_guards(
     reproduce, so a guard sitting below an ``#include`` stays this issue's
     residual and `_line_breakpoints` still drops the seed there.
 
+    A guard name inside the probe's own ``forseti_guard_probe_`` namespace is
+    dropped rather than answered — the leading ``#undef``\\ s would undefine the
+    very name its ``#ifdef`` tests — so it comes back absent, which
+    `_line_breakpoints` reads as opaque and assumed-live.
+
     Fails closed to ``()`` — an unrunnable or failing esbmc, an unwritable or
     unencodable temporary file, a probe overrunning `_PROBE_TIMEOUT_CAP_S`, a
     dump missing the unconditional sentinel. ``()`` is not a degraded answer but
@@ -2217,11 +2226,36 @@ def probe_predefined_guards(
     successfully by this point, so a probe failure must not turn a good listing
     into a raised error.
     """
-    names = _guard_macro_names(source_no_comments)
+    # A guard name inside the probe's own namespace cannot be measured by this
+    # scheme at all: the `#undef` block below would undefine the very name its
+    # `#ifdef` tests. Drop it rather than answer, so it comes back absent —
+    # which `_line_breakpoints` reads as opaque and assumed-live, the safe
+    # direction — instead of a silent `False`. Filtered on the whole prefix, not
+    # on the identifiers actually emitted: the emitted set is a function of how
+    # many names survive this filter, so a rule that depended on the index
+    # arithmetic would shift its own boundary.
+    names = tuple(
+        name
+        for name in _guard_macro_names(source_no_comments)
+        if not name.startswith(_PROBE_PREFIX)
+    )
     if not names:
         return ()
     probe_timeout_s = min(timeout_s, _PROBE_TIMEOUT_CAP_S)
-    probe_text = "".join(
+    declared = [f"{_PROBE_PREFIX}{index}" for index in range(len(names))]
+    declared.append(f"{_PROBE_PREFIX}{_PROBE_SENTINEL}")
+    # The declarations name themselves, so a build that predefines one of these
+    # identifiers rewrites the declaration before it reaches the AST: under
+    # `-Dforseti_guard_probe_0=WIDGET` the probe emits `int WIDGET;`, index `0`
+    # is absent from the dump, and a guard that *is* defined is recorded
+    # `False`. The sentinel still survives, so nothing fails closed — it is a
+    # silent inversion in the wrong *dead* direction. `#undef` of a macro that
+    # was never defined is a well-defined no-op in C and C++, so undefining
+    # every emitted identifier up front costs nothing in the normal case and
+    # makes the reading independent of `-D`s and preincluded headers alike
+    # (review feedback on PR #231).
+    probe_text = "".join(f"#undef {ident}\n" for ident in declared)
+    probe_text += "".join(
         f"#ifdef {name}\nint {_PROBE_PREFIX}{index};\n#endif\n"
         for index, name in enumerate(names)
     )

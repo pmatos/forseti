@@ -2933,6 +2933,80 @@ def test_probe_predefined_guards_reads_the_sources_own_language() -> None:
     assert probe_predefined_guards(source, suffix=".cpp") == (("__cplusplus", True),)
 
 
+_COLLIDING_FLAGS = [
+    # The probe's declarations name themselves, so a build that predefines one
+    # of those identifiers rewrites the declaration before it reaches the AST:
+    # `int forseti_guard_probe_0;` becomes `int WIDGET;`, index `0` is absent
+    # from the dump, and a guard that *is* defined is recorded `False`. The
+    # sentinel survives, so nothing fails closed — a silent inversion in the
+    # wrong *dead* direction (review feedback on PR #231).
+    ("#ifdef __linux__\n#endif\n", ("-Dforseti_guard_probe_0=WIDGET",)),
+    # An object-like `-D` carrying no replacement list expands to nothing,
+    # leaving `int ;` — a different corruption of the same declaration.
+    ("#ifdef __linux__\n#endif\n", ("-Dforseti_guard_probe_0",)),
+    # The sentinel's own collision. This one already failed closed to `()`,
+    # safe but a total loss of measurement; undefining it up front recovers
+    # the reading instead, so the fix is an improvement here, not a no-op.
+    ("#ifdef __linux__\n#endif\n", ("-Dforseti_guard_probe_sentinel=Z",)),
+    # The replacement token is itself a macro, so the corrupted declaration
+    # expands recursively — and the *second* guard is the one whose index
+    # collides, which is where "the sentinel survived so the probe is healthy"
+    # is most convincing.
+    (
+        "#ifdef __linux__\n#endif\n#ifdef __GNUC__\n#endif\n",
+        ("-Dforseti_guard_probe_1=__linux__",),
+    ),
+    # Every emitted identifier collides at once.
+    (
+        "#ifdef __linux__\n#endif\n#ifdef __GNUC__\n#endif\n",
+        (
+            "-Dforseti_guard_probe_0=X",
+            "-Dforseti_guard_probe_1=Y",
+            "-Dforseti_guard_probe_sentinel=Z",
+        ),
+    ),
+]
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+@pytest.mark.parametrize(("source", "flags"), _COLLIDING_FLAGS)
+def test_a_build_flag_colliding_with_a_probe_identifier_changes_nothing(
+    source: str, flags: tuple[str, ...]
+) -> None:
+    # Asserted against the same source's own uncollided reading rather than a
+    # hardcoded `True`, so the property under test is exactly the one that
+    # matters — a `-D` the source never mentions must not move the answer — and
+    # the case does not depend on which builtins this host defines.
+    baseline = probe_predefined_guards(source)
+    assert baseline, "baseline measures nothing; the case would pass vacuously"
+    assert probe_predefined_guards(source, extra_flags=flags) == baseline
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_a_guard_inside_the_probe_namespace_is_dropped_rather_than_answered() -> None:
+    # The `#undef` block that closes the collision above would undefine the very
+    # name such a guard's `#ifdef` tests, so this scheme cannot measure it at
+    # all. Dropped rather than answered: absent from the result reads as opaque
+    # and assumed-live in `_line_breakpoints`, where a `False` would be the
+    # wrong dead direction for a name the build may well have defined.
+    assert (
+        probe_predefined_guards(
+            "#ifdef forseti_guard_probe_0\n#endif\n",
+            extra_flags=("-Dforseti_guard_probe_0=WIDGET",),
+        )
+        == ()
+    )
+    # And it does not take the rest of the source's guards down with it.
+    only_real = probe_predefined_guards("#ifdef __linux__\n#endif\n")
+    assert only_real
+    assert (
+        probe_predefined_guards(
+            "#ifdef forseti_guard_probe_0\n#endif\n#ifdef __linux__\n#endif\n"
+        )
+        == only_real
+    )
+
+
 def test_a_non_ascii_guard_name_reaches_the_probe() -> None:
     # `_MACRO_NAME`'s continuation class is `[\w$]`, which Python's `re` reads
     # as Unicode, so a non-ASCII guard name really is collected and really does
