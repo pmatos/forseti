@@ -2979,3 +2979,56 @@ def test_probe_predefined_guards_caps_its_share_of_the_time_budget(
     # A budget already under the cap is handed through untouched, never raised.
     assert probe_predefined_guards("#ifdef W\n#endif\n", timeout_s=0.5) == ()
     assert seen == [_PROBE_TIMEOUT_CAP_S, 0.5]
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_the_cpp_family_of_extensions_all_probe_as_cpp(tmp_path: Path) -> None:
+    # `.cpp` is not the only C++ spelling esbmc takes. Before the suffix was
+    # plumbed through, every one of these was probed as `.c` — `__cplusplus`
+    # reported undefined, the arm esbmc really compiles proven dead. Pinning the
+    # family, not just the one spelling the regression was found through.
+    for ext in (".cpp", ".cc", ".cxx"):
+        src = tmp_path / f"sig{ext}"
+        src.write_text(
+            "#ifdef __cplusplus\n#line 100\nvoid g(int p[20]) { (void)p; }\n#endif\n"
+            "#ifndef __cplusplus\n#line 100\nvoid g(int *p) { *p = 1; }\n#endif\n"
+        )
+        g = next(u for u in list_units(src) if u.name == "g")
+        assert g.predefined_guards == (("__cplusplus", True),), ext
+        assert g.params[0].array_extent == 20, ext
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_an_extension_esbmc_rejects_never_reaches_the_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `probe_predefined_guards` documents that an extension esbmc will not take
+    # needs no special case because "a source carrying one could not have been
+    # parsed in the first place". That is an ordering claim, so pin the order:
+    # the source parse raises first and the probe is never called. Were it ever
+    # reversed, the probe would run on a file esbmc refuses, read no sentinel,
+    # and return `()` — indistinguishable from "measured nothing".
+    called: list[str] = []
+    monkeypatch.setattr(
+        "forseti.esbmc.units.probe_predefined_guards",
+        lambda *a, **kw: called.append(kw.get("suffix", "")) or (),
+    )
+    # Two definition-shaped occurrences of `g`, so the cost gate *passes*: were
+    # the probe reachable at all here, it would run. `called` staying empty is
+    # then the ordering, not the gate.
+    source = (
+        "#ifdef WIDGET\n#line 100\nvoid g(int p[20]) { (void)p; }\n#endif\n"
+        "#ifndef WIDGET\n#line 100\nvoid g(int *p) { *p = 1; }\n#endif\n"
+    )
+    for ext in (".h", ".hpp", ""):
+        src = tmp_path / f"sig{ext}"
+        src.write_text(source)
+        with pytest.raises(ListUnitsError):
+            list_units(src)
+    assert called == []
+    # The gate really does pass for this source: the same text under an
+    # extension esbmc accepts reaches the probe.
+    accepted = tmp_path / "sig.c"
+    accepted.write_text(source)
+    list_units(accepted)
+    assert called == [".c"]
