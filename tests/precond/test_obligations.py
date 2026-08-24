@@ -9,6 +9,8 @@ and that a plan L0 cannot name is declined rather than injected wrongly.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from forseti.esbmc.units import Param, Unit
@@ -164,6 +166,38 @@ def test_injection_targets_the_compiled_definition_not_a_dead_if0_body() -> None
     assert "__ESBMC_assert" in lines[3]  # rides the live body (line 4)
     assert "__ESBMC_assert" not in lines[1]  # never the dead `#if 0` body (line 2)
     assert f'"{OBLIGATION_LABEL_PREFIX}f:p"' in lines[3]
+
+
+_GUARD_DUP = """\
+#ifndef WIDGET
+#line 100
+void f(int *p) { *p = 0; }
+#endif
+#ifdef WIDGET
+#line 100
+void f(int *p) { *p = 1; }
+#endif
+"""
+
+
+def test_injection_targets_the_definition_the_build_flags_selected() -> None:
+    # Issue #226 on the same path: both bodies translate to presumed line 100,
+    # so `def_line` alone cannot separate them and the physical-line tiebreak
+    # answers with the second one whatever the build did. `Unit.predefined_guards`
+    # — what `list_units` measured about `WIDGET` under the very flags that
+    # produced this `def_line` — is what picks the arm cpp actually kept; without
+    # it the obligation lands in the deleted arm and every caller of `f` passes
+    # DISCHARGED against a callee carrying no obligation at all.
+    unit = Unit("f", (Param("p", "int *"),), def_line=100)
+    undefined = replace(unit, predefined_guards=(("WIDGET", False),))
+    lines = inject_obligations(_GUARD_DUP, plan_unit(undefined)).splitlines()
+    assert "__ESBMC_assert" in lines[2]  # the live `#ifndef WIDGET` body
+    assert "__ESBMC_assert" not in lines[6]  # never the deleted `#ifdef` body
+
+    defined = replace(unit, predefined_guards=(("WIDGET", True),))
+    lines = inject_obligations(_GUARD_DUP, plan_unit(defined)).splitlines()
+    assert "__ESBMC_assert" not in lines[2]
+    assert "__ESBMC_assert" in lines[6]
 
 
 def test_unresolved_plan_is_declined() -> None:

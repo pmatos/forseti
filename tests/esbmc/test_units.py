@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ from forseti.esbmc.units import (
     ListUnitsError,
     Param,
     Unit,
+    _guard_macro_names,
     _line_breakpoints,
     _stripped_for_scan,
     annotate_array_extents,
@@ -30,6 +32,7 @@ from forseti.esbmc.units import (
     parse_implicit_invocations,
     parse_symbol_aliases,
     parse_units,
+    probe_predefined_guards,
     rename_all_declarations_and_definitions,
 )
 
@@ -2690,3 +2693,215 @@ def test_parse_asm_statements_file_scope_match_is_whole_word() -> None:
     # contained in its name.
     assert parse_asm_statements(_FILE_SCOPE_ASM_AST, "help") == ()
     assert parse_asm_statements(_FILE_SCOPE_ASM_AST, "helpers") == ()
+
+
+# Issue #226: the half of #157 a textual scan structurally cannot prove — a
+# guard whose name is defined *outside* this file, by a command-line `-D` or by
+# a compiler builtin. `probe_predefined_guards` measures it against the real
+# preprocessor under the real build flags; `Unit.predefined_guards` carries the
+# reading to every consumer of `def_line`.
+
+# Two definitions of `f` in complementary arms of the *same* undecidable guard,
+# each preceded by a `#line` resolving to the same presumed line. This is #157's
+# worked example: `def_line` cannot separate the candidates (both translate to
+# 100), so before #226 the physical-line tiebreak decided — correctly for only
+# one of the two arms.
+_GUARD_TIE_SOURCE = (
+    "#ifndef WIDGET\n"
+    "#line 100\n"
+    "void f(int *p) { *p = 1; }\n"
+    "#endif\n"
+    "#ifdef WIDGET\n"
+    "#line 100\n"
+    "void f(int p[20]) { (void)p; }\n"
+    "#endif\n"
+)
+
+
+def test_line_breakpoints_decides_an_ifdef_from_the_predefined_seed() -> None:
+    # `W` is never mentioned by the file, so #157 leaves it opaque
+    # (`test_line_breakpoints_leaves_an_unmentioned_ifdef_opaque`). A seed saying
+    # it was defined before line 1 proves the `#ifndef` arm dead, which the file
+    # alone never could.
+    source = "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(2, 5), (5, 9)]
+    assert _line_breakpoints(source, (("W", True),)) == [(5, 9)]
+
+
+def test_line_breakpoints_seed_can_prove_a_guard_undefined() -> None:
+    # The direction #157 refused to guess at: "not defined" is now *measured*,
+    # so the `#ifdef` arm is dead and its `#line 5` never resets the counter.
+    source = "#ifdef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source, (("W", False),)) == [(5, 9)]
+
+
+def test_line_breakpoints_seed_is_overridden_by_the_files_own_undef() -> None:
+    # The seed describes line 0. A top-level `#undef` after it is later evidence
+    # about the same name and wins outright.
+    source = "#undef W\n#ifdef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source, (("W", True),)) == [(6, 9)]
+
+
+def test_line_breakpoints_seed_does_not_survive_an_include() -> None:
+    # This issue's stated residual: a header may `#define`/`#undef` anything, so
+    # the seed stops holding below an `#include` exactly as a `#define` proven
+    # above one does. The `#line 5` counts again.
+    source = '#include "h.h"\n#ifdef W\n#line 5\nx\n#endif\n#line 9\ny\n'
+    assert _line_breakpoints(source, (("W", False),)) == [(3, 5), (6, 9)]
+
+
+def test_line_breakpoints_seed_is_dropped_by_a_conditional_define() -> None:
+    # A `#define W` this scan cannot prove cpp reaches makes the seed stale for
+    # `W`, on the same fail-closed terms as any other proven fact (#165/#157) —
+    # the `#ifndef W` below goes back to opaque rather than staying decided.
+    source = "#ifdef Q\n#define W\n#endif\n#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source, (("W", False),)) == [(5, 5), (8, 9)]
+
+
+def test_guard_macro_names_collects_every_defined_shaped_spelling() -> None:
+    source = (
+        "#ifdef A\n#endif\n"
+        "#ifndef B\n#endif\n"
+        "#if defined C\n#elif !defined(D)\n#endif\n"
+        "#ifdef A\n#endif\n"
+        "#if 0\n#elifdef E\n#elifndef F\n#endif\n"
+    )
+    assert _guard_macro_names(source) == ("A", "B", "E", "F", "C", "D")
+
+
+def test_guard_macro_names_skips_a_condition_no_probe_could_answer() -> None:
+    # Definedness is all a probe reports, so a condition needing macro *values*
+    # contributes no name — probing `V` would answer a question nobody asked.
+    assert _guard_macro_names("#if V > 2\n#endif\n#if 0\n#endif\n") == ()
+
+
+def test_guard_macro_names_reads_the_text_the_walk_reads() -> None:
+    # Same two passes, same order, as `_line_breakpoints`: a spliced operand is
+    # probed under the name cpp actually tests, and a `#ifdef` that only appears
+    # inside a string literal is not a directive and must not be probed at all.
+    # (Without the strip pass this would return `("WIDE", "STR")`.)
+    source = '#ifdef W\\\nIDE\n#endif\nchar *s = "#ifdef STR";\n'
+    assert _guard_macro_names(source) == ("WIDE",)
+
+
+def test_guard_macro_names_ignores_an_operandless_ifdef() -> None:
+    assert _guard_macro_names("#ifdef\n#endif\n#ifdef W\n#endif\n") == ("W",)
+
+
+def test_find_definition_brace_uses_the_predefined_guard_seed() -> None:
+    # The `synth.py` consumer: with `WIDGET` measured undefined the injection
+    # point is the `#ifndef` arm's body; measured defined, the `#ifdef` arm's.
+    # Un-seeded, the physical-line tiebreak answers with the later one either way.
+    undefined = find_definition_brace(_GUARD_TIE_SOURCE, "f", 100, (("WIDGET", False),))
+    defined = find_definition_brace(_GUARD_TIE_SOURCE, "f", 100, (("WIDGET", True),))
+    assert _GUARD_TIE_SOURCE[undefined:].startswith("{ *p = 1; }")
+    assert _GUARD_TIE_SOURCE[defined:].startswith("{ (void)p; }")
+    assert find_definition_brace(_GUARD_TIE_SOURCE, "f", 100) == defined
+
+
+def test_annotate_array_extents_uses_the_units_predefined_guards() -> None:
+    unit = Unit("f", (Param("p", "int *"),), def_line=100)
+    assert (
+        annotate_array_extents([unit], _GUARD_TIE_SOURCE)[0].params[0].array_extent
+        == 20
+    )
+    seeded = replace(unit, predefined_guards=(("WIDGET", False),))
+    assert (
+        annotate_array_extents([seeded], _GUARD_TIE_SOURCE)[0].params[0].array_extent
+        is None
+    )
+
+
+def test_probe_predefined_guards_without_guards_never_runs_esbmc() -> None:
+    # No guard name to ask about — so no probe TU, no subprocess. Proven by the
+    # unrunnable binary: a probe that ran would fail closed to `()` as well, but
+    # this source would also have to have been written and compiled first.
+    assert (
+        probe_predefined_guards(
+            "void f(int *p) { *p = 1; }\n", esbmc_bin="forseti-no-such-esbmc"
+        )
+        == ()
+    )
+
+
+def test_probe_predefined_guards_fails_closed_on_an_unrunnable_esbmc() -> None:
+    # A failed probe must read as "nothing measured" — every guard back to
+    # opaque and assumed live — never as "nothing defined", which would delete
+    # real breakpoints.
+    assert (
+        probe_predefined_guards(
+            "#ifdef WIDGET\n#endif\n", esbmc_bin="forseti-no-such-esbmc"
+        )
+        == ()
+    )
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_probe_predefined_guards_reads_a_command_line_define() -> None:
+    source = "#ifdef WIDGET\n#endif\n"
+    assert probe_predefined_guards(source) == (("WIDGET", False),)
+    assert probe_predefined_guards(source, extra_flags=("-DWIDGET",)) == (
+        ("WIDGET", True),
+    )
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_probe_predefined_guards_reads_a_compiler_builtin() -> None:
+    # The second shape this issue names: no `-D` anywhere, the name is simply
+    # part of the target's predefined set.
+    assert probe_predefined_guards("#ifdef __linux__\n#endif\n") == (
+        ("__linux__", True),
+    )
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_anchors_extent_through_a_command_line_guard(
+    tmp_path: Path,
+) -> None:
+    # End-to-end, both compiles of #157's worked example. Before #226 both
+    # returned 20: the un-`-D`'d compile harvested its extent from the `#ifdef
+    # WIDGET` body cpp had deleted.
+    src = tmp_path / "sig.c"
+    src.write_text(_GUARD_TIE_SOURCE)
+    plain = next(u for u in list_units(src) if u.name == "f")
+    assert plain.params[0].array_extent is None
+    assert plain.params[0].array_extent_unresolved is False
+    widget = next(
+        u for u in list_units(src, extra_flags=("-DWIDGET",)) if u.name == "f"
+    )
+    assert widget.params[0].array_extent == 20
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_anchors_extent_through_a_builtin_guard(tmp_path: Path) -> None:
+    # The builtin shape, ordered so the physical-line tiebreak gets it wrong:
+    # the live arm is the *first* candidate here, and before #226 `list_units`
+    # returned `None` — the dead `#ifndef` body's plain pointer.
+    src = tmp_path / "sig.c"
+    src.write_text(
+        "#ifdef __linux__\n"
+        "#line 100\n"
+        "void g(int p[20]) { (void)p; }\n"
+        "#endif\n"
+        "#ifndef __linux__\n"
+        "#line 100\n"
+        "void g(int *p) { *p = 1; }\n"
+        "#endif\n"
+    )
+    g = next(u for u in list_units(src) if u.name == "g")
+    assert g.params[0].array_extent == 20
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_skips_the_probe_for_a_single_definition_source(
+    tmp_path: Path,
+) -> None:
+    # The cost gate: one definition-shaped occurrence per name means
+    # `_select_definition` returns it whatever the breakpoints say, so the extra
+    # `--parse-tree-only` run is skipped and no reading is recorded — even
+    # though the file does have a guard worth probing.
+    src = tmp_path / "sig.c"
+    src.write_text("#ifdef WIDGET\nint x;\n#endif\nvoid f(int p[20]) { (void)p; }\n")
+    f = next(u for u in list_units(src) if u.name == "f")
+    assert f.predefined_guards == ()
+    assert f.params[0].array_extent == 20
