@@ -729,11 +729,14 @@ class Unit:
     fact a textual scan of the file can never derive, because it is set by the
     build command (``-D``) and by the compiler's own builtins, not by the file
     (issue #226). `list_units` reads it back from the preprocessor itself
-    (`probe_predefined_guards`), under the *same* binary and flags as the parse
-    that set `def_line` — so the two always describe one compile — and every
-    consumer of `def_line` (the extent anchor here, the obligation-injection
-    anchor in `forseti.precond.synth`) passes it down so `_line_breakpoints` can
-    decide guards this file leaves open.
+    (`probe_predefined_guards`), in the same call and under the same binary and
+    flags as the parse that set `def_line`, so the two are measured together;
+    every consumer of `def_line` (the extent anchor here, the
+    obligation-injection anchor in `forseti.precond.synth`) passes it down so
+    `_line_breakpoints` can decide guards this file leaves open. Being measured
+    together is all this field promises: a consumer that re-reads the source
+    after the listing carries a `def_line` from that same listing and is stale
+    in exactly the same way and to exactly the same degree.
 
     It ranges over guard names only, never over every macro, and it says nothing
     about state *below* an ``#include``: a header may redefine anything, and
