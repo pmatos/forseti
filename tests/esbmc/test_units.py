@@ -2973,22 +2973,32 @@ def test_probe_predefined_guards_caps_its_share_of_the_time_budget(
 
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
-def test_the_cpp_family_of_extensions_all_probe_as_cpp(tmp_path: Path) -> None:
+@pytest.mark.parametrize("ext", [".cpp", ".cc", ".cxx", ".C"])
+def test_the_cpp_family_of_extensions_all_probe_as_cpp(
+    tmp_path: Path, ext: str
+) -> None:
     # `.cpp` is not the only C++ spelling esbmc takes. Before the suffix was
     # plumbed through, every one of these was probed as `.c` — `__cplusplus`
     # reported undefined, the arm esbmc really compiles proven dead, and the
     # deleted `#ifndef` body's plain pointer harvested in place of the live
     # arm's `int p[20]`. Pinning the family, not just the one spelling the
     # regression was found through: this is the end-to-end pin for all of them.
-    for ext in (".cpp", ".cc", ".cxx"):
-        src = tmp_path / f"sig{ext}"
-        src.write_text(
-            "#ifdef __cplusplus\n#line 100\nvoid g(int p[20]) { (void)p; }\n#endif\n"
-            "#ifndef __cplusplus\n#line 100\nvoid g(int *p) { *p = 1; }\n#endif\n"
-        )
-        g = next(u for u in list_units(src) if u.name == "g")
-        assert g.predefined_guards == (("__cplusplus", True),), ext
-        assert g.params[0].array_extent == 20, ext
+    #
+    # Parametrized rather than looped so each spelling is its own case: a loop
+    # stops at the first failure, so `.cpp` failing would leave the later
+    # spellings unexecuted and the pin unproven for exactly the one — uppercase
+    # `.C` — that is easiest to get wrong. `.C` is the gate's own accepted
+    # spelling (`suffix.lower() == ".c"` there), staged with its case intact
+    # (`test_snapshot_preserves_the_source_extension_including_case`), so it
+    # reaches this code in production.
+    src = tmp_path / f"sig{ext}"
+    src.write_text(
+        "#ifdef __cplusplus\n#line 100\nvoid g(int p[20]) { (void)p; }\n#endif\n"
+        "#ifndef __cplusplus\n#line 100\nvoid g(int *p) { *p = 1; }\n#endif\n"
+    )
+    g = next(u for u in list_units(src) if u.name == "g")
+    assert g.predefined_guards == (("__cplusplus", True),), ext
+    assert g.params[0].array_extent == 20, ext
 
 
 @pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
