@@ -1460,6 +1460,12 @@ def _select_definition(
     on its own line). Without `def_line` the first definition-shaped occurrence is
     used, as before.
 
+    A sole candidate is returned without consulting the breakpoints at all: there
+    is nothing for `def_line` or `predefined` to choose between, so neither can
+    change the answer. Stated here rather than left to be re-derived, because
+    `_with_predefined_guards`' cost gate is exactly this property read backwards —
+    it skips the probe for a listing whose every name has one candidate.
+
     `def_line` is clang's *presumed* line — the coordinate a ``#line``/linemarker
     directive in the source can rewrite away from physical line count. Comparing
     it against a raw physical line count would silently anchor to the wrong
@@ -1495,7 +1501,7 @@ def _select_definition(
     """
     if not matches:
         return None
-    if def_line is None:
+    if def_line is None or len(matches) == 1:
         return matches[0]
     breakpoints = _line_breakpoints(source_no_comments, predefined)
     # Sort key: candidates at or after `def_line` (key[0] == False) all sort before
@@ -2017,24 +2023,26 @@ def _presumed_line(physical_line: int, breakpoints: list[tuple[int, int]]) -> in
 
 
 def _param_list_text(
+    matches: list[_DefinitionMatch],
     source_no_comments: str,
-    fn_name: str,
-    def_line: int | None = None,
-    predefined: Sequence[tuple[str, bool]] = (),
+    unit: Unit,
 ) -> str | None:
-    """The parameter-list text of `fn_name`'s *definition*, or ``None``.
+    """The parameter-list text of `unit`'s *definition*, or ``None``.
 
     The declarator text between ``(`` and its matching ``)`` for the
-    definition-shaped occurrence `def_line` anchors to — see `_definition_candidates`
-    for what counts as definition-shaped and `_select_definition` for how
-    `def_line` (issue #145) picks the compiled definition over an inactive
-    ``#if 0`` alternative.
+    definition-shaped occurrence `unit.def_line` anchors to — see
+    `_definition_candidates` for what counts as definition-shaped (and produces
+    `matches`) and `_select_definition` for how `def_line` (issue #145) and
+    `predefined_guards` (issue #226) pick the compiled definition over an
+    inactive ``#if 0``/``#ifdef`` alternative.
+
+    Takes `unit` rather than its three fields unpacked, and `matches` rather than
+    the name to rescan for: the two anchors are only meaningful together (see
+    `Unit.predefined_guards`), and the candidate list is already computed once
+    per listing (`list_units`).
     """
     chosen = _select_definition(
-        _definition_candidates(source_no_comments, fn_name),
-        source_no_comments,
-        def_line,
-        predefined,
+        matches, source_no_comments, unit.def_line, unit.predefined_guards
     )
     return None if chosen is None else chosen.params
 
@@ -2060,21 +2068,39 @@ def annotate_array_extents(units: list[Unit], source_text: str) -> list[Unit]:
     `rename_all_declarations_and_definitions` does: a literal spelling
     `name(...)` is not a parameter list to isolate.
     """
-    return _annotate_array_extents(units, _stripped_for_scan(source_text))
+    stripped = _stripped_for_scan(source_text)
+    candidates = _candidates_by_name(units, stripped)
+    return _annotate_array_extents(units, stripped, candidates)
 
 
-def _annotate_array_extents(units: list[Unit], stripped: str) -> list[Unit]:
-    """`annotate_array_extents` on text `_stripped_for_scan` has already masked.
+def _candidates_by_name(
+    units: list[Unit], stripped: str
+) -> dict[str, list[_DefinitionMatch]]:
+    """Each unit name's definition-shaped occurrences in `stripped`, scanned once.
 
-    Split out so `list_units`, which needs the same masked text for
-    `_with_predefined_guards`' cost gate, pays for the mask once instead of
-    twice per listing.
+    Keyed by name because that is all `_definition_candidates` reads, so two
+    units sharing a name share the one scan.
+    """
+    return {unit.name: _definition_candidates(stripped, unit.name) for unit in units}
+
+
+def _annotate_array_extents(
+    units: list[Unit],
+    stripped: str,
+    candidates: dict[str, list[_DefinitionMatch]],
+) -> list[Unit]:
+    """`annotate_array_extents` on text `_stripped_for_scan` has already masked,
+    and candidates `_candidates_by_name` has already scanned for.
+
+    Split out so `list_units` pays for both once per listing rather than twice:
+    it needs the same masked text and the same candidate lists for
+    `_with_predefined_guards`' cost gate, which would otherwise scan every unit
+    name here a second time — on every listing, including the common one where
+    the gate declines to probe at all.
     """
     annotated: list[Unit] = []
     for unit in units:
-        param_list = _param_list_text(
-            stripped, unit.name, unit.def_line, unit.predefined_guards
-        )
+        param_list = _param_list_text(candidates[unit.name], stripped, unit)
         if param_list is None:
             annotated.append(unit)
             continue
@@ -2144,7 +2170,10 @@ def probe_predefined_guards(
     source_no_comments: str,
     *,
     esbmc_bin: str = "esbmc",
-    timeout_s: float = 30.0,
+    # Not `list_units`' 30.0: every budget at or above the cap behaves
+    # identically, so mirroring that default would only invite the reader to
+    # think the probe gets 30s. The production caller passes its own anyway.
+    timeout_s: float = _PROBE_TIMEOUT_CAP_S,
     extra_flags: Sequence[str] = (),
     suffix: str = ".c",
 ) -> tuple[tuple[str, bool], ...]:
@@ -2280,6 +2309,7 @@ def list_caller_openings(
 def _with_predefined_guards(
     units: list[Unit],
     masked: str,
+    candidates: dict[str, list[_DefinitionMatch]],
     *,
     esbmc_bin: str,
     timeout_s: float,
@@ -2288,22 +2318,23 @@ def _with_predefined_guards(
 ) -> list[Unit]:
     """`units`, each carrying `probe_predefined_guards`' reading of `masked`.
 
-    `masked` is `_stripped_for_scan` output, the same text the extent pass
-    scans — taken as an argument rather than re-derived so a listing masks its
-    source once.
+    `masked` is `_stripped_for_scan` output and `candidates` is
+    `_candidates_by_name` over it — the same text and the same scan the extent
+    pass uses, taken as arguments rather than re-derived so a listing pays for
+    each once.
 
     Returned unchanged unless some unit's name has more than one
     definition-shaped occurrence. That is the exact precondition for the guard
-    seed to change any answer: `_select_definition` returns the sole candidate
-    whatever the breakpoints say, so probing a single-definition file — the
-    common case, and one that would otherwise pay a whole extra ``esbmc
-    --parse-tree-only`` run per listing — buys nothing.
+    seed to change any answer: `_select_definition` returns a sole candidate
+    without consulting the breakpoints at all, so probing a single-definition
+    file — the common case, and one that would otherwise pay a whole extra
+    ``esbmc --parse-tree-only`` run per listing — buys nothing.
 
     The probe runs at most once per listing, under the same binary, flags and
     file extension as the parse it annotates, and contributes ``()`` when it
     cannot (see `probe_predefined_guards`).
     """
-    if not any(len(_definition_candidates(masked, unit.name)) > 1 for unit in units):
+    if not any(len(matches) > 1 for matches in candidates.values()):
         return units
     guards = probe_predefined_guards(
         masked,
@@ -2343,10 +2374,12 @@ def list_units(
     except OSError:
         return units
     masked = _stripped_for_scan(source_text)
+    candidates = _candidates_by_name(units, masked)
     return _annotate_array_extents(
         _with_predefined_guards(
             units,
             masked,
+            candidates,
             esbmc_bin=esbmc_bin,
             timeout_s=timeout_s,
             extra_flags=extra_flags,
@@ -2356,4 +2389,5 @@ def list_units(
             suffix=Path(source).suffix,
         ),
         masked,
+        candidates,
     )
