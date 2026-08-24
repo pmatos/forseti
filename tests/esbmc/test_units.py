@@ -2813,16 +2813,29 @@ def test_annotate_array_extents_uses_the_units_predefined_guards() -> None:
     )
 
 
-def test_probe_predefined_guards_without_guards_never_runs_esbmc() -> None:
-    # No guard name to ask about — so no probe TU, no subprocess. Proven by the
-    # unrunnable binary: a probe that ran would fail closed to `()` as well, but
-    # this source would also have to have been written and compiled first.
-    assert (
-        probe_predefined_guards(
-            "void f(int *p) { *p = 1; }\n", esbmc_bin="forseti-no-such-esbmc"
-        )
-        == ()
-    )
+def test_probe_predefined_guards_without_guards_never_runs_esbmc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No guard name to ask about — so no probe TU, no subprocess. Asserted
+    # against `_parse_tree` itself rather than through an unrunnable binary:
+    # that spelling returns `()` whether or not the probe ran, so it also passes
+    # with the `if not names` short-circuit deleted — which is the one thing
+    # this test exists to pin. `called` is what makes it fail then.
+    called: list[Path] = []
+
+    def fake_parse_tree(
+        source: Path, esbmc_bin: str, timeout_s: float, extra_flags: object
+    ) -> str:
+        called.append(source)
+        raise ListUnitsError("stubbed")
+
+    monkeypatch.setattr("forseti.esbmc.units._parse_tree", fake_parse_tree)
+    assert probe_predefined_guards("void f(int *p) { *p = 1; }\n") == ()
+    assert called == []
+    # Same stub, a source that does carry a guard: the probe really would have
+    # run, so the assertion above is not vacuous.
+    assert probe_predefined_guards("#ifdef WIDGET\n#endif\n") == ()
+    assert len(called) == 1
 
 
 def test_probe_predefined_guards_fails_closed_on_an_unrunnable_esbmc() -> None:
@@ -2920,28 +2933,6 @@ def test_probe_predefined_guards_reads_the_sources_own_language() -> None:
     assert probe_predefined_guards(source, suffix=".cpp") == (("__cplusplus", True),)
 
 
-@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
-def test_list_units_probes_a_cpp_source_as_cpp(tmp_path: Path) -> None:
-    # End-to-end: `#ifdef __cplusplus` is the arm esbmc really compiles for a
-    # `.cpp` source, so its `int p[20]` is the extent to harvest. A probe run as
-    # C reports `__cplusplus` undefined, proves that live arm dead, and returns
-    # the deleted `#ifndef` body's plain pointer instead.
-    src = tmp_path / "sig.cpp"
-    src.write_text(
-        "#ifdef __cplusplus\n"
-        "#line 100\n"
-        "void g(int p[20]) { (void)p; }\n"
-        "#endif\n"
-        "#ifndef __cplusplus\n"
-        "#line 100\n"
-        "void g(int *p) { *p = 1; }\n"
-        "#endif\n"
-    )
-    g = next(u for u in list_units(src) if u.name == "g")
-    assert g.predefined_guards == (("__cplusplus", True),)
-    assert g.params[0].array_extent == 20
-
-
 def test_a_non_ascii_guard_name_reaches_the_probe() -> None:
     # `_MACRO_NAME`'s continuation class is `[\w$]`, which Python's `re` reads
     # as Unicode, so a non-ASCII guard name really is collected and really does
@@ -2985,8 +2976,10 @@ def test_probe_predefined_guards_caps_its_share_of_the_time_budget(
 def test_the_cpp_family_of_extensions_all_probe_as_cpp(tmp_path: Path) -> None:
     # `.cpp` is not the only C++ spelling esbmc takes. Before the suffix was
     # plumbed through, every one of these was probed as `.c` — `__cplusplus`
-    # reported undefined, the arm esbmc really compiles proven dead. Pinning the
-    # family, not just the one spelling the regression was found through.
+    # reported undefined, the arm esbmc really compiles proven dead, and the
+    # deleted `#ifndef` body's plain pointer harvested in place of the live
+    # arm's `int p[20]`. Pinning the family, not just the one spelling the
+    # regression was found through: this is the end-to-end pin for all of them.
     for ext in (".cpp", ".cc", ".cxx"):
         src = tmp_path / f"sig{ext}"
         src.write_text(
