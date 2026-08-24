@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import tempfile
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -312,20 +313,25 @@ _INT_LITERAL_RE = re.compile(r"[0-9]+")
 # (issue #157: every such conditional used to be opaque, so a `#line` guarding
 # an inactive alternative definition still donated a phantom breakpoint and left
 # `_select_definition` with a presumed-line tie only its `-m.line` physical-order
-# guess could break). Proof runs in one direction only: a `#define NAME`/`#undef
-# NAME` this scan can itself place (see `known_defined` in `_line_breakpoints`)
-# establishes defined/undefined, and nothing else does. In particular the
-# *absence* of any `#define NAME` proves nothing — a command-line `-D NAME`, a
-# compiler builtin, or an `#include`d header can each define a name this file
-# never mentions, and `list_units` really does forward `-D` flags.
+# guess could break). It resolves from *proof* and never from a default: a
+# `#define NAME`/`#undef NAME` this scan can itself place (see `known_defined`
+# in `_line_breakpoints`) establishes defined/undefined, and so does
+# `predefined`, the seed `probe_predefined_guards` measures by asking the real
+# preprocessor what the command line and the compiler's builtins had already
+# defined before line 1 (issue #226 — the two sources #157 could only name as
+# residuals, since neither leaves a trace in the file and `list_units` really
+# does forward `-D` flags). The *absence* of both still proves nothing: an
+# `#include`d header can define a name this file never mentions, which is why
+# `_INCLUDE_RE` below drops every fact — seed included — at an `#include`, and
+# why that last shape stays this rule's residual.
 #
-# That one-directional rule is what the cost asymmetry demands, and the same
-# asymmetry is what `_INCLUDE_RE` below rests on: a wrongly *live* verdict costs
-# nothing, since an opaque conditional is already assumed live and so lands on
-# exactly today's behaviour, whereas a wrongly *dead* verdict deletes a real
-# breakpoint and corrupts the presumed-line translation of every live line after
-# it. Only the dead verdict is new here, so only the dead verdict has to be
-# proven — and it is proven from this file's text or not at all.
+# Proof-or-nothing is what the cost asymmetry demands, and the same asymmetry is
+# what `_INCLUDE_RE` rests on: a wrongly *live* verdict costs nothing, since an
+# opaque conditional is already assumed live and so lands on exactly the
+# pre-#157 behaviour, whereas a wrongly *dead* verdict deletes a real breakpoint
+# and corrupts the presumed-line translation of every live line after it. Only
+# the dead verdict is new here, so only the dead verdict has to be proven — from
+# this file's text or from a measurement of the same build, never from a guess.
 #
 # Any other `#if`/`#elif <expr>` still stays opaque — `defined(A) && defined(B)`
 # needs a real expression evaluator, not a lookup — so it is tracked only to
@@ -717,6 +723,30 @@ class Unit:
     hand-built `Unit` (tests). `annotate_array_extents` anchors its declarator
     search to this line so a `#if 0`/`#ifdef`-excluded alternative body with the
     same name cannot donate its array shape to the active definition (issue #145).
+
+    `predefined_guards` says, for each conditional-guard name in the source,
+    whether it was defined *before the translation unit's first line* — the one
+    fact a textual scan of the file can never derive, because it is set by the
+    build command (``-D``) and by the compiler's own builtins, not by the file
+    (issue #226). `list_units` reads it back from the preprocessor itself
+    (`probe_predefined_guards`), in the same call and under the same binary and
+    flags as the parse that set `def_line`, so the two are measured together;
+    every consumer of `def_line` (the extent anchor here, the
+    obligation-injection anchor in `forseti.precond.synth`) passes it down so
+    `_line_breakpoints` can decide guards this file leaves open. Being measured
+    together is all this field promises: a consumer that re-reads the source
+    after the listing carries a `def_line` from that same listing and is stale
+    in exactly the same way and to exactly the same degree.
+
+    It ranges over guard names only, never over every macro, and it says nothing
+    about state *below* an ``#include``: a header may redefine anything, and
+    `_INCLUDE_RE` still drops the whole seed there. Empty for a hand-built
+    `Unit`, for a source with no guards, whenever the probe could not run, and
+    — the common case — whenever `list_units` skipped the probe because no
+    unit's name had a second definition-shaped occurrence for the seed to
+    choose between (`_with_predefined_guards`). ``()`` therefore says "not
+    measured", never "nothing was defined": all four fall back to the
+    assumed-live default that predates this field.
     """
 
     name: str
@@ -724,6 +754,7 @@ class Unit:
     calls: tuple[str, ...] = ()
     internal_linkage: bool = False
     def_line: int | None = None
+    predefined_guards: tuple[tuple[str, bool], ...] = ()
 
     @property
     def takes_pointer(self) -> bool:
@@ -1413,7 +1444,10 @@ def _definition_candidates(
 
 
 def _select_definition(
-    matches: list[_DefinitionMatch], source_no_comments: str, def_line: int | None
+    matches: list[_DefinitionMatch],
+    source_no_comments: str,
+    def_line: int | None,
+    predefined: Sequence[tuple[str, bool]] = (),
 ) -> _DefinitionMatch | None:
     """The definition-shaped occurrence `def_line` anchors to, or the first.
 
@@ -1425,6 +1459,12 @@ def _select_definition(
     line, which the ``fn_name (`` text can follow by a line or two (a return type
     on its own line). Without `def_line` the first definition-shaped occurrence is
     used, as before.
+
+    A sole candidate is returned without consulting the breakpoints at all: there
+    is nothing for `def_line` or `predefined` to choose between, so neither can
+    change the answer. Stated here rather than left to be re-derived, because
+    `_with_predefined_guards`' cost gate is exactly this property read backwards —
+    it skips the probe for a listing whose every name has one candidate.
 
     `def_line` is clang's *presumed* line — the coordinate a ``#line``/linemarker
     directive in the source can rewrite away from physical line count. Comparing
@@ -1445,20 +1485,25 @@ def _select_definition(
     inactive alternative more often sits *before* the active one than after.
 
     A duplicate directive inside a ``#ifdef``/``#ifndef``/``#if defined(...)``
-    is only sometimes this case. `_line_breakpoints` now excludes it whenever
-    this file's own ``#define``/``#undef`` directives prove the guard's state
-    (issue #157), so the common single-build-flag shape no longer reaches the
-    tiebreak at all. What stays a residual is a guard this file never decides —
-    one defined on the command line with ``-D``, by a compiler builtin, or in an
-    ``#include``d header: there the scan cannot tell which branch cpp took, so
-    nothing here, this tiebreak included, can pick the right candidate in both
-    compiles of such an input.
+    is only sometimes this case. `_line_breakpoints` excludes it whenever the
+    guard's state is proven — by this file's own ``#define``/``#undef``
+    directives (issue #157) or by `predefined`, the definedness the command line
+    and the compiler's builtins gave each guard name before the first line
+    (issue #226). Passing `predefined` is what lets both compiles of the same
+    ``-D``-selected source pick their own definition; without it (a caller with
+    no build flags to measure under) such a guard reads opaque and the tiebreak
+    below decides, which is right for only one of the two physical orderings.
+
+    What stays a residual either way is a guard an ``#include``d header decides:
+    `_line_breakpoints` drops every definedness fact at an ``#include``, seed
+    included, because a header's effect depends on where it is included and no
+    probe of a separate translation unit reproduces that.
     """
     if not matches:
         return None
-    if def_line is None:
+    if def_line is None or len(matches) == 1:
         return matches[0]
-    breakpoints = _line_breakpoints(source_no_comments)
+    breakpoints = _line_breakpoints(source_no_comments, predefined)
     # Sort key: candidates at or after `def_line` (key[0] == False) all sort before
     # any that are only before it, then nearest wins within each group — "at or
     # nearest after", falling back to nearest-before only if none qualify. `-m.line`
@@ -1475,7 +1520,10 @@ def _select_definition(
 
 
 def find_definition_brace(
-    source_text: str, fn_name: str, def_line: int | None = None
+    source_text: str,
+    fn_name: str,
+    def_line: int | None = None,
+    predefined: Sequence[tuple[str, bool]] = (),
 ) -> int | None:
     """Index of the ``{`` opening `fn_name`'s definition body in `source_text`.
 
@@ -1490,10 +1538,15 @@ def find_definition_brace(
     an inactive ``#if 0`` body ahead of the compiled one must not capture the
     injection point, or an obligation would land in dead code cpp deletes and go
     unchecked (issue #145; the anchor lives in `_select_definition`).
+
+    `predefined` (`Unit.predefined_guards`) carries the one input that anchor
+    cannot read off the text — which guards the build flags and the compiler's
+    builtins had already defined (issue #226). Omitting it is safe but weaker:
+    every such guard reads live, exactly as it did before that field existed.
     """
     masked = _stripped_for_scan(source_text)
     chosen = _select_definition(
-        _definition_candidates(masked, fn_name), masked, def_line
+        _definition_candidates(masked, fn_name), masked, def_line, predefined
     )
     return None if chosen is None else chosen.brace
 
@@ -1638,7 +1691,9 @@ def _annotated_param(param: Param, param_list: str) -> Param:
     )
 
 
-def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
+def _line_breakpoints(
+    source_no_comments: str, predefined: Sequence[tuple[str, bool]] = ()
+) -> list[tuple[int, int]]:
     """``(physical_line, presumed_line)`` pairs from `source_no_comments`'s
     ``#line``/linemarker directives, one per directive reachable by cpp, in
     physical order.
@@ -1661,15 +1716,23 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
 
     A ``#ifdef NAME``/``#ifndef NAME`` — or the ``#if defined NAME``/``#if
     !defined(NAME)`` spelling of the same predicate — is decided too, but only
-    when this file's own ``#define``/``#undef`` directives already proved
-    whether ``NAME`` is defined at that point (issue #157, tracked in
-    `known_defined`). The proof is one-directional on purpose: a name this file
-    never mentions stays *unknown*, never "undefined", because a command-line
-    ``-D``, a compiler builtin, or an ``#include``d header can define it — and
-    any ``#include`` cpp can reach drops every fact proven above it. `_IFDEF_RE`
-    carries the full rationale; the short version is that a wrong *live* verdict
-    only reproduces the opaque default, while a wrong *dead* verdict deletes a
-    real breakpoint.
+    when ``NAME``'s definedness at that point is *proven*: either by this file's
+    own ``#define``/``#undef`` directives (issue #157) or by `predefined`, which
+    seeds `known_defined` with what was true before the file's first line. The
+    proof stays one-directional on purpose: a name neither `predefined` nor this
+    file mentions stays *unknown*, never "undefined", because an ``#include``d
+    header can still define it — and any ``#include`` cpp can reach drops every
+    fact proven above it, the seed included. `_IFDEF_RE` carries the full
+    rationale; the short version is that a wrong *live* verdict only reproduces
+    the opaque default, while a wrong *dead* verdict deletes a real breakpoint.
+
+    `predefined` is the only thing here that a scan of this file cannot derive
+    for itself: a command-line ``-D`` and a compiler builtin are both invisible
+    in the text (issue #226). It is measured, not guessed —
+    `probe_predefined_guards` asks the same preprocessor, under the same build
+    flags — so seeding it keeps the "proven, never assumed" rule above intact.
+    Absent it (``()``, the default and what every caller without build flags
+    passes) this decides exactly what #157 decided and no more.
 
     Every other branch whose own condition is not the complete literal ``0`` or
     ``1`` and not a decidable ``defined`` test stays opaque — its condition needs
@@ -1787,7 +1850,10 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
     # happen", exactly as #165 already did. `macro_stack_opaque` below suspends
     # establishment for the rest of the file on the same terms. See `_IFDEF_RE`
     # for why absence of a `#define` is never read as "undefined" (issue #157).
-    known_defined: dict[str, bool] = {}
+    # Seeded with what held before the file's first line (`predefined`, issue
+    # #226); the file's own directives overwrite or drop those entries on the
+    # exact same terms as any other, and an `#include` clears them too.
+    known_defined: dict[str, bool] = dict(predefined)
     # Latched by the `_Pragma` operator, which can spell a `pop_macro` and fire
     # anywhere at or below its own text (`_PRAGMA_OPERATOR_RE`): once set, no
     # `#define`/`#undef` may *establish* a fact again, so every later guard in
@@ -1903,6 +1969,45 @@ def _line_breakpoints(source_no_comments: str) -> list[tuple[int, int]]:
     return breakpoints
 
 
+def _guard_macro_names(source_no_comments: str) -> tuple[str, ...]:
+    """Every macro name a ``defined``-shaped conditional in `source_no_comments`
+    tests, deduplicated.
+
+    Order is stable but not the source's: the ``#ifdef``-spelled names come
+    first, then the ``#if defined``-spelled ones, each group in its own textual
+    order. Nothing reads it as a source order — `probe_predefined_guards` pairs
+    each name with its probe declaration through one `enumerate`, so any stable
+    order round-trips.
+
+    Exactly the names `_line_breakpoints` would consult `known_defined` for:
+    ``#ifdef``/``#ifndef`` and their ``#elifdef``/``#elifndef`` twins
+    (`_IFDEF_RE`, `_ELIFDEF_RE`), plus the ``#if defined X``/``#elif
+    !defined(X)`` spelling of the same predicate (`_macro_test`). A condition of
+    any other shape contributes nothing — its answer needs macro *values*, which
+    no probe of definedness could supply.
+
+    Runs over spliced, comment- and literal-stripped text, the same two passes
+    and in the same order `_line_breakpoints` runs them: a name reachable only
+    through a backslash continuation (``#ifdef W\\`` + newline + ``IDE``) has to
+    be probed under the name cpp actually tests, and a ``#ifdef`` mentioned
+    inside a string literal must not be probed at all.
+    """
+    spliced, _ = _splice_continuations(source_no_comments)
+    spliced = _stripped_for_scan(spliced)
+    names: dict[str, None] = {}
+    for pattern in (_IFDEF_RE, _ELIFDEF_RE):
+        for match in pattern.finditer(spliced):
+            name = match.group("name")
+            if name is not None:
+                names[name] = None
+    for pattern in (_IF_RE, _ELIF_RE):
+        for match in pattern.finditer(spliced):
+            test = _macro_test(_strip_literal_parens(match.group(1)))
+            if test is not None:
+                names[test.group("name")] = None
+    return tuple(names)
+
+
 def _presumed_line(physical_line: int, breakpoints: list[tuple[int, int]]) -> int:
     """`physical_line`'s presumed line, per `breakpoints` (see `_line_breakpoints`).
 
@@ -1918,20 +2023,26 @@ def _presumed_line(physical_line: int, breakpoints: list[tuple[int, int]]) -> in
 
 
 def _param_list_text(
-    source_no_comments: str, fn_name: str, def_line: int | None = None
+    matches: list[_DefinitionMatch],
+    source_no_comments: str,
+    unit: Unit,
 ) -> str | None:
-    """The parameter-list text of `fn_name`'s *definition*, or ``None``.
+    """The parameter-list text of `unit`'s *definition*, or ``None``.
 
     The declarator text between ``(`` and its matching ``)`` for the
-    definition-shaped occurrence `def_line` anchors to — see `_definition_candidates`
-    for what counts as definition-shaped and `_select_definition` for how
-    `def_line` (issue #145) picks the compiled definition over an inactive
-    ``#if 0`` alternative.
+    definition-shaped occurrence `unit.def_line` anchors to — see
+    `_definition_candidates` for what counts as definition-shaped (and produces
+    `matches`) and `_select_definition` for how `def_line` (issue #145) and
+    `predefined_guards` (issue #226) pick the compiled definition over an
+    inactive ``#if 0``/``#ifdef`` alternative.
+
+    Takes `unit` rather than its three fields unpacked, and `matches` rather than
+    the name to rescan for: the two anchors are only meaningful together (see
+    `Unit.predefined_guards`), and the candidate list is already computed once
+    per listing (`list_units`).
     """
     chosen = _select_definition(
-        _definition_candidates(source_no_comments, fn_name),
-        source_no_comments,
-        def_line,
+        matches, source_no_comments, unit.def_line, unit.predefined_guards
     )
     return None if chosen is None else chosen.params
 
@@ -1950,15 +2061,46 @@ def annotate_array_extents(units: list[Unit], source_text: str) -> list[Unit]:
 
     The declarator search is anchored to `Unit.def_line` (`_param_list_text`), so
     a same-named definition excluded by `#if 0`/`#ifdef` cannot donate its extent
-    to the one clang actually compiled (issue #145). String/char literals are
+    to the one clang actually compiled (issue #145), and to each unit's own
+    `Unit.predefined_guards` so that a ``#ifdef`` only the build flags or a
+    compiler builtin decide is excluded too (issue #226). String/char literals are
     stripped alongside comments (`_stripped_for_scan`) for the same reason
     `rename_all_declarations_and_definitions` does: a literal spelling
     `name(...)` is not a parameter list to isolate.
     """
     stripped = _stripped_for_scan(source_text)
+    candidates = _candidates_by_name(units, stripped)
+    return _annotate_array_extents(units, stripped, candidates)
+
+
+def _candidates_by_name(
+    units: list[Unit], stripped: str
+) -> dict[str, list[_DefinitionMatch]]:
+    """Each unit name's definition-shaped occurrences in `stripped`, scanned once.
+
+    Keyed by name because that is all `_definition_candidates` reads, so two
+    units sharing a name share the one scan.
+    """
+    return {unit.name: _definition_candidates(stripped, unit.name) for unit in units}
+
+
+def _annotate_array_extents(
+    units: list[Unit],
+    stripped: str,
+    candidates: dict[str, list[_DefinitionMatch]],
+) -> list[Unit]:
+    """`annotate_array_extents` on text `_stripped_for_scan` has already masked,
+    and candidates `_candidates_by_name` has already scanned for.
+
+    Split out so `list_units` pays for both once per listing rather than twice:
+    it needs the same masked text and the same candidate lists for
+    `_with_predefined_guards`' cost gate, which would otherwise scan every unit
+    name here a second time — on every listing, including the common one where
+    the gate declines to probe at all.
+    """
     annotated: list[Unit] = []
     for unit in units:
-        param_list = _param_list_text(stripped, unit.name, unit.def_line)
+        param_list = _param_list_text(candidates[unit.name], stripped, unit)
         if param_list is None:
             annotated.append(unit)
             continue
@@ -1995,6 +2137,151 @@ def _parse_tree(
         )
         raise ListUnitsError(f"esbmc --parse-tree-only failed ({esbmc_bin}): {detail}")
     return proc.stdout + "\n" + proc.stderr
+
+
+# The probe translation unit `probe_predefined_guards` compiles: a leading
+# `#undef` of every identifier it is about to declare, then one
+# `int <prefix><i>;` per guard name, emitted only inside `#ifdef NAME`, so the
+# declarations that survive into the dump name exactly the guards the
+# preprocessor considered defined. The `#undef`s are what make that reading
+# true under any `extra_flags`: the declarations name themselves, so without
+# them a `-D` of one of these identifiers rewrites its declaration before the
+# AST and the guard reads `False`. `sentinel` is unconditional and so must
+# always survive — its absence means the dump is not a dump of this probe (a
+# flag that broke the run, an ESBMC that printed something else) and the whole
+# reading is discarded rather than read as "nothing was defined".
+_PROBE_STEM = "forseti_guard_probe"
+_PROBE_PREFIX = f"{_PROBE_STEM}_"
+_PROBE_SENTINEL = "sentinel"
+# Anchored on the trailing `_` of `_PROBE_PREFIX`, which is what keeps the probe
+# *file* name out of the reading: the dump quotes `forseti_guard_probe.c` (or
+# `.cpp`) in every location it prints, and a `.` is not a `_`.
+_PROBE_DECL_RE = re.compile(rf"\b{_PROBE_PREFIX}(\d+|{_PROBE_SENTINEL})\b")
+
+# The probe's share of a listing's time budget. `_parse_tree` applies its
+# timeout per `subprocess.run`, so handing the probe the caller's whole
+# `timeout_s` would double `list_units`' in-process worst case — past the
+# margin the Claude Code gate sizes its own `subprocess.run` with
+# (`LIST_UNITS_TIMEOUT_S + 15s`, written for one esbmc run), turning an
+# optional, fail-closed measurement into a blocking `UnitsUnavailable` on
+# every edit of a slow-parsing file. A probe TU is a few declarations and no
+# `#include`s — ~11ms locally — so a small cap costs nothing real, and a probe
+# that overruns it degrades to `()` like any other probe failure.
+_PROBE_TIMEOUT_CAP_S = 10.0
+
+
+def probe_predefined_guards(
+    source_no_comments: str,
+    *,
+    esbmc_bin: str = "esbmc",
+    # Not `list_units`' 30.0: every budget at or above the cap behaves
+    # identically, so mirroring that default would only invite the reader to
+    # think the probe gets 30s. The production caller passes its own anyway.
+    timeout_s: float = _PROBE_TIMEOUT_CAP_S,
+    extra_flags: Sequence[str] = (),
+    suffix: str = ".c",
+) -> tuple[tuple[str, bool], ...]:
+    """Which of `source_no_comments`' conditional guards are defined before its
+    first line, measured against the real preprocessor under `extra_flags`.
+
+    The one question `_line_breakpoints`' textual scan structurally cannot
+    answer (issue #226): a ``#ifdef WIDGET`` whose ``WIDGET`` comes from a
+    command-line ``-D`` or is a compiler builtin leaves no trace in the file, so
+    the scan has to assume the branch live and can then count a ``#line`` cpp
+    never reached. This asks instead — it compiles a generated probe TU that
+    declares one uniquely named variable per guard name inside that name's own
+    ``#ifdef``, with the *same* `esbmc_bin`, `extra_flags` and `suffix` the real
+    parse used, and reports which declarations survived.
+
+    Those three are the complete list of inputs that decide the predefined set,
+    and every one of them has to be reproduced or the probe answers a different
+    question than the parse it annotates. The binary picks the builtins, the
+    flags add ``-D``\\ s — and the *file extension* picks the language: esbmc
+    parses ``x.cpp`` as C++ and defines ``__cplusplus``, ``x.c`` as C and does
+    not, so probing a C++ source through a ``.c`` file reports ``__cplusplus``
+    undefined and proves the arm cpp actually took *dead*. Nothing else is in
+    play: the process cwd is shared with the real run (so a relative ``-I``
+    resolves the same), and the probe's own directory is irrelevant because it
+    ``#include``\\ s nothing. An extension esbmc will not take (``""`` among
+    them — ``failed to figure out type of file``) needs no special case: it
+    fails the probe run, which fails closed like every other probe failure, and
+    a source carrying one could not have been parsed in the first place.
+
+    What it measures is definedness at the *start* of a translation unit and
+    nothing else. The probe deliberately ``#include``s nothing: a header's
+    effects depend on where it is included, which a separate TU cannot
+    reproduce, so a guard sitting below an ``#include`` stays this issue's
+    residual and `_line_breakpoints` still drops the seed there.
+
+    A guard name inside the probe's own ``forseti_guard_probe_`` namespace is
+    dropped rather than answered — the leading ``#undef``\\ s would undefine the
+    very name its ``#ifdef`` tests — so it comes back absent, which
+    `_line_breakpoints` reads as opaque and assumed-live.
+
+    Fails closed to ``()`` — an unrunnable or failing esbmc, an unwritable or
+    unencodable temporary file, a probe overrunning `_PROBE_TIMEOUT_CAP_S`, a
+    dump missing the unconditional sentinel. ``()`` is not a degraded answer but
+    the *previous* answer: every guard reads opaque and assumed-live again,
+    exactly as before this existed. The caller has already parsed the source
+    successfully by this point, so a probe failure must not turn a good listing
+    into a raised error.
+    """
+    # A guard name inside the probe's own namespace cannot be measured by this
+    # scheme at all: the `#undef` block below would undefine the very name its
+    # `#ifdef` tests. Drop it rather than answer, so it comes back absent —
+    # which `_line_breakpoints` reads as opaque and assumed-live, the safe
+    # direction — instead of a silent `False`. Filtered on the whole prefix, not
+    # on the identifiers actually emitted: the emitted set is a function of how
+    # many names survive this filter, so a rule that depended on the index
+    # arithmetic would shift its own boundary.
+    names = tuple(
+        name
+        for name in _guard_macro_names(source_no_comments)
+        if not name.startswith(_PROBE_PREFIX)
+    )
+    if not names:
+        return ()
+    probe_timeout_s = min(timeout_s, _PROBE_TIMEOUT_CAP_S)
+    declared = [f"{_PROBE_PREFIX}{index}" for index in range(len(names))]
+    declared.append(f"{_PROBE_PREFIX}{_PROBE_SENTINEL}")
+    # The declarations name themselves, so a build that predefines one of these
+    # identifiers rewrites the declaration before it reaches the AST: under
+    # `-Dforseti_guard_probe_0=WIDGET` the probe emits `int WIDGET;`, index `0`
+    # is absent from the dump, and a guard that *is* defined is recorded
+    # `False`. The sentinel still survives, so nothing fails closed — it is a
+    # silent inversion in the wrong *dead* direction. `#undef` of a macro that
+    # was never defined is a well-defined no-op in C and C++, so undefining
+    # every emitted identifier up front costs nothing in the normal case and
+    # makes the reading independent of `-D`s and preincluded headers alike
+    # (review feedback on PR #231).
+    probe_text = "".join(f"#undef {ident}\n" for ident in declared)
+    probe_text += "".join(
+        f"#ifdef {name}\nint {_PROBE_PREFIX}{index};\n#endif\n"
+        for index, name in enumerate(names)
+    )
+    probe_text += f"int {_PROBE_PREFIX}{_PROBE_SENTINEL};\n"
+    try:
+        with tempfile.TemporaryDirectory(prefix="forseti-guard-probe-") as tmp:
+            probe_path = Path(tmp) / f"{_PROBE_STEM}{suffix}"
+            # Explicit UTF-8, never the locale's encoding: `_MACRO_NAME`'s
+            # continuation class is `[\w$]`, which Python's `re` reads as
+            # Unicode, so `#ifdef Wé` is a name this probe really can be asked
+            # about. Under a C/latin-1 locale the default would either raise
+            # `UnicodeEncodeError` — a `ValueError`, which the handler below
+            # does *not* catch, so it would escape and fail a listing that had
+            # already parsed — or write mis-encoded bytes, making the probe test
+            # a *different* name and answer `False` for a guard that is defined.
+            # That is the wrong *dead* direction, the one this module is built
+            # to never take. Pinning the encoding closes both, which is why the
+            # handler can stay narrow.
+            probe_path.write_text(probe_text, encoding="utf-8")
+            dump = _parse_tree(probe_path, esbmc_bin, probe_timeout_s, extra_flags)
+    except (OSError, ListUnitsError):
+        return ()
+    survived = {match.group(1) for match in _PROBE_DECL_RE.finditer(dump)}
+    if _PROBE_SENTINEL not in survived:
+        return ()
+    return tuple((name, str(index) in survived) for index, name in enumerate(names))
 
 
 @dataclass(frozen=True)
@@ -2053,6 +2340,48 @@ def list_caller_openings(
     )
 
 
+def _with_predefined_guards(
+    units: list[Unit],
+    masked: str,
+    candidates: dict[str, list[_DefinitionMatch]],
+    *,
+    esbmc_bin: str,
+    timeout_s: float,
+    extra_flags: Sequence[str],
+    suffix: str,
+) -> list[Unit]:
+    """`units`, each carrying `probe_predefined_guards`' reading of `masked`.
+
+    `masked` is `_stripped_for_scan` output and `candidates` is
+    `_candidates_by_name` over it — the same text and the same scan the extent
+    pass uses, taken as arguments rather than re-derived so a listing pays for
+    each once.
+
+    Returned unchanged unless some unit's name has more than one
+    definition-shaped occurrence. That is the exact precondition for the guard
+    seed to change any answer: `_select_definition` returns a sole candidate
+    without consulting the breakpoints at all, so probing a single-definition
+    file — the common case, and one that would otherwise pay a whole extra
+    ``esbmc --parse-tree-only`` run per listing — buys nothing.
+
+    The probe runs at most once per listing, under the same binary, flags and
+    file extension as the parse it annotates, and contributes ``()`` when it
+    cannot (see `probe_predefined_guards`).
+    """
+    if not any(len(matches) > 1 for matches in candidates.values()):
+        return units
+    guards = probe_predefined_guards(
+        masked,
+        esbmc_bin=esbmc_bin,
+        timeout_s=timeout_s,
+        extra_flags=extra_flags,
+        suffix=suffix,
+    )
+    if not guards:
+        return units
+    return [replace(unit, predefined_guards=guards) for unit in units]
+
+
 def list_units(
     source: Path,
     *,
@@ -2078,4 +2407,21 @@ def list_units(
         source_text = Path(source).read_text()
     except OSError:
         return units
-    return annotate_array_extents(units, source_text)
+    masked = _stripped_for_scan(source_text)
+    candidates = _candidates_by_name(units, masked)
+    return _annotate_array_extents(
+        _with_predefined_guards(
+            units,
+            masked,
+            candidates,
+            esbmc_bin=esbmc_bin,
+            timeout_s=timeout_s,
+            extra_flags=extra_flags,
+            # The extension is a parse input like the binary and the flags: it
+            # picks the language, and so the predefined set the probe reads
+            # (`probe_predefined_guards`).
+            suffix=Path(source).suffix,
+        ),
+        masked,
+        candidates,
+    )

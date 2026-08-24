@@ -568,8 +568,13 @@ def inject_obligations(
     function = plan.unit.name
     # Anchor on the compiled definition's line (issue #145): an inactive `#if 0`
     # body of the same name ahead of it must not capture the injection point, or
-    # the obligation lands in dead code cpp deletes and goes unchecked.
-    brace = find_definition_brace(source_text, function, plan.unit.def_line)
+    # the obligation lands in dead code cpp deletes and goes unchecked. The
+    # unit's guard seed goes with it (issue #226) so a `#ifdef` decided by the
+    # build flags or a compiler builtin — invisible in the text — cannot make a
+    # dead body look like the compiled one.
+    brace = find_definition_brace(
+        source_text, function, plan.unit.def_line, plan.unit.predefined_guards
+    )
     if brace is None:
         raise SynthError(f"no definition of {function}() found in the source text")
     if site_probe:

@@ -7,15 +7,18 @@
 from __future__ import annotations
 
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from forseti.esbmc.units import (
+    _PROBE_TIMEOUT_CAP_S,
     CallerOpenings,
     ListUnitsError,
     Param,
     Unit,
+    _guard_macro_names,
     _line_breakpoints,
     _stripped_for_scan,
     annotate_array_extents,
@@ -30,6 +33,7 @@ from forseti.esbmc.units import (
     parse_implicit_invocations,
     parse_symbol_aliases,
     parse_units,
+    probe_predefined_guards,
     rename_all_declarations_and_definitions,
 )
 
@@ -2690,3 +2694,418 @@ def test_parse_asm_statements_file_scope_match_is_whole_word() -> None:
     # contained in its name.
     assert parse_asm_statements(_FILE_SCOPE_ASM_AST, "help") == ()
     assert parse_asm_statements(_FILE_SCOPE_ASM_AST, "helpers") == ()
+
+
+# Issue #226: the half of #157 a textual scan structurally cannot prove — a
+# guard whose name is defined *outside* this file, by a command-line `-D` or by
+# a compiler builtin. `probe_predefined_guards` measures it against the real
+# preprocessor under the real build flags; `Unit.predefined_guards` carries the
+# reading to every consumer of `def_line`.
+
+# Two definitions of `f` in complementary arms of the *same* undecidable guard,
+# each preceded by a `#line` resolving to the same presumed line. This is #157's
+# worked example: `def_line` cannot separate the candidates (both translate to
+# 100), so before #226 the physical-line tiebreak decided — correctly for only
+# one of the two arms.
+_GUARD_TIE_SOURCE = (
+    "#ifndef WIDGET\n"
+    "#line 100\n"
+    "void f(int *p) { *p = 1; }\n"
+    "#endif\n"
+    "#ifdef WIDGET\n"
+    "#line 100\n"
+    "void f(int p[20]) { (void)p; }\n"
+    "#endif\n"
+)
+
+
+def test_line_breakpoints_decides_an_ifdef_from_the_predefined_seed() -> None:
+    # `W` is never mentioned by the file, so #157 leaves it opaque
+    # (`test_line_breakpoints_leaves_an_unmentioned_ifdef_opaque`). A seed saying
+    # it was defined before line 1 proves the `#ifndef` arm dead, which the file
+    # alone never could.
+    source = "#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source) == [(2, 5), (5, 9)]
+    assert _line_breakpoints(source, (("W", True),)) == [(5, 9)]
+
+
+def test_line_breakpoints_seed_can_prove_a_guard_undefined() -> None:
+    # The direction #157 refused to guess at: "not defined" is now *measured*,
+    # so the `#ifdef` arm is dead and its `#line 5` never resets the counter.
+    source = "#ifdef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source, (("W", False),)) == [(5, 9)]
+
+
+def test_line_breakpoints_seed_is_overridden_by_the_files_own_undef() -> None:
+    # The seed describes line 0. A top-level `#undef` after it is later evidence
+    # about the same name and wins outright.
+    source = "#undef W\n#ifdef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source, (("W", True),)) == [(6, 9)]
+
+
+def test_line_breakpoints_seed_does_not_survive_an_include() -> None:
+    # This issue's stated residual: a header may `#define`/`#undef` anything, so
+    # the seed stops holding below an `#include` exactly as a `#define` proven
+    # above one does. The `#line 5` counts again.
+    source = '#include "h.h"\n#ifdef W\n#line 5\nx\n#endif\n#line 9\ny\n'
+    assert _line_breakpoints(source, (("W", False),)) == [(3, 5), (6, 9)]
+
+
+def test_line_breakpoints_seed_is_dropped_by_a_conditional_define() -> None:
+    # A `#define W` this scan cannot prove cpp reaches makes the seed stale for
+    # `W`, on the same fail-closed terms as any other proven fact (#165/#157) —
+    # the `#ifndef W` below goes back to opaque rather than staying decided.
+    source = "#ifdef Q\n#define W\n#endif\n#ifndef W\n#line 5\nx\n#endif\n#line 9\ny\n"
+    assert _line_breakpoints(source, (("W", False),)) == [(5, 5), (8, 9)]
+
+
+def test_guard_macro_names_collects_every_defined_shaped_spelling() -> None:
+    source = (
+        "#ifdef A\n#endif\n"
+        "#ifndef B\n#endif\n"
+        "#if defined C\n#elif !defined(D)\n#endif\n"
+        "#ifdef A\n#endif\n"
+        "#if 0\n#elifdef E\n#elifndef F\n#endif\n"
+    )
+    assert _guard_macro_names(source) == ("A", "B", "E", "F", "C", "D")
+
+
+def test_guard_macro_names_skips_a_condition_no_probe_could_answer() -> None:
+    # Definedness is all a probe reports, so a condition needing macro *values*
+    # contributes no name — probing `V` would answer a question nobody asked.
+    assert _guard_macro_names("#if V > 2\n#endif\n#if 0\n#endif\n") == ()
+
+
+def test_guard_macro_names_reads_the_text_the_walk_reads() -> None:
+    # Same two passes, same order, as `_line_breakpoints`: a spliced operand is
+    # probed under the name cpp actually tests, and a `#ifdef` that only appears
+    # inside a string literal is not a directive and must not be probed at all.
+    # (Without the strip pass this would return `("WIDE", "STR")`.)
+    source = '#ifdef W\\\nIDE\n#endif\nchar *s = "#ifdef STR";\n'
+    assert _guard_macro_names(source) == ("WIDE",)
+
+
+def test_guard_macro_names_ignores_an_operandless_ifdef() -> None:
+    assert _guard_macro_names("#ifdef\n#endif\n#ifdef W\n#endif\n") == ("W",)
+
+
+def test_find_definition_brace_uses_the_predefined_guard_seed() -> None:
+    # The `synth.py` consumer: with `WIDGET` measured undefined the injection
+    # point is the `#ifndef` arm's body; measured defined, the `#ifdef` arm's.
+    # Un-seeded, the physical-line tiebreak answers with the later one either way.
+    undefined = find_definition_brace(_GUARD_TIE_SOURCE, "f", 100, (("WIDGET", False),))
+    defined = find_definition_brace(_GUARD_TIE_SOURCE, "f", 100, (("WIDGET", True),))
+    assert _GUARD_TIE_SOURCE[undefined:].startswith("{ *p = 1; }")
+    assert _GUARD_TIE_SOURCE[defined:].startswith("{ (void)p; }")
+    assert find_definition_brace(_GUARD_TIE_SOURCE, "f", 100) == defined
+
+
+def test_annotate_array_extents_uses_the_units_predefined_guards() -> None:
+    unit = Unit("f", (Param("p", "int *"),), def_line=100)
+    assert (
+        annotate_array_extents([unit], _GUARD_TIE_SOURCE)[0].params[0].array_extent
+        == 20
+    )
+    seeded = replace(unit, predefined_guards=(("WIDGET", False),))
+    assert (
+        annotate_array_extents([seeded], _GUARD_TIE_SOURCE)[0].params[0].array_extent
+        is None
+    )
+
+
+def test_probe_predefined_guards_without_guards_never_runs_esbmc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No guard name to ask about — so no probe TU, no subprocess. Asserted
+    # against `_parse_tree` itself rather than through an unrunnable binary:
+    # that spelling returns `()` whether or not the probe ran, so it also passes
+    # with the `if not names` short-circuit deleted — which is the one thing
+    # this test exists to pin. `called` is what makes it fail then.
+    called: list[Path] = []
+
+    def fake_parse_tree(
+        source: Path, esbmc_bin: str, timeout_s: float, extra_flags: object
+    ) -> str:
+        called.append(source)
+        raise ListUnitsError("stubbed")
+
+    monkeypatch.setattr("forseti.esbmc.units._parse_tree", fake_parse_tree)
+    assert probe_predefined_guards("void f(int *p) { *p = 1; }\n") == ()
+    assert called == []
+    # Same stub, a source that does carry a guard: the probe really would have
+    # run, so the assertion above is not vacuous.
+    assert probe_predefined_guards("#ifdef WIDGET\n#endif\n") == ()
+    assert len(called) == 1
+
+
+def test_probe_predefined_guards_fails_closed_on_an_unrunnable_esbmc() -> None:
+    # A failed probe must read as "nothing measured" — every guard back to
+    # opaque and assumed live — never as "nothing defined", which would delete
+    # real breakpoints.
+    assert (
+        probe_predefined_guards(
+            "#ifdef WIDGET\n#endif\n", esbmc_bin="forseti-no-such-esbmc"
+        )
+        == ()
+    )
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_probe_predefined_guards_reads_a_command_line_define() -> None:
+    source = "#ifdef WIDGET\n#endif\n"
+    assert probe_predefined_guards(source) == (("WIDGET", False),)
+    assert probe_predefined_guards(source, extra_flags=("-DWIDGET",)) == (
+        ("WIDGET", True),
+    )
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_probe_predefined_guards_reads_a_compiler_builtin() -> None:
+    # The second shape this issue names: no `-D` anywhere, the name is simply
+    # part of the target's predefined set.
+    assert probe_predefined_guards("#ifdef __linux__\n#endif\n") == (
+        ("__linux__", True),
+    )
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_anchors_extent_through_a_command_line_guard(
+    tmp_path: Path,
+) -> None:
+    # End-to-end, both compiles of #157's worked example. Before #226 both
+    # returned 20: the un-`-D`'d compile harvested its extent from the `#ifdef
+    # WIDGET` body cpp had deleted.
+    src = tmp_path / "sig.c"
+    src.write_text(_GUARD_TIE_SOURCE)
+    plain = next(u for u in list_units(src) if u.name == "f")
+    assert plain.params[0].array_extent is None
+    assert plain.params[0].array_extent_unresolved is False
+    widget = next(
+        u for u in list_units(src, extra_flags=("-DWIDGET",)) if u.name == "f"
+    )
+    assert widget.params[0].array_extent == 20
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_anchors_extent_through_a_builtin_guard(tmp_path: Path) -> None:
+    # The builtin shape, ordered so the physical-line tiebreak gets it wrong:
+    # the live arm is the *first* candidate here, and before #226 `list_units`
+    # returned `None` — the dead `#ifndef` body's plain pointer.
+    src = tmp_path / "sig.c"
+    src.write_text(
+        "#ifdef __linux__\n"
+        "#line 100\n"
+        "void g(int p[20]) { (void)p; }\n"
+        "#endif\n"
+        "#ifndef __linux__\n"
+        "#line 100\n"
+        "void g(int *p) { *p = 1; }\n"
+        "#endif\n"
+    )
+    g = next(u for u in list_units(src) if u.name == "g")
+    assert g.params[0].array_extent == 20
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_skips_the_probe_for_a_single_definition_source(
+    tmp_path: Path,
+) -> None:
+    # The cost gate: one definition-shaped occurrence per name means
+    # `_select_definition` returns it whatever the breakpoints say, so the extra
+    # `--parse-tree-only` run is skipped and no reading is recorded — even
+    # though the file does have a guard worth probing.
+    src = tmp_path / "sig.c"
+    src.write_text("#ifdef WIDGET\nint x;\n#endif\nvoid f(int p[20]) { (void)p; }\n")
+    f = next(u for u in list_units(src) if u.name == "f")
+    assert f.predefined_guards == ()
+    assert f.params[0].array_extent == 20
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_probe_predefined_guards_reads_the_sources_own_language() -> None:
+    # The file extension is a parse input exactly like the binary and the flags:
+    # esbmc parses `.cpp` as C++ and defines `__cplusplus`, `.c` as C and does
+    # not. Probing a C++ source through a `.c` file answers a different question
+    # than the parse it annotates — and answers it in the *dead* direction, the
+    # one this module must never guess.
+    source = "#ifdef __cplusplus\n#endif\n"
+    assert probe_predefined_guards(source) == (("__cplusplus", False),)
+    assert probe_predefined_guards(source, suffix=".cpp") == (("__cplusplus", True),)
+
+
+_COLLIDING_FLAGS = [
+    # The probe's declarations name themselves, so a build that predefines one
+    # of those identifiers rewrites the declaration before it reaches the AST:
+    # `int forseti_guard_probe_0;` becomes `int WIDGET;`, index `0` is absent
+    # from the dump, and a guard that *is* defined is recorded `False`. The
+    # sentinel survives, so nothing fails closed — a silent inversion in the
+    # wrong *dead* direction (review feedback on PR #231).
+    ("#ifdef __linux__\n#endif\n", ("-Dforseti_guard_probe_0=WIDGET",)),
+    # An object-like `-D` carrying no replacement list expands to nothing,
+    # leaving `int ;` — a different corruption of the same declaration.
+    ("#ifdef __linux__\n#endif\n", ("-Dforseti_guard_probe_0",)),
+    # The sentinel's own collision. This one already failed closed to `()`,
+    # safe but a total loss of measurement; undefining it up front recovers
+    # the reading instead, so the fix is an improvement here, not a no-op.
+    ("#ifdef __linux__\n#endif\n", ("-Dforseti_guard_probe_sentinel=Z",)),
+    # The replacement token is itself a macro, so the corrupted declaration
+    # expands recursively — and the *second* guard is the one whose index
+    # collides, which is where "the sentinel survived so the probe is healthy"
+    # is most convincing.
+    (
+        "#ifdef __linux__\n#endif\n#ifdef __GNUC__\n#endif\n",
+        ("-Dforseti_guard_probe_1=__linux__",),
+    ),
+    # Every emitted identifier collides at once.
+    (
+        "#ifdef __linux__\n#endif\n#ifdef __GNUC__\n#endif\n",
+        (
+            "-Dforseti_guard_probe_0=X",
+            "-Dforseti_guard_probe_1=Y",
+            "-Dforseti_guard_probe_sentinel=Z",
+        ),
+    ),
+]
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+@pytest.mark.parametrize(("source", "flags"), _COLLIDING_FLAGS)
+def test_a_build_flag_colliding_with_a_probe_identifier_changes_nothing(
+    source: str, flags: tuple[str, ...]
+) -> None:
+    # Asserted against the same source's own uncollided reading rather than a
+    # hardcoded `True`, so the property under test is exactly the one that
+    # matters — a `-D` the source never mentions must not move the answer — and
+    # the case does not depend on which builtins this host defines.
+    baseline = probe_predefined_guards(source)
+    assert baseline, "baseline measures nothing; the case would pass vacuously"
+    assert probe_predefined_guards(source, extra_flags=flags) == baseline
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_a_guard_inside_the_probe_namespace_is_dropped_rather_than_answered() -> None:
+    # The `#undef` block that closes the collision above would undefine the very
+    # name such a guard's `#ifdef` tests, so this scheme cannot measure it at
+    # all. Dropped rather than answered: absent from the result reads as opaque
+    # and assumed-live in `_line_breakpoints`, where a `False` would be the
+    # wrong dead direction for a name the build may well have defined.
+    assert (
+        probe_predefined_guards(
+            "#ifdef forseti_guard_probe_0\n#endif\n",
+            extra_flags=("-Dforseti_guard_probe_0=WIDGET",),
+        )
+        == ()
+    )
+    # And it does not take the rest of the source's guards down with it.
+    only_real = probe_predefined_guards("#ifdef __linux__\n#endif\n")
+    assert only_real
+    assert (
+        probe_predefined_guards(
+            "#ifdef forseti_guard_probe_0\n#endif\n#ifdef __linux__\n#endif\n"
+        )
+        == only_real
+    )
+
+
+def test_a_non_ascii_guard_name_reaches_the_probe() -> None:
+    # `_MACRO_NAME`'s continuation class is `[\w$]`, which Python's `re` reads
+    # as Unicode, so a non-ASCII guard name really is collected and really does
+    # get written into the probe TU. That is why `probe_predefined_guards` pins
+    # `encoding="utf-8"` on the write rather than taking the locale's: the
+    # alternative is an escaping `UnicodeEncodeError` (a `ValueError`, which the
+    # probe deliberately does not catch, so it would fail a listing that had
+    # already parsed) or mis-encoded bytes making `#ifdef` test a name the
+    # source never wrote — a `False` for a guard that is defined, the wrong
+    # *dead* direction. The encoding itself is not observable in-process on a
+    # UTF-8 machine, so this carries the half that is: the name reaching the
+    # probe at all.
+    source = "#ifdef Wé\n#endif\n"
+    assert _guard_macro_names(source) == ("Wé",)
+    assert probe_predefined_guards(source, esbmc_bin="forseti-no-such-esbmc") == ()
+
+
+def test_probe_predefined_guards_caps_its_share_of_the_time_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `_parse_tree` applies its timeout per `subprocess.run`, so an uncapped
+    # probe would double `list_units`' in-process worst case — past the margin
+    # the Claude Code gate sizes its own `subprocess.run` with, turning an
+    # optional, fail-closed measurement into a blocking `UnitsUnavailable`.
+    seen: list[float] = []
+
+    def fake_parse_tree(
+        source: Path, esbmc_bin: str, timeout_s: float, extra_flags: object
+    ) -> str:
+        seen.append(timeout_s)
+        raise ListUnitsError("stubbed")
+
+    monkeypatch.setattr("forseti.esbmc.units._parse_tree", fake_parse_tree)
+    assert probe_predefined_guards("#ifdef W\n#endif\n", timeout_s=1000.0) == ()
+    # A budget already under the cap is handed through untouched, never raised.
+    assert probe_predefined_guards("#ifdef W\n#endif\n", timeout_s=0.5) == ()
+    assert seen == [_PROBE_TIMEOUT_CAP_S, 0.5]
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+@pytest.mark.parametrize("ext", [".cpp", ".cc", ".cxx", ".C"])
+def test_the_cpp_family_of_extensions_all_probe_as_cpp(
+    tmp_path: Path, ext: str
+) -> None:
+    # `.cpp` is not the only C++ spelling esbmc takes. Before the suffix was
+    # plumbed through, every one of these was probed as `.c` — `__cplusplus`
+    # reported undefined, the arm esbmc really compiles proven dead, and the
+    # deleted `#ifndef` body's plain pointer harvested in place of the live
+    # arm's `int p[20]`. Pinning the family, not just the one spelling the
+    # regression was found through: this is the end-to-end pin for all of them.
+    #
+    # Parametrized rather than looped so each spelling is its own case: a loop
+    # stops at the first failure, so `.cpp` failing would leave the later
+    # spellings unexecuted and the pin unproven for exactly the one — uppercase
+    # `.C` — that is easiest to get wrong. `.C` is the gate's own accepted
+    # spelling (`suffix.lower() == ".c"` there), staged with its case intact
+    # (`test_snapshot_preserves_the_source_extension_including_case`), so it
+    # reaches this code in production.
+    src = tmp_path / f"sig{ext}"
+    src.write_text(
+        "#ifdef __cplusplus\n#line 100\nvoid g(int p[20]) { (void)p; }\n#endif\n"
+        "#ifndef __cplusplus\n#line 100\nvoid g(int *p) { *p = 1; }\n#endif\n"
+    )
+    g = next(u for u in list_units(src) if u.name == "g")
+    assert g.predefined_guards == (("__cplusplus", True),), ext
+    assert g.params[0].array_extent == 20, ext
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_an_extension_esbmc_rejects_never_reaches_the_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `probe_predefined_guards` documents that an extension esbmc will not take
+    # needs no special case because "a source carrying one could not have been
+    # parsed in the first place". That is an ordering claim, so pin the order:
+    # the source parse raises first and the probe is never called. Were it ever
+    # reversed, the probe would run on a file esbmc refuses, read no sentinel,
+    # and return `()` — indistinguishable from "measured nothing".
+    called: list[str] = []
+    monkeypatch.setattr(
+        "forseti.esbmc.units.probe_predefined_guards",
+        lambda *a, **kw: called.append(kw.get("suffix", "")) or (),
+    )
+    # Two definition-shaped occurrences of `g`, so the cost gate *passes*: were
+    # the probe reachable at all here, it would run. `called` staying empty is
+    # then the ordering, not the gate.
+    source = (
+        "#ifdef WIDGET\n#line 100\nvoid g(int p[20]) { (void)p; }\n#endif\n"
+        "#ifndef WIDGET\n#line 100\nvoid g(int *p) { *p = 1; }\n#endif\n"
+    )
+    for ext in (".h", ".hpp", ""):
+        src = tmp_path / f"sig{ext}"
+        src.write_text(source)
+        with pytest.raises(ListUnitsError):
+            list_units(src)
+    assert called == []
+    # The gate really does pass for this source: the same text under an
+    # extension esbmc accepts reaches the probe.
+    accepted = tmp_path / "sig.c"
+    accepted.write_text(source)
+    list_units(accepted)
+    assert called == [".c"]
