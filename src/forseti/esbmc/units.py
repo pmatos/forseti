@@ -741,8 +741,12 @@ class Unit:
     It ranges over guard names only, never over every macro, and it says nothing
     about state *below* an ``#include``: a header may redefine anything, and
     `_INCLUDE_RE` still drops the whole seed there. Empty for a hand-built
-    `Unit`, for a source with no guards, and whenever the probe could not run —
-    all of which fall back to the assumed-live default that predates this field.
+    `Unit`, for a source with no guards, whenever the probe could not run, and
+    — the common case — whenever `list_units` skipped the probe because no
+    unit's name had a second definition-shaped occurrence for the seed to
+    choose between (`_with_predefined_guards`). ``()`` therefore says "not
+    measured", never "nothing was defined": all four fall back to the
+    assumed-live default that predates this field.
     """
 
     name: str
@@ -1961,7 +1965,13 @@ def _line_breakpoints(
 
 def _guard_macro_names(source_no_comments: str) -> tuple[str, ...]:
     """Every macro name a ``defined``-shaped conditional in `source_no_comments`
-    tests, deduplicated, in textual order.
+    tests, deduplicated.
+
+    Order is stable but not the source's: the ``#ifdef``-spelled names come
+    first, then the ``#if defined``-spelled ones, each group in its own textual
+    order. Nothing reads it as a source order — `probe_predefined_guards` pairs
+    each name with its probe declaration through one `enumerate`, so any stable
+    order round-trips.
 
     Exactly the names `_line_breakpoints` would consult `known_defined` for:
     ``#ifdef``/``#ifndef`` and their ``#elifdef``/``#elifndef`` twins
@@ -2050,7 +2060,16 @@ def annotate_array_extents(units: list[Unit], source_text: str) -> list[Unit]:
     `rename_all_declarations_and_definitions` does: a literal spelling
     `name(...)` is not a parameter list to isolate.
     """
-    stripped = _stripped_for_scan(source_text)
+    return _annotate_array_extents(units, _stripped_for_scan(source_text))
+
+
+def _annotate_array_extents(units: list[Unit], stripped: str) -> list[Unit]:
+    """`annotate_array_extents` on text `_stripped_for_scan` has already masked.
+
+    Split out so `list_units`, which needs the same masked text for
+    `_with_predefined_guards`' cost gate, pays for the mask once instead of
+    twice per listing.
+    """
     annotated: list[Unit] = []
     for unit in units:
         param_list = _param_list_text(
@@ -2101,9 +2120,24 @@ def _parse_tree(
 # always survive — its absence means the dump is not a dump of this probe (a
 # flag that broke the run, an ESBMC that printed something else) and the whole
 # reading is discarded rather than read as "nothing was defined".
-_PROBE_PREFIX = "forseti_guard_probe_"
+_PROBE_STEM = "forseti_guard_probe"
+_PROBE_PREFIX = f"{_PROBE_STEM}_"
 _PROBE_SENTINEL = "sentinel"
+# Anchored on the trailing `_` of `_PROBE_PREFIX`, which is what keeps the probe
+# *file* name out of the reading: the dump quotes `forseti_guard_probe.c` (or
+# `.cpp`) in every location it prints, and a `.` is not a `_`.
 _PROBE_DECL_RE = re.compile(rf"\b{_PROBE_PREFIX}(\d+|{_PROBE_SENTINEL})\b")
+
+# The probe's share of a listing's time budget. `_parse_tree` applies its
+# timeout per `subprocess.run`, so handing the probe the caller's whole
+# `timeout_s` would double `list_units`' in-process worst case — past the
+# margin the Claude Code gate sizes its own `subprocess.run` with
+# (`LIST_UNITS_TIMEOUT_S + 15s`, written for one esbmc run), turning an
+# optional, fail-closed measurement into a blocking `UnitsUnavailable` on
+# every edit of a slow-parsing file. A probe TU is a few declarations and no
+# `#include`s — ~11ms locally — so a small cap costs nothing real, and a probe
+# that overruns it degrades to `()` like any other probe failure.
+_PROBE_TIMEOUT_CAP_S = 10.0
 
 
 def probe_predefined_guards(
@@ -2112,6 +2146,7 @@ def probe_predefined_guards(
     esbmc_bin: str = "esbmc",
     timeout_s: float = 30.0,
     extra_flags: Sequence[str] = (),
+    suffix: str = ".c",
 ) -> tuple[tuple[str, bool], ...]:
     """Which of `source_no_comments`' conditional guards are defined before its
     first line, measured against the real preprocessor under `extra_flags`.
@@ -2122,8 +2157,22 @@ def probe_predefined_guards(
     the scan has to assume the branch live and can then count a ``#line`` cpp
     never reached. This asks instead — it compiles a generated probe TU that
     declares one uniquely named variable per guard name inside that name's own
-    ``#ifdef``, with the *same* `esbmc_bin` and `extra_flags` the real parse
-    used, and reports which declarations survived.
+    ``#ifdef``, with the *same* `esbmc_bin`, `extra_flags` and `suffix` the real
+    parse used, and reports which declarations survived.
+
+    Those three are the complete list of inputs that decide the predefined set,
+    and every one of them has to be reproduced or the probe answers a different
+    question than the parse it annotates. The binary picks the builtins, the
+    flags add ``-D``\\ s — and the *file extension* picks the language: esbmc
+    parses ``x.cpp`` as C++ and defines ``__cplusplus``, ``x.c`` as C and does
+    not, so probing a C++ source through a ``.c`` file reports ``__cplusplus``
+    undefined and proves the arm cpp actually took *dead*. Nothing else is in
+    play: the process cwd is shared with the real run (so a relative ``-I``
+    resolves the same), and the probe's own directory is irrelevant because it
+    ``#include``\\ s nothing. An extension esbmc will not take (``""`` among
+    them — ``failed to figure out type of file``) needs no special case: it
+    fails the probe run, which fails closed like every other probe failure, and
+    a source carrying one could not have been parsed in the first place.
 
     What it measures is definedness at the *start* of a translation unit and
     nothing else. The probe deliberately ``#include``s nothing: a header's
@@ -2131,16 +2180,18 @@ def probe_predefined_guards(
     reproduce, so a guard sitting below an ``#include`` stays this issue's
     residual and `_line_breakpoints` still drops the seed there.
 
-    Fails closed to ``()`` — an unrunnable or failing esbmc, an unwritable
-    temporary file, a dump missing the unconditional sentinel. ``()`` is not a
-    degraded answer but the *previous* answer: every guard reads opaque and
-    assumed-live again, exactly as before this existed. The caller has already
-    parsed the source successfully by this point, so a probe failure must not
-    turn a good listing into a raised error.
+    Fails closed to ``()`` — an unrunnable or failing esbmc, an unwritable or
+    unencodable temporary file, a probe overrunning `_PROBE_TIMEOUT_CAP_S`, a
+    dump missing the unconditional sentinel. ``()`` is not a degraded answer but
+    the *previous* answer: every guard reads opaque and assumed-live again,
+    exactly as before this existed. The caller has already parsed the source
+    successfully by this point, so a probe failure must not turn a good listing
+    into a raised error.
     """
     names = _guard_macro_names(source_no_comments)
     if not names:
         return ()
+    probe_timeout_s = min(timeout_s, _PROBE_TIMEOUT_CAP_S)
     probe_text = "".join(
         f"#ifdef {name}\nint {_PROBE_PREFIX}{index};\n#endif\n"
         for index, name in enumerate(names)
@@ -2148,9 +2199,20 @@ def probe_predefined_guards(
     probe_text += f"int {_PROBE_PREFIX}{_PROBE_SENTINEL};\n"
     try:
         with tempfile.TemporaryDirectory(prefix="forseti-guard-probe-") as tmp:
-            probe_path = Path(tmp) / "forseti_guard_probe.c"
-            probe_path.write_text(probe_text)
-            dump = _parse_tree(probe_path, esbmc_bin, timeout_s, extra_flags)
+            probe_path = Path(tmp) / f"{_PROBE_STEM}{suffix}"
+            # Explicit UTF-8, never the locale's encoding: `_MACRO_NAME`'s
+            # continuation class is `[\w$]`, which Python's `re` reads as
+            # Unicode, so `#ifdef Wé` is a name this probe really can be asked
+            # about. Under a C/latin-1 locale the default would either raise
+            # `UnicodeEncodeError` — a `ValueError`, which the handler below
+            # does *not* catch, so it would escape and fail a listing that had
+            # already parsed — or write mis-encoded bytes, making the probe test
+            # a *different* name and answer `False` for a guard that is defined.
+            # That is the wrong *dead* direction, the one this module is built
+            # to never take. Pinning the encoding closes both, which is why the
+            # handler can stay narrow.
+            probe_path.write_text(probe_text, encoding="utf-8")
+            dump = _parse_tree(probe_path, esbmc_bin, probe_timeout_s, extra_flags)
     except (OSError, ListUnitsError):
         return ()
     survived = {match.group(1) for match in _PROBE_DECL_RE.finditer(dump)}
@@ -2217,13 +2279,18 @@ def list_caller_openings(
 
 def _with_predefined_guards(
     units: list[Unit],
-    source_text: str,
+    masked: str,
     *,
     esbmc_bin: str,
     timeout_s: float,
     extra_flags: Sequence[str],
+    suffix: str,
 ) -> list[Unit]:
-    """`units`, each carrying `probe_predefined_guards`' reading of `source_text`.
+    """`units`, each carrying `probe_predefined_guards`' reading of `masked`.
+
+    `masked` is `_stripped_for_scan` output, the same text the extent pass
+    scans — taken as an argument rather than re-derived so a listing masks its
+    source once.
 
     Returned unchanged unless some unit's name has more than one
     definition-shaped occurrence. That is the exact precondition for the guard
@@ -2232,15 +2299,18 @@ def _with_predefined_guards(
     common case, and one that would otherwise pay a whole extra ``esbmc
     --parse-tree-only`` run per listing — buys nothing.
 
-    The probe runs at most once per listing, under the same binary and flags as
-    the parse it annotates, and contributes ``()`` when it cannot (see
-    `probe_predefined_guards`).
+    The probe runs at most once per listing, under the same binary, flags and
+    file extension as the parse it annotates, and contributes ``()`` when it
+    cannot (see `probe_predefined_guards`).
     """
-    masked = _stripped_for_scan(source_text)
     if not any(len(_definition_candidates(masked, unit.name)) > 1 for unit in units):
         return units
     guards = probe_predefined_guards(
-        masked, esbmc_bin=esbmc_bin, timeout_s=timeout_s, extra_flags=extra_flags
+        masked,
+        esbmc_bin=esbmc_bin,
+        timeout_s=timeout_s,
+        extra_flags=extra_flags,
+        suffix=suffix,
     )
     if not guards:
         return units
@@ -2272,13 +2342,18 @@ def list_units(
         source_text = Path(source).read_text()
     except OSError:
         return units
-    return annotate_array_extents(
+    masked = _stripped_for_scan(source_text)
+    return _annotate_array_extents(
         _with_predefined_guards(
             units,
-            source_text,
+            masked,
             esbmc_bin=esbmc_bin,
             timeout_s=timeout_s,
             extra_flags=extra_flags,
+            # The extension is a parse input like the binary and the flags: it
+            # picks the language, and so the predefined set the probe reads
+            # (`probe_predefined_guards`).
+            suffix=Path(source).suffix,
         ),
-        source_text,
+        masked,
     )

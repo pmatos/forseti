@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from forseti.esbmc.units import (
+    _PROBE_TIMEOUT_CAP_S,
     CallerOpenings,
     ListUnitsError,
     Param,
@@ -2905,3 +2906,76 @@ def test_list_units_skips_the_probe_for_a_single_definition_source(
     f = next(u for u in list_units(src) if u.name == "f")
     assert f.predefined_guards == ()
     assert f.params[0].array_extent == 20
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_probe_predefined_guards_reads_the_sources_own_language() -> None:
+    # The file extension is a parse input exactly like the binary and the flags:
+    # esbmc parses `.cpp` as C++ and defines `__cplusplus`, `.c` as C and does
+    # not. Probing a C++ source through a `.c` file answers a different question
+    # than the parse it annotates — and answers it in the *dead* direction, the
+    # one this module must never guess.
+    source = "#ifdef __cplusplus\n#endif\n"
+    assert probe_predefined_guards(source) == (("__cplusplus", False),)
+    assert probe_predefined_guards(source, suffix=".cpp") == (("__cplusplus", True),)
+
+
+@pytest.mark.skipif(not _HAVE_ESBMC, reason="needs esbmc on PATH")
+def test_list_units_probes_a_cpp_source_as_cpp(tmp_path: Path) -> None:
+    # End-to-end: `#ifdef __cplusplus` is the arm esbmc really compiles for a
+    # `.cpp` source, so its `int p[20]` is the extent to harvest. A probe run as
+    # C reports `__cplusplus` undefined, proves that live arm dead, and returns
+    # the deleted `#ifndef` body's plain pointer instead.
+    src = tmp_path / "sig.cpp"
+    src.write_text(
+        "#ifdef __cplusplus\n"
+        "#line 100\n"
+        "void g(int p[20]) { (void)p; }\n"
+        "#endif\n"
+        "#ifndef __cplusplus\n"
+        "#line 100\n"
+        "void g(int *p) { *p = 1; }\n"
+        "#endif\n"
+    )
+    g = next(u for u in list_units(src) if u.name == "g")
+    assert g.predefined_guards == (("__cplusplus", True),)
+    assert g.params[0].array_extent == 20
+
+
+def test_a_non_ascii_guard_name_reaches_the_probe() -> None:
+    # `_MACRO_NAME`'s continuation class is `[\w$]`, which Python's `re` reads
+    # as Unicode, so a non-ASCII guard name really is collected and really does
+    # get written into the probe TU. That is why `probe_predefined_guards` pins
+    # `encoding="utf-8"` on the write rather than taking the locale's: the
+    # alternative is an escaping `UnicodeEncodeError` (a `ValueError`, which the
+    # probe deliberately does not catch, so it would fail a listing that had
+    # already parsed) or mis-encoded bytes making `#ifdef` test a name the
+    # source never wrote — a `False` for a guard that is defined, the wrong
+    # *dead* direction. The encoding itself is not observable in-process on a
+    # UTF-8 machine, so this carries the half that is: the name reaching the
+    # probe at all.
+    source = "#ifdef Wé\n#endif\n"
+    assert _guard_macro_names(source) == ("Wé",)
+    assert probe_predefined_guards(source, esbmc_bin="forseti-no-such-esbmc") == ()
+
+
+def test_probe_predefined_guards_caps_its_share_of_the_time_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `_parse_tree` applies its timeout per `subprocess.run`, so an uncapped
+    # probe would double `list_units`' in-process worst case — past the margin
+    # the Claude Code gate sizes its own `subprocess.run` with, turning an
+    # optional, fail-closed measurement into a blocking `UnitsUnavailable`.
+    seen: list[float] = []
+
+    def fake_parse_tree(
+        source: Path, esbmc_bin: str, timeout_s: float, extra_flags: object
+    ) -> str:
+        seen.append(timeout_s)
+        raise ListUnitsError("stubbed")
+
+    monkeypatch.setattr("forseti.esbmc.units._parse_tree", fake_parse_tree)
+    assert probe_predefined_guards("#ifdef W\n#endif\n", timeout_s=1000.0) == ()
+    # A budget already under the cap is handed through untouched, never raised.
+    assert probe_predefined_guards("#ifdef W\n#endif\n", timeout_s=0.5) == ()
+    assert seen == [_PROBE_TIMEOUT_CAP_S, 0.5]
