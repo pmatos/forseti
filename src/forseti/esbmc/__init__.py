@@ -14,6 +14,7 @@ from .counterexample import (
     Step,
     ViolatedProperty,
 )
+from .preprocessor import mask_comments
 from .render import EXIT_CODES, render_result, result_to_dict
 from .result import (
     Error,
@@ -34,7 +35,6 @@ from .units import (
     find_definition_brace,
     list_caller_openings,
     list_units,
-    mask_comments,
     parse_address_escapes,
     parse_asm_statements,
     parse_definitions,
