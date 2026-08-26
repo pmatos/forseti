@@ -102,7 +102,8 @@ jobs:
         # fail_ci_if_error, adding a red herring next to the real failure.
         # hashFiles is the precondition itself, so it also covers pytest dying
         # before it writes the XML (e.g. a collection error).
-        if: ${{ !cancelled() && hashFiles('coverage.xml') != '' }}
+        # Skip coverage uploads for Dependabot-authored PRs, regardless of triggering actor.
+        if: ${{ !cancelled() && hashFiles('coverage.xml') != '' && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]') }}
         uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
