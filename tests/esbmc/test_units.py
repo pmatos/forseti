@@ -12,20 +12,22 @@ from pathlib import Path
 
 import pytest
 
+from forseti.esbmc.preprocessor import (
+    _guard_macro_names,
+    _line_breakpoints,
+    _stripped_for_scan,
+    mask_comments,
+)
 from forseti.esbmc.units import (
     _PROBE_TIMEOUT_CAP_S,
     CallerOpenings,
     ListUnitsError,
     Param,
     Unit,
-    _guard_macro_names,
-    _line_breakpoints,
-    _stripped_for_scan,
     annotate_array_extents,
     find_definition_brace,
     list_caller_openings,
     list_units,
-    mask_comments,
     parse_address_escapes,
     parse_asm_statements,
     parse_definitions,
