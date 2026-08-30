@@ -1,3 +1,11 @@
+## [1.8.1](https://github.com/pmatos/forseti/compare/v1.8.0...v1.8.1) (2026-08-30)
+
+
+### Bug Fixes
+
+* **units:** decide an #ifdef guard from this file's own #define state ([#157](https://github.com/pmatos/forseti/issues/157)) ([#225](https://github.com/pmatos/forseti/issues/225)) ([c0e4127](https://github.com/pmatos/forseti/commit/c0e41278ffccdd4ec84134935240c8f1e4188e2d)), closes [#ifdef](https://github.com/pmatos/forseti/issues/ifdef) [#define](https://github.com/pmatos/forseti/issues/define)
+* **units:** decide an #ifdef guard set by -D or a compiler builtin ([#226](https://github.com/pmatos/forseti/issues/226)) ([#231](https://github.com/pmatos/forseti/issues/231)) ([bb339a7](https://github.com/pmatos/forseti/commit/bb339a7b73d77eb5e9a16bba55d85e9098927b40)), closes [#ifdef](https://github.com/pmatos/forseti/issues/ifdef)
+
 # [1.8.0](https://github.com/pmatos/forseti/compare/v1.7.5...v1.8.0) (2026-08-23)
 
 
