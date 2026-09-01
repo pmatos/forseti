@@ -25,7 +25,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, assert_never
 
 from forseti.esbmc import (
     EsbmcResult,
@@ -41,6 +41,7 @@ from forseti.esbmc import (
 from forseti.orchestrator.ladder import climb_to_terminal, validated_ladder
 from forseti.orchestrator.ports import VerifyPort
 
+from .reachability import ProbeReachability, classify_site_probe
 from .synth import (
     DEFAULT_MAX_LEN,
     NON_VACUITY_LABEL,
@@ -392,19 +393,23 @@ def _assess_non_vacuity(
             plan=plan,
         )
 
-    if isinstance(probe, Violated) and NON_VACUITY_LABEL in probe.raw_counterexample:
-        return outcome(
-            Assessment.ASSUMED_VERIFIED,
-            "verified up to k assuming valid caller pointers; call site reachable",
-        )
-    if isinstance(probe, Verified):
-        return outcome(
-            Assessment.VACUOUS,
-            "the assert-at-call-site was unreachable: the synthesised precondition "
-            "is contradictory (a vacuous proof)",
-        )
-    return outcome(
-        Assessment.UNKNOWN,
-        "could not confirm call-site reachability "
-        f"(non-vacuity probe: {probe.verdict.value})",
-    )
+    match r := classify_site_probe(probe, label=NON_VACUITY_LABEL):
+        case ProbeReachability.REACHED:
+            return outcome(
+                Assessment.ASSUMED_VERIFIED,
+                "verified up to k assuming valid caller pointers; call site reachable",
+            )
+        case ProbeReachability.UNREACHABLE:
+            return outcome(
+                Assessment.VACUOUS,
+                "the assert-at-call-site was unreachable: the synthesised precondition "
+                "is contradictory (a vacuous proof)",
+            )
+        case ProbeReachability.INCONCLUSIVE:
+            return outcome(
+                Assessment.UNKNOWN,
+                "could not confirm call-site reachability "
+                f"(non-vacuity probe: {probe.verdict.value})",
+            )
+        case _:
+            assert_never(r)
