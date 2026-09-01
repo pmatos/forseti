@@ -131,17 +131,48 @@ def _refuse_sentinel_collision(existing_text: str, config_path: Path) -> None:
         )
 
 
+def _refuse_unpaired_sentinels(existing_text: str, config_path: Path) -> None:
+    """Refuse text without exactly one well-formed sentinel pair, or none at all.
+
+    `_BLOCK_RE`'s non-greedy match runs from the first START to the *next* END --
+    given a stray, unpaired START (e.g. a half-reverted hand edit, or two managed
+    files concatenated by a merge), it would silently consume everything up to
+    some unrelated later END, deleting real content in between rather than
+    raising. Since forseti only ever writes at most one pair, anything else --
+    an unpaired START or END, or more than one pair -- means the file is already
+    in a state forseti didn't produce, and it's not safe to guess which part (if
+    any) is forseti's own block.
+    """
+    starts = existing_text.count(_SENTINEL_START)
+    ends = existing_text.count(_SENTINEL_END)
+    if starts == 0 and ends == 0:
+        return
+    if (
+        starts == 1
+        and ends == 1
+        and existing_text.index(_SENTINEL_START) < existing_text.index(_SENTINEL_END)
+    ):
+        return
+    raise ProjectConfigError(
+        f"{config_path}: found {starts} forseti sentinel start marker(s) and "
+        f"{ends} end marker(s), not one well-formed pair -- refusing to touch "
+        "it, since a stray or duplicated sentinel could make the block-removal "
+        "regex silently delete unrelated content between it and the next marker"
+    )
+
+
 def merge_config(existing_text: str, config_path: Path) -> str:
     """Return `existing_text` with forseti's managed block replaced by the current one.
 
     Raises `ProjectConfigError` if a `"forseti codex-hook "`-prefixed command exists
-    *outside* the managed block (hand-edited, or a leftover half-sentinel) rather than
-    risk installing a second, possibly-duplicate hook entry; if the sentinel text
-    appears inside an existing TOML string value rather than a comment (stripping it
-    would silently delete part of that string); and if the merged result fails to
-    parse as TOML, rather than ever writing it.
+    *outside* the managed block (hand-edited) rather than risk installing a second,
+    possibly-duplicate hook entry; if the sentinel text appears inside an existing
+    TOML string value rather than a comment, or as an unpaired/duplicated marker
+    (either would let `_strip_managed_block` silently delete unrelated content); and
+    if the merged result fails to parse as TOML, rather than ever writing it.
     """
     _refuse_sentinel_collision(existing_text, config_path)
+    _refuse_unpaired_sentinels(existing_text, config_path)
     stripped = _strip_managed_block(existing_text)
     if _MARKER_PREFIX in stripped:
         raise ProjectConfigError(
@@ -218,7 +249,8 @@ def remove(project_dir: Path) -> tuple[Path, RemoveOutcome]:
     byte-for-byte rather than leaving that artifact behind. The write is
     atomic (temp file + rename); a symlinked target raises `ProjectConfigError`
     rather than silently replacing the link with a plain file, as does sentinel
-    text found inside a TOML string value rather than a comment.
+    text found inside a TOML string value rather than a comment, or an
+    unpaired/duplicated sentinel marker.
     """
     config_path = _config_path(project_dir)
     if config_path.is_symlink():
@@ -235,6 +267,7 @@ def remove(project_dir: Path) -> tuple[Path, RemoveOutcome]:
             f"{config_path}: cannot read existing config ({exc})"
         ) from exc
     _refuse_sentinel_collision(existing_text, config_path)
+    _refuse_unpaired_sentinels(existing_text, config_path)
     stripped = _strip_managed_block(existing_text)
     if stripped == existing_text:
         return config_path, RemoveOutcome.UNCHANGED

@@ -117,6 +117,32 @@ def test_merge_config_refuses_sentinel_copied_into_toml_string() -> None:
         merge_config(existing, Path("config.toml"))
 
 
+def test_merge_config_refuses_unpaired_start_sentinel() -> None:
+    # A stray START with no matching END -- e.g. a half-reverted hand edit --
+    # would otherwise make `_BLOCK_RE`'s non-greedy match run from this START
+    # through whatever END comes *next*, silently deleting real content in
+    # between (#250 review). Refuse rather than guess.
+    existing = f"{install_module._SENTINEL_START}\nnotify = 1\n"
+    with pytest.raises(ProjectConfigError, match="not one well-formed pair"):
+        merge_config(existing, Path("config.toml"))
+
+
+def test_merge_config_refuses_stray_start_before_a_real_block() -> None:
+    # The exact failure mode reported: a stray START sitting before an
+    # unrelated legitimate-looking END would let `_strip_managed_block`
+    # consume everything between them, including foreign TOML content.
+    existing = (
+        "notify = 1\n"
+        + install_module._SENTINEL_START
+        + "\n"
+        + "important = true\n"
+        + "also_important = 42\n"
+        + install_module._managed_block()
+    )
+    with pytest.raises(ProjectConfigError, match="not one well-formed pair"):
+        merge_config(existing, Path("config.toml"))
+
+
 def test_install_creates_fresh_config(tmp_path: Path) -> None:
     path, outcome = install(tmp_path)
     assert outcome is InstallOutcome.CREATED
@@ -183,6 +209,24 @@ def test_remove_refuses_sentinel_copied_into_toml_string(tmp_path: Path) -> None
     block = install_module._managed_block()
     config.write_text(f'instructions = """\n{block}"""\n')
     with pytest.raises(ProjectConfigError, match="string value"):
+        remove(tmp_path)
+
+
+def test_remove_refuses_stray_start_before_a_real_block(tmp_path: Path) -> None:
+    # Same failure mode as merge_config's: a stray START sitting before an
+    # unrelated legitimate-looking END must not let `remove` silently delete
+    # the foreign content between them (#250 review).
+    config = tmp_path / ".codex" / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        "notify = 1\n"
+        + install_module._SENTINEL_START
+        + "\n"
+        + "important = true\n"
+        + "also_important = 42\n"
+        + install_module._managed_block()
+    )
+    with pytest.raises(ProjectConfigError, match="not one well-formed pair"):
         remove(tmp_path)
 
 
