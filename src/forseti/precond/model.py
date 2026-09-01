@@ -1,15 +1,20 @@
 """The discharge result vocabulary (RFC-0003 S3).
 
-Pure value objects — no ESBMC, no tempfiles, no driver logic — that record what
-checking a callee's callers established: `CallerOutcome` (what one caller's run
-proved), `CallerCheck` (one caller's contribution to or withholding of the
-discharge), and `DischargeResult` (the S2 verdict plus what the callers did to
-it, with its honest one-line `label` and `--json` `to_dict`).
+Value objects that record what checking a callee's callers established:
+`CallerOutcome` (what one caller's run proved), `CallerCheck` (one caller's
+contribution to or withholding of the discharge), and `DischargeResult` (the
+S2 verdict plus what the callers did to it, with its honest one-line `label`
+and `--json` `to_dict`).
 
-Isolated from the `discharge` driver so the vocabulary the CLI and `--json`
-consumers read does not pull in the tempfile/ESBMC machinery that produces it.
-The dependency runs one way: the driver imports these; they import nothing from
-it.
+The source-level dependency runs one way: the `discharge` driver imports these
+types; this module never imports from `discharge`, so the extraction adds no
+cycle. That is a narrower guarantee than full runtime isolation — `verify.py`
+(imported here for `Assessment`/`PreconditionResult`) and the package's own
+`__init__.py` still pull in the ESBMC/tempfile machinery transitively, so this
+module cannot yet be imported standalone without that machinery loading too.
+The payoff today is testability: these value objects can be constructed and
+their `label`/`to_dict` exercised directly, without standing up the driver's
+injected-fake wiring.
 """
 
 from __future__ import annotations

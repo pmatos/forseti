@@ -1,11 +1,11 @@
-"""The discharge result vocabulary is a pure leaf (`precond/model.py`).
+"""The discharge result vocabulary, extracted to its own module (`precond/model.py`).
 
-`CallerOutcome`, `CallerCheck` and `DischargeResult` are value objects — no
-ESBMC, no tempfiles, no driver logic — that the S3 discharge driver constructs
-and the CLI/`--json` consumer reads. Extracting them out of `discharge.py`
-(RFC-0003 S3) gives them a home the driver depends *on*, never the reverse; these
-tests pin that one-directional boundary and the value semantics directly, without
-the esbmc-gated driver runs `test_discharge.py` needs to reach them.
+`CallerOutcome`, `CallerCheck` and `DischargeResult` are value objects that the
+S3 discharge driver constructs and the CLI/`--json` consumer reads. Extracting
+them out of `discharge.py` (RFC-0003 S3) gives them a home the driver depends
+*on*, never the reverse; these tests pin that one-directional source-level
+boundary and the value semantics directly, without the esbmc-gated driver runs
+`test_discharge.py` needs to reach them.
 """
 
 from __future__ import annotations
@@ -152,12 +152,15 @@ def test_to_dict_marks_an_assumed_verdict() -> None:
     assert payload["discharged"] is False
 
 
-def test_model_is_a_leaf_and_never_imports_from_the_discharge_driver() -> None:
+def test_model_never_imports_from_the_discharge_driver() -> None:
     """The one-directional boundary: the driver depends on the model, never back.
 
     An AST walk over the *import statements* (not the source text — the module
-    docstring names `discharge.py` in prose) proves the leaf pulls nothing from
-    the driver, so the extraction cannot have smuggled a cycle back in.
+    docstring names `discharge.py` in prose) proves `model.py` itself names no
+    import of `discharge`, so the extraction cannot have smuggled a cycle back
+    in. This is a source-level acyclicity check, not a runtime-isolation one:
+    it says nothing about what `model.py`'s own imports (`.verify`) or the
+    package's `__init__.py` pull in transitively.
     """
     import forseti.precond.model as model
 
