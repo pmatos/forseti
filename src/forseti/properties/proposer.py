@@ -156,6 +156,15 @@ class ProposalParseError(ValueError):
     """The model output was not a well-formed candidate envelope (fail-loud)."""
 
 
+class BlankProvenanceError(ValueError):
+    """A caller-supplied `provider`/`model` was blank (#213 review, fail-loud).
+
+    `Provenance`'s `""` default is the pre-#213 legacy-row sentinel (`model.py`)
+    -- a blank value from `submit_candidates` would be stored identically and
+    make a fresh submission indistinguishable from migrated data.
+    """
+
+
 def _accept_reject(
     specs: Sequence[CandidateSpec],
     *,
@@ -290,7 +299,15 @@ def submit_candidates(
     that same provenance without ever being rendered or sent anywhere --
     there is no prompt text to send. `model_raw` is `""`: there is no raw
     model transcript for a submitted batch.
+
+    Raises `BlankProvenanceError` if `provider` or `model` is blank -- a caller
+    error, not data about the candidate, so it fails loud before anything is
+    validated or persisted rather than being routed through `rejected`.
     """
+    if not provider.strip() or not model.strip():
+        raise BlankProvenanceError(
+            f"provider={provider!r} and model={model!r} must both be nonblank"
+        )
     template = request.prompt
     provenance = Provenance(
         prompt_id=template.prompt_id,

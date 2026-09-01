@@ -17,7 +17,7 @@ import pytest
 from forseti.core import submit_source
 from forseti.core.cli import main
 from forseti.core.events import events_path
-from forseti.properties import PropertyStore, PropertyStoreError
+from forseti.properties import BlankProvenanceError, PropertyStore, PropertyStoreError
 
 ABS_SLICE = "int64_t my_abs(int64_t x) {\n    return (x < 0) ? -x : x;\n}\n"
 
@@ -64,6 +64,22 @@ def test_submit_source_rejects_the_same_way_propose_does(tmp_path: Path) -> None
     )
     assert not result.accepted
     assert "bogus_ident" in result.rejected[0].reason
+
+
+@pytest.mark.parametrize(("provider", "model"), [("", "gpt-5.1"), ("codex", "  ")])
+def test_submit_source_rejects_blank_provenance(
+    tmp_path: Path, provider: str, model: str
+) -> None:
+    source = _write_unit(tmp_path)
+    with pytest.raises(BlankProvenanceError):
+        submit_source(
+            source,
+            function="my_abs",
+            expression="result >= 0",
+            provider=provider,
+            model=model,
+            persist=False,
+        )
 
 
 def test_submit_source_persists_the_candidate(tmp_path: Path) -> None:
@@ -214,6 +230,29 @@ def test_cli_submit_property_rejected_candidate_exits_one(
     )
     assert code == 1
     assert "Rejected 1" in capsys.readouterr().out
+
+
+def test_cli_submit_property_blank_provider_exits_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = _write_unit(tmp_path)
+    code = main(
+        [
+            "submit-property",
+            str(source),
+            "--function",
+            "my_abs",
+            "--expression",
+            "result >= 0",
+            "--provider",
+            "",
+            "--model",
+            "gpt-5.1",
+            "--no-store",
+        ]
+    )
+    assert code == 1
+    assert "forseti submit-property:" in capsys.readouterr().err
 
 
 def test_cli_submit_property_store_error_exits_one(

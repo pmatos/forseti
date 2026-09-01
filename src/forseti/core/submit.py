@@ -63,9 +63,10 @@ def submit_source(
     Reads `source` as the unit text, keys the unit as ``<source>::<function>``,
     and best-effort parses the signature the same way `propose_source` does --
     a parse miss (`HarnessError`) degrades to signature-free static checks
-    rather than failing the run. `provider`/`model` are required (never
-    defaulted to a Core-owned backend) so a submitted property's provenance
-    always names its real origin. `prompt_id`/`prompt_version` default to a
+    rather than failing the run. `provider`/`model` are required and must be
+    nonblank (never defaulted to a Core-owned backend, `BlankProvenanceError`
+    on a blank value) so a submitted property's provenance always names its
+    real origin. `prompt_id`/`prompt_version` default to a
     `"host-submitted"` marker for a candidate with no versioned Core prompt
     behind it; a caller that *does* have one (e.g. a subagent following a
     published prompt spec) can pass it through instead. When `persist` is

@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from forseti.properties import (
+    BlankProvenanceError,
     BufferParam,
     CandidateSpec,
     LLMError,
@@ -189,6 +190,23 @@ def test_submit_candidates_persists_idempotently() -> None:
 
     submit_candidates(request, spec, provider="codex", model="gpt-5.1", store=store)
     assert len(store.items) == 1
+
+
+@pytest.mark.parametrize(
+    ("provider", "model"),
+    [("", "gpt-5.1"), ("codex", ""), ("   ", "gpt-5.1"), ("codex", "   "), ("", "")],
+)
+def test_submit_candidates_rejects_blank_provenance(provider: str, model: str) -> None:
+    store = FakeStore()
+    with pytest.raises(BlankProvenanceError):
+        submit_candidates(
+            ProposalRequest(ABS_UNIT, ABS_SOURCE, signature=abs_sig()),
+            (CandidateSpec(expression="result >= 0"),),
+            provider=provider,
+            model=model,
+            store=store,
+        )
+    assert not store.items  # rejected before anything is persisted
 
 
 def test_parse_candidates_strips_markdown_fence() -> None:

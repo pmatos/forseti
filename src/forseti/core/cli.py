@@ -94,6 +94,7 @@ from forseti.esbmc import (
 )
 from forseti.orchestrator import PropertyCheckRun, property_check_transcript
 from forseti.properties import (
+    BlankProvenanceError,
     LLMError,
     PropertyStoreError,
     ProposalParseError,
@@ -470,7 +471,7 @@ def _run_submit_property(args: argparse.Namespace) -> int:
             store_root=args.store_root,
             max_candidates=args.max_candidates,
         )
-    except (PropertyStoreError, OSError) as exc:
+    except (BlankProvenanceError, PropertyStoreError, OSError) as exc:
         print(f"forseti submit-property: {exc}", file=sys.stderr)
         return 1
     if args.json:

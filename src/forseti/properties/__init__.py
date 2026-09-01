@@ -50,6 +50,7 @@ from .prompts import (
     render_prompt,
 )
 from .proposer import (
+    BlankProvenanceError,
     CandidateSpec,
     CandidateStore,
     ProposalParseError,
@@ -77,6 +78,7 @@ __all__ = [
     "PROMPTS",
     "RESULT_IDENT",
     "SEMANTIC_V1",
+    "BlankProvenanceError",
     "BufferParam",
     "CandidateSpec",
     "CandidateStore",
