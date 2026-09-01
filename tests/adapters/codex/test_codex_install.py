@@ -105,6 +105,18 @@ def test_merge_config_rejects_output_that_would_not_parse() -> None:
         merge_config(existing, Path("config.toml"))
 
 
+def test_merge_config_refuses_sentinel_copied_into_toml_string() -> None:
+    # A copied managed block hand-pasted into an unrelated multiline string
+    # value (e.g. a prompt/instructions field) still contains the sentinel
+    # lines verbatim. `tomllib` sees them as string data, not comments --
+    # blindly stripping them as our own block would silently delete part of
+    # that string. Refuse instead of guessing.
+    block = install_module._managed_block()
+    existing = f'instructions = """\n{block}"""\n'
+    with pytest.raises(ProjectConfigError, match="string value"):
+        merge_config(existing, Path("config.toml"))
+
+
 def test_install_creates_fresh_config(tmp_path: Path) -> None:
     path, outcome = install(tmp_path)
     assert outcome is InstallOutcome.CREATED
@@ -162,6 +174,15 @@ def test_remove_on_broken_symlink_raises(tmp_path: Path) -> None:
     config_dir.mkdir()
     (config_dir / "config.toml").symlink_to(tmp_path / "missing.toml")
     with pytest.raises(ProjectConfigError, match="symlink"):
+        remove(tmp_path)
+
+
+def test_remove_refuses_sentinel_copied_into_toml_string(tmp_path: Path) -> None:
+    config = tmp_path / ".codex" / "config.toml"
+    config.parent.mkdir(parents=True)
+    block = install_module._managed_block()
+    config.write_text(f'instructions = """\n{block}"""\n')
+    with pytest.raises(ProjectConfigError, match="string value"):
         remove(tmp_path)
 
 

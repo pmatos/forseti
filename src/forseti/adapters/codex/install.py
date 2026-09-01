@@ -96,14 +96,52 @@ def _strip_managed_block(text: str) -> str:
     return _BLOCK_RE.sub("", text)
 
 
+def _sentinel_in_parsed_data(value: object) -> bool:
+    """True if a sentinel string occurs inside parsed TOML data, not a comment.
+
+    `tomllib` discards comments entirely -- they never reach the parsed tree --
+    so the only way parsed data can contain sentinel text is a TOML string
+    literal (e.g. a copied example block hand-pasted into a prompt/notes
+    value) that happens to embed it. That distinguishes a real collision from
+    `_BLOCK_RE` matching our own already-installed comment block, without
+    needing a full TOML-aware line scanner.
+    """
+    if isinstance(value, str):
+        return _SENTINEL_START in value or _SENTINEL_END in value
+    if isinstance(value, dict):
+        return any(_sentinel_in_parsed_data(k) for k in value) or any(
+            _sentinel_in_parsed_data(v) for v in value.values()
+        )
+    if isinstance(value, list):
+        return any(_sentinel_in_parsed_data(v) for v in value)
+    return False
+
+
+def _refuse_sentinel_collision(existing_text: str, config_path: Path) -> None:
+    try:
+        parsed = tomllib.loads(existing_text)
+    except tomllib.TOMLDecodeError:
+        return
+    if _sentinel_in_parsed_data(parsed):
+        raise ProjectConfigError(
+            f"{config_path}: forseti's sentinel text appears inside a TOML "
+            "string value, not a comment -- refusing to touch it, since "
+            "`_strip_managed_block` can't tell that apart from our own "
+            "managed block and would silently delete part of that string"
+        )
+
+
 def merge_config(existing_text: str, config_path: Path) -> str:
     """Return `existing_text` with forseti's managed block replaced by the current one.
 
     Raises `ProjectConfigError` if a `"forseti codex-hook "`-prefixed command exists
     *outside* the managed block (hand-edited, or a leftover half-sentinel) rather than
-    risk installing a second, possibly-duplicate hook entry; and if the merged result
-    fails to parse as TOML, rather than ever writing it.
+    risk installing a second, possibly-duplicate hook entry; if the sentinel text
+    appears inside an existing TOML string value rather than a comment (stripping it
+    would silently delete part of that string); and if the merged result fails to
+    parse as TOML, rather than ever writing it.
     """
+    _refuse_sentinel_collision(existing_text, config_path)
     stripped = _strip_managed_block(existing_text)
     if _MARKER_PREFIX in stripped:
         raise ProjectConfigError(
@@ -179,7 +217,8 @@ def remove(project_dir: Path) -> tuple[Path, RemoveOutcome]:
     before its own block is trimmed back off, so a remove undoes an install
     byte-for-byte rather than leaving that artifact behind. The write is
     atomic (temp file + rename); a symlinked target raises `ProjectConfigError`
-    rather than silently replacing the link with a plain file.
+    rather than silently replacing the link with a plain file, as does sentinel
+    text found inside a TOML string value rather than a comment.
     """
     config_path = _config_path(project_dir)
     if config_path.is_symlink():
@@ -195,6 +234,7 @@ def remove(project_dir: Path) -> tuple[Path, RemoveOutcome]:
         raise ProjectConfigError(
             f"{config_path}: cannot read existing config ({exc})"
         ) from exc
+    _refuse_sentinel_collision(existing_text, config_path)
     stripped = _strip_managed_block(existing_text)
     if stripped == existing_text:
         return config_path, RemoveOutcome.UNCHANGED
