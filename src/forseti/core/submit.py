@@ -21,7 +21,7 @@ import sqlite3
 from collections.abc import Sequence
 from pathlib import Path
 
-from forseti.core.events import PROPERTY_PROPOSED, record_event
+from forseti.core.events import record_property_proposed
 from forseti.core.propose import DEFAULT_STORE_ROOT
 from forseti.properties import (
     CandidateSpec,
@@ -109,38 +109,19 @@ def submit_source(
             max_candidates=max_candidates,
         )
 
-    store: PropertyStore | None = None
     try:
-        store = PropertyStore.open(store_root)
-        result = submit_candidates(
-            request,
-            (spec,),
-            provider=provider,
-            model=model,
-            store=store,
-            max_candidates=max_candidates,
-        )
-        _record_submitted(store_root, result)
-        return result
+        with PropertyStore.open(store_root) as store:
+            result = submit_candidates(
+                request,
+                (spec,),
+                provider=provider,
+                model=model,
+                store=store,
+                max_candidates=max_candidates,
+            )
     except sqlite3.Error as exc:
         raise PropertyStoreError(
             f"property store error at {store_root}: {exc}"
         ) from exc
-    finally:
-        if store is not None:
-            store.close()
-
-
-def _record_submitted(store_root: Path, result: ProposalResult) -> None:
-    """One canonical `property.proposed` event per accepted candidate (#213)."""
-    for prop in result.accepted:
-        record_event(
-            store_root,
-            PROPERTY_PROPOSED,
-            unit_id=prop.unit_id,
-            property_id=prop.property_id,
-            expression=prop.expression,
-            provider=result.provider,
-            model=result.model,
-            channel="submitted",
-        )
+    record_property_proposed(store_root, result, channel="submitted")
+    return result

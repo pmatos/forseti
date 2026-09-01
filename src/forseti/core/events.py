@@ -21,7 +21,10 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from forseti.properties import ProposalResult
 
 _EVENTS_FILE = "events.jsonl"
 
@@ -57,3 +60,25 @@ def record_event(store_root: Path, event_type: str, **fields: Any) -> None:
             handle.write(json.dumps(event, sort_keys=True) + "\n")
     except (OSError, TypeError, ValueError):
         pass
+
+
+def record_property_proposed(
+    store_root: Path, result: ProposalResult, *, channel: str
+) -> None:
+    """One canonical `property.proposed` event per accepted candidate (#213).
+
+    Shared by `core.propose.propose_source` (`channel="llm"`) and
+    `core.submit.submit_source` (`channel="submitted"`) -- the two differ only
+    in how the candidate was produced, not in what gets traced.
+    """
+    for prop in result.accepted:
+        record_event(
+            store_root,
+            PROPERTY_PROPOSED,
+            unit_id=prop.unit_id,
+            property_id=prop.property_id,
+            expression=prop.expression,
+            provider=result.provider,
+            model=result.model,
+            channel=channel,
+        )

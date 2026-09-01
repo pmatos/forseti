@@ -27,6 +27,21 @@ from . import event_log
 from . import forseti_gate as gate
 
 
+def _record_gate_decision(
+    project_dir: str, rel: str, unit_ids: list[str], decision: str
+) -> None:
+    """Core's canonical `gate.decision` event (`core/events.py`, #213)."""
+    record_core_event(
+        Path(project_dir) / ".forseti",
+        GATE_DECISION,
+        harness="claude-code",
+        adapter="claude-code-post-tool-use",
+        unit_ids=unit_ids,
+        file=rel,
+        decision=decision,
+    )
+
+
 def main() -> int:
     raw = sys.stdin.read()
     data = json.loads(raw) if raw.strip() else {}
@@ -111,15 +126,7 @@ def main() -> int:
             n_needs_contract=len(needs),
             exit_code=0,
         )
-        record_core_event(
-            Path(project_dir) / ".forseti",
-            GATE_DECISION,
-            harness="claude-code",
-            adapter="claude-code-post-tool-use",
-            unit_ids=[v.unit_id for v in verdicts],
-            file=rel,
-            decision="pass",
-        )
+        _record_gate_decision(project_dir, rel, [v.unit_id for v in verdicts], "pass")
         out = []
         if verified:
             oks = ", ".join(f"{v.unit_id} (k={v.k})" for v in verified)
@@ -160,15 +167,7 @@ def main() -> int:
         n_needs_contract=len(needs),
         exit_code=2,
     )
-    record_core_event(
-        Path(project_dir) / ".forseti",
-        GATE_DECISION,
-        harness="claude-code",
-        adapter="claude-code-post-tool-use",
-        unit_ids=[v.unit_id for v in failures],
-        file=rel,
-        decision="block",
-    )
+    _record_gate_decision(project_dir, rel, [v.unit_id for v in failures], "block")
     print("\n".join(lines), file=sys.stderr)
     return 2
 
