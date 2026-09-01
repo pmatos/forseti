@@ -18,7 +18,7 @@ dependencies = []
 mcp = ["mcp>=2.1.1,<3"]
 # dev pulls in the mcp extra so CI type-checks and tests the server too.
 dev = [
-    "build>=1.5.0",
+    "build>=1.6.0",
     "setuptools>=84.0.0",
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
