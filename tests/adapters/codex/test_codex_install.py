@@ -225,6 +225,25 @@ def test_install_then_remove_restores_original_content_exactly(
     assert path.read_text() == original
 
 
+def test_remove_preserves_extra_trailing_newlines_beyond_separator(
+    tmp_path: Path,
+) -> None:
+    # `merge_config` never strips existing newlines, only pads up to a
+    # two-newline separator -- so three or more trailing newlines in the
+    # original can only have come from the file itself, and `remove` must
+    # leave them exactly as they were rather than collapsing to one (#250
+    # review).
+    config = tmp_path / ".codex" / "config.toml"
+    config.parent.mkdir(parents=True)
+    original = 'notify = ["python3", "/x/notify.py"]\n\n\n'
+    config.write_text(original)
+
+    install(tmp_path)
+    path, outcome = remove(tmp_path)
+    assert outcome is RemoveOutcome.REMOVED
+    assert path.read_text() == original
+
+
 def test_remove_again_reports_unchanged(tmp_path: Path) -> None:
     install(tmp_path)
     remove(tmp_path)

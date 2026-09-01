@@ -238,8 +238,16 @@ def remove(project_dir: Path) -> tuple[Path, RemoveOutcome]:
     stripped = _strip_managed_block(existing_text)
     if stripped == existing_text:
         return config_path, RemoveOutcome.UNCHANGED
-    normalized = stripped.rstrip("\n")
-    if normalized:
-        normalized += "\n"
-    write_text_atomic(config_path, normalized)
+    trailing_newlines = len(stripped) - len(stripped.rstrip("\n"))
+    if trailing_newlines <= 2:
+        # `merge_config` pads at most up to a two-newline (blank-line) separator
+        # before appending its block, so <=2 trailing newlines here can't be told
+        # apart from a genuine 0/1/2-newline original -- collapse to one. Beyond
+        # two, `merge_config` never strips existing newlines, so any extra ones
+        # can only be the original file's own EOF whitespace; preserve them
+        # exactly instead of normalizing them away.
+        stripped = stripped.rstrip("\n")
+        if stripped:
+            stripped += "\n"
+    write_text_atomic(config_path, stripped)
     return config_path, RemoveOutcome.REMOVED
