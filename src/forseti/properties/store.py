@@ -171,13 +171,33 @@ class PropertyStore:
         `provider`/`model`, #213) needs an explicit `ALTER TABLE` here or
         every insert against that pre-existing `forseti.db` fails with "no
         such column" the first time it's bound.
+
+        Two `PropertyStore`s racing to open the same pre-migration
+        `forseti.db` (e.g. a subagent's `forseti check` overlapping the main
+        session's Stop-gate -- neither takes the adapter's `gate_state.json`
+        lock, which guards a different resource) can both read this table as
+        missing the column before either `ALTER`s it: `PRAGMA table_info` is
+        a plain read, not a lock. The loser's `ALTER TABLE` then raises
+        "duplicate column name" even though the column now exists and its
+        own insert would succeed. Tolerate exactly that outcome -- re-check
+        after the failure and only swallow it if the column is actually
+        there now; anything else (a genuinely broken DDL, a disk error) still
+        raises (issue #252 review).
         """
-        existing = {
+        existing = self._existing_columns()
+        for name, ddl in _MIGRATED_COLUMNS:
+            if name in existing:
+                continue
+            try:
+                self._conn.execute(f"ALTER TABLE properties ADD COLUMN {name} {ddl}")
+            except sqlite3.OperationalError:
+                if name not in self._existing_columns():
+                    raise
+
+    def _existing_columns(self) -> set[str]:
+        return {
             str(row[1]) for row in self._conn.execute("PRAGMA table_info(properties)")
         }
-        for name, ddl in _MIGRATED_COLUMNS:
-            if name not in existing:
-                self._conn.execute(f"ALTER TABLE properties ADD COLUMN {name} {ddl}")
 
     def close(self) -> None:
         self._conn.close()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -147,6 +148,95 @@ def test_ensure_schema_migrates_a_pre_provider_model_db(tmp_path: Path) -> None:
         assert got.provenance.model == ""
     finally:
         store.close()
+
+
+def test_migrate_columns_tolerates_concurrent_alter_race(tmp_path: Path) -> None:
+    """Two `PropertyStore`s racing to migrate the same pre-#213 db: the loser's
+    `ALTER TABLE` must not fail once the column is actually there, since
+    `PRAGMA table_info` (the missing-column check) isn't itself a lock and
+    both openers can read the column as absent before either writes (issue
+    #252 review).
+    """
+    db_path = tmp_path / "forseti.db"
+    pre_213_schema = """
+    CREATE TABLE properties (
+        property_id       TEXT PRIMARY KEY,
+        unit_id           TEXT NOT NULL,
+        kind              TEXT NOT NULL,
+        expression        TEXT NOT NULL,
+        domain            TEXT NOT NULL DEFAULT '[]',
+        description       TEXT,
+        status            TEXT NOT NULL,
+        prompt_id         TEXT NOT NULL,
+        prompt_version    TEXT NOT NULL,
+        grading_verdict   TEXT,
+        grading_kill_rate REAL,
+        grading_reason    TEXT
+    );
+    """
+    setup_conn = sqlite3.connect(db_path)
+    setup_conn.executescript(pre_213_schema)
+    setup_conn.close()
+
+    class RacingConnection(sqlite3.Connection):
+        """Runs the same `ALTER` on a second connection right before this
+        one's own attempt -- the exact interleaving two concurrent
+        `PropertyStore`s opening the same pre-migration db could hit.
+        """
+
+        _fired = False
+
+        def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
+            if not self._fired and sql.startswith(
+                "ALTER TABLE properties ADD COLUMN provider"
+            ):
+                self._fired = True
+                racer = sqlite3.connect(db_path)
+                racer.execute(sql)
+                racer.commit()
+                racer.close()
+            return super().execute(sql, parameters)
+
+    conn = sqlite3.connect(db_path, factory=RacingConnection)
+    store = PropertyStore(conn)
+    try:
+        prop = make_prop()
+        store.add(prop)
+        got = store.get(prop.property_id)
+        assert got is not None
+        assert got.provenance.provider == ""
+    finally:
+        store.close()
+
+
+def test_migrate_columns_reraises_a_genuine_alter_failure(tmp_path: Path) -> None:
+    """The race tolerance must not swallow a real migration failure: if the
+    column still isn't there after the `ALTER` raises, re-raise (issue #252
+    review).
+    """
+    db_path = tmp_path / "forseti.db"
+
+    class BoomingConnection(sqlite3.Connection):
+        def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
+            if sql.startswith("ALTER TABLE properties ADD COLUMN model"):
+                raise sqlite3.OperationalError("disk I/O error")
+            return super().execute(sql, parameters)
+
+    conn = sqlite3.connect(db_path, factory=BoomingConnection)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE properties (
+            property_id TEXT PRIMARY KEY,
+            provider    TEXT NOT NULL DEFAULT ''
+        );
+        """
+    )
+    store = PropertyStore.__new__(PropertyStore)
+    store._conn = conn  # type: ignore[attr-defined]
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        store._migrate_columns()  # type: ignore[attr-defined]
 
 
 def test_add_duplicate_raises() -> None:
