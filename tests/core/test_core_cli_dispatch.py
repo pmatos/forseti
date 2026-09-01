@@ -14,7 +14,8 @@ from pathlib import Path
 
 import pytest
 
-from forseti.adapters.claude_code.install import HOOK_NAMES
+from forseti.adapters.claude_code.install import HOOK_NAMES as CLAUDE_CODE_HOOK_NAMES
+from forseti.adapters.codex.install import HOOK_NAMES as CODEX_HOOK_NAMES
 from forseti.core import cli
 from forseti.core.cli import _build_parser, main
 
@@ -42,7 +43,9 @@ def test_every_subcommand_binds_a_callable_handler() -> None:
         "propose",
         "check",
         "claude-code-hook",
+        "codex-hook",
         "enable-project",
+        "disable-project",
         "mcp",
     }
     for name, subparser in subparsers.items():
@@ -67,7 +70,15 @@ def test_claude_code_hook_choices_match_install_hook_specs() -> None:
     name_action = next(
         a for a in subparsers["claude-code-hook"]._actions if a.dest == "name"
     )
-    assert set(name_action.choices or []) == HOOK_NAMES
+    assert set(name_action.choices or []) == CLAUDE_CODE_HOOK_NAMES
+
+
+def test_codex_hook_choices_match_install_hook_names() -> None:
+    # Same pin as above, for `codex-hook <name>` against
+    # `codex.install.HOOK_NAMES` (what `enable-project --harness codex` wires).
+    subparsers = _registered_subparsers(_build_parser())
+    name_action = next(a for a in subparsers["codex-hook"]._actions if a.dest == "name")
+    assert set(name_action.choices or []) == CODEX_HOOK_NAMES
 
 
 def test_main_dispatches_to_the_bound_handler(

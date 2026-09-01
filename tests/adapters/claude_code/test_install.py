@@ -17,8 +17,10 @@ from forseti.adapters.claude_code import install as install_module
 from forseti.adapters.claude_code.install import (
     InstallOutcome,
     ProjectSettingsError,
+    RemoveOutcome,
     install,
     merge_hooks,
+    remove,
 )
 
 _MARKER = install_module._MARKER_PREFIX
@@ -322,6 +324,31 @@ def test_install_rerun_is_unchanged(tmp_path: Path) -> None:
     install(tmp_path)
     _, outcome = install(tmp_path)
     assert outcome is InstallOutcome.UNCHANGED
+
+
+def test_install_then_remove_restores_original_content(tmp_path: Path) -> None:
+    # Companion to the Codex adapter's equivalent test: install/remove must
+    # round-trip when forseti was the sole "hooks" contributor -- no dead
+    # "<event>": [] skeleton, and no lingering empty "hooks" key.
+    settings_path = tmp_path / ".claude" / "settings.local.json"
+    settings_path.parent.mkdir(parents=True)
+    original = json.dumps({"permissions": {"allow": ["Bash(git *)"]}})
+    settings_path.write_text(original)
+
+    install(tmp_path)
+    path, outcome = remove(tmp_path)
+    assert outcome is RemoveOutcome.REMOVED
+    assert json.loads(path.read_text()) == json.loads(original)
+
+
+def test_remove_again_reports_unchanged(tmp_path: Path) -> None:
+    # The first remove() drops a now-empty "hooks" key entirely (see above);
+    # a second remove() over that same file must recognize there is nothing
+    # left to strip, not treat the key's absence as something to "fix" again.
+    install(tmp_path)
+    remove(tmp_path)
+    _path, outcome = remove(tmp_path)
+    assert outcome is RemoveOutcome.UNCHANGED
 
 
 def test_install_rerun_with_an_empty_foreign_group_stays_unchanged(

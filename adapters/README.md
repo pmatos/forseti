@@ -20,6 +20,12 @@ Core calls.
 | [`codex/`](./codex/) | Codex | `PostToolUse` verify hook (the gate) + `AGENTS.md` + Core-as-MCP + `notify` — #47 |
 | [`opencode/`](./opencode/) | opencode | custom command/subagent + Core-as-MCP, **no hooks** — #48 |
 
+`forseti enable-project [--harness codex|claude-code] [DIR]` installs the Claude Code or Codex
+hook automatically (`--harness` defaults to auto-detecting the session's own harness; it fails
+closed rather than guessing when that's ambiguous or unknown — #212). `forseti disable-project
+--harness <codex|claude-code> [DIR]` is the migration path back out: it removes only forseti's
+own entries for that one harness, e.g. after `enable-project` installed the wrong one.
+
 The **Claude Code** adapter is a **self-contained plugin in this repo**, not a
 fork of the `esbmc-plugin`. RFC-0001 originally planned it as a downstream fork;
 we deliberately reversed that so the reference hard gate is independent and

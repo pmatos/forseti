@@ -35,10 +35,24 @@ Subcommands:
 - ``forseti claude-code-hook <name>`` — dispatch to one of the Claude Code
   adapter's verify-gate hooks (RFC-0004). Internal: wired into a project's
   settings file by ``enable-project``, not meant to be run by hand.
-- ``forseti enable-project [DIR] [--shared]`` — install/update the Claude Code
-  verify-gate hooks for a project (RFC-0004). Idempotent: always regenerates
-  forseti's own hook entries from the currently installed version, leaving
-  every other hook/key in the target settings file untouched.
+- ``forseti codex-hook <name>`` — dispatch to the Codex adapter's
+  ``PostToolUse`` verify-gate hook (#212). Internal: wired into a project's
+  ``.codex/config.toml`` by ``enable-project --harness codex``.
+- ``forseti enable-project [DIR] [--harness codex|claude-code] [--shared]`` —
+  install/update the verify-gate hooks for one harness (RFC-0004, #212).
+  ``--harness`` defaults to auto-detection from the session's own env vars
+  (Codex's ``CODEX_SESSION_ID``/``CODEX_THREAD_ID``, Claude Code's
+  ``CLAUDECODE``); if that's ambiguous or the markers are absent, the command
+  fails rather than guessing. Idempotent: always regenerates forseti's own
+  hook entries from the currently installed version, leaving every other
+  hook/key in the target file untouched. Codex installs never create
+  ``.claude/``, and vice versa. Codex's project-local config cannot carry a
+  ``notify`` key (Codex 0.148); forseti never emits one.
+- ``forseti disable-project [DIR] --harness codex|claude-code [--shared]`` —
+  migration cleanup: remove *only* forseti's own hook entries for one harness
+  (e.g. after ``enable-project`` targeted the wrong one), leaving foreign
+  hooks and unrelated keys untouched. Requires an explicit ``--harness``;
+  never auto-detects, and never creates a file that wasn't already there.
 - ``forseti mcp`` — start the Core MCP server on stdio (needs the ``mcp`` extra;
   imported lazily so plain ``verify`` works without the SDK).
 
@@ -52,13 +66,17 @@ import argparse
 import json
 import sys
 from collections.abc import Callable
+from enum import Enum
 from pathlib import Path
 
+from forseti.adapters.claude_code import install as claude_code_install
 from forseti.adapters.claude_code.install import (
-    HOOK_NAMES,
-    ProjectSettingsError,
-    install,
+    HOOK_NAMES as CLAUDE_CODE_HOOK_NAMES,
 )
+from forseti.adapters.codex import install as codex_install
+from forseti.adapters.codex import verify_hook as codex_verify_hook
+from forseti.adapters.codex.install import HOOK_NAMES as CODEX_HOOK_NAMES
+from forseti.adapters.harness import Harness, detect_harness
 from forseti.esbmc import (
     ListUnitsError,
     Verdict,
@@ -496,7 +514,9 @@ def _add_claude_code_hook_parser(
             "wires these into a project's settings file (RFC-0004)."
         ),
     )
-    p.add_argument("name", choices=sorted(HOOK_NAMES), help="which hook to run")
+    p.add_argument(
+        "name", choices=sorted(CLAUDE_CODE_HOOK_NAMES), help="which hook to run"
+    )
     p.set_defaults(func=_run_claude_code_hook)
 
 
@@ -525,18 +545,46 @@ def _run_claude_code_hook(args: argparse.Namespace) -> int:
     raise AssertionError(f"unreachable: unknown hook {args.name!r} (argparse choices)")
 
 
+def _add_codex_hook_parser(
+    sub: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    p = sub.add_parser(
+        "codex-hook",
+        help="run a Codex verify-gate hook (internal; wired by enable-project)",
+        description=(
+            "Dispatch to the Codex adapter's `PostToolUse` hook handler, reading "
+            "the hook JSON payload from stdin the way Codex's hook protocol "
+            "expects. Not meant to be invoked by hand -- `forseti enable-project "
+            "--harness codex` wires this into a project's `.codex/config.toml` "
+            "(#212)."
+        ),
+    )
+    p.add_argument("name", choices=sorted(CODEX_HOOK_NAMES), help="which hook to run")
+    p.set_defaults(func=_run_codex_hook)
+
+
+def _run_codex_hook(args: argparse.Namespace) -> int:
+    if args.name == "verify":
+        return codex_verify_hook.main()
+    raise AssertionError(f"unreachable: unknown hook {args.name!r} (argparse choices)")
+
+
 def _add_enable_project_parser(
     sub: argparse._SubParsersAction[argparse.ArgumentParser],
 ) -> None:
     p = sub.add_parser(
         "enable-project",
-        help="install/update the Claude Code verify-gate hooks for a project",
+        help="install/update the verify-gate hooks for a project's harness",
         description=(
-            "Write (or idempotently update) the Claude Code adapter's "
-            "SessionStart/PostToolUse/Stop hook entries into a project's Claude "
-            "Code settings file. Always regenerates forseti's own hook entries "
-            "from the currently installed forseti version; every other hook or "
-            "key already in the file is left untouched (RFC-0004)."
+            "Write (or idempotently update) the selected harness's verify-gate "
+            "hook entries into a project's settings file: Claude Code's "
+            "SessionStart/PostToolUse/Stop hooks into its settings file, or "
+            "Codex's PostToolUse `apply_patch` gate into `.codex/config.toml`. "
+            "Always regenerates forseti's own entries from the currently "
+            "installed forseti version; every other hook or key already in the "
+            "file is left untouched (RFC-0004, #212). Codex skips a freshly "
+            "wired hook until you trust it: run `/hooks` in Codex and trust the "
+            "PostToolUse entry."
         ),
     )
     p.add_argument(
@@ -547,25 +595,153 @@ def _add_enable_project_parser(
         help="the project root (default: the current directory)",
     )
     p.add_argument(
+        "--harness",
+        choices=[h.value for h in Harness],
+        default=None,
+        help=(
+            "which harness to install for; default: auto-detect from the "
+            "session's own env vars (Codex's CODEX_SESSION_ID/CODEX_THREAD_ID, "
+            "Claude Code's CLAUDECODE), failing rather than guessing if that's "
+            "ambiguous or absent"
+        ),
+    )
+    p.add_argument(
         "--shared",
         action="store_true",
         help=(
             "write to .claude/settings.json (git-committed, team-wide) instead "
-            "of the default .claude/settings.local.json (gitignored, personal)"
+            "of the default .claude/settings.local.json (gitignored, personal) "
+            "-- claude-code only"
         ),
     )
     p.set_defaults(func=_run_enable_project)
 
 
-def _run_enable_project(args: argparse.Namespace) -> int:
+def _run_harness_action(
+    command: str,
+    action: Callable[[], tuple[Path, Enum]],
+    error_types: tuple[type[Exception], ...],
+    success_message: Callable[[Path, Enum], str],
+) -> int:
+    """Run one adapter's install/remove `action`, printing forseti's uniform
+    `"forseti {command}: ..."` success/error line. Shared by `enable-project`
+    and `disable-project`'s per-harness branches, which differ only in which
+    adapter function to call and how to phrase the outcome.
+    """
     try:
-        settings_path, outcome = install(args.project_dir, shared=args.shared)
-    except (ProjectSettingsError, OSError) as exc:
-        print(f"forseti enable-project: {exc}", file=sys.stderr)
+        path, outcome = action()
+    except error_types as exc:
+        print(f"forseti {command}: {exc}", file=sys.stderr)
         return 1
-    message = f"Claude Code verify-gate hooks {outcome.value} at {settings_path}"
-    print(f"forseti enable-project: {message}")
+    print(f"forseti {command}: {success_message(path, outcome)}")
     return 0
+
+
+def _run_enable_project(args: argparse.Namespace) -> int:
+    harness = args.harness
+    if harness is None:
+        detected = detect_harness()
+        if detected is None:
+            print(
+                "forseti enable-project: could not determine the harness "
+                "automatically (no unambiguous session env vars found); pass "
+                "--harness codex or --harness claude-code",
+                file=sys.stderr,
+            )
+            return 1
+        harness = detected.value
+
+    if harness == Harness.CODEX.value:
+        if args.shared:
+            print(
+                "forseti enable-project: --shared has no effect for "
+                "--harness codex (there is only one .codex/config.toml)",
+                file=sys.stderr,
+            )
+            return 1
+        return _run_harness_action(
+            "enable-project",
+            lambda: codex_install.install(args.project_dir),
+            (codex_install.ProjectConfigError, OSError),
+            lambda path, outcome: (
+                f"Codex verify-gate hook {outcome.value} at {path} (harness: "
+                "codex). Codex skips a hook until you trust it -- run `/hooks` "
+                "in Codex and trust the PostToolUse entry."
+            ),
+        )
+
+    return _run_harness_action(
+        "enable-project",
+        lambda: claude_code_install.install(args.project_dir, shared=args.shared),
+        (claude_code_install.ProjectSettingsError, OSError),
+        lambda path, outcome: (
+            f"Claude Code verify-gate hooks {outcome.value} at {path} "
+            "(harness: claude-code)"
+        ),
+    )
+
+
+def _add_disable_project_parser(
+    sub: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    p = sub.add_parser(
+        "disable-project",
+        help="remove forseti's own verify-gate hook entries for one harness",
+        description=(
+            "Migration cleanup: remove only forseti's own hook entries for the "
+            "given --harness from a project (e.g. after `enable-project` "
+            "targeted the wrong one), leaving foreign hooks and unrelated keys "
+            "untouched. Never auto-detects the harness and never creates a file "
+            "that wasn't already there (#212)."
+        ),
+    )
+    p.add_argument(
+        "project_dir",
+        type=Path,
+        nargs="?",
+        default=Path("."),
+        help="the project root (default: the current directory)",
+    )
+    p.add_argument(
+        "--harness",
+        choices=[h.value for h in Harness],
+        required=True,
+        help="which harness's forseti-owned entries to remove",
+    )
+    p.add_argument(
+        "--shared",
+        action="store_true",
+        help=(
+            "target .claude/settings.json instead of the default "
+            ".claude/settings.local.json -- claude-code only"
+        ),
+    )
+    p.set_defaults(func=_run_disable_project)
+
+
+def _run_disable_project(args: argparse.Namespace) -> int:
+    if args.harness == Harness.CODEX.value:
+        if args.shared:
+            print(
+                "forseti disable-project: --shared has no effect for --harness codex",
+                file=sys.stderr,
+            )
+            return 1
+        return _run_harness_action(
+            "disable-project",
+            lambda: codex_install.remove(args.project_dir),
+            (codex_install.ProjectConfigError, OSError),
+            lambda path, outcome: f"Codex verify-gate hook {outcome.value} at {path}",
+        )
+
+    return _run_harness_action(
+        "disable-project",
+        lambda: claude_code_install.remove(args.project_dir, shared=args.shared),
+        (claude_code_install.ProjectSettingsError, OSError),
+        lambda path, outcome: (
+            f"Claude Code verify-gate hooks {outcome.value} at {path}"
+        ),
+    )
 
 
 def _add_mcp_parser(
@@ -614,14 +790,16 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_propose_parser(sub)
     _add_check_parser(sub)
     _add_claude_code_hook_parser(sub)
+    _add_codex_hook_parser(sub)
     _add_enable_project_parser(sub)
+    _add_disable_project_parser(sub)
     _add_mcp_parser(sub)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if not arguments or arguments[0] not in {"claude-code-hook", "mcp"}:
+    if not arguments or arguments[0] not in {"claude-code-hook", "codex-hook", "mcp"}:
         notice = update_notice()
         if notice is not None:
             print(notice, file=sys.stderr)
