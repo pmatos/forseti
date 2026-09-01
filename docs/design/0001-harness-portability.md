@@ -124,7 +124,8 @@ names, distinct at a glance from an adapter's own short local names (`edit`, `ga
 | `property.proposed` | `core.propose.propose_source`, `core.submit.submit_source` | `unit_id`, `property_id`, `expression`, `provider`, `model`, `channel` (`"llm"` \| `"submitted"`) |
 | `property.check.start` | `core.check.check_source` | `unit_id` |
 | `property.verdict` | `core.check.check_source` | `unit_id`, `property_id`, `outcome`, `k` |
-| `gate.decision` | each adapter's own per-edit hook | `harness`, `adapter`, `unit_ids`, `decision` |
+| `gate.decision` | Claude Code's `post_tool_use` | `harness`, `adapter`, `unit_ids` (`path::symbol`, per verified function), `decision` |
+| `gate.decision` | Codex's `verify_hook` | `harness`, `adapter`, `files` (raw edited paths — the hook verifies a whole file at a time, no per-function enumeration), `decision` |
 
 All four append to `<store_root>/events.jsonl` — the project's `.forseti/events.jsonl` when
 `store_root` is the default, the same file the Claude Code adapter's own
@@ -138,9 +139,13 @@ records nothing — `record_event`'s own `mkdir` would otherwise violate the doc
 
 Both adapters emit `gate.decision` at their own per-edit gate point: Claude Code's
 `adapters.claude_code.post_tool_use` (pass/block after verifying an edited file's functions)
-and Codex's `adapters.codex.verify_hook` (pass/unresolved/block after an `apply_patch`).
-Recording is best-effort and never raises — a trace failure must not turn a real verdict
-into a hook crash.
+and Codex's `adapters.codex.verify_hook` (pass/unresolved/block after an `apply_patch`). The
+two differ in granularity, and the event says so honestly rather than faking parity: Claude
+Code enumerates and verifies each function, so its `unit_ids` are real `path::symbol` keys
+joinable with `property.proposed`/`property.verdict`; Codex verifies a whole edited file at a
+time (no per-function enumeration), so its event carries `files` — raw source paths — instead
+of `unit_ids`. Recording is best-effort and never raises — a trace failure must not turn a
+real verdict into a hook crash.
 
 ### Capability / enforcement matrix (implemented, #213)
 

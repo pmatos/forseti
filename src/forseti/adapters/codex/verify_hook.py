@@ -119,9 +119,11 @@ def main() -> int:
 
     violated: list[tuple[str, str]] = []
     inconclusive: list[tuple[str, str]] = []
+    checked: list[str] = []
     for path in edited:
         if not Path(path).exists():
             continue
+        checked.append(path)
         verdict, evidence = _verify(path)
         if verdict == "violated":
             violated.append((path, evidence))
@@ -137,13 +139,13 @@ def main() -> int:
         if inconclusive:
             residual = ", ".join(f"{p} [{v}]" for p, v in inconclusive)
             lines.append(f"\nAlso inconclusive (do not ignore): {residual}")
-        _record_gate_decision(edited, "block")
+        _record_gate_decision(checked, "block")
         print(json.dumps({"decision": "block", "reason": "\n".join(lines)}))
         return 0
 
     if inconclusive:
         residual = ", ".join(f"{p} [{v}]" for p, v in inconclusive)
-        _record_gate_decision(edited, "unresolved")
+        _record_gate_decision(checked, "unresolved")
         print(
             json.dumps(
                 {
@@ -156,12 +158,38 @@ def main() -> int:
         )
         return 0
 
-    _record_gate_decision(edited, "pass")
+    if not checked:
+        # Every edited path was gone by the time this hook ran (e.g. a rename's
+        # old name, or a file deleted later in the same turn) -- nothing was
+        # actually verified, so this must not read as a pass in the canonical
+        # trace (issue #252 review; AGENTS.md: an unverified unit is never a
+        # silent pass).
+        _record_gate_decision(edited, "unresolved")
+        print(
+            json.dumps(
+                {
+                    "systemMessage": (
+                        "Forseti: no edited source still exists to verify "
+                        f"({', '.join(edited)}). Not a pass."
+                    )
+                }
+            )
+        )
+        return 0
+
+    _record_gate_decision(checked, "pass")
     return 0
 
 
-def _record_gate_decision(paths: list[str], decision: str) -> None:
+def _record_gate_decision(files: list[str], decision: str) -> None:
     """Core's canonical `gate.decision` event (`core/events.py`, #213).
+
+    `files` are the raw edited source paths, not canonical `path::symbol` unit
+    IDs: `_verify` above checks a whole file at a time (module docstring), so
+    there is no per-function verdict to key one by. Recorded under `files`
+    rather than `unit_ids` so this event is honest about its own granularity
+    instead of implying it joins with `property.proposed`/`property.verdict`,
+    which are keyed by real units (issue #252 review).
 
     Written to the hook process's own cwd's `.forseti/events.jsonl` -- the
     same directory `forseti check`/`propose`/`submit` write their own
@@ -174,7 +202,7 @@ def _record_gate_decision(paths: list[str], decision: str) -> None:
         GATE_DECISION,
         harness="codex",
         adapter="codex-post-tool-use",
-        unit_ids=list(paths),
+        files=list(files),
         decision=decision,
     )
 

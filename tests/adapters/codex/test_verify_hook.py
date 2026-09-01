@@ -103,6 +103,33 @@ def test_main_skips_nonexistent_edited_file(
     assert verify_hook.main() == 0
 
 
+def test_main_does_not_record_pass_when_nothing_was_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A patch whose only edited path no longer exists must not read as a pass
+    in the canonical trace (issue #252 review): nothing was actually checked.
+    """
+    from forseti.core.events import events_path
+
+    event = {
+        "tool_name": "apply_patch",
+        "tool_input": {"command": "*** Update File: /does/not/exist.c\n"},
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+    monkeypatch.chdir(tmp_path)
+
+    assert verify_hook.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "decision" not in payload
+    assert "/does/not/exist.c" in payload["systemMessage"]
+
+    lines = events_path(tmp_path / ".forseti").read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    assert len(events) == 1
+    assert events[0]["decision"] == "unresolved"
+    assert events[0]["files"] == ["/does/not/exist.c"]
+
+
 def test_main_blocks_on_violated_verdict(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -201,7 +228,7 @@ def test_main_records_canonical_gate_decision_events(
     for event in events:
         assert event["harness"] == "codex"
         assert event["adapter"] == "codex-post-tool-use"
-        assert isinstance(event["unit_ids"], list)
+        assert isinstance(event["files"], list)
 
 
 def test_main_reports_violated_plus_inconclusive_residual(
