@@ -395,4 +395,118 @@ firing should take it as pure extraction and file the event gap as `canonical-ga
 
 ## Design
 
-*(written in step 4 — see below, appended after this section was first committed.)*
+Three interfaces were produced in parallel by sub-agents (design-it-twice), each briefed to
+a *radically different* altitude, then adjudicated by a fourth sub-agent that authored none of
+them, against the fixed criteria in priority order: **depth → locality → seam placement → test
+surface → blast radius**.
+
+### The three designs
+
+**Design A — minimal, interpretation-only.** A pure `classify_site_probe(probe, expected_label)
+-> Reachability` in `precond/probe.py`. Hides the tri-state derivation (incl. the
+`Violated`⇒reached inversion and the fail-closed default); each caller keeps its own
+render/write/run. Smallest diff; plain caller `match` with no exhaustiveness claim; positional
+label.
+
+**Design B — maximum depth, the full triple.** `probe_site(render_thunk, *, label, stem,
+work_dir, verify, k) -> ProbeResult` in `precond/probe.py`. Takes over render → write →
+`verify(path, unwind=k)` → interpret, returning a `ProbeResult` carrying the tri-state plus the
+underlying `EsbmcResult` and k. The varying render is supplied as a `Callable[[], str]` lambda.
+
+**Design C — interpretation-only, idiomatic.** `classify_site_probe(result, *, label) ->
+Reachability` in `precond/reachability.py`. Same interpret-only seam as A, but callers use the
+repo's standing `match … case _: assert_never(...)` exhaustiveness idiom (present in
+`orchestrator/state.py:69`, `orchestrator/check.py:369`, `esbmc/render.py:55,107`,
+`orchestrator/loop.py:163`), `label` is keyword-only, and an empty-label precondition raises
+(fail-closed — an empty label substring-matches *every* trace, turning any `Violated` into a
+false REACHED, i.e. an unsound `DISCHARGED`/`ASSUMED_VERIFIED` upgrade).
+
+### Adjudication — winner: Design C
+
+- **Depth (1)** — A/C ahead. Depth is leverage, and leverage is highest where the hidden
+  behaviour is *hard to get right*: the `Violated`⇒reached inversion and the collapse of three
+  unlike inputs (`Unknown`, `Error`, and the footgun — a `Violated` **without** the label) into
+  one fail-closed INCONCLUSIVE bucket. A/C put exactly that behind a two-argument call. B hides
+  *more absolute* behaviour, but its marginal scope over A/C is three trivial lines both callers
+  already had, bought with a six-parameter, callback-bearing interface — easy behaviour behind a
+  wide interface is shallow. (Tell: B's `ProbeResult.result` field exists only to hand back the
+  `EsbmcResult` its own encapsulation removed.) B is *closest* here but does not overtake.
+- **Locality (2) — decides C over A.** C adopts the repo's `match + assert_never` idiom, so a
+  future `EsbmcResult`/`Reachability` variant breaks *at the match site, idiomatically*, instead
+  of silently falling into INCONCLUSIVE; keyword-only `label` removes arg-order mistakes. A
+  declines to claim exhaustiveness.
+- **Seam placement (3) — separates B.** The seam belongs where behaviour *varies*: the render
+  decision (include path, `non_vacuity` flag, plan, label). What is identical-and-duplicated is
+  the interpretation. A/C draw the seam around the identical interpretation; B circles the
+  *sameness* (write→run) and leaks the *variation* back out as a caller-authored
+  `lambda: render_sidecar(...)` — its own doc concedes "the thunk buys one frame, not the render
+  decision." Wrong place.
+- **Test surface (4) — confirms A/C over B; slight edge C.** A/C are pure: the dangerous
+  `Violated`-without-label → INCONCLUSIVE branch (which no current test isolates) becomes a
+  direct unit test with no tempdir or fake port. B re-buries it behind `tmp_path` + a fake
+  `VerifyPort`. C additionally covers the `label=""` guard through the interface.
+- **Blast radius (5)** — A is smallest, but does not apply: A and C differ on higher-priority
+  criteria 2 and 4, so C wins before the tiebreaker.
+
+### Winner vs the runner-up **design**
+
+The strongest loser is **Design B** (the full-triple `probe_site`) — the only real
+architectural *alternative*, since it takes over the run rather than interpreting a result the
+caller already computed. It lost because (a) its seam is in the wrong place — it hides the
+identical/trivial write+run and passes the varying render through as a callback; (b) it makes a
+shallow depth trade — a six-param thunk-bearing interface plus a self-inflicted `ProbeResult`
+wrapper to hide three lines; (c) it gives back the test-surface prize by re-entangling the
+inversion branch with I/O. Its one genuine merit — centralising the `{stem}.c` C-frontend
+filename convention — is not the duplicated, bug-prone essence the criteria reward.
+
+Design A is a dominated near-duplicate of C, losing only on the empty-label guard (criterion 4)
+and the `assert_never` idiom (criterion 2).
+
+### The interface to build
+
+Module `src/forseti/precond/reachability.py` — a new leaf importing only `forseti.esbmc`
+(`EsbmcResult`, `Verified`, `Violated`). Not in `model.py` (which imports `verify.py`, so a
+classifier there would close a `model → verify → model` cycle); not exported from
+`precond/__init__.py` (internal, shared by the two sibling drivers).
+
+The enum is named **`ProbeReachability`** rather than a bare `Reachability`, so the type carries
+the "as decided by *this* site probe, in *this* harness at bound k" framing and does not read as
+"reachable in general" (the PR #175 self-caller residual; cf. the "verdict names are reviewed for
+scope" convention). Members stay REACHED / UNREACHABLE / INCONCLUSIVE.
+
+```python
+from enum import Enum
+from forseti.esbmc import EsbmcResult, Verified, Violated
+
+
+class ProbeReachability(Enum):
+    """Whether a labelled assert(0) site probe fired, in THIS harness at its bound k."""
+
+    REACHED = "reached"            # labelled Violated: the probe assert fired
+    UNREACHABLE = "unreachable"    # Verified: the assert never fired
+    INCONCLUSIVE = "inconclusive"  # Unknown / Error / unlabelled Violated — never a pass
+
+
+def classify_site_probe(result: EsbmcResult, *, label: str) -> ProbeReachability:
+    if not label:
+        raise ValueError("classify_site_probe needs a non-empty probe label")
+    if isinstance(result, Violated) and label in result.raw_counterexample:
+        return ProbeReachability.REACHED
+    if isinstance(result, Verified):
+        return ProbeReachability.UNREACHABLE
+    return ProbeReachability.INCONCLUSIVE
+```
+
+Each caller keeps its own render/write/run, its own domain enum (`Assessment` vs
+`CallerOutcome`), and its own detail wording; only the tri-state derivation is shared. Callers
+rewrite their interpretation tail to the exhaustive `match r := classify_site_probe(...)` /
+`case _: assert_never(r)` idiom, keeping `probe` in local scope so `probe.verdict.value` remains
+available for the INCONCLUSIVE detail string (no wrapper object needed). The discharge site
+passes the bare `OBLIGATION_SITE_LABEL_PREFIX` and keeps storing the caller's *primary*
+obligation verdict (not the probe) in the `CallerCheck` — behaviour-preserving throughout.
+
+**Test-first:** a new `tests/precond/test_reachability.py` pins REACHED / UNREACHABLE /
+INCONCLUSIVE (×3: unlabelled `Violated`, `Unknown`, `Error`) / `label=""` → `ValueError`. The
+non-vacuity path's INCONCLUSIVE arm (`verify.py:406-410`), currently unpinned, is now covered
+directly. Existing `tests/precond/test_precond_verify.py` and `test_discharge.py` are the
+unmodified regression guard.
