@@ -61,6 +61,13 @@ class InstallOutcome(Enum):
     UNCHANGED = "already up to date"
 
 
+class RemoveOutcome(Enum):
+    """What `remove` did to the target settings file (`.value` is CLI-facing prose)."""
+
+    REMOVED = "removed"
+    UNCHANGED = "already absent"
+
+
 class ProjectSettingsError(Exception):
     """The target settings file exists but cannot be safely read as forseti's own."""
 
@@ -91,20 +98,7 @@ def _generated_matcher_groups() -> dict[str, list[dict[str, Any]]]:
     return groups
 
 
-def merge_hooks(existing: dict[str, Any]) -> dict[str, Any]:
-    """Return `existing` with forseti's own hook entries replaced by the current set.
-
-    Total over any `existing` whose `"hooks"` value has the shape Claude Code
-    itself writes (absent, or a dict mapping event name to a list of matcher
-    groups): every non-forseti hook, matcher, and top-level key survives
-    unchanged; a matcher-group is dropped only when removing forseti's own
-    hooks from it is what left it with none (an already-empty or -omitted
-    `hooks` array is preserved as-is, not read as "all forseti's own" and
-    dropped). Raises `ProjectSettingsError` if `"hooks"` or any event's value
-    doesn't have that shape, rather than silently dropping/corrupting it.
-    """
-    merged = dict(existing)
-    raw_hooks = merged.get("hooks", {})
+def _validate_hooks_shape(raw_hooks: object) -> dict[str, Any]:
     if not isinstance(raw_hooks, dict):
         raise ProjectSettingsError('existing settings\' "hooks" key must be an object')
     hooks: dict[str, Any] = dict(raw_hooks)
@@ -113,11 +107,23 @@ def merge_hooks(existing: dict[str, Any]) -> dict[str, Any]:
             raise ProjectSettingsError(
                 f'existing settings\' "hooks"."{event}" must be a list'
             )
-    generated = _generated_matcher_groups()
+    return hooks
 
-    for event in set(hooks) | set(generated):
+
+def _strip_forseti_hooks(hooks: dict[str, Any]) -> dict[str, Any]:
+    """Return `hooks` with every forseti-owned hook entry removed.
+
+    Total over the shape Claude Code itself writes (a dict mapping event name
+    to a list of matcher groups): every non-forseti hook, matcher, and event
+    survives unchanged; a matcher-group is dropped only when removing
+    forseti's own hooks from it is what left it with none (an already-empty
+    or -omitted `hooks` array is preserved as-is, not read as "all forseti's
+    own" and dropped).
+    """
+    stripped: dict[str, Any] = {}
+    for event, groups in hooks.items():
         kept: list[Any] = []
-        for group in hooks.get(event, []):
+        for group in groups:
             if not isinstance(group, dict):
                 kept.append(group)
                 continue
@@ -137,11 +143,37 @@ def merge_hooks(existing: dict[str, Any]) -> dict[str, Any]:
             elif remaining:
                 kept.append({**group, "hooks": remaining})
             # else: every hook in this group was forseti's own -- drop it.
-        kept.extend(generated.get(event, []))
-        hooks[event] = kept
+        stripped[event] = kept
+    return stripped
 
-    merged["hooks"] = hooks
+
+def merge_hooks(existing: dict[str, Any]) -> dict[str, Any]:
+    """Return `existing` with forseti's own hook entries replaced by the current set.
+
+    Total over any `existing` whose `"hooks"` value has the shape Claude Code
+    itself writes (absent, or a dict mapping event name to a list of matcher
+    groups): every non-forseti hook, matcher, and top-level key survives
+    unchanged (see `_strip_forseti_hooks`). Raises `ProjectSettingsError` if
+    `"hooks"` or any event's value doesn't have that shape, rather than
+    silently dropping/corrupting it.
+    """
+    merged = dict(existing)
+    hooks = _validate_hooks_shape(merged.get("hooks", {}))
+    generated = _generated_matcher_groups()
+
+    stripped = _strip_forseti_hooks(hooks)
+    for event in set(hooks) | set(generated):
+        kept = list(stripped.get(event, []))
+        kept.extend(generated.get(event, []))
+        stripped[event] = kept
+
+    merged["hooks"] = stripped
     return merged
+
+
+def _settings_path(project_dir: Path, *, shared: bool) -> Path:
+    name = "settings.json" if shared else "settings.local.json"
+    return project_dir / ".claude" / name
 
 
 def install(project_dir: Path, *, shared: bool = False) -> tuple[Path, InstallOutcome]:
@@ -155,8 +187,7 @@ def install(project_dir: Path, *, shared: bool = False) -> tuple[Path, InstallOu
     replace the link itself with a plain file rather than writing through it;
     raises `ProjectSettingsError` instead of doing that.
     """
-    claude_dir = project_dir / ".claude"
-    settings_path = claude_dir / ("settings.json" if shared else "settings.local.json")
+    settings_path = _settings_path(project_dir, shared=shared)
     if settings_path.is_symlink():
         raise ProjectSettingsError(
             f"{settings_path} is a symlink -- refusing to replace it (an atomic "
@@ -189,3 +220,38 @@ def install(project_dir: Path, *, shared: bool = False) -> tuple[Path, InstallOu
     event_log.write_text_atomic(settings_path, json.dumps(updated, indent=2) + "\n")
     outcome = InstallOutcome.CREATED if not existed else InstallOutcome.UPDATED
     return settings_path, outcome
+
+
+def remove(project_dir: Path, *, shared: bool = False) -> tuple[Path, RemoveOutcome]:
+    """Remove forseti's own hook entries from `project_dir`'s Claude Code settings.
+
+    No-ops -- and never creates the settings file -- if it is absent or carries
+    no forseti-owned hook entries. Leaves every other hook/key untouched (the
+    migration cleanup path for a project that installed the wrong harness).
+    """
+    settings_path = _settings_path(project_dir, shared=shared)
+    if settings_path.is_symlink():
+        raise ProjectSettingsError(
+            f"{settings_path} is a symlink -- refusing to replace it (an atomic "
+            "rewrite would swap in a plain file, silently breaking the link)"
+        )
+    if not settings_path.exists():
+        return settings_path, RemoveOutcome.UNCHANGED
+
+    try:
+        existing = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ProjectSettingsError(
+            f"{settings_path}: cannot read existing settings ({exc})"
+        ) from exc
+    if not isinstance(existing, dict):
+        raise ProjectSettingsError(f"{settings_path}: top-level JSON must be an object")
+
+    merged = dict(existing)
+    hooks = _validate_hooks_shape(merged.get("hooks", {}))
+    merged["hooks"] = _strip_forseti_hooks(hooks)
+    if merged == existing:
+        return settings_path, RemoveOutcome.UNCHANGED
+
+    event_log.write_text_atomic(settings_path, json.dumps(merged, indent=2) + "\n")
+    return settings_path, RemoveOutcome.REMOVED

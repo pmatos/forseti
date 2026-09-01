@@ -8,15 +8,20 @@ feeds the counterexample back to the model instead of letting it move on. That
 is the verify → counterexample → fix loop, enforced by the harness rather than
 by prompt goodwill (the AGENTS.md instructions remain as a fallback).
 
-Wire it in ~/.codex/config.toml (see ./config.toml.example):
+`forseti enable-project --harness codex` wires this into a project's
+`.codex/config.toml` (#212) as:
 
     [[hooks.PostToolUse]]
     matcher = "apply_patch"
 
     [[hooks.PostToolUse.hooks]]
     type = "command"
-    command = 'python3 "/absolute/path/to/adapters/codex/verify_hook.py"'
+    command = "forseti codex-hook verify"
     timeout = 120
+
+`main()` here is dispatched in-process by `forseti codex-hook verify`
+(`core/cli.py`), not invoked as a standalone script — the written command
+needs only `forseti` on `PATH`, never an absolute path to this file.
 
 Codex sends the hook one JSON object on **stdin** with `tool_name` and, for
 `apply_patch`, a `tool_input.command` holding the patch envelope (whose

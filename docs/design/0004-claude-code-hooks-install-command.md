@@ -101,9 +101,19 @@ The write itself is atomic (temp file + rename) so a crash mid-write cannot leav
 
 ## Out of scope
 
-- The `codex`/`opencode` adapters are untouched — this RFC only relocates and wires the
-  Claude Code adapter's hooks.
-- No `forseti disable-project` / hook-removal command. Not asked for; add if it comes up.
-- No auto-detection of which harness a project uses. `enable-project` installs the Claude Code
-  hooks specifically; a multi-harness `--harness` flag is future scope if a second harness needs
-  the same treatment.
+- The `opencode` adapter is untouched — it has no tool-use hooks to install (RFC-0001), so it
+  stays on the prompt+tools fallback.
+
+**Reversed by #212** (harness-neutral `enable-project`): the three bullets below described this
+RFC's original scope but no longer hold — see `docs/design/0001-harness-portability.md` and the
+adapter `install.py`/`core/cli.py` modules for the current behavior.
+
+- ~~The `codex` adapter is untouched — this RFC only relocates and wires the Claude Code
+  adapter's hooks.~~ `forseti enable-project --harness codex` now installs the packaged Codex
+  `PostToolUse` hook into `.codex/config.toml` the same way.
+- ~~No `forseti disable-project` / hook-removal command.~~ `forseti disable-project --harness
+  <codex|claude-code>` removes only forseti's own entries for one harness (migration cleanup).
+- ~~No auto-detection of which harness a project uses.~~ `enable-project` auto-detects from each
+  harness's own unambiguous session env vars (Codex's `CODEX_SESSION_ID`/`CODEX_THREAD_ID`,
+  Claude Code's `CLAUDECODE`) when `--harness` is omitted, and fails closed (requires an explicit
+  `--harness`) rather than guessing when that's ambiguous or absent.

@@ -85,7 +85,10 @@ def test_user_facing_command_warns_before_running_when_a_new_wheel_exists(
         lambda _request, *, timeout: _latest_release(),
     )
 
-    assert main(["enable-project", str(tmp_path / "project")]) == 0
+    assert (
+        main(["enable-project", "--harness", "claude-code", str(tmp_path / "project")])
+        == 0
+    )
 
     captured = capsys.readouterr()
     assert "verify-gate hooks installed" in captured.out
@@ -110,9 +113,9 @@ def test_fresh_cache_warns_again_without_another_github_request(
     monkeypatch.setattr(urllib.request, "urlopen", open_once)
     project = tmp_path / "project"
 
-    assert main(["enable-project", str(project)]) == 0
+    assert main(["enable-project", "--harness", "claude-code", str(project)]) == 0
     assert capsys.readouterr().err == _expected_banner()
-    assert main(["enable-project", str(project)]) == 0
+    assert main(["enable-project", "--harness", "claude-code", str(project)]) == 0
     assert capsys.readouterr().err == _expected_banner()
 
 
@@ -133,13 +136,13 @@ def test_cache_refreshes_after_twelve_hours_but_not_before(
     )
     project = tmp_path / "project"
 
-    assert main(["enable-project", str(project)]) == 0
+    assert main(["enable-project", "--harness", "claude-code", str(project)]) == 0
     assert capsys.readouterr().err == _expected_banner()
     now += 12 * 60 * 60 - 1
-    assert main(["enable-project", str(project)]) == 0
+    assert main(["enable-project", "--harness", "claude-code", str(project)]) == 0
     assert capsys.readouterr().err == _expected_banner()
     now += 1
-    assert main(["enable-project", str(project)]) == 0
+    assert main(["enable-project", "--harness", "claude-code", str(project)]) == 0
     assert capsys.readouterr().err == (
         "╭─ Forseti update available: 1.7.5 → 1.9.0\n"
         "│ uv tool install --force https://github.com/pmatos/forseti/"
@@ -167,9 +170,9 @@ def test_github_failure_is_silent_and_throttled(
     monkeypatch.setattr(urllib.request, "urlopen", unavailable)
     project = tmp_path / "project"
 
-    assert main(["enable-project", str(project)]) == 0
+    assert main(["enable-project", "--harness", "claude-code", str(project)]) == 0
     assert capsys.readouterr().err == ""
-    assert main(["enable-project", str(project)]) == 0
+    assert main(["enable-project", "--harness", "claude-code", str(project)]) == 0
     assert capsys.readouterr().err == ""
 
 
@@ -192,9 +195,9 @@ def test_http_protocol_failure_is_silent_and_throttled(
     monkeypatch.setattr(urllib.request, "urlopen", truncated)
     project = tmp_path / "project"
 
-    assert main(["enable-project", str(project)]) == 0
+    assert main(["enable-project", "--harness", "claude-code", str(project)]) == 0
     assert capsys.readouterr().err == ""
-    assert main(["enable-project", str(project)]) == 0
+    assert main(["enable-project", "--harness", "claude-code", str(project)]) == 0
     assert capsys.readouterr().err == ""
 
 
@@ -217,7 +220,10 @@ def test_uninstalled_source_tree_does_not_check_for_updates(
         ),
     )
 
-    assert main(["enable-project", str(tmp_path / "project")]) == 0
+    assert (
+        main(["enable-project", "--harness", "claude-code", str(tmp_path / "project")])
+        == 0
+    )
     assert capsys.readouterr().err == ""
 
 
@@ -244,7 +250,10 @@ def test_malformed_github_release_payload_does_not_warn(
         lambda _request, *, timeout: _Response(payload),
     )
 
-    assert main(["enable-project", str(tmp_path / "project")]) == 0
+    assert (
+        main(["enable-project", "--harness", "claude-code", str(tmp_path / "project")])
+        == 0
+    )
     assert capsys.readouterr().err == ""
 
 
@@ -277,7 +286,10 @@ def test_release_with_unrelated_assets_still_finds_the_wheel(
         lambda _request, *, timeout: _Response(payload),
     )
 
-    assert main(["enable-project", str(tmp_path / "project")]) == 0
+    assert (
+        main(["enable-project", "--harness", "claude-code", str(tmp_path / "project")])
+        == 0
+    )
     assert capsys.readouterr().err == _expected_banner()
 
 
@@ -297,7 +309,10 @@ def test_release_without_a_stable_v_tag_does_not_warn(
         lambda _request, *, timeout: _Response(payload),
     )
 
-    assert main(["enable-project", str(tmp_path / "project")]) == 0
+    assert (
+        main(["enable-project", "--harness", "claude-code", str(tmp_path / "project")])
+        == 0
+    )
     assert capsys.readouterr().err == ""
 
 
@@ -317,7 +332,10 @@ def test_release_without_a_downloadable_github_wheel_does_not_warn(
         lambda _request, *, timeout: _Response(payload),
     )
 
-    assert main(["enable-project", str(tmp_path / "project")]) == 0
+    assert (
+        main(["enable-project", "--harness", "claude-code", str(tmp_path / "project")])
+        == 0
+    )
     assert capsys.readouterr().err == ""
 
 
@@ -344,7 +362,10 @@ def test_non_update_release_does_not_warn(
         lambda _request, *, timeout: _Response(payload),
     )
 
-    assert main(["enable-project", str(tmp_path / "project")]) == 0
+    assert (
+        main(["enable-project", "--harness", "claude-code", str(tmp_path / "project")])
+        == 0
+    )
     assert capsys.readouterr().err == ""
 
 
@@ -376,7 +397,10 @@ def test_malformed_cache_timestamp_is_ignored(
         lambda _request, *, timeout: _Response({"tag_name": "v1.7.5", "assets": []}),
     )
 
-    assert main(["enable-project", str(tmp_path / "project")]) == 0
+    assert (
+        main(["enable-project", "--harness", "claude-code", str(tmp_path / "project")])
+        == 0
+    )
     assert capsys.readouterr().err == ""
 
 
@@ -397,7 +421,10 @@ def test_non_dict_cache_is_ignored(
         lambda _request, *, timeout: _Response({"tag_name": "v1.7.5", "assets": []}),
     )
 
-    assert main(["enable-project", str(tmp_path / "project")]) == 0
+    assert (
+        main(["enable-project", "--harness", "claude-code", str(tmp_path / "project")])
+        == 0
+    )
     assert capsys.readouterr().err == ""
 
 
@@ -431,7 +458,10 @@ def test_cache_with_malformed_candidate_is_ignored(
         lambda _request, *, timeout: _Response({"tag_name": "v1.7.5", "assets": []}),
     )
 
-    assert main(["enable-project", str(tmp_path / "project")]) == 0
+    assert (
+        main(["enable-project", "--harness", "claude-code", str(tmp_path / "project")])
+        == 0
+    )
     assert capsys.readouterr().err == ""
 
 
@@ -452,7 +482,10 @@ def test_non_text_cache_is_ignored(
         lambda _request, *, timeout: _Response({"tag_name": "v1.7.5", "assets": []}),
     )
 
-    assert main(["enable-project", str(tmp_path / "project")]) == 0
+    assert (
+        main(["enable-project", "--harness", "claude-code", str(tmp_path / "project")])
+        == 0
+    )
     assert capsys.readouterr().err == ""
 
 
