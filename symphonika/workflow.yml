@@ -1,0 +1,112 @@
+workflow:
+  name: forseti_issue_to_pr
+  initial: shipit
+  use:
+    shipit:
+      template: builtin:single-agent-pr
+      with:
+        provider: claude
+        prompt: WORKFLOW.md
+      exits:
+        success: code_review_fix
+        blocked: failed
+  states:
+    code_review_fix:
+      action:
+        kind: agent
+        provider: claude
+        prompt: prompts/code-review-fix.md
+      transitions:
+        - to: simplify
+          when:
+            provider_success: true
+        - to: failed
+
+    simplify:
+      action:
+        kind: agent
+        provider: claude
+        prompt: prompts/simplify.md
+      transitions:
+        - to: wait_for_pr
+          when:
+            provider_success: true
+        - to: failed
+
+    wait_for_pr:
+      action:
+        kind: wait
+      transitions:
+        - to: merged
+          when:
+            pr_merged: true
+        - to: failed
+          when:
+            pr_open: false
+        - to: merge
+          when:
+            checks: success
+            mergeable: true
+            unresolved_review_threads: 0
+        - to: resolve_conflicts
+          when:
+            mergeable: false
+        - to: autofix
+          when:
+            checks: failure
+        # Reviewer feedback on an otherwise-green PR. Ordered last so a clean
+        # PR still merges and a broken one still repairs first. Without this
+        # the state parks forever on the common shape -- green checks, one
+        # unresolved thread -- because `merge` needs
+        # unresolved_review_threads: 0 and `autofix` needs failing checks.
+        # The orchestrator-wide review_followup loop no longer dispatches
+        # alongside a parked raw-FSM run (issue #616), so a case this state
+        # does not name is a case nothing handles.
+        - to: autofix
+          when:
+            has_unresolved_reviews: true
+
+    autofix:
+      action:
+        kind: agent
+        provider: claude
+        prompt: prompts/autofix-pr.md
+      transitions:
+        - to: wait_for_pr
+          when:
+            provider_success: true
+        - to: failed
+
+    resolve_conflicts:
+      action:
+        kind: agent
+        provider: claude
+        prompt: prompts/resolve-conflicts.md
+      transitions:
+        - to: wait_for_pr
+          when:
+            provider_success: true
+        - to: failed
+
+    merge:
+      action:
+        kind: merge_pr
+      transitions:
+        - to: merged
+          when:
+            pr_merged: true
+        - to: failed
+          when:
+            pr_open: false
+        - to: resolve_conflicts
+          when:
+            mergeable: false
+        - to: autofix
+          when:
+            checks: failure
+
+    merged:
+      terminal: success
+
+    failed:
+      terminal: blocked
