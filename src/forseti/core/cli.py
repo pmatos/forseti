@@ -124,7 +124,7 @@ from .check import (
 from .check import (
     DEFAULT_UNWIND_LADDER as CHECK_DEFAULT_UNWIND_LADDER,
 )
-from .check import check_source
+from .check import check_source, default_unwind_ladder_above
 from .propose import (
     DEFAULT_MAX_CANDIDATES,
     DEFAULT_MODEL,
@@ -603,7 +603,7 @@ def _run_check(args: argparse.Namespace) -> int:
         # `-k 8` (or higher) doesn't collide with the fixed default rungs and
         # raise ValueError below (issue #95 review) -- an explicit
         # --unwind-ladder (including "" -> ()) always passes through as-is.
-        unwind_ladder = tuple(k for k in CHECK_DEFAULT_UNWIND_LADDER if k > args.unwind)
+        unwind_ladder = default_unwind_ladder_above(args.unwind)
     try:
         result = check_source(
             args.source,

@@ -24,10 +24,7 @@ from .check import (
 from .check import (
     DEFAULT_UNWIND as CHECK_DEFAULT_UNWIND,
 )
-from .check import (
-    DEFAULT_UNWIND_LADDER as CHECK_DEFAULT_UNWIND_LADDER,
-)
-from .check import check_source
+from .check import check_source, default_unwind_ladder_above
 from .propose import (
     DEFAULT_MAX_CANDIDATES,
     DEFAULT_MODEL,
@@ -199,7 +196,7 @@ def check_tool(
         store_root: The `.forseti` store directory to read properties from.
         unwind: Loop-unwind bound k for the first attempt.
         unwind_ladder: Bounds tried after `unwind` on an UNKNOWN verdict
-            (default: `CHECK_DEFAULT_UNWIND_LADDER`'s rungs above `unwind`).
+            (default: `default_unwind_ladder_above(unwind)`).
         timeout_s: Per-attempt esbmc timeout in seconds.
         esbmc_bin: The esbmc binary to invoke.
 
@@ -210,7 +207,7 @@ def check_tool(
     ladder = (
         tuple(unwind_ladder)
         if unwind_ladder is not None
-        else tuple(k for k in CHECK_DEFAULT_UNWIND_LADDER if k > unwind)
+        else default_unwind_ladder_above(unwind)
     )
     run = check_source(
         Path(source),

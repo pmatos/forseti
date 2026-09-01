@@ -79,6 +79,17 @@ DEFAULT_TIMEOUT_S = 110.0
 _WORK_SUBDIR = "check-work"
 
 
+def default_unwind_ladder_above(unwind: int) -> tuple[int, ...]:
+    """`DEFAULT_UNWIND_LADDER` rungs above `unwind`.
+
+    Callers that expose their own `--unwind`/`unwind` but not
+    `unwind_ladder` derive the ladder this way so a caller-chosen unwind
+    (e.g. `-k 8`) doesn't collide with the fixed default rungs and raise
+    ValueError in `check_source` (issue #95 review).
+    """
+    return tuple(k for k in DEFAULT_UNWIND_LADDER if k > unwind)
+
+
 def check_source(
     source: Path,
     *,
@@ -146,9 +157,9 @@ def check_source(
             no_unwinding_assertions=False,
         )
     )
-    record_event(store_root, PROPERTY_CHECK_START, unit_id=unit.unit_id)
     try:
         with PropertyStore.open(store_root) as store:
+            record_event(store_root, PROPERTY_CHECK_START, unit_id=unit.unit_id)
             run = check_properties(
                 unit,
                 store=store,
