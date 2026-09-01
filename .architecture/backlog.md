@@ -6,12 +6,22 @@ same ideas. Reconciled against `gh` at the start of every run.
 
 ## precond-reachability-probe-tri-state
 
-- **Status**: proposed
+- **Status**: in-flight
 - **Score**: 20/25 (leverage 4, locality 4, blast radius 2, heat 4)
 - **Files**: ~4–5 estimated
-- **Modules**: `src/forseti/precond/verify.py` (`_assess_non_vacuity`), `src/forseti/precond/discharge.py` (`_check_caller`), a new `precond` interpreter leaf
+- **Modules**: `src/forseti/precond/verify.py` (`_assess_non_vacuity`), `src/forseti/precond/discharge.py` (`_check_caller`), new leaf `src/forseti/precond/reachability.py`
 - **Summary**: Give the duplicated assert(0)-reachability-probe interpretation (Violated+label → reached, Verified → unreachable, else → inconclusive) one tested home so its FAILED-means-reached inversion lives once beside its single emitter in `synth.py`.
 - **First seen**: 2026-09-02
+- **PR**: #254
+
+### Run 2026-09-02 — complete
+
+- **Outcome**: complete
+- **Stopped at**: step 6 — PR opened; work landed on branch
+- **Branch**: `pm-deepen/precond-reachability-probe-tri-state` — *created* as `pm-deepen/run-2026-09-02-0102` from `origin/main` and renamed at step 2. Branch adoption was **refused** at step 0 on condition 3: the firing branch's `@{u}` resolved to `origin/main` (it has an upstream), so it was not a made-for-this-run, no-upstream branch.
+- **Committed**: review report, design pass, the `refactor(precond)` implementation, and this backlog update.
+- **Evidence**: quality gate green — ruff check + ruff format --check + ty check + pytest (1494 passed, 1 skipped, ESBMC-gated included); project coverage 97.40% (gate 96%); PR #254.
+- **Next**: human review of PR #254. Natural next firing: the runner-up candidate `hook-verdict-report-two-hooks` (19/25, within 1 point), taken as pure extraction with its wire-format `gate.decision` gap filed as `canonical-gate-decision-helper`.
 
 ## hook-verdict-report-two-hooks
 

@@ -9,7 +9,7 @@ unusually well-factored — most low fruit was already picked (units preprocesso
 #222, git-porcelain out of `forseti_gate` #205) — so this run went looking for the
 *remaining* shallowness rather than the obvious god-modules.
 
-**Picked**: `precond-reachability-probe-tri-state` — see the PR and `.architecture/backlog.md`.
+**Picked**: `precond-reachability-probe-tri-state` — see PR #254 and `.architecture/backlog.md`.
 
 **Degradations**: none. `gh` authenticated; both exploration sub-agents ran; `codebase-design`
 vocabulary used as defined. Branch adoption was **refused** — condition 3 failed: the firing
