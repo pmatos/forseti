@@ -118,7 +118,9 @@ def _strip_forseti_hooks(hooks: dict[str, Any]) -> dict[str, Any]:
     survives unchanged; a matcher-group is dropped only when removing
     forseti's own hooks from it is what left it with none (an already-empty
     or -omitted `hooks` array is preserved as-is, not read as "all forseti's
-    own" and dropped).
+    own" and dropped). An event whose *every* matcher-group was forseti's own
+    is dropped from the result entirely rather than left behind as a dead
+    `"<event>": []` entry -- an event that already had no groups is untouched.
     """
     stripped: dict[str, Any] = {}
     for event, groups in hooks.items():
@@ -143,7 +145,8 @@ def _strip_forseti_hooks(hooks: dict[str, Any]) -> dict[str, Any]:
             elif remaining:
                 kept.append({**group, "hooks": remaining})
             # else: every hook in this group was forseti's own -- drop it.
-        stripped[event] = kept
+        if kept or not groups:
+            stripped[event] = kept
     return stripped
 
 
@@ -227,7 +230,12 @@ def remove(project_dir: Path, *, shared: bool = False) -> tuple[Path, RemoveOutc
 
     No-ops -- and never creates the settings file -- if it is absent or carries
     no forseti-owned hook entries. Leaves every other hook/key untouched (the
-    migration cleanup path for a project that installed the wrong harness).
+    migration cleanup path for a project that installed the wrong harness). An
+    event whose groups were entirely forseti's own is dropped rather than left
+    behind as a dead `"<event>": []` entry (see `_strip_forseti_hooks`); if that
+    was the *only* content the pre-existing `"hooks"` key had, the key itself
+    is dropped too, so a project forseti was the sole `"hooks"` contributor
+    restores its pre-install content.
     """
     settings_path = _settings_path(project_dir, shared=shared)
     if settings_path.is_symlink():
@@ -249,9 +257,13 @@ def remove(project_dir: Path, *, shared: bool = False) -> tuple[Path, RemoveOutc
 
     merged = dict(existing)
     hooks = _validate_hooks_shape(merged.get("hooks", {}))
-    merged["hooks"] = _strip_forseti_hooks(hooks)
-    if merged == existing:
+    stripped = _strip_forseti_hooks(hooks)
+    if stripped == hooks:
         return settings_path, RemoveOutcome.UNCHANGED
+    if stripped:
+        merged["hooks"] = stripped
+    else:
+        merged.pop("hooks", None)
 
     event_log.write_text_atomic(settings_path, json.dumps(merged, indent=2) + "\n")
     return settings_path, RemoveOutcome.REMOVED

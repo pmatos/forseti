@@ -236,10 +236,9 @@ def test_disable_project_claude_code_removes_only_forseti_entries(
     assert code == 0
     remaining = json.loads(settings_path.read_text())
     assert remaining["permissions"] == {"allow": ["Bash(git *)"]}
-    for groups in remaining["hooks"].values():
-        for group in groups:
-            for hook in group["hooks"]:
-                assert not hook["command"].startswith("forseti claude-code-hook ")
+    # every hook group here was forseti's own, so "hooks" is dropped entirely
+    # rather than left behind as a dead "<event>": [] skeleton.
+    assert "hooks" not in remaining
 
 
 def test_disable_project_codex_does_not_touch_claude_settings(
@@ -266,10 +265,9 @@ def test_disable_project_claude_code_does_not_touch_codex_config(
     assert code == 0
     assert (tmp_path / ".codex" / "config.toml").read_text() == codex_before
     settings = json.loads((tmp_path / ".claude" / "settings.local.json").read_text())
-    for groups in settings["hooks"].values():
-        for group in groups:
-            for hook in group["hooks"]:
-                assert not hook["command"].startswith("forseti claude-code-hook ")
+    # every hook group here was forseti's own, so "hooks" is dropped entirely
+    # rather than left behind as a dead "<event>": [] skeleton.
+    assert "hooks" not in settings
 
 
 def test_disable_project_codex_shared_flag_errors(tmp_path: Path) -> None:

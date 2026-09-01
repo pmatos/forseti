@@ -40,15 +40,21 @@ no absolute script path to keep in sync with wherever this checkout lives.
    This writes (or idempotently updates) a `[[hooks.PostToolUse]]` entry into
    the project's `.codex/config.toml` whose command is the stable
    `forseti codex-hook verify` — dispatched in-process by the installed
-   `forseti`, never a `python3 "/absolute/path/..."` invocation. Rerunning is
-   safe: it always regenerates forseti's own block from the currently
-   installed `forseti` version and leaves every other key/hook in the file
-   untouched. `--harness codex` may be omitted if `enable-project` can
-   auto-detect the session (Codex sets `CODEX_SESSION_ID`/`CODEX_THREAD_ID`);
-   it refuses to guess if that's ambiguous or absent. `forseti disable-project
-   --harness codex` removes only this block later, e.g. if it was installed
-   for the wrong harness by mistake. `config.toml.example` still shows the
-   equivalent hand-written form for reference.
+   `forseti`, never a `python3 "/absolute/path/..."` invocation. Rerunning
+   *this command* is safe: it always regenerates forseti's own
+   sentinel-delimited block from the currently installed `forseti` version
+   and leaves every other key/hook in the file untouched. `--harness codex`
+   may be omitted if `enable-project` can auto-detect the session (Codex sets
+   `CODEX_SESSION_ID`/`CODEX_THREAD_ID`); it refuses to guess if that's
+   ambiguous or absent. `forseti disable-project --harness codex` removes
+   only this block later, e.g. if it was installed for the wrong harness by
+   mistake. `config.toml.example` still shows the equivalent hand-written
+   form for reference — don't hand-copy its `[[hooks.PostToolUse]]` block
+   into a project's `.codex/config.toml`, though: `enable-project` only
+   recognizes *its own* sentinel-delimited block as forseti's, so a
+   hand-copied `forseti codex-hook ...` command sitting outside it looks
+   hand-edited and makes `enable-project` refuse to run (rather than risk
+   installing a second, possibly-duplicate entry) until it's removed by hand.
 
 3. **Give Codex the loop instructions.** Copy `AGENTS.md` to your project root,
    or merge its contents into an existing `AGENTS.md`.

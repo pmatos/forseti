@@ -108,7 +108,7 @@ Code** (`claude`), then confirm with `/hooks`.
 `PATH`, from the target project run:
 
 ```console
-$ forseti enable-project
+$ forseti enable-project --harness claude-code
 ```
 
 This writes the four hook entries into `.claude/settings.local.json`
@@ -119,6 +119,17 @@ to write `.claude/settings.json` instead (git-committed, applies to the whole
 team), or a directory argument to target a project other than the current one.
 Safe to rerun any time (after a `forseti` upgrade, say): it always regenerates
 its own hook entries and leaves everything else in the file untouched.
+
+`enable-project` is shared across harnesses (#212): `--harness` may be
+omitted and auto-detected from the session's own env vars (Claude Code sets
+`CLAUDECODE`), but it refuses to guess — and installs nothing — if that's
+ambiguous or absent, so pass `--harness claude-code` explicitly outside a
+Claude Code session (e.g. first-time setup from a plain terminal). Forseti
+also has a Codex adapter (`adapters/codex/`, `--harness codex`); running
+`enable-project` under the wrong harness by mistake is undone with
+`forseti disable-project --harness claude-code`, which removes only
+forseti's own hook entries and leaves everything else — foreign hooks,
+`.codex/config.toml`, unrelated settings keys — untouched.
 
 **As a plugin (also portable, no `forseti` CLI call needed):** install this
 directory as a plugin (via your marketplace, or point Claude Code at
