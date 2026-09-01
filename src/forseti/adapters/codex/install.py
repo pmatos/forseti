@@ -177,9 +177,16 @@ def remove(project_dir: Path) -> tuple[Path, RemoveOutcome]:
     if the config is absent or carries no forseti-owned block. Leaves every
     other key/table untouched; the blank-line separator `merge_config` inserts
     before its own block is trimmed back off, so a remove undoes an install
-    byte-for-byte rather than leaving that artifact behind.
+    byte-for-byte rather than leaving that artifact behind. The write is
+    atomic (temp file + rename); a symlinked target raises `ProjectConfigError`
+    rather than silently replacing the link with a plain file.
     """
     config_path = _config_path(project_dir)
+    if config_path.is_symlink():
+        raise ProjectConfigError(
+            f"{config_path} is a symlink -- refusing to replace it (an atomic "
+            "rewrite would swap in a plain file, silently breaking the link)"
+        )
     if not config_path.exists():
         return config_path, RemoveOutcome.UNCHANGED
     try:

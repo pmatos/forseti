@@ -145,6 +145,26 @@ def test_install_on_symlink_raises(tmp_path: Path) -> None:
         install(tmp_path)
 
 
+def test_remove_on_symlink_raises(tmp_path: Path) -> None:
+    real = tmp_path / "real.toml"
+    real.write_text('notify = ["python3", "/x/notify.py"]\n')
+    config_dir = tmp_path / ".codex"
+    config_dir.mkdir()
+    (config_dir / "config.toml").symlink_to(real)
+    with pytest.raises(ProjectConfigError, match="symlink"):
+        remove(tmp_path)
+    assert real.is_file()
+    assert not real.is_symlink()
+
+
+def test_remove_on_broken_symlink_raises(tmp_path: Path) -> None:
+    config_dir = tmp_path / ".codex"
+    config_dir.mkdir()
+    (config_dir / "config.toml").symlink_to(tmp_path / "missing.toml")
+    with pytest.raises(ProjectConfigError, match="symlink"):
+        remove(tmp_path)
+
+
 def test_remove_on_missing_project_is_noop_and_creates_nothing(
     tmp_path: Path,
 ) -> None:
