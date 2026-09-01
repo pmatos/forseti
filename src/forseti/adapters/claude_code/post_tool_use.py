@@ -104,7 +104,10 @@ def main() -> int:
         # it, the file reads stale and the scan re-offers it. What must not happen
         # is reporting the superseded verdicts, which would exit 2 with a
         # counterexample for code no longer on disk. The `edit` event above logs an
-        # empty `functions` list either way.
+        # empty `functions` list either way. Still record the canonical decision
+        # (empty `unit_ids`) so this allowing outcome isn't invisible to the
+        # cross-harness trace (issue #252 review).
+        _record_gate_decision(project_dir, rel, [], "pass")
         return 0
 
     # NEEDS_CONTRACT (pointer/array units the gate can't check without a harness)

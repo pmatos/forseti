@@ -185,6 +185,14 @@ def test_c_file_with_no_functions_is_a_silent_pass(
     src.write_text("// no functions here\n")
     assert _run(tmp_path, monkeypatch, file_path=str(src)) == 0
 
+    events = event_log.read_events(str(tmp_path))
+    # An empty verification batch is still a decision this gate made -- record
+    # the canonical `gate.decision` event so the cross-harness trace isn't
+    # missing this allowing outcome (issue #252 review).
+    assert events[-1]["type"] == "gate.decision"
+    assert events[-1]["decision"] == "pass"
+    assert events[-1]["unit_ids"] == []
+
 
 def test_failure_without_a_counterexample_prints_its_detail(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
