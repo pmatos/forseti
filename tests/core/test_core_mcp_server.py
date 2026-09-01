@@ -20,7 +20,13 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import CallToolResult
 
-from forseti.core.mcp_server import build_server, propose_tool, verify_tool
+from forseti.core.mcp_server import (
+    build_server,
+    check_tool,
+    propose_tool,
+    submit_tool,
+    verify_tool,
+)
 
 _ABS_SLICE = "int64_t my_abs(int64_t x) {\n    return (x < 0) ? -x : x;\n}\n"
 _CANNED_REPLY = json.dumps({"candidates": [{"expression": "result >= 0"}]})
@@ -93,6 +99,90 @@ def test_propose_tool_returns_payload(
     accepted = payload["accepted"]
     assert isinstance(accepted, list)
     assert any(a["expression"] == "result >= 0" for a in accepted)
+
+
+def test_build_server_registers_submit_tool() -> None:
+    server = build_server()
+    tools = asyncio.run(server.list_tools())
+    names = {t.name for t in tools}
+    assert "submit" in names
+    submit = next(t for t in tools if t.name == "submit")
+    props = submit.input_schema.get("properties", {})
+    assert {"source", "function", "expression", "provider", "model"} <= props.keys()
+
+
+def test_build_server_registers_check_tool() -> None:
+    server = build_server()
+    tools = asyncio.run(server.list_tools())
+    names = {t.name for t in tools}
+    assert "check" in names
+    check = next(t for t in tools if t.name == "check")
+    props = check.input_schema.get("properties", {})
+    assert "source" in props
+    assert "function" in props
+
+
+def test_submit_tool_never_shells_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No LLM call: the MCP `submit` tool must never invoke a subprocess."""
+    import subprocess
+
+    def _boom(*_a: object, **_kw: object) -> None:
+        raise AssertionError("submit_tool must never invoke a subprocess")
+
+    monkeypatch.setattr(subprocess, "run", _boom)
+    source = tmp_path / "abs_unit.c"
+    source.write_text(_ABS_SLICE)
+    payload = submit_tool(
+        str(source),
+        "my_abs",
+        "result >= 0",
+        provider="codex",
+        model="gpt-5.1",
+        persist=False,
+    )
+    assert payload["provider"] == "codex"
+    accepted = payload["accepted"]
+    assert isinstance(accepted, list)
+    assert accepted[0]["expression"] == "result >= 0"
+    assert accepted[0]["provenance"]["provider"] == "codex"
+
+
+@needs_esbmc
+def test_check_tool_reports_held_and_violated(tmp_path: Path) -> None:
+    source = tmp_path / "abs_unit.c"
+    source.write_text(_ABS_SLICE)
+    store_root = tmp_path / ".forseti"
+    submit_tool(
+        str(source),
+        "my_abs",
+        "result >= 0",
+        provider="codex",
+        model="gpt-5.1",
+        domain=["x > INT64_MIN"],  # exclude the un-negatable minimum
+        store_root=str(store_root),
+    )
+    submit_tool(
+        str(source),
+        "my_abs",
+        "result == x",  # false for any negative x -- must come back VIOLATED
+        provider="codex",
+        model="gpt-5.1",
+        domain=["x > INT64_MIN"],
+        store_root=str(store_root),
+    )
+    run = check_tool(str(source), "my_abs", store_root=str(store_root))
+    counts = run["counts"]
+    assert isinstance(counts, dict)
+    assert counts["held"] == 1
+    assert counts["violated"] == 1
+    verdicts = run["verdicts"]
+    assert isinstance(verdicts, list)
+    outcomes = {v["outcome"] for v in verdicts}
+    assert outcomes == {"held", "violated"}
+    violated = next(v for v in verdicts if v["outcome"] == "violated")
+    assert violated["result"]["raw_counterexample"]
 
 
 @needs_esbmc

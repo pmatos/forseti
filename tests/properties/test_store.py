@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
 from pathlib import Path
 
@@ -93,6 +94,59 @@ def test_add_roundtrip_preserves_empty_domain() -> None:
 
 def test_get_unknown_returns_none() -> None:
     assert mem_store().get("nope") is None
+
+
+def test_add_get_roundtrip_preserves_provider_and_model() -> None:
+    store = mem_store()
+    prop = dataclasses.replace(
+        make_prop(),
+        provenance=Provenance("proposer-v1", "1", provider="codex", model="gpt-5.1"),
+    )
+    store.add(prop)
+    got = store.get(prop.property_id)
+    assert got is not None
+    assert got.provenance.provider == "codex"
+    assert got.provenance.model == "gpt-5.1"
+
+
+def test_ensure_schema_migrates_a_pre_provider_model_db(tmp_path: Path) -> None:
+    """A `forseti.db` created before #213 lacks `provider`/`model` columns.
+
+    `_ensure_schema`'s `ALTER TABLE` migration must add them in place -- an
+    insert against a project that upgraded forseti in place (not a fresh
+    `.forseti/`) must not fail with "no such column".
+    """
+    db_path = tmp_path / "forseti.db"
+    pre_213_schema = """
+    CREATE TABLE properties (
+        property_id       TEXT PRIMARY KEY,
+        unit_id           TEXT NOT NULL,
+        kind              TEXT NOT NULL,
+        expression        TEXT NOT NULL,
+        domain            TEXT NOT NULL DEFAULT '[]',
+        description       TEXT,
+        status            TEXT NOT NULL,
+        prompt_id         TEXT NOT NULL,
+        prompt_version    TEXT NOT NULL,
+        grading_verdict   TEXT,
+        grading_kill_rate REAL,
+        grading_reason    TEXT
+    );
+    """
+    conn = sqlite3.connect(db_path)
+    conn.executescript(pre_213_schema)
+    conn.close()
+
+    store = PropertyStore(sqlite3.connect(db_path))
+    try:
+        prop = make_prop()
+        store.add(prop)
+        got = store.get(prop.property_id)
+        assert got is not None
+        assert got.provenance.provider == ""
+        assert got.provenance.model == ""
+    finally:
+        store.close()
 
 
 def test_add_duplicate_raises() -> None:

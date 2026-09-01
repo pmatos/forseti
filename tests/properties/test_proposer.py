@@ -30,6 +30,7 @@ from forseti.properties import (
     propose_properties,
     render_semantic_harness,
     spec_from_property,
+    submit_candidates,
     validate_candidate,
 )
 
@@ -143,6 +144,51 @@ def test_llm_error_propagates() -> None:
             ProposalRequest(ABS_UNIT, ABS_SOURCE),
             client=RaisingLLMClient(),
         )
+
+
+def test_submit_candidates_accepts_a_valid_spec() -> None:
+    # No LLMClient at all (#213): submit_candidates takes already-parsed specs.
+    result = submit_candidates(
+        ProposalRequest(ABS_UNIT, ABS_SOURCE, signature=abs_sig()),
+        (CandidateSpec(expression="result >= 0", domain=("x > INT64_MIN",)),),
+        provider="codex",
+        model="gpt-5.1",
+    )
+    assert len(result.accepted) == 1
+    prop = result.accepted[0]
+    assert prop.expression == "result >= 0"
+    assert prop.provenance.provider == "codex"
+    assert prop.provenance.model == "gpt-5.1"
+    assert result.provider == "codex"
+    assert result.model == "gpt-5.1"
+    assert result.model_raw == ""  # no raw model transcript for a submitted batch
+
+
+def test_submit_candidates_applies_the_same_static_checks_as_propose() -> None:
+    # The unknown-identifier candidate propose_properties's own TWO_GOOD-adjacent
+    # tests reject must be rejected here too -- submit is not a bypass (#213).
+    result = submit_candidates(
+        ProposalRequest(ABS_UNIT, ABS_SOURCE, signature=abs_sig()),
+        (CandidateSpec(expression="bogus_ident >= 0"),),
+        provider="codex",
+        model="gpt-5.1",
+    )
+    assert not result.accepted
+    assert "bogus_ident" in result.rejected[0].reason
+
+
+def test_submit_candidates_persists_idempotently() -> None:
+    store = FakeStore()
+    request = ProposalRequest(ABS_UNIT, ABS_SOURCE, signature=abs_sig())
+    spec = (CandidateSpec(expression="result >= 0", domain=("x > INT64_MIN",)),)
+    first = submit_candidates(
+        request, spec, provider="codex", model="gpt-5.1", store=store
+    )
+    assert len(store.items) == 1
+    assert {p.property_id for p in first.accepted} == set(store.items)
+
+    submit_candidates(request, spec, provider="codex", model="gpt-5.1", store=store)
+    assert len(store.items) == 1
 
 
 def test_parse_candidates_strips_markdown_fence() -> None:

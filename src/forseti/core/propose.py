@@ -22,6 +22,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from forseti.core.events import PROPERTY_PROPOSED, record_event
 from forseti.properties import (
     MAX_CANDIDATES_DEFAULT,
     ClaudeCliClient,
@@ -84,14 +85,20 @@ def propose_source(
     )
 
     if not persist:
+        # No event recorded: `record_event` would create `store_root` (its
+        # parent `mkdir`), breaking the documented "dry run touches nothing"
+        # contract below -- a proposal never persisted has nothing durable to
+        # trace either.
         return propose_properties(request, client=llm, max_candidates=max_candidates)
 
     store: PropertyStore | None = None
     try:
         store = PropertyStore.open(store_root)
-        return propose_properties(
+        result = propose_properties(
             request, client=llm, store=store, max_candidates=max_candidates
         )
+        _record_proposed(store_root, result)
+        return result
     except sqlite3.Error as exc:
         raise PropertyStoreError(
             f"property store error at {store_root}: {exc}"
@@ -99,3 +106,18 @@ def propose_source(
     finally:
         if store is not None:
             store.close()
+
+
+def _record_proposed(store_root: Path, result: ProposalResult) -> None:
+    """One canonical `property.proposed` event per accepted candidate (#213)."""
+    for prop in result.accepted:
+        record_event(
+            store_root,
+            PROPERTY_PROPOSED,
+            unit_id=prop.unit_id,
+            property_id=prop.property_id,
+            expression=prop.expression,
+            provider=result.provider,
+            model=result.model,
+            channel="llm",
+        )

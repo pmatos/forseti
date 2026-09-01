@@ -113,11 +113,16 @@ def test_verified_c_file_prints_the_kernel_and_exits_zero(
     assert "clean.c::f" in out
 
     events = event_log.read_events(str(tmp_path))
+    # A trailing canonical `gate.decision` event (core/events.py, #213) shares
+    # the same events.jsonl as the adapter-local trace -- see this module's
+    # own docstring.
     assert [e["type"] for e in events] == [
         event_log.EDIT,
         event_log.VERIFY,
         event_log.GATE,
+        "gate.decision",
     ]
+    assert events[-2]["decision"] == "pass"
     assert events[-1]["decision"] == "pass"
 
 
@@ -149,9 +154,13 @@ def test_violated_c_file_prints_counterexample_to_stderr_and_exits_two(
     assert "division by zero" in err
 
     events = event_log.read_events(str(tmp_path))
-    assert events[-1]["type"] == event_log.GATE
+    # A trailing canonical `gate.decision` event (core/events.py, #213) shares
+    # the same events.jsonl as the adapter-local trace.
+    assert events[-1]["type"] == "gate.decision"
     assert events[-1]["decision"] == "block"
-    assert events[-1]["exit_code"] == 2
+    assert events[-2]["type"] == event_log.GATE
+    assert events[-2]["decision"] == "block"
+    assert events[-2]["exit_code"] == 2
 
 
 def test_pointer_unit_is_reported_loudly_and_does_not_block(

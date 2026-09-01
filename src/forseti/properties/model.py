@@ -54,14 +54,24 @@ class Provenance:
     """Proposer origin hooks -- the GEPA (#5) prompt-evolution key.
 
     Deliberately excluded from `make_property_id`: the predicate is the identity,
-    the prompt that proposed it is metadata.
+    the prompt that proposed it is metadata. `provider`/`model` name the backend
+    that produced the candidate (e.g. "claude -p"/"sonnet", or a host harness's
+    own descriptor for a submitted candidate, #213) -- default `""` for
+    provenance built before these fields existed, never guessed.
     """
 
     prompt_id: str
     prompt_version: str
+    provider: str = ""
+    model: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {"prompt_id": self.prompt_id, "prompt_version": self.prompt_version}
+        return {
+            "prompt_id": self.prompt_id,
+            "prompt_version": self.prompt_version,
+            "provider": self.provider,
+            "model": self.model,
+        }
 
 
 @dataclass(frozen=True)

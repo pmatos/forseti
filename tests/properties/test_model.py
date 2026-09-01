@@ -61,7 +61,12 @@ def test_to_dict_roundtrips_fields_without_grading() -> None:
         "kind": "semantic",
         "expression": "result >= 0",
         "status": "candidate",
-        "provenance": {"prompt_id": "proposer-v1", "prompt_version": "1"},
+        "provenance": {
+            "prompt_id": "proposer-v1",
+            "prompt_version": "1",
+            "provider": "",
+            "model": "",
+        },
         "domain": ["x > INT64_MIN"],
         "grading": None,
         "description": "abs is non-negative",

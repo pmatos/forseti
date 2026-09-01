@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS properties (
                         CHECK (status IN ('candidate','graded','accepted','rejected')),
     prompt_id         TEXT NOT NULL,
     prompt_version    TEXT NOT NULL,
+    provider          TEXT NOT NULL DEFAULT '',
+    model             TEXT NOT NULL DEFAULT '',
     grading_verdict   TEXT CHECK (grading_verdict IN ('held','violated','unknown')),
     grading_kill_rate REAL,
     grading_reason    TEXT,
@@ -52,12 +54,24 @@ CREATE INDEX IF NOT EXISTS idx_properties_unit_status ON properties(unit_id, sta
 _INSERT = """
 INSERT INTO properties (
     property_id, unit_id, kind, expression, domain, description, status,
-    prompt_id, prompt_version, grading_verdict, grading_kill_rate, grading_reason
+    prompt_id, prompt_version, provider, model,
+    grading_verdict, grading_kill_rate, grading_reason
 ) VALUES (
     :property_id, :unit_id, :kind, :expression, :domain, :description, :status,
-    :prompt_id, :prompt_version, :grading_verdict, :grading_kill_rate, :grading_reason
+    :prompt_id, :prompt_version, :provider, :model,
+    :grading_verdict, :grading_kill_rate, :grading_reason
 )
 """
+
+# Columns added after the table's original release (#213): a pre-existing
+# `forseti.db` predates them and `CREATE TABLE IF NOT EXISTS` is a no-op
+# against an already-created table, so `_ensure_schema` must migrate it
+# explicitly or every insert into an upgraded-in-place project's store would
+# fail with "no such column" the first time `provider`/`model` are bound.
+_MIGRATED_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("provider", "TEXT NOT NULL DEFAULT ''"),
+    ("model", "TEXT NOT NULL DEFAULT ''"),
+)
 
 
 class PropertyStoreError(Exception):
@@ -92,6 +106,8 @@ def _property_to_row(prop: Property) -> dict[str, Any]:
         "status": prop.status.value,
         "prompt_id": prop.provenance.prompt_id,
         "prompt_version": prop.provenance.prompt_version,
+        "provider": prop.provenance.provider,
+        "model": prop.provenance.model,
         "grading_verdict": grading.verdict.value if grading is not None else None,
         "grading_kill_rate": grading.kill_rate if grading is not None else None,
         "grading_reason": grading.reason if grading is not None else None,
@@ -118,6 +134,8 @@ def _row_to_property(row: sqlite3.Row) -> Property:
         provenance=Provenance(
             prompt_id=str(row["prompt_id"]),
             prompt_version=str(row["prompt_version"]),
+            provider=str(row["provider"]),
+            model=str(row["model"]),
         ),
         domain=tuple(str(item) for item in json.loads(row["domain"])),
         grading=grading,
@@ -142,7 +160,24 @@ class PropertyStore:
     def _ensure_schema(self) -> None:
         with self._conn:
             self._conn.executescript(_SCHEMA)
+            self._migrate_columns()
             self._conn.execute("PRAGMA user_version = 1")
+
+    def _migrate_columns(self) -> None:
+        """Add any column in `_MIGRATED_COLUMNS` missing from an existing table.
+
+        `CREATE TABLE IF NOT EXISTS` above is a no-op against a table a prior
+        forseti version already created, so a column added since then (e.g.
+        `provider`/`model`, #213) needs an explicit `ALTER TABLE` here or
+        every insert against that pre-existing `forseti.db` fails with "no
+        such column" the first time it's bound.
+        """
+        existing = {
+            str(row[1]) for row in self._conn.execute("PRAGMA table_info(properties)")
+        }
+        for name, ddl in _MIGRATED_COLUMNS:
+            if name not in existing:
+                self._conn.execute(f"ALTER TABLE properties ADD COLUMN {name} {ddl}")
 
     def close(self) -> None:
         self._conn.close()

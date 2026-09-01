@@ -58,6 +58,7 @@ from .proposer import (
     RejectedCandidate,
     parse_candidates,
     propose_properties,
+    submit_candidates,
     validate_candidate,
 )
 from .store import (
@@ -114,5 +115,6 @@ __all__ = [
     "render_semantic_harness",
     "renderability_reason",
     "spec_from_property",
+    "submit_candidates",
     "validate_candidate",
 ]

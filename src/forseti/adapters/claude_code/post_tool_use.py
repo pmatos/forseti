@@ -6,6 +6,11 @@ function at the function level (ESBMC safety properties, no harness) and records
 each verdict in the gate state. On any non-VERIFIED verdict it writes an
 actionable message to stderr and exits 2, which feeds the counterexample back to
 Claude to fix. A clean file exits 0. UNKNOWN is never treated as a pass.
+
+Each pass/block decision also emits Core's canonical `gate.decision` event
+(`core/events.py`, #213) alongside the adapter-local `event_log.GATE` one, so
+this harness's per-edit gate reads the same in a trace as Codex's own
+`adapters.codex.verify_hook` decision.
 """
 
 from __future__ import annotations
@@ -13,6 +18,10 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
+
+from forseti.core.events import GATE_DECISION
+from forseti.core.events import record_event as record_core_event
 
 from . import event_log
 from . import forseti_gate as gate
@@ -102,6 +111,15 @@ def main() -> int:
             n_needs_contract=len(needs),
             exit_code=0,
         )
+        record_core_event(
+            Path(project_dir) / ".forseti",
+            GATE_DECISION,
+            harness="claude-code",
+            adapter="claude-code-post-tool-use",
+            unit_ids=[v.unit_id for v in verdicts],
+            file=rel,
+            decision="pass",
+        )
         out = []
         if verified:
             oks = ", ".join(f"{v.unit_id} (k={v.k})" for v in verified)
@@ -141,6 +159,15 @@ def main() -> int:
         n_failures=len(failures),
         n_needs_contract=len(needs),
         exit_code=2,
+    )
+    record_core_event(
+        Path(project_dir) / ".forseti",
+        GATE_DECISION,
+        harness="claude-code",
+        adapter="claude-code-post-tool-use",
+        unit_ids=[v.unit_id for v in failures],
+        file=rel,
+        decision="block",
     )
     print("\n".join(lines), file=sys.stderr)
     return 2
