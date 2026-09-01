@@ -12,11 +12,13 @@ only when every caller was checked and every check passed.
 """
 
 from .discharge import (
+    discharge_precondition,
+    emit_obligations,
+)
+from .model import (
     CallerCheck,
     CallerOutcome,
     DischargeResult,
-    discharge_precondition,
-    emit_obligations,
 )
 from .synth import (
     DEFAULT_INCLUDES,
