@@ -66,6 +66,7 @@ import argparse
 import json
 import sys
 from collections.abc import Callable
+from enum import Enum
 from pathlib import Path
 
 from forseti.adapters.claude_code import install as claude_code_install
@@ -616,6 +617,26 @@ def _add_enable_project_parser(
     p.set_defaults(func=_run_enable_project)
 
 
+def _run_harness_action(
+    command: str,
+    action: Callable[[], tuple[Path, Enum]],
+    error_types: tuple[type[Exception], ...],
+    success_message: Callable[[Path, Enum], str],
+) -> int:
+    """Run one adapter's install/remove `action`, printing forseti's uniform
+    `"forseti {command}: ..."` success/error line. Shared by `enable-project`
+    and `disable-project`'s per-harness branches, which differ only in which
+    adapter function to call and how to phrase the outcome.
+    """
+    try:
+        path, outcome = action()
+    except error_types as exc:
+        print(f"forseti {command}: {exc}", file=sys.stderr)
+        return 1
+    print(f"forseti {command}: {success_message(path, outcome)}")
+    return 0
+
+
 def _run_enable_project(args: argparse.Namespace) -> int:
     harness = args.harness
     if harness is None:
@@ -638,30 +659,26 @@ def _run_enable_project(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        try:
-            config_path, outcome = codex_install.install(args.project_dir)
-        except (codex_install.ProjectConfigError, OSError) as exc:
-            print(f"forseti enable-project: {exc}", file=sys.stderr)
-            return 1
-        print(
-            f"forseti enable-project: Codex verify-gate hook {outcome.value} at "
-            f"{config_path} (harness: codex). Codex skips a hook until you "
-            "trust it -- run `/hooks` in Codex and trust the PostToolUse entry."
+        return _run_harness_action(
+            "enable-project",
+            lambda: codex_install.install(args.project_dir),
+            (codex_install.ProjectConfigError, OSError),
+            lambda path, outcome: (
+                f"Codex verify-gate hook {outcome.value} at {path} (harness: "
+                "codex). Codex skips a hook until you trust it -- run `/hooks` "
+                "in Codex and trust the PostToolUse entry."
+            ),
         )
-        return 0
 
-    try:
-        settings_path, outcome = claude_code_install.install(
-            args.project_dir, shared=args.shared
-        )
-    except (claude_code_install.ProjectSettingsError, OSError) as exc:
-        print(f"forseti enable-project: {exc}", file=sys.stderr)
-        return 1
-    print(
-        f"forseti enable-project: Claude Code verify-gate hooks {outcome.value} "
-        f"at {settings_path} (harness: claude-code)"
+    return _run_harness_action(
+        "enable-project",
+        lambda: claude_code_install.install(args.project_dir, shared=args.shared),
+        (claude_code_install.ProjectSettingsError, OSError),
+        lambda path, outcome: (
+            f"Claude Code verify-gate hooks {outcome.value} at {path} "
+            "(harness: claude-code)"
+        ),
     )
-    return 0
 
 
 def _add_disable_project_parser(
@@ -710,29 +727,21 @@ def _run_disable_project(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        try:
-            config_path, outcome = codex_install.remove(args.project_dir)
-        except (codex_install.ProjectConfigError, OSError) as exc:
-            print(f"forseti disable-project: {exc}", file=sys.stderr)
-            return 1
-        print(
-            f"forseti disable-project: Codex verify-gate hook {outcome.value} "
-            f"at {config_path}"
+        return _run_harness_action(
+            "disable-project",
+            lambda: codex_install.remove(args.project_dir),
+            (codex_install.ProjectConfigError, OSError),
+            lambda path, outcome: f"Codex verify-gate hook {outcome.value} at {path}",
         )
-        return 0
 
-    try:
-        settings_path, outcome = claude_code_install.remove(
-            args.project_dir, shared=args.shared
-        )
-    except (claude_code_install.ProjectSettingsError, OSError) as exc:
-        print(f"forseti disable-project: {exc}", file=sys.stderr)
-        return 1
-    print(
-        f"forseti disable-project: Claude Code verify-gate hooks {outcome.value} "
-        f"at {settings_path}"
+    return _run_harness_action(
+        "disable-project",
+        lambda: claude_code_install.remove(args.project_dir, shared=args.shared),
+        (claude_code_install.ProjectSettingsError, OSError),
+        lambda path, outcome: (
+            f"Claude Code verify-gate hooks {outcome.value} at {path}"
+        ),
     )
-    return 0
 
 
 def _add_mcp_parser(

@@ -34,13 +34,12 @@ revisit if it comes up.
 
 from __future__ import annotations
 
-import contextlib
-import os
 import re
-import stat
 import tomllib
 from enum import Enum
 from pathlib import Path
+
+from forseti.adapters._atomic import write_text_atomic
 
 _MARKER_PREFIX = "forseti codex-hook "
 _HOOK_NAME = "verify"
@@ -127,23 +126,6 @@ def merge_config(existing_text: str, config_path: Path) -> str:
     return merged
 
 
-def _write_text_atomic(path: Path, text: str) -> None:
-    """Write `text` to `path` atomically: pid-qualified temp file + rename.
-
-    Deliberately duplicates `claude_code.event_log.write_text_atomic` (short-write
-    looping via `os.fdopen`, mode preserved before the swap) rather than importing
-    it -- this package should not depend on a sibling adapter for a generic helper.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(text.encode("utf-8"))
-    with contextlib.suppress(FileNotFoundError):
-        os.chmod(tmp, stat.S_IMODE(path.stat().st_mode))
-    tmp.replace(path)
-
-
 def _config_path(project_dir: Path) -> Path:
     return project_dir / ".codex" / "config.toml"
 
@@ -183,7 +165,7 @@ def install(project_dir: Path) -> tuple[Path, InstallOutcome]:
     if merged == existing_text:
         return config_path, InstallOutcome.UNCHANGED
 
-    _write_text_atomic(config_path, merged)
+    write_text_atomic(config_path, merged)
     outcome = InstallOutcome.CREATED if not existed else InstallOutcome.UPDATED
     return config_path, outcome
 
@@ -212,5 +194,5 @@ def remove(project_dir: Path) -> tuple[Path, RemoveOutcome]:
     normalized = stripped.rstrip("\n")
     if normalized:
         normalized += "\n"
-    _write_text_atomic(config_path, normalized)
+    write_text_atomic(config_path, normalized)
     return config_path, RemoveOutcome.REMOVED

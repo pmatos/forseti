@@ -179,6 +179,29 @@ def _settings_path(project_dir: Path, *, shared: bool) -> Path:
     return project_dir / ".claude" / name
 
 
+def _read_existing_settings(settings_path: Path) -> dict[str, Any]:
+    """Read and validate `settings_path`'s JSON; `{}` if it doesn't exist.
+
+    Raises `ProjectSettingsError` on unreadable/malformed JSON or a
+    non-object top level, shared by `install` and `remove`.
+    """
+    if not settings_path.exists():
+        return {}
+    try:
+        existing = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        # ValueError, not just json.JSONDecodeError: a byte sequence the
+        # locale codec would otherwise misdecode into mojibake instead
+        # raises UnicodeDecodeError here (also a ValueError subclass),
+        # so it hits this same honest-error path rather than escaping it.
+        raise ProjectSettingsError(
+            f"{settings_path}: cannot read existing settings ({exc})"
+        ) from exc
+    if not isinstance(existing, dict):
+        raise ProjectSettingsError(f"{settings_path}: top-level JSON must be an object")
+    return existing
+
+
 def install(project_dir: Path, *, shared: bool = False) -> tuple[Path, InstallOutcome]:
     """Install/update the Claude Code verify-gate hooks for `project_dir`.
 
@@ -197,24 +220,7 @@ def install(project_dir: Path, *, shared: bool = False) -> tuple[Path, InstallOu
             "rewrite would swap in a plain file, silently breaking the link)"
         )
     existed = settings_path.exists()
-
-    if existed:
-        try:
-            existing = json.loads(settings_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            # ValueError, not just json.JSONDecodeError: a byte sequence the
-            # locale codec would otherwise misdecode into mojibake instead
-            # raises UnicodeDecodeError here (also a ValueError subclass),
-            # so it hits this same honest-error path rather than escaping it.
-            raise ProjectSettingsError(
-                f"{settings_path}: cannot read existing settings ({exc})"
-            ) from exc
-        if not isinstance(existing, dict):
-            raise ProjectSettingsError(
-                f"{settings_path}: top-level JSON must be an object"
-            )
-    else:
-        existing = {}
+    existing = _read_existing_settings(settings_path)
 
     updated = merge_hooks(existing)
     if updated == existing:
@@ -246,15 +252,7 @@ def remove(project_dir: Path, *, shared: bool = False) -> tuple[Path, RemoveOutc
     if not settings_path.exists():
         return settings_path, RemoveOutcome.UNCHANGED
 
-    try:
-        existing = json.loads(settings_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise ProjectSettingsError(
-            f"{settings_path}: cannot read existing settings ({exc})"
-        ) from exc
-    if not isinstance(existing, dict):
-        raise ProjectSettingsError(f"{settings_path}: top-level JSON must be an object")
-
+    existing = _read_existing_settings(settings_path)
     merged = dict(existing)
     hooks = _validate_hooks_shape(merged.get("hooks", {}))
     stripped = _strip_forseti_hooks(hooks)
