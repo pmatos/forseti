@@ -37,6 +37,11 @@ to avoid deleting a sibling invocation's still-in-flight directory, which is
 exactly the race this per-invocation isolation exists to rule out — bounding
 or sweeping `check-work/` is a separate, follow-up concern, not a correctness
 issue for `check_source` itself (the directory is already git-ignored).
+
+Emits Core's canonical `property.check.start` event before the run and one
+`property.verdict` per checked property after (`core/events.py`, #213), so a
+trace built from `.forseti/events.jsonl` reads the same regardless of which
+harness triggered the check.
 """
 
 from __future__ import annotations
@@ -47,6 +52,7 @@ from collections.abc import Sequence
 from functools import partial
 from pathlib import Path
 
+from forseti.core.events import PROPERTY_CHECK_START, PROPERTY_VERDICT, record_event
 from forseti.core.propose import DEFAULT_STORE_ROOT
 from forseti.esbmc import verify
 from forseti.orchestrator import (
@@ -71,6 +77,17 @@ DEFAULT_UNWIND = 4
 DEFAULT_UNWIND_LADDER: tuple[int, ...] = (8, 16)
 DEFAULT_TIMEOUT_S = 110.0
 _WORK_SUBDIR = "check-work"
+
+
+def default_unwind_ladder_above(unwind: int) -> tuple[int, ...]:
+    """`DEFAULT_UNWIND_LADDER` rungs above `unwind`.
+
+    Callers that expose their own `--unwind`/`unwind` but not
+    `unwind_ladder` derive the ladder this way so a caller-chosen unwind
+    (e.g. `-k 8`) doesn't collide with the fixed default rungs and raise
+    ValueError in `check_source` (issue #95 review).
+    """
+    return tuple(k for k in DEFAULT_UNWIND_LADDER if k > unwind)
 
 
 def check_source(
@@ -142,7 +159,8 @@ def check_source(
     )
     try:
         with PropertyStore.open(store_root) as store:
-            return check_properties(
+            record_event(store_root, PROPERTY_CHECK_START, unit_id=unit.unit_id)
+            run = check_properties(
                 unit,
                 store=store,
                 render=SemanticHarnessWriter(),
@@ -163,3 +181,13 @@ def check_source(
         raise PropertyStoreError(
             f"property store error at {store_root}: {exc}"
         ) from exc
+    for verdict in run.verdicts:
+        record_event(
+            store_root,
+            PROPERTY_VERDICT,
+            unit_id=verdict.unit_id,
+            property_id=verdict.property_id,
+            outcome=verdict.outcome.value,
+            k=verdict.k,
+        )
+    return run

@@ -50,6 +50,7 @@ from .prompts import (
     render_prompt,
 )
 from .proposer import (
+    BlankProvenanceError,
     CandidateSpec,
     CandidateStore,
     ProposalParseError,
@@ -58,6 +59,7 @@ from .proposer import (
     RejectedCandidate,
     parse_candidates,
     propose_properties,
+    submit_candidates,
     validate_candidate,
 )
 from .store import (
@@ -76,6 +78,7 @@ __all__ = [
     "PROMPTS",
     "RESULT_IDENT",
     "SEMANTIC_V1",
+    "BlankProvenanceError",
     "BufferParam",
     "CandidateSpec",
     "CandidateStore",
@@ -114,5 +117,6 @@ __all__ = [
     "render_semantic_harness",
     "renderability_reason",
     "spec_from_property",
+    "submit_candidates",
     "validate_candidate",
 ]

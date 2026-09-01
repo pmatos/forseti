@@ -39,6 +39,12 @@ file, not a registered verification unit:
   - **VERIFIED** (up to k) → allow.
 
 Any internal error still exits 0 so a broken hook cannot wedge Codex.
+
+Each block/unresolved/pass decision also emits Core's canonical `gate.decision`
+event (`core/events.py`, #213) to the hook's own cwd's `.forseti/events.jsonl`
+-- the same file `forseti check`/`propose`/`submit` write their own canonical
+events into from a project root -- so this harness's per-edit gate reads the
+same in a trace as the Claude Code adapter's own `post_tool_use` decision.
 """
 
 from __future__ import annotations
@@ -48,6 +54,9 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+
+from forseti.core.events import GATE_DECISION
+from forseti.core.events import record_event as record_core_event
 
 # Source kinds Forseti (ESBMC) targets: C -> C++ -> Python.
 _SRC_SUFFIXES = {".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".py"}
@@ -104,11 +113,17 @@ def main() -> int:
     tool_input = event.get("tool_input")
     command = tool_input.get("command", "") if isinstance(tool_input, dict) else ""
 
+    edited = _edited_sources(command)
+    if not edited:
+        return 0
+
     violated: list[tuple[str, str]] = []
     inconclusive: list[tuple[str, str]] = []
-    for path in _edited_sources(command):
+    checked: list[str] = []
+    for path in edited:
         if not Path(path).exists():
             continue
+        checked.append(path)
         verdict, evidence = _verify(path)
         if verdict == "violated":
             violated.append((path, evidence))
@@ -124,11 +139,13 @@ def main() -> int:
         if inconclusive:
             residual = ", ".join(f"{p} [{v}]" for p, v in inconclusive)
             lines.append(f"\nAlso inconclusive (do not ignore): {residual}")
+        _record_gate_decision(checked, "block")
         print(json.dumps({"decision": "block", "reason": "\n".join(lines)}))
         return 0
 
     if inconclusive:
         residual = ", ".join(f"{p} [{v}]" for p, v in inconclusive)
+        _record_gate_decision(checked, "unresolved")
         print(
             json.dumps(
                 {
@@ -139,7 +156,55 @@ def main() -> int:
                 }
             )
         )
+        return 0
+
+    if not checked:
+        # Every edited path was gone by the time this hook ran (e.g. a rename's
+        # old name, or a file deleted later in the same turn) -- nothing was
+        # actually verified, so this must not read as a pass in the canonical
+        # trace (issue #252 review; AGENTS.md: an unverified unit is never a
+        # silent pass).
+        _record_gate_decision(edited, "unresolved")
+        print(
+            json.dumps(
+                {
+                    "systemMessage": (
+                        "Forseti: no edited source still exists to verify "
+                        f"({', '.join(edited)}). Not a pass."
+                    )
+                }
+            )
+        )
+        return 0
+
+    _record_gate_decision(checked, "pass")
     return 0
+
+
+def _record_gate_decision(files: list[str], decision: str) -> None:
+    """Core's canonical `gate.decision` event (`core/events.py`, #213).
+
+    `files` are the raw edited source paths, not canonical `path::symbol` unit
+    IDs: `_verify` above checks a whole file at a time (module docstring), so
+    there is no per-function verdict to key one by. Recorded under `files`
+    rather than `unit_ids` so this event is honest about its own granularity
+    instead of implying it joins with `property.proposed`/`property.verdict`,
+    which are keyed by real units (issue #252 review).
+
+    Written to the hook process's own cwd's `.forseti/events.jsonl` -- the
+    same directory `forseti check`/`propose`/`submit` write their own
+    canonical events into when run from a project root, which is how Codex
+    invokes this hook (module docstring: `_verify` shells out to `forseti
+    verify` without an explicit `cwd`, i.e. inherits the hook's own).
+    """
+    record_core_event(
+        Path.cwd() / ".forseti",
+        GATE_DECISION,
+        harness="codex",
+        adapter="codex-post-tool-use",
+        files=list(files),
+        decision=decision,
+    )
 
 
 if __name__ == "__main__":

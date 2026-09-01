@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
@@ -155,6 +156,71 @@ class ProposalParseError(ValueError):
     """The model output was not a well-formed candidate envelope (fail-loud)."""
 
 
+class BlankProvenanceError(ValueError):
+    """A caller-supplied `provider`/`model` was blank (#213 review, fail-loud).
+
+    `Provenance`'s `""` default is the pre-#213 legacy-row sentinel (`model.py`)
+    -- a blank value from `submit_candidates` would be stored identically and
+    make a fresh submission indistinguishable from migrated data.
+    """
+
+
+def _accept_reject(
+    specs: Sequence[CandidateSpec],
+    *,
+    unit_id: str,
+    signature: UnitSignature | None,
+    provenance: Provenance,
+    max_candidates: int,
+) -> tuple[list[Property], list[RejectedCandidate]]:
+    """Validate `specs` against `signature`, building `status=CANDIDATE` survivors.
+
+    Shared by `propose_properties` (LLM-sourced specs) and `submit_candidates`
+    (host-submitted specs, #213): both must apply the exact same static checks
+    (`validate_candidate`) and batch-duplicate dedup by content id, so a
+    submitted candidate can't bypass a check an LLM-proposed one is held to.
+    """
+    accepted: list[Property] = []
+    rejected: list[RejectedCandidate] = []
+    seen: set[str] = set()
+    for spec in specs:
+        if len(accepted) >= max_candidates:
+            rejected.append(RejectedCandidate(spec, "over max_candidates"))
+            continue
+        reason = validate_candidate(spec, signature)
+        if reason is not None:
+            rejected.append(RejectedCandidate(spec, reason))
+            continue
+        prop = Property(
+            property_id=make_property_id(
+                unit_id, PropertyKind.SEMANTIC, spec.expression, spec.domain
+            ),
+            unit_id=unit_id,
+            kind=PropertyKind.SEMANTIC,
+            expression=spec.expression,
+            status=PropertyStatus.CANDIDATE,
+            provenance=provenance,
+            domain=spec.domain,
+            description=spec.rationale or None,
+        )
+        if prop.property_id in seen:
+            rejected.append(RejectedCandidate(spec, "duplicate in batch"))
+            continue
+        seen.add(prop.property_id)
+        accepted.append(prop)
+    return accepted, rejected
+
+
+def _persist(accepted: Sequence[Property], store: CandidateStore | None) -> None:
+    if store is None:
+        return
+    for prop in accepted:
+        if store.get(prop.property_id) is None:
+            # a racing writer may insert the same content id first; idempotent
+            with contextlib.suppress(DuplicateProperty):
+                store.add(prop)
+
+
 def propose_properties(
     request: ProposalRequest,
     *,
@@ -183,46 +249,21 @@ def propose_properties(
     )
     raw = client.complete(prompt)
     specs = parse_candidates(raw)
-    signature = request.signature
     provenance = Provenance(
-        prompt_id=template.prompt_id, prompt_version=template.version
+        prompt_id=template.prompt_id,
+        prompt_version=template.version,
+        provider=client.provider,
+        model=client.model,
     )
 
-    accepted: list[Property] = []
-    rejected: list[RejectedCandidate] = []
-    seen: set[str] = set()
-    for spec in specs:
-        if len(accepted) >= max_candidates:
-            rejected.append(RejectedCandidate(spec, "over max_candidates"))
-            continue
-        reason = validate_candidate(spec, signature)
-        if reason is not None:
-            rejected.append(RejectedCandidate(spec, reason))
-            continue
-        prop = Property(
-            property_id=make_property_id(
-                request.unit_id, PropertyKind.SEMANTIC, spec.expression, spec.domain
-            ),
-            unit_id=request.unit_id,
-            kind=PropertyKind.SEMANTIC,
-            expression=spec.expression,
-            status=PropertyStatus.CANDIDATE,
-            provenance=provenance,
-            domain=spec.domain,
-            description=spec.rationale or None,
-        )
-        if prop.property_id in seen:
-            rejected.append(RejectedCandidate(spec, "duplicate in batch"))
-            continue
-        seen.add(prop.property_id)
-        accepted.append(prop)
-
-    if store is not None:
-        for prop in accepted:
-            if store.get(prop.property_id) is None:
-                # a racing writer may insert the same content id first; idempotent
-                with contextlib.suppress(DuplicateProperty):
-                    store.add(prop)
+    accepted, rejected = _accept_reject(
+        specs,
+        unit_id=request.unit_id,
+        signature=request.signature,
+        provenance=provenance,
+        max_candidates=max_candidates,
+    )
+    _persist(accepted, store)
 
     return ProposalResult(
         unit_id=request.unit_id,
@@ -233,6 +274,66 @@ def propose_properties(
         accepted=tuple(accepted),
         rejected=tuple(rejected),
         model_raw=raw,
+    )
+
+
+def submit_candidates(
+    request: ProposalRequest,
+    specs: Sequence[CandidateSpec],
+    *,
+    provider: str,
+    model: str,
+    store: CandidateStore | None = None,
+    max_candidates: int = MAX_CANDIDATES_DEFAULT,
+) -> ProposalResult:
+    """Ingest host-supplied candidate specs -- no LLM call (#213).
+
+    The harness-neutral counterpart to `propose_properties`: a host harness
+    (or a configured non-`claude -p` proposer) has already produced `specs` by
+    whatever means it likes, and wants them validated and persisted through
+    the exact same gate an LLM-proposed candidate goes through
+    (`_accept_reject`) -- so a submitted property can't smuggle in something
+    the proposer's own static checks would have rejected. `provider`/`model`
+    are caller-supplied (never guessed) and land in each accepted property's
+    `Provenance`; `request.prompt` supplies `prompt_id`/`prompt_version` for
+    that same provenance without ever being rendered or sent anywhere --
+    there is no prompt text to send. `model_raw` is `""`: there is no raw
+    model transcript for a submitted batch.
+
+    Raises `BlankProvenanceError` if `provider` or `model` is blank -- a caller
+    error, not data about the candidate, so it fails loud before anything is
+    validated or persisted rather than being routed through `rejected`.
+    """
+    if not provider.strip() or not model.strip():
+        raise BlankProvenanceError(
+            f"provider={provider!r} and model={model!r} must both be nonblank"
+        )
+    template = request.prompt
+    provenance = Provenance(
+        prompt_id=template.prompt_id,
+        prompt_version=template.version,
+        provider=provider,
+        model=model,
+    )
+
+    accepted, rejected = _accept_reject(
+        specs,
+        unit_id=request.unit_id,
+        signature=request.signature,
+        provenance=provenance,
+        max_candidates=max_candidates,
+    )
+    _persist(accepted, store)
+
+    return ProposalResult(
+        unit_id=request.unit_id,
+        prompt_id=template.prompt_id,
+        prompt_version=template.version,
+        provider=provider,
+        model=model,
+        accepted=tuple(accepted),
+        rejected=tuple(rejected),
+        model_raw="",
     )
 
 

@@ -6,6 +6,11 @@ function at the function level (ESBMC safety properties, no harness) and records
 each verdict in the gate state. On any non-VERIFIED verdict it writes an
 actionable message to stderr and exits 2, which feeds the counterexample back to
 Claude to fix. A clean file exits 0. UNKNOWN is never treated as a pass.
+
+Each pass/block decision also emits Core's canonical `gate.decision` event
+(`core/events.py`, #213) alongside the adapter-local `event_log.GATE` one, so
+this harness's per-edit gate reads the same in a trace as Codex's own
+`adapters.codex.verify_hook` decision.
 """
 
 from __future__ import annotations
@@ -13,9 +18,28 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
+
+from forseti.core.events import GATE_DECISION
+from forseti.core.events import record_event as record_core_event
 
 from . import event_log
 from . import forseti_gate as gate
+
+
+def _record_gate_decision(
+    project_dir: str, rel: str, unit_ids: list[str], decision: str
+) -> None:
+    """Core's canonical `gate.decision` event (`core/events.py`, #213)."""
+    record_core_event(
+        Path(project_dir) / ".forseti",
+        GATE_DECISION,
+        harness="claude-code",
+        adapter="claude-code-post-tool-use",
+        unit_ids=unit_ids,
+        file=rel,
+        decision=decision,
+    )
 
 
 def main() -> int:
@@ -80,7 +104,10 @@ def main() -> int:
         # it, the file reads stale and the scan re-offers it. What must not happen
         # is reporting the superseded verdicts, which would exit 2 with a
         # counterexample for code no longer on disk. The `edit` event above logs an
-        # empty `functions` list either way.
+        # empty `functions` list either way. Still record the canonical decision
+        # (empty `unit_ids`) so this allowing outcome isn't invisible to the
+        # cross-harness trace (issue #252 review).
+        _record_gate_decision(project_dir, rel, [], "pass")
         return 0
 
     # NEEDS_CONTRACT (pointer/array units the gate can't check without a harness)
@@ -102,6 +129,7 @@ def main() -> int:
             n_needs_contract=len(needs),
             exit_code=0,
         )
+        _record_gate_decision(project_dir, rel, [v.unit_id for v in verdicts], "pass")
         out = []
         if verified:
             oks = ", ".join(f"{v.unit_id} (k={v.k})" for v in verified)
@@ -142,6 +170,7 @@ def main() -> int:
         n_needs_contract=len(needs),
         exit_code=2,
     )
+    _record_gate_decision(project_dir, rel, [v.unit_id for v in failures], "block")
     print("\n".join(lines), file=sys.stderr)
     return 2
 

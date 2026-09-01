@@ -25,6 +25,12 @@ Subcommands:
   for candidate properties over that unit and persist the survivors (``--json``
   emits the same payload the MCP tool returns). Exit 0 on a completed run,
   1 when the run itself fails (LLM/parse/store/IO) — never a silent empty run.
+- ``forseti submit-property <source> --function NAME --expression EXPR
+  --provider NAME --model NAME`` — ingest one already-formed candidate property
+  through the exact same static validation `propose` applies, with no LLM call
+  (#213): for a host harness, or a configured non-``claude -p`` proposer, that
+  generates its own candidates. Exit 0 iff the candidate was accepted, 1 if it
+  was rejected or the run itself failed (store/IO) — never a silent no-op.
 - ``forseti check <source> --function NAME`` — check that unit's stored,
   checkable properties (#66) against ESBMC, one verdict each (``--json`` emits
   the ``PropertyCheckRun`` payload). Exit follows worst-outcome-wins over every
@@ -88,6 +94,7 @@ from forseti.esbmc import (
 )
 from forseti.orchestrator import PropertyCheckRun, property_check_transcript
 from forseti.properties import (
+    BlankProvenanceError,
     LLMError,
     PropertyStoreError,
     ProposalParseError,
@@ -118,7 +125,7 @@ from .check import (
 from .check import (
     DEFAULT_UNWIND_LADDER as CHECK_DEFAULT_UNWIND_LADDER,
 )
-from .check import check_source
+from .check import check_source, default_unwind_ladder_above
 from .propose import (
     DEFAULT_MAX_CANDIDATES,
     DEFAULT_MODEL,
@@ -128,6 +135,9 @@ from .propose import (
 from .propose import (
     DEFAULT_TIMEOUT_S as PROPOSE_TIMEOUT_S,
 )
+from .submit import DEFAULT_PROMPT_ID as SUBMIT_DEFAULT_PROMPT_ID
+from .submit import DEFAULT_PROMPT_VERSION as SUBMIT_DEFAULT_PROMPT_VERSION
+from .submit import submit_source
 from .verify import result_to_payload, verify_source
 
 
@@ -356,6 +366,121 @@ def _run_propose(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_submit_property_parser(
+    sub: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    p = sub.add_parser(
+        "submit-property",
+        help="ingest a host-generated candidate property -- no LLM call",
+        description=(
+            "Validate and store one already-formed candidate property for "
+            "<source>::<function>, the same static checks `forseti propose` "
+            "applies, without invoking any LLM. For a host harness (or a "
+            "configured non-claude proposer) that generates its own candidates."
+        ),
+    )
+    _add_unit_store_arguments(p)
+    p.add_argument(
+        "--expression",
+        required=True,
+        help='the candidate\'s C boolean expression, e.g. "result >= 0"',
+    )
+    p.add_argument(
+        "--domain",
+        action="append",
+        default=[],
+        metavar="EXPR",
+        help=(
+            "a precondition over the parameters (repeatable); emitted as "
+            "__ESBMC_assume(...) before the call"
+        ),
+    )
+    p.add_argument(
+        "--referenced-param",
+        dest="referenced_params",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="a parameter name --expression references (repeatable)",
+    )
+    p.add_argument(
+        "--rationale",
+        default="",
+        help="free-text rationale, stored as the property's description",
+    )
+    p.add_argument(
+        "--provider",
+        required=True,
+        help='who/what produced this candidate, e.g. "codex" or "claude-code-subagent"',
+    )
+    p.add_argument(
+        "--model",
+        required=True,
+        help='the model that produced this candidate, e.g. "gpt-5.1"',
+    )
+    p.add_argument(
+        "--prompt-id",
+        default=SUBMIT_DEFAULT_PROMPT_ID,
+        help=(
+            "provenance prompt id for this candidate "
+            f"(default: {SUBMIT_DEFAULT_PROMPT_ID})"
+        ),
+    )
+    p.add_argument(
+        "--prompt-version",
+        default=SUBMIT_DEFAULT_PROMPT_VERSION,
+        help=(
+            "provenance prompt version for this candidate "
+            f"(default: {SUBMIT_DEFAULT_PROMPT_VERSION})"
+        ),
+    )
+    p.add_argument(
+        "--no-store",
+        action="store_true",
+        help="dry run: validate without writing to the store",
+    )
+    p.add_argument(
+        "--max-candidates",
+        type=int,
+        default=DEFAULT_MAX_CANDIDATES,
+        metavar="N",
+        help=f"cap on accepted candidates (default: {DEFAULT_MAX_CANDIDATES})",
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the result as a JSON object (the MCP tool's payload)",
+    )
+    p.set_defaults(func=_run_submit_property)
+
+
+def _run_submit_property(args: argparse.Namespace) -> int:
+    try:
+        result = submit_source(
+            args.source,
+            function=args.function,
+            expression=args.expression,
+            provider=args.provider,
+            model=args.model,
+            domain=args.domain,
+            referenced_params=args.referenced_params,
+            rationale=args.rationale,
+            prompt_id=args.prompt_id,
+            prompt_version=args.prompt_version,
+            persist=not args.no_store,
+            store_root=args.store_root,
+            max_candidates=args.max_candidates,
+        )
+    except (BlankProvenanceError, PropertyStoreError, OSError) as exc:
+        print(f"forseti submit-property: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(result.to_dict()))
+    else:
+        print(_render_proposal(result))
+    return 0 if result.accepted else 1
+
+
 def _parse_ladder(value: str) -> tuple[int, ...]:
     """``"8,16"`` -> ``(8, 16)``; ``""`` -> ``()``. Raises on a non-int token."""
     if not value.strip():
@@ -479,7 +604,7 @@ def _run_check(args: argparse.Namespace) -> int:
         # `-k 8` (or higher) doesn't collide with the fixed default rungs and
         # raise ValueError below (issue #95 review) -- an explicit
         # --unwind-ladder (including "" -> ()) always passes through as-is.
-        unwind_ladder = tuple(k for k in CHECK_DEFAULT_UNWIND_LADDER if k > args.unwind)
+        unwind_ladder = default_unwind_ladder_above(args.unwind)
     try:
         result = check_source(
             args.source,
@@ -788,6 +913,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_synth_parser(sub)
     _add_discharge_parser(sub)
     _add_propose_parser(sub)
+    _add_submit_property_parser(sub)
     _add_check_parser(sub)
     _add_claude_code_hook_parser(sub)
     _add_codex_hook_parser(sub)

@@ -91,13 +91,43 @@ def test_main_tolerates_unparseable_stdin(monkeypatch: pytest.MonkeyPatch) -> No
     assert verify_hook.main() == 0
 
 
-def test_main_skips_nonexistent_edited_file(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_main_skips_nonexistent_edited_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     event = {
         "tool_name": "apply_patch",
         "tool_input": {"command": "*** Update File: /does/not/exist.c\n"},
     }
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+    monkeypatch.chdir(tmp_path)
     assert verify_hook.main() == 0
+
+
+def test_main_does_not_record_pass_when_nothing_was_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A patch whose only edited path no longer exists must not read as a pass
+    in the canonical trace (issue #252 review): nothing was actually checked.
+    """
+    from forseti.core.events import events_path
+
+    event = {
+        "tool_name": "apply_patch",
+        "tool_input": {"command": "*** Update File: /does/not/exist.c\n"},
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+    monkeypatch.chdir(tmp_path)
+
+    assert verify_hook.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "decision" not in payload
+    assert "/does/not/exist.c" in payload["systemMessage"]
+
+    lines = events_path(tmp_path / ".forseti").read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    assert len(events) == 1
+    assert events[0]["decision"] == "unresolved"
+    assert events[0]["files"] == ["/does/not/exist.c"]
 
 
 def test_main_blocks_on_violated_verdict(
@@ -115,6 +145,7 @@ def test_main_blocks_on_violated_verdict(
     monkeypatch.setattr(
         verify_hook, "_verify", lambda path: ("violated", "counterexample: x=0")
     )
+    monkeypatch.chdir(tmp_path)
 
     assert verify_hook.main() == 0
     payload = json.loads(capsys.readouterr().out)
@@ -136,6 +167,7 @@ def test_main_surfaces_inconclusive_without_blocking(
     }
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
     monkeypatch.setattr(verify_hook, "_verify", lambda path: ("unknown", ""))
+    monkeypatch.chdir(tmp_path)
 
     assert verify_hook.main() == 0
     payload = json.loads(capsys.readouterr().out)
@@ -157,9 +189,46 @@ def test_main_allows_verified_silently(
     }
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
     monkeypatch.setattr(verify_hook, "_verify", lambda path: ("verified", ""))
+    monkeypatch.chdir(tmp_path)
 
     assert verify_hook.main() == 0
     assert capsys.readouterr().out == ""
+
+
+def test_main_records_canonical_gate_decision_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Each decision emits Core's canonical `gate.decision` event (#213)."""
+    from forseti.core.events import events_path
+
+    monkeypatch.chdir(tmp_path)
+
+    def run_with_verdict(name: str, verdict: str) -> None:
+        edited = tmp_path / f"{name}.c"
+        edited.write_text("int main(void) { return 0; }\n")
+        event = {
+            "tool_name": "apply_patch",
+            "tool_input": {"command": f"*** Update File: {edited}\n"},
+        }
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+        monkeypatch.setattr(verify_hook, "_verify", lambda path: (verdict, "cex"))
+        assert verify_hook.main() == 0
+        capsys.readouterr()
+
+    run_with_verdict("bad", "violated")
+    run_with_verdict("iffy", "unknown")
+    run_with_verdict("clean", "verified")
+
+    lines = events_path(tmp_path / ".forseti").read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    assert [e["type"] for e in events] == ["gate.decision"] * 3
+    assert [e["decision"] for e in events] == ["block", "unresolved", "pass"]
+    for event in events:
+        assert event["harness"] == "codex"
+        assert event["adapter"] == "codex-post-tool-use"
+        assert isinstance(event["files"], list)
 
 
 def test_main_reports_violated_plus_inconclusive_residual(
@@ -183,6 +252,7 @@ def test_main_reports_violated_plus_inconclusive_residual(
         return ("violated", "cex") if path == str(bad) else ("unknown", "")
 
     monkeypatch.setattr(verify_hook, "_verify", fake_verify)
+    monkeypatch.chdir(tmp_path)
 
     assert verify_hook.main() == 0
     payload = json.loads(capsys.readouterr().out)

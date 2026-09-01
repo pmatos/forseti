@@ -110,7 +110,62 @@ A loop spanning hooks, an agent, the Core, and ESBMC is undebuggable without a *
 event log**. Every step in the sequence diagram emits a JSONL event to a per-session trace:
 `trigger.fired`, `core.verify.start`, `esbmc.invoke` / `esbmc.verdict`, `counterexample`,
 `fix.attempt`, `stopgate.decision`, `property.proposed` / `property.graded`. One trace = one
-replayable story of what the system did and why, across any harness. (Roadmap **W10**.)
+replayable story of what the system did and why, across any harness. (Roadmap **W10**; the
+minimal cross-harness slice below is #213 — full replay/redaction/export stays #15.)
+
+### Canonical Core lifecycle events (implemented, #213)
+
+Core emits a small, harness-neutral event vocabulary from `forseti.core.events` — dotted
+names, distinct at a glance from an adapter's own short local names (`edit`, `gate`, `stop`,
+...):
+
+| Event | Emitted by | Fields |
+|---|---|---|
+| `property.proposed` | `core.propose.propose_source`, `core.submit.submit_source` | `unit_id`, `property_id`, `expression`, `provider`, `model`, `channel` (`"llm"` \| `"submitted"`) |
+| `property.check.start` | `core.check.check_source` | `unit_id` |
+| `property.verdict` | `core.check.check_source` | `unit_id`, `property_id`, `outcome`, `k` |
+| `gate.decision` | Claude Code's `post_tool_use` | `harness`, `adapter`, `unit_ids` (`path::symbol`, per verified function), `decision` |
+| `gate.decision` | Codex's `verify_hook` | `harness`, `adapter`, `files` (raw edited paths — the hook verifies a whole file at a time, no per-function enumeration), `decision` |
+
+All four append to `<store_root>/events.jsonl` — the project's `.forseti/events.jsonl` when
+`store_root` is the default, the same file the Claude Code adapter's own
+`adapters.claude_code.event_log` trace already writes to (`edit`/`verify`/`gate`/`stop`/
+`session`, keyed by `type`). **One trace file, two vocabularies**, not three incompatible
+formats: adapter-local events are trigger metadata around a harness's own hook shape (a
+Claude Code `PostToolUse` firing, a Stop-gate attempt count); canonical events are what
+happened in Core, independent of which harness asked for it. A dry run (`persist=False`)
+records nothing — `record_event`'s own `mkdir` would otherwise violate the documented
+"a dry run touches nothing" contract `propose_source`/`submit_source` hold themselves to.
+
+Both adapters emit `gate.decision` at their own per-edit gate point: Claude Code's
+`adapters.claude_code.post_tool_use` (pass/block after verifying an edited file's functions)
+and Codex's `adapters.codex.verify_hook` (pass/unresolved/block after an `apply_patch`). The
+two differ in granularity, and the event says so honestly rather than faking parity: Claude
+Code enumerates and verifies each function, so its `unit_ids` are real `path::symbol` keys
+joinable with `property.proposed`/`property.verdict`; Codex verifies a whole edited file at a
+time (no per-function enumeration), so its event carries `files` — raw source paths — instead
+of `unit_ids`. Recording is best-effort and never raises — a trace failure must not turn a
+real verdict into a hook crash.
+
+### Capability / enforcement matrix (implemented, #213)
+
+Adapters differ in what their harness lets them do, not in which Core operations they call.
+Every row below calls the same `forseti verify` / `propose` / `submit` / `check` (CLI or
+MCP); only the trigger and gate strictness change per harness.
+
+| Capability | Claude Code | Codex | opencode (fallback) |
+|---|---|---|---|
+| Post-edit trigger | `PostToolUse` hook, native | `PostToolUse` hook (`apply_patch` matcher), native | none — prompt+tools only |
+| Completion / Stop-gate | `Stop` hook, blocks the turn (`MAX_STOP_ATTEMPTS`, then a loud residual) | none — no turn-completion hook; per-edit `PostToolUse` block is the only enforcement point | none — instructions ask the model to keep fixing until `verify` passes |
+| Host-model property generation | a property-generation subagent calls `forseti propose`/`submit` (#95) | the active turn's model calls `submit` (MCP) or `forseti submit-property` (CLI) directly — no subagent concept | the driving model calls `propose`/`submit` via MCP per its own prompt instructions |
+| Transport | CLI (hooks shell out to `forseti ... --json`) | CLI (hooks shell out to `forseti ... --json`) + MCP (`forseti mcp`) available to the model | MCP only |
+| Enforcement level | **Strong**: PostToolUse blocks on a counterexample, Stop-gate blocks turn completion up to a bounded number of attempts | **Medium**: PostToolUse blocks on a counterexample (VIOLATED), but nothing gates "done" — an UNKNOWN is reported (`systemMessage`), never silently passed, but does not block | **Weak**: purely convention — a model that ignores its own instructions can end the turn with an unverified edit; still never silently reports a fabricated pass, because nothing reports a verdict without calling Core |
+| Install | `forseti enable-project --harness claude-code [--shared]` → `.claude/settings(.local).json` | `forseti enable-project --harness codex` → `.codex/config.toml` (Codex 0.148+ requires `/hooks` trust after install) | no installer — wire the MCP server (`forseti mcp`) and the fallback prompt/command by hand |
+
+"Honest degradation" is the operative rule from the strawman above: a harness without a given
+hook does not get a fake version of it — it drops to the next weaker enforcement level
+(prompt+tools) while calling the exact same Core. #249 (Oh My Pi) extends this table with its
+own row once its adapter lands; the columns above are what a new adapter needs to fill in.
 
 ## What ESBMC actually returns (terminology — read this first)
 
