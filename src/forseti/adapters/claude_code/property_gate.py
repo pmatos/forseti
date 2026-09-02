@@ -1,16 +1,42 @@
-"""Stop-gate surface for semantic property checks (issue #95).
+"""Stop-gate surface for semantic property checks (issue #95, blocking: #213).
 
-Read-only and best-effort: if `.forseti/forseti.db` already holds CANDIDATE
+Read-only apart from the Stop-gate's own `stop_attempts` bookkeeping, and
+best-effort otherwise: if `.forseti/forseti.db` already holds CANDIDATE
 semantic properties for a unit the safety gate has *already* verified clean,
 `forseti check` them and surface any VIOLATED loudly at Stop -- the same
 "never silently pass" spirit the safety gate holds itself to (CLAUDE.md),
 extended to properties a subagent proposed out of band (`forseti propose`,
-the #95 property-generation subagent). Deliberately non-blocking: making this
-*block* the turn needs the same prune/reconciliation machinery
-`blocking_units`/`prune_deleted_units` already give the safety-verdict `units`
-map (issue #99 review) -- a parallel `state["properties"]` key without
-matching reconciliation would reproduce that class of Stop-gate deadlock. A
-blocking version is a documented follow-up (issue #95), not this cut.
+the #95 property-generation subagent). As of issue #213, a VIOLATED verdict
+also blocks the turn (`stop_gate.main`); every other outcome here (unresolved,
+failed, skipped, deferred) stays loud-but-non-blocking.
+
+Blocking needed none of the persisted `state["properties"]` map + prune/
+reconciliation machinery `blocking_units`/`prune_deleted_units` give the
+safety-verdict `state["units"]` map (issue #99 review), because nothing here
+is cached across turns the way `state["units"]` is. Every Stop call recomputes
+`semantic_check_summary` fresh: from whatever is currently in the property
+store, checked against whatever the C source currently says, via a live
+`forseti check` subprocess. A property that starts holding after a fix lands
+simply stops appearing in `violations` on the very next call -- no
+reconciliation step needed -- and a unit whose backing file was deleted
+out-of-band yields `failed` (the subprocess can't find the file), never a
+stale `violated`. What *is* shared with `state["units"]`'s blocking loop is
+`stop_attempts`/`MAX_STOP_ATTEMPTS` (issue #95 review): a property that can
+never be made to hold because the property itself, not the code, is wrong
+still exits loudly past the attempt cap, the same "genuinely stuck" outcome
+an unverifiable safety unit already gets. Forseti currently exposes no
+host-facing way to withdraw or reclassify a stored CANDIDATE property short
+of the code satisfying it (`PropertyStore.update_status` is a library method
+only, with no CLI/MCP command) -- the attempt cap is the only exit in that
+case, and `stop_gate._semantic_message` says so.
+
+One residual inherited unchanged from the non-blocking cut: this whole
+surface runs inside the Stop hook's own budget (`MAX_TOTAL_CHECK_S`, default
+60s, half of hooks.json's 120s Stop timeout). If Claude Code kills the hook
+process before this module returns, a real VIOLATED property is lost for that
+turn the same way every other Stop-gate decision would be -- a fail-open by
+hook-kill, not by this module's own logic, and not something a smaller
+`MAX_TOTAL_CHECK_S` can fully close since the outer timeout is the harness's.
 
 Store-presence *is* the opt-in: properties only land via an explicit `forseti
 propose` (or another store write) -- a project that never proposes stays at

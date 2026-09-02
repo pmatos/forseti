@@ -79,16 +79,19 @@ Instead:
   call) then `forseti check`, and reports any `violated` property back like
   the safety gate reports a counterexample. It is deliberately *not* wired
   into the automatic PostToolUse/Stop hooks, for the same cost/latency reason.
-- **The Stop hook also surfaces (never blocks on) violated semantic
+- **The Stop hook also checks — and blocks on — violated semantic
   properties.** If a unit the safety gate already verified clean has stored
   `CANDIDATE` properties (because you ran `forseti propose`/the subagent for
-  it at some point), the Stop-gate cheaply re-checks them and reports any
-  `VIOLATED` one loudly in its message — but does **not** fail the turn over
-  it. Making it block needs the same prune/reconciliation machinery the
-  safety-verdict `units` map already has (issue #99); that is a documented
-  follow-up (issue #95), not this cut. A project that never runs `forseti
-  propose` sees zero behaviour change (and zero extra cost — the check is
-  skipped outright when `.forseti/forseti.db` doesn't exist).
+  it at some point), the Stop-gate cheaply re-checks them and, on any
+  `VIOLATED` one, fails the turn the same way an unverified safety unit does
+  — up to `MAX_STOP_ATTEMPTS` consecutive attempts, then a loud residual
+  (issue #213). Every other outcome (unresolved, failed, skipped, deferred)
+  stays loud-but-non-blocking. Nothing here is cached across turns — each
+  Stop call re-checks live against the current property store and current C
+  source, so a fix landing clears the block on its own next call, no
+  reconciliation step needed. A project that never runs `forseti propose`
+  sees zero behaviour change (and zero extra cost — the check is skipped
+  outright when `.forseti/forseti.db` doesn't exist).
 
 ## Requirements
 
@@ -213,7 +216,7 @@ turns a verdict into an error.
 | Stop-gate attempts | `MAX_STOP_ATTEMPTS` in `src/forseti/adapters/claude_code/forseti_gate.py` | `3` | blocks then lets the turn end with a loud residual |
 | Out-of-band include | `FORSETI_GATE_INCLUDE` env | *(all C files)* | `:`/`,`-separated globs; if set, only changed C files matching one are scanned. A bare name (`src`) matches any path segment; a glob (`kernels/*.c`) matches the project-relative path. |
 | Out-of-band exclude | `FORSETI_GATE_EXCLUDE` env | `third_party`, `vendor`, `node_modules` | same syntax; excludes win over includes. Setting it **replaces** the defaults. Git's own ignore rules already drop gitignored build output before this applies. |
-| Semantic-check unwind bound *k* | `FORSETI_PROPERTY_UNWIND` env | `4` | the Stop-gate's own (tighter) bound for its automatic, non-blocking property re-check — separate from `forseti check`'s own CLI default (`4`, ladder `8,16`); the gate never ladders, to keep one property to one esbmc run inside the 120 s Stop hook budget |
+| Semantic-check unwind bound *k* | `FORSETI_PROPERTY_UNWIND` env | `4` | the Stop-gate's own (tighter) bound for its automatic property re-check (VIOLATED blocks the turn, issue #213) — separate from `forseti check`'s own CLI default (`4`, ladder `8,16`); the gate never ladders, to keep one property to one esbmc run inside the 120 s Stop hook budget |
 | Semantic-check per-call timeout | `FORSETI_PROPERTY_CHECK_TIMEOUT_S` env | `20` | budget for one `forseti check` subprocess the Stop-gate shells out to |
 | Semantic-check units per turn | `FORSETI_PROPERTY_MAX_UNITS` env | `3` | caps how many units-with-stored-properties one Stop-gate pass will actually check; the rest are reported as deferred, never silently skipped |
 
@@ -325,12 +328,14 @@ turns a verdict into an error.
   reported loudly but non-blocking. Actually verifying these — by generating a
   memory precondition/harness — is [#122](https://github.com/pmatos/forseti/issues/122)
   (design in [RFC-0003](../../docs/design/0003-memory-preconditions.md)).
-- **Safety is automatic; semantics are opt-in and non-blocking.** The
-  automatic PostToolUse/Stop hooks still check only the built-in safety
-  properties. Functional correctness beyond that (v1, issue #95) requires an
-  explicit `forseti propose`/the `forseti-property-check` subagent per unit,
-  and a `VIOLATED` semantic property is surfaced loudly at Stop but does not
-  fail the turn — see **Scope: v0 = safety, v1 = semantics** above for why.
+- **Safety is automatic; semantics are opt-in but blocking once proposed.**
+  The automatic PostToolUse/Stop hooks still check only the built-in safety
+  properties on every edit. Functional correctness beyond that (v1, issue
+  #95) requires an explicit `forseti propose`/the `forseti-property-check`
+  subagent per unit — but once a property is stored, a `VIOLATED` verdict
+  fails the turn at Stop the same way an unverified safety unit does (issue
+  #213); a project that never proposes a property sees no change in
+  behaviour — see **Scope: v0 = safety, v1 = semantics** above for why.
 - **Very slow, many-function files.** Verdicts persist incrementally so a hook
   kill can't cause a silent pass, but a file whose *total* verification exceeds
   the PostToolUse hook timeout can have its last, still-running function cut off
