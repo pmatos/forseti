@@ -361,7 +361,7 @@ def parse_candidates(model_text: str) -> tuple[CandidateSpec, ...]:
         raise ProposalParseError("model JSON is neither an object nor a list")
     if not isinstance(elements, list):
         raise ProposalParseError('"candidates" is not a list')
-    return tuple(_parse_element(elem, i) for i, elem in enumerate(elements))
+    return tuple(parse_candidate(elem, i) for i, elem in enumerate(elements))
 
 
 def validate_candidate(
@@ -439,7 +439,15 @@ def _strip_fences(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-def _parse_element(elem: object, index: int) -> CandidateSpec:
+def parse_candidate(elem: object, index: int = 0) -> CandidateSpec:
+    """One JSON candidate object -> `CandidateSpec`; `ProposalParseError` if malformed.
+
+    The single-element half of `parse_candidates`, also used directly by the
+    CLI's `--candidates-json` and the `semantic_loop` MCP tool's `candidates`
+    list -- one validated conversion for every host-supplied candidate,
+    LLM-proposed or not (#213 review: two independent hand-rolled versions of
+    this had silently weaker type-checking than this one).
+    """
     if not isinstance(elem, dict):
         raise ProposalParseError(f"candidate {index} is not an object")
     expression = elem.get("expression")

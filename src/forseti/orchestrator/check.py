@@ -29,7 +29,7 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, assert_never
+from typing import Any, Literal, assert_never
 
 from forseti.esbmc import (
     Error,
@@ -177,6 +177,9 @@ class PropertyVerdict:
         }
 
 
+RunOutcome = Literal["held", "violated", "unknown", "error", "empty"]
+
+
 @dataclass(frozen=True)
 class PropertyCheckRun:
     """The result of checking every stored property for one unit."""
@@ -195,11 +198,38 @@ class PropertyCheckRun:
         """The HELD subset — the mutation-kill candidate set the #4 seam grades."""
         return tuple(v for v in self.verdicts if v.outcome is PropertyOutcome.HELD)
 
+    @property
+    def outcome(self) -> RunOutcome:
+        """Core-owned, worst-outcome-wins summary across every checked property.
+
+        `violated` > `unknown` > `error` > `empty` (nothing semantically
+        checked: no property stored, or every stored one was `skipped`) >
+        `held`. The one field a caller — the CLI's exit code, the MCP `check`
+        payload, and the composed loop (`core/loop.py`) — reads instead of
+        re-deriving verdict severity itself (issue #213): an adapter that
+        recomputed this from `counts()` on its own could drift from the CLI's
+        own policy, or (CLAUDE.md "never silently pass") miss that `empty`
+        must not read as a clean pass just because it shares `held`'s exit
+        code.
+        """
+        counts = self.counts()
+        if counts["violated"]:
+            return "violated"
+        if counts["unknown"]:
+            return "unknown"
+        if counts["error"]:
+            return "error"
+        checked = len(self.verdicts) - counts["skipped"]
+        if checked == 0:
+            return "empty"
+        return "held"
+
     def to_dict(self) -> dict[str, Any]:
-        """A JSON-serializable dict (unit id, counts, and every verdict)."""
+        """A JSON-serializable dict (unit id, counts, outcome, and every verdict)."""
         return {
             "unit_id": self.unit_id,
             "counts": self.counts(),
+            "outcome": self.outcome,
             "verdicts": [verdict.to_dict() for verdict in self.verdicts],
         }
 

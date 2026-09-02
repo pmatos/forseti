@@ -506,6 +506,110 @@ def test_held_subset_helper(tmp_path: Path) -> None:
     assert [v.property_id for v in held] == ["p1"]
 
 
+# --- PropertyCheckRun.outcome -----------------------------------------------
+#
+# Core's own worst-outcome-wins summary (issue #213): the one field a caller
+# (the CLI's exit code, the MCP `check` payload, the composed loop) keys its
+# gate/report decision on instead of re-deriving severity from counts().
+
+
+def test_outcome_all_held(tmp_path: Path) -> None:
+    store = InMemoryPropertyStore([semantic_prop("p1"), semantic_prop("p2")])
+    run = check_properties(
+        UNIT,
+        store=store,
+        render=FakeHarnessWriter(),
+        verify=FakeVerify([Verified(meta()), Verified(meta())]),
+        work_dir=tmp_path / "work",
+        unwind=8,
+    )
+    assert run.outcome == "held"
+
+
+def test_outcome_violated_beats_everything(tmp_path: Path) -> None:
+    store = InMemoryPropertyStore(
+        [semantic_prop("p1"), semantic_prop("p2"), semantic_prop("p3")]
+    )
+    run = check_properties(
+        UNIT,
+        store=store,
+        render=FakeHarnessWriter(),
+        verify=FakeVerify([violated(), unknown(), Error(meta(), "boom")]),
+        work_dir=tmp_path / "work",
+        unwind=8,
+    )
+    assert run.outcome == "violated"
+
+
+def test_outcome_unknown_beats_error(tmp_path: Path) -> None:
+    store = InMemoryPropertyStore([semantic_prop("p1"), semantic_prop("p2")])
+    run = check_properties(
+        UNIT,
+        store=store,
+        render=FakeHarnessWriter(),
+        verify=FakeVerify([unknown(), Error(meta(), "boom")]),
+        work_dir=tmp_path / "work",
+        unwind=8,
+    )
+    assert run.outcome == "unknown"
+
+
+def test_outcome_error_when_no_violated_or_unknown(tmp_path: Path) -> None:
+    store = InMemoryPropertyStore([semantic_prop("p1"), semantic_prop("p2")])
+    run = check_properties(
+        UNIT,
+        store=store,
+        render=FakeHarnessWriter(),
+        verify=FakeVerify([Verified(meta()), Error(meta(), "boom")]),
+        work_dir=tmp_path / "work",
+        unwind=8,
+    )
+    assert run.outcome == "error"
+
+
+def test_outcome_empty_store_is_not_held(tmp_path: Path) -> None:
+    # CLAUDE.md "never silently pass": nothing was stored, so nothing was
+    # checked -- this must not read the same as "held".
+    run = check_properties(
+        UNIT,
+        store=InMemoryPropertyStore([]),
+        render=FakeHarnessWriter(),
+        verify=FakeVerify([]),
+        work_dir=tmp_path / "work",
+        unwind=8,
+    )
+    assert run.outcome == "empty"
+
+
+def test_outcome_all_skipped_is_not_held(tmp_path: Path) -> None:
+    # Every stored property is reachability-kind (deferred, ADR-0009 D2): no
+    # semantic property was actually checked, so this is also "empty", not
+    # "held".
+    store = InMemoryPropertyStore([reachability_prop("r1")])
+    run = check_properties(
+        UNIT,
+        store=store,
+        render=FakeHarnessWriter(),
+        verify=FakeVerify([]),  # must never be called
+        work_dir=tmp_path / "work",
+        unwind=8,
+    )
+    assert run.outcome == "empty"
+
+
+def test_outcome_in_to_dict(tmp_path: Path) -> None:
+    store = InMemoryPropertyStore([semantic_prop("p1")])
+    run = check_properties(
+        UNIT,
+        store=store,
+        render=FakeHarnessWriter(),
+        verify=FakeVerify([violated()]),
+        work_dir=tmp_path / "work",
+        unwind=8,
+    )
+    assert run.to_dict()["outcome"] == "violated"
+
+
 def test_transcript_shows_every_outcome(tmp_path: Path) -> None:
     store = InMemoryPropertyStore(
         [semantic_prop("p1"), semantic_prop("p2"), reachability_prop("r1")]
