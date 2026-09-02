@@ -74,6 +74,7 @@ import sys
 from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
+from typing import cast
 
 from forseti.adapters.claude_code import install as claude_code_install
 from forseti.adapters.claude_code.install import (
@@ -100,7 +101,7 @@ from forseti.properties import (
     PropertyStoreError,
     ProposalParseError,
     ProposalResult,
-    parse_candidate,
+    parse_candidate_list,
 )
 from forseti.update_notice import installed_version, update_notice
 
@@ -583,18 +584,17 @@ def _render_check(run: PropertyCheckRun) -> str:
     """
     total = len(run.verdicts)
     lines: list[str] = []
-    if run.outcome == "empty":
-        if total == 0:
-            lines.append(
-                f"No properties stored for {run.unit_id} -- nothing was checked. "
-                "Run `forseti propose` first."
-            )
-        else:
-            lines.append(
-                f"{total} stored propert{'y' if total == 1 else 'ies'} for "
-                f"{run.unit_id} -- all reachability-kind (deferred, ADR-0009 D2); "
-                "no semantic property was actually checked."
-            )
+    if total == 0:
+        lines.append(
+            f"No properties stored for {run.unit_id} -- nothing was checked. "
+            "Run `forseti propose` first."
+        )
+    elif run.outcome == "empty":
+        lines.append(
+            f"{total} stored propert{'y' if total == 1 else 'ies'} for "
+            f"{run.unit_id} -- all reachability-kind (deferred, ADR-0009 D2); "
+            "no semantic property was actually checked."
+        )
     lines.append(property_check_transcript(run))
     return "\n".join(lines)
 
@@ -767,9 +767,9 @@ def _parse_candidates_json(path: Path) -> tuple[CandidateSpec, ...]:
     Raises `ValueError` (malformed JSON, not a list, or a candidate missing
     `expression` or holding a wrongly-typed field) so the CLI can report one
     clean diagnostic rather than a bare `KeyError`/`TypeError` traceback. Each
-    element is validated by `parse_candidate`, the same per-candidate parser
-    `parse_candidates` (LLM output) uses, so a host-submitted batch can't
-    bypass a type check an LLM-proposed one is held to.
+    element is validated by `parse_candidate_list`, the same per-candidate
+    parser `parse_candidates` (LLM output) uses, so a host-submitted batch
+    can't bypass a type check an LLM-proposed one is held to.
     """
     try:
         raw = json.loads(path.read_text())
@@ -778,7 +778,7 @@ def _parse_candidates_json(path: Path) -> tuple[CandidateSpec, ...]:
     if not isinstance(raw, list):
         raise ValueError(f"{path}: must contain a JSON array of candidate objects")
     try:
-        return tuple(parse_candidate(entry, index) for index, entry in enumerate(raw))
+        return parse_candidate_list(raw)
     except ProposalParseError as exc:
         raise ValueError(f"{path}: {exc}") from exc
 
@@ -815,17 +815,9 @@ def _run_semantic_loop(args: argparse.Namespace) -> int:
         )
         return 1
 
-    loop_mode: LoopMode
-    if args.mode == "propose":
-        loop_mode = "propose"
-    elif args.mode == "submit":
-        loop_mode = "submit"
-    else:
-        loop_mode = "check_only"
-
-    unwind_ladder = args.unwind_ladder
-    if unwind_ladder is None:
-        unwind_ladder = default_unwind_ladder_above(args.unwind)
+    # argparse's --mode choices use a hyphen ("check-only"); LoopMode spells
+    # it with an underscore -- "propose"/"submit" need no respelling.
+    loop_mode = cast(LoopMode, args.mode.replace("-", "_"))
 
     try:
         result = run_semantic_loop(
@@ -843,7 +835,7 @@ def _run_semantic_loop(args: argparse.Namespace) -> int:
             claude_bin=args.claude_bin,
             propose_timeout_s=args.propose_timeout,
             unwind=args.unwind,
-            unwind_ladder=unwind_ladder,
+            unwind_ladder=args.unwind_ladder,
             check_timeout_s=args.timeout,
             extra_flags=tuple(args.esbmc_args),
             esbmc_bin=args.esbmc_bin,
