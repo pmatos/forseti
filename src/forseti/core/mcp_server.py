@@ -3,9 +3,11 @@
 Claude Code, Codex, and opencode all differ in their hooks but agree on MCP, so
 the Core exposes its operations as MCP tools here: `verify` (ESBMC), `propose`
 (the LLM property proposer, #65), `submit` (ingest a host-generated candidate,
-no LLM call, #213), and `check` (verify a unit's stored properties, #213). Each
-tool is a thin shell over its `forseti.core` entry point and returns the same
-JSON payload the CLI's `--json` does, so an adapter sees one shape either way.
+no LLM call, #213), `check` (verify a unit's stored properties, #213), and
+`semantic_loop` (the composed ingest -> check -> outcome operation, #213) --
+one call in place of `propose`/`submit` and `check` separately. Each tool is a
+thin shell over its `forseti.core` entry point and returns the same JSON
+payload the CLI's `--json` does, so an adapter sees one shape either way.
 
 This module imports the `mcp` SDK at import time (an optional dependency,
 `forseti[mcp]`); the unified CLI imports it lazily so `forseti verify` works
@@ -15,8 +17,11 @@ without the SDK installed.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from mcp.server.mcpserver import MCPServer
+
+from forseti.properties import CandidateSpec
 
 from .check import (
     DEFAULT_TIMEOUT_S as CHECK_TIMEOUT_S,
@@ -25,6 +30,7 @@ from .check import (
     DEFAULT_UNWIND as CHECK_DEFAULT_UNWIND,
 )
 from .check import check_source, default_unwind_ladder_above
+from .loop import LoopMode, run_semantic_loop
 from .propose import (
     DEFAULT_MAX_CANDIDATES,
     DEFAULT_MODEL,
@@ -50,7 +56,9 @@ _INSTRUCTIONS = (
     "Call `propose` to generate candidate properties for a unit before checking, "
     "or `submit` to ingest a candidate the host model already generated (no LLM "
     "call). Call `check` to verify a unit's stored properties: held | violated | "
-    "unknown | error, plus skipped for a deferred reachability property."
+    "unknown | error, plus skipped for a deferred reachability property. Or call "
+    "`semantic_loop` to do ingestion and checking in one call and get back "
+    "Core's own worst-outcome-wins outcome, instead of deriving it yourself."
 )
 
 
@@ -221,9 +229,107 @@ def check_tool(
     return run.to_dict()
 
 
+def semantic_loop_tool(
+    source: str,
+    function: str,
+    mode: str,
+    store_root: str = str(DEFAULT_STORE_ROOT),
+    max_candidates: int = DEFAULT_MAX_CANDIDATES,
+    candidates: list[dict[str, Any]] | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    prompt_id: str = DEFAULT_PROMPT_ID,
+    prompt_version: str = DEFAULT_PROMPT_VERSION,
+    propose_model: str = DEFAULT_MODEL,
+    claude_bin: str = "claude",
+    propose_timeout_s: float = PROPOSE_TIMEOUT_S,
+    unwind: int = CHECK_DEFAULT_UNWIND,
+    unwind_ladder: list[int] | None = None,
+    timeout_s: float = CHECK_TIMEOUT_S,
+    esbmc_bin: str = "esbmc",
+) -> dict[str, object]:
+    """The composed semantic-property loop (#213): ingest, then check -- one call.
+
+    Args:
+        source: Path to the source file defining the unit.
+        function: The function under test (the `symbol` of `path::symbol`).
+        mode: One of `"propose"` (ask the LLM proposer), `"submit"` (ingest
+            `candidates`, no LLM call), or `"check_only"` (skip ingestion and
+            check whatever the store already holds).
+        store_root: The `.forseti` store directory.
+        max_candidates: Cap on accepted candidates.
+        candidates: `mode="submit"` only -- a list of candidate objects, each
+            `{"expression": ..., "domain": [...], "referenced_params": [...],
+            "rationale": ...}`; validated and persisted independently, so a
+            rejected candidate stays visible in the `ingestion` list rather
+            than vanishing into a merged batch result.
+        provider: `mode="submit"` only -- who/what produced these candidates.
+        model: `mode="submit"` only -- the model that produced these candidates.
+        prompt_id: `mode="submit"` only -- provenance prompt id.
+        prompt_version: `mode="submit"` only -- provenance prompt version.
+        propose_model: `mode="propose"` only -- LLM model for the proposer.
+        claude_bin: `mode="propose"` only -- claude binary to invoke.
+        propose_timeout_s: `mode="propose"` only -- per-call timeout for the
+            proposer's LLM invocation.
+        unwind: Loop-unwind bound k for the first check attempt.
+        unwind_ladder: Bounds tried after `unwind` on an UNKNOWN verdict
+            (default: `default_unwind_ladder_above(unwind)`).
+        timeout_s: Per-attempt esbmc timeout in seconds.
+        esbmc_bin: The esbmc binary to invoke.
+
+    Returns:
+        A JSON object with the unit id, `mode`, the per-candidate ingestion
+        results (empty for `check_only`), the check run, and Core's own
+        worst-outcome-wins `outcome`: held | violated | unknown | error |
+        empty -- the one field to key a gate/report decision on.
+    """
+    if mode == "propose":
+        loop_mode: LoopMode = "propose"
+    elif mode == "submit":
+        loop_mode = "submit"
+    elif mode == "check_only":
+        loop_mode = "check_only"
+    else:
+        raise ValueError(f"mode must be one of propose|submit|check_only, got {mode!r}")
+    ladder = (
+        tuple(unwind_ladder)
+        if unwind_ladder is not None
+        else default_unwind_ladder_above(unwind)
+    )
+    specs = tuple(
+        CandidateSpec(
+            expression=str(c["expression"]),
+            domain=tuple(str(d) for d in c.get("domain") or ()),
+            referenced_params=tuple(str(p) for p in c.get("referenced_params") or ()),
+            rationale=str(c.get("rationale") or ""),
+        )
+        for c in (candidates or ())
+    )
+    result = run_semantic_loop(
+        Path(source),
+        function=function,
+        mode=loop_mode,
+        store_root=Path(store_root),
+        max_candidates=max_candidates,
+        candidates=specs,
+        provider=provider,
+        model=model,
+        prompt_id=prompt_id,
+        prompt_version=prompt_version,
+        propose_model=propose_model,
+        claude_bin=claude_bin,
+        propose_timeout_s=propose_timeout_s,
+        unwind=unwind,
+        unwind_ladder=ladder,
+        check_timeout_s=timeout_s,
+        esbmc_bin=esbmc_bin,
+    )
+    return result.to_dict()
+
+
 def build_server(name: str = "forseti") -> MCPServer:
     """An `MCPServer` exposing Forseti Core's tools (`verify`, `propose`,
-    `submit`, `check`)."""
+    `submit`, `check`, `semantic_loop`)."""
     server: MCPServer = MCPServer(name, instructions=_INSTRUCTIONS)
     server.add_tool(
         verify_tool,
@@ -252,6 +358,17 @@ def build_server(name: str = "forseti") -> MCPServer:
         description=(
             "Check a unit's stored properties with ESBMC; returns held | "
             "violated | unknown | error (plus skipped) per property."
+        ),
+    )
+    server.add_tool(
+        semantic_loop_tool,
+        name="semantic_loop",
+        description=(
+            "The composed semantic-property loop (#213): ingest candidates per "
+            "mode (propose | submit | check_only), then check with ESBMC -- one "
+            "call instead of propose/submit and check separately. Returns the "
+            "ingestion results, the check run, and Core's own worst-outcome-wins "
+            "outcome: held | violated | unknown | error | empty."
         ),
     )
     return server

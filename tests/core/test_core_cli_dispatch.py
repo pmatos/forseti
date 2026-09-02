@@ -43,6 +43,7 @@ def test_every_subcommand_binds_a_callable_handler() -> None:
         "propose",
         "submit-property",
         "check",
+        "semantic-loop",
         "claude-code-hook",
         "codex-hook",
         "enable-project",

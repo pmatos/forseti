@@ -56,3 +56,59 @@ Keep the write → verify → counterexample → fix cycle tight: verify the sma
 unit you just touched, fix from the counterexample, and re-verify, rather than
 batching many edits before a single check.
 <!-- END forseti-fallback-instructions -->
+
+## Semantic properties (functional correctness, not just safety)
+
+The `PostToolUse` hook above only checks language-level *safety* (memory
+safety, overflow, bounds, UB) on the whole edited file — it says nothing
+about whether a function computes the right thing. For a unit whose
+correctness matters beyond memory safety, use the `semantic_loop` MCP tool
+(issue #213) to check a *semantic* property you have in mind for it — "the
+output is sorted", "abs(x) >= 0", "the result is a permutation of the input"
+— something ESBMC cannot infer on its own. Invoke this deliberately, per
+unit, after a function whose contract matters; it is not run on every edit.
+
+1. **Submit your own candidate properties, then check.** You already read
+   and wrote the code, so state the property yourself rather than asking a
+   nested LLM to guess one — call the `semantic_loop` MCP tool with `mode:
+   "submit"`, the unit's `source`/`function`, and `candidates`: a list of
+   `{"expression": ..., "domain": [...], "referenced_params": [...],
+   "rationale": ...}` objects (`expression` is a C boolean over the unit's
+   parameters and `result`; `domain` states any precondition the property
+   assumes, e.g. `"x > INT64_MIN"`). Set `provider`/`model` to identify
+   yourself (e.g. `"codex"` / your own model name) — Core records this as
+   the property's provenance, never guessed. Each candidate is statically
+   validated and, if accepted, persisted to the project's
+   `.forseti/forseti.db` store, then immediately rendered into a
+   self-contained ESBMC harness and verified — escalating a
+   loop-under-unwound `unknown` along a k-ladder before settling. To
+   re-check without re-submitting (e.g. after a fix), call again with
+   `mode: "check_only"` and no `candidates`.
+
+2. **Read `outcome`, not just the call's success or failure.** The result's
+   top-level `outcome` is Core's own worst-outcome-wins policy across every
+   property this call checked: `held` (every checked property held, up to
+   its settled `k`), `violated` (at least one has a counterexample),
+   `unknown` (inconclusive — never a pass), `error` (a tooling failure), or
+   `empty` (nothing was checkable — every candidate was rejected, or none
+   was submitted). Per-property detail is under `check.verdicts[]` — each
+   has `property_id`, `outcome`, `k`, and (for a settled verdict) `result`;
+   a `violated` one carries `result.raw_counterexample` (ESBMC's trace
+   text). `ingestion[]` carries each submitted candidate's own accept/reject
+   result, so a rejected candidate stays visible, never silently dropped.
+
+3. **Act on it before you hand the turn back.** For `violated`, read the
+   counterexample, fix the unit so the property holds, then re-check with
+   `mode: "check_only"`. For `unknown`, raise `unwind`/`unwind_ladder` or
+   simplify the unit; never treat it as done. For `empty`, say so explicitly
+   — it is not the same as `held`. Do not declare the unit's semantic
+   correctness settled until every property you submitted for it reads
+   `held`.
+
+The safety verify hook above still gates every `apply_patch` edit
+independently; this loop is the semantic half you drive yourself over MCP —
+the same Core operation and the same `outcome` field the Claude Code
+adapter's `forseti-property-check` subagent uses
+(`adapters/claude-code/agents/property-check.md`), just triggered
+differently: there, an explicitly-invoked Bash subagent; here, a tool call
+you make directly, since Codex has no subagent concept of its own.

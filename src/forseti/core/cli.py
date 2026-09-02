@@ -95,6 +95,7 @@ from forseti.esbmc import (
 from forseti.orchestrator import PropertyCheckRun, property_check_transcript
 from forseti.properties import (
     BlankProvenanceError,
+    CandidateSpec,
     LLMError,
     PropertyStoreError,
     ProposalParseError,
@@ -126,6 +127,7 @@ from .check import (
     DEFAULT_UNWIND_LADDER as CHECK_DEFAULT_UNWIND_LADDER,
 )
 from .check import check_source, default_unwind_ladder_above
+from .loop import LoopMode, SemanticLoopResult, run_semantic_loop
 from .propose import (
     DEFAULT_MAX_CANDIDATES,
     DEFAULT_MODEL,
@@ -548,24 +550,24 @@ def _add_check_parser(
     p.set_defaults(func=_run_check)
 
 
-def _check_exit_code(run: PropertyCheckRun) -> int:
-    """Worst-outcome-wins over every checked property, mirroring `EXIT_CODES`.
+_OUTCOME_VERDICT = {
+    "violated": Verdict.VIOLATED,
+    "unknown": Verdict.UNKNOWN,
+    "error": Verdict.ERROR,
+    "empty": Verdict.VERIFIED,
+    "held": Verdict.VERIFIED,
+}
 
-    `violated` beats `unknown` beats `error` beats a clean run (`held`/`skipped`
-    only) — the same VIOLATED > UNKNOWN > ERROR > VERIFIED severity ordering a
-    single-unit `forseti verify` uses, extended to "worst verdict across every
-    property this run checked" rather than one. A run makes exactly one of the
-    four counts decisive, in that order, so it can never under-report a
-    violation because an unrelated property also came back unknown/error.
+
+def _check_exit_code(run: PropertyCheckRun) -> int:
+    """`run.outcome`'s exit code, mirroring `EXIT_CODES`.
+
+    `run.outcome` is Core's own worst-outcome-wins policy (`PropertyCheckRun`,
+    issue #213) — this only maps that one decision onto the same VIOLATED >
+    UNKNOWN > ERROR > VERIFIED severity ordering a single-unit `forseti verify`
+    uses, rather than re-deriving it from `counts()` here.
     """
-    counts = run.counts()
-    if counts["violated"]:
-        return EXIT_CODES[Verdict.VIOLATED]
-    if counts["unknown"]:
-        return EXIT_CODES[Verdict.UNKNOWN]
-    if counts["error"]:
-        return EXIT_CODES[Verdict.ERROR]
-    return EXIT_CODES[Verdict.VERIFIED]
+    return EXIT_CODES[_OUTCOME_VERDICT[run.outcome]]
 
 
 def _render_check(run: PropertyCheckRun) -> str:
@@ -573,26 +575,25 @@ def _render_check(run: PropertyCheckRun) -> str:
     semantically checked", then the full per-property transcript.
 
     An empty run (no stored properties at all) and an all-`skipped` run (every
-    stored property is reachability-kind, deferred per ADR-0009 D2) both read as
-    a clean 0 counts otherwise indistinguishable from "every property held" —
-    CLAUDE.md "never silently pass" applies to the report, not just the exit
-    code.
+    stored property is reachability-kind, deferred per ADR-0009 D2) both settle
+    `run.outcome == "empty"` (`PropertyCheckRun`) — otherwise indistinguishable
+    from "every property held" by exit code alone. CLAUDE.md "never silently
+    pass" applies to the report, not just the exit code.
     """
-    counts = run.counts()
     total = len(run.verdicts)
-    checked = total - counts["skipped"]
     lines: list[str] = []
-    if total == 0:
-        lines.append(
-            f"No properties stored for {run.unit_id} -- nothing was checked. "
-            "Run `forseti propose` first."
-        )
-    elif checked == 0:
-        lines.append(
-            f"{total} stored propert{'y' if total == 1 else 'ies'} for "
-            f"{run.unit_id} -- all reachability-kind (deferred, ADR-0009 D2); "
-            "no semantic property was actually checked."
-        )
+    if run.outcome == "empty":
+        if total == 0:
+            lines.append(
+                f"No properties stored for {run.unit_id} -- nothing was checked. "
+                "Run `forseti propose` first."
+            )
+        else:
+            lines.append(
+                f"{total} stored propert{'y' if total == 1 else 'ies'} for "
+                f"{run.unit_id} -- all reachability-kind (deferred, ADR-0009 D2); "
+                "no semantic property was actually checked."
+            )
     lines.append(property_check_transcript(run))
     return "\n".join(lines)
 
@@ -624,6 +625,250 @@ def _run_check(args: argparse.Namespace) -> int:
     else:
         print(_render_check(result))
     return _check_exit_code(result)
+
+
+def _add_semantic_loop_parser(
+    sub: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    p = sub.add_parser(
+        "semantic-loop",
+        help="ingest candidates (per --mode), then check them with ESBMC -- one call",
+        description=(
+            "The composed semantic-property loop (#213): ingest candidate "
+            "properties for <source>::<function> per --mode (propose from the "
+            "LLM proposer, submit already-formed ones, or skip ingestion and "
+            "check what's already stored), then check every stored, checkable "
+            "property with ESBMC and report Core's own worst-outcome-wins "
+            "`outcome`: held | violated | unknown | error | empty. Replaces "
+            "calling `propose`/`submit-property` and `check` separately and "
+            "re-deriving that decision yourself."
+        ),
+    )
+    _add_unit_store_arguments(p)
+    p.add_argument(
+        "--mode",
+        required=True,
+        choices=("propose", "submit", "check-only"),
+        help="how to ingest candidates before checking",
+    )
+    p.add_argument(
+        "--candidates-json",
+        type=Path,
+        metavar="FILE",
+        help=(
+            "--mode submit only: a file containing a JSON array of candidate "
+            'objects ({"expression": ..., "domain": [...], '
+            '"referenced_params": [...], "rationale": ...}), each validated '
+            "and persisted independently"
+        ),
+    )
+    p.add_argument(
+        "--provider",
+        help='--mode submit only: who/what produced these candidates, e.g. "codex"',
+    )
+    p.add_argument(
+        "--model",
+        help=(
+            "--mode submit only: the model that produced these candidates, "
+            'e.g. "gpt-5.1"'
+        ),
+    )
+    p.add_argument(
+        "--prompt-id",
+        default=SUBMIT_DEFAULT_PROMPT_ID,
+        help=(
+            "--mode submit only: provenance prompt id for these candidates "
+            f"(default: {SUBMIT_DEFAULT_PROMPT_ID})"
+        ),
+    )
+    p.add_argument(
+        "--prompt-version",
+        default=SUBMIT_DEFAULT_PROMPT_VERSION,
+        help=(
+            "--mode submit only: provenance prompt version for these candidates "
+            f"(default: {SUBMIT_DEFAULT_PROMPT_VERSION})"
+        ),
+    )
+    p.add_argument(
+        "--propose-model",
+        default=DEFAULT_MODEL,
+        help=(
+            "--mode propose only: LLM model for the proposer "
+            f"(default: {DEFAULT_MODEL})"
+        ),
+    )
+    p.add_argument(
+        "--claude-bin",
+        default="claude",
+        help="--mode propose only: claude binary to invoke (default: claude on PATH)",
+    )
+    p.add_argument(
+        "--propose-timeout",
+        type=float,
+        default=PROPOSE_TIMEOUT_S,
+        metavar="SECONDS",
+        help=(
+            "--mode propose only: proposer LLM timeout in seconds "
+            f"(default: {PROPOSE_TIMEOUT_S:g})"
+        ),
+    )
+    p.add_argument(
+        "--max-candidates",
+        type=int,
+        default=DEFAULT_MAX_CANDIDATES,
+        metavar="N",
+        help=f"cap on accepted candidates (default: {DEFAULT_MAX_CANDIDATES})",
+    )
+    p.add_argument(
+        "-k",
+        "--unwind",
+        type=int,
+        default=CHECK_DEFAULT_UNWIND,
+        help=f"loop unwind bound k (default: {CHECK_DEFAULT_UNWIND})",
+    )
+    p.add_argument(
+        "--unwind-ladder",
+        type=_parse_ladder,
+        default=None,
+        metavar="K1,K2,...",
+        help=(
+            "comma-separated bounds tried after --unwind on an UNKNOWN verdict "
+            f"(default: whichever of {','.join(map(str, CHECK_DEFAULT_UNWIND_LADDER))} "
+            "exceed --unwind, so raising -k/--unwind alone still works)"
+        ),
+    )
+    p.add_argument(
+        "-t",
+        "--timeout",
+        type=float,
+        default=CHECK_TIMEOUT_S,
+        metavar="SECONDS",
+        help=f"per-attempt esbmc timeout in seconds (default: {CHECK_TIMEOUT_S:g})",
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the run as a JSON object (the MCP tool's payload)",
+    )
+    add_esbmc_invocation_arguments(
+        p,
+        passthrough_help=(
+            "flags forwarded verbatim to esbmc; place them after a `--` separator, "
+            "e.g. `... file.c --function f --mode check-only -- -DNDEBUG`"
+        ),
+    )
+    p.set_defaults(func=_run_semantic_loop)
+
+
+def _parse_candidates_json(path: Path) -> tuple[CandidateSpec, ...]:
+    """A JSON array of candidate objects -> `CandidateSpec`s.
+
+    Raises `ValueError` (malformed JSON, not a list, or a candidate missing
+    `expression`) so the CLI can report one clean diagnostic rather than a
+    bare `KeyError`/`TypeError` traceback.
+    """
+    try:
+        raw = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path}: invalid JSON ({exc})") from exc
+    if not isinstance(raw, list):
+        raise ValueError(f"{path}: must contain a JSON array of candidate objects")
+    candidates = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict) or "expression" not in entry:
+            raise ValueError(f"{path}: candidate {index} is missing 'expression'")
+        candidates.append(
+            CandidateSpec(
+                expression=entry["expression"],
+                domain=tuple(entry.get("domain", ())),
+                referenced_params=tuple(entry.get("referenced_params", ())),
+                rationale=entry.get("rationale", ""),
+            )
+        )
+    return tuple(candidates)
+
+
+def _render_semantic_loop(result: SemanticLoopResult) -> str:
+    lines = [_render_proposal(ingested) for ingested in result.ingestion]
+    lines.append(_render_check(result.check))
+    return "\n".join(lines)
+
+
+def _run_semantic_loop(args: argparse.Namespace) -> int:
+    candidates: tuple[CandidateSpec, ...] = ()
+    if args.mode == "submit":
+        if args.candidates_json is None:
+            print(
+                "forseti semantic-loop: --mode submit requires --candidates-json",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            candidates = _parse_candidates_json(args.candidates_json)
+        except (ValueError, OSError) as exc:
+            print(f"forseti semantic-loop: {exc}", file=sys.stderr)
+            return 1
+    elif args.candidates_json is not None:
+        # Caught here, not left to run_semantic_loop's own "does not take
+        # candidates" ValueError: a --mode propose/check-only caller passing
+        # --candidates-json anyway is a CLI-level mistake (the flag would
+        # otherwise be silently ignored -- CLAUDE.md "never silently pass").
+        print(
+            f"forseti semantic-loop: --candidates-json is --mode submit only, "
+            f"not --mode {args.mode}",
+            file=sys.stderr,
+        )
+        return 1
+
+    loop_mode: LoopMode
+    if args.mode == "propose":
+        loop_mode = "propose"
+    elif args.mode == "submit":
+        loop_mode = "submit"
+    else:
+        loop_mode = "check_only"
+
+    unwind_ladder = args.unwind_ladder
+    if unwind_ladder is None:
+        unwind_ladder = default_unwind_ladder_above(args.unwind)
+
+    try:
+        result = run_semantic_loop(
+            args.source,
+            function=args.function,
+            mode=loop_mode,
+            store_root=args.store_root,
+            max_candidates=args.max_candidates,
+            candidates=candidates,
+            provider=args.provider,
+            model=args.model,
+            prompt_id=args.prompt_id,
+            prompt_version=args.prompt_version,
+            propose_model=args.propose_model,
+            claude_bin=args.claude_bin,
+            propose_timeout_s=args.propose_timeout,
+            unwind=args.unwind,
+            unwind_ladder=unwind_ladder,
+            check_timeout_s=args.timeout,
+            extra_flags=tuple(args.esbmc_args),
+            esbmc_bin=args.esbmc_bin,
+        )
+    except (
+        ValueError,
+        LLMError,
+        ProposalParseError,
+        BlankProvenanceError,
+        PropertyStoreError,
+        OSError,
+    ) as exc:
+        print(f"forseti semantic-loop: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(result.to_dict()))
+    else:
+        print(_render_semantic_loop(result))
+    return _check_exit_code(result.check)
 
 
 def _add_claude_code_hook_parser(
@@ -915,6 +1160,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_propose_parser(sub)
     _add_submit_property_parser(sub)
     _add_check_parser(sub)
+    _add_semantic_loop_parser(sub)
     _add_claude_code_hook_parser(sub)
     _add_codex_hook_parser(sub)
     _add_enable_project_parser(sub)

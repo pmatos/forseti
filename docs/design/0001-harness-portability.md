@@ -147,17 +147,45 @@ time (no per-function enumeration), so its event carries `files` — raw source 
 of `unit_ids`. Recording is best-effort and never raises — a trace failure must not turn a
 real verdict into a hook crash.
 
+### The composed semantic-loop operation (implemented, #213)
+
+`propose`/`submit` and `check` above are still independently useful (a dry-run proposal, a
+re-check with no new candidates), but composing "ingest → persist → render harness → check →
+verdict policy" into the single `verify(U)` step the sequence diagram above always depicted was
+deferred in the first #213 slice until a second caller needed the composed shape — Codex's
+AGENTS.md wiring below is that second caller. `forseti.core.loop.run_semantic_loop` is the one
+entry point: `path::symbol` in, one of three ingestion modes (`propose` — ask the configured
+LLM proposer; `submit` — ingest already-formed candidates, no LLM call; `check_only` — skip
+ingestion, check what the store already holds), then always `check_source` and Core's own
+`PropertyCheckRun.outcome` — a worst-outcome-wins `held | violated | unknown | error | empty`
+that both faces below return unchanged, so an adapter reads one field instead of re-deriving
+severity from `verdicts[]` itself. Exposed as `forseti semantic-loop <source> --function NAME
+--mode {propose,submit,check-only}` (CLI) and the `semantic_loop` MCP tool; both call
+`run_semantic_loop` and return `SemanticLoopResult.to_dict()` — no separate serializer. Neither
+face formats a unit id, persists a candidate, or renders a harness itself — those stay exactly
+where `propose_source`/`submit_source`/`check_source` already put them; the composed op only
+sequences the existing calls and adds the `outcome` policy on top.
+
+The Claude Code subagent (`adapters/claude-code/agents/property-check.md`) now makes one
+`--mode propose` call instead of a separate `propose` then `check`, and reads `outcome` instead
+of recomputing worst-outcome-wins from `verdicts[]` itself. Codex's `AGENTS.md` gained a
+semantic-property section that was simply absent before this issue — the capability matrix
+below described a Codex "host-model property generation" capability, but no adapter file
+actually told the model to call `submit`/`check`; the closest instructions were the safety-only
+`verify` loop shared with opencode's fallback. That gap is closed by adding a `semantic_loop`
+(`mode: "submit"`) block to `AGENTS.md`, parallel to (not merged into) the shared safety block.
+
 ### Capability / enforcement matrix (implemented, #213)
 
 Adapters differ in what their harness lets them do, not in which Core operations they call.
-Every row below calls the same `forseti verify` / `propose` / `submit` / `check` (CLI or
-MCP); only the trigger and gate strictness change per harness.
+Every row below calls the same `forseti verify` / `propose` / `submit` / `check` /
+`semantic-loop` (CLI or MCP); only the trigger and gate strictness change per harness.
 
 | Capability | Claude Code | Codex | opencode (fallback) |
 |---|---|---|---|
 | Post-edit trigger | `PostToolUse` hook, native | `PostToolUse` hook (`apply_patch` matcher), native | none — prompt+tools only |
 | Completion / Stop-gate | `Stop` hook, blocks the turn (`MAX_STOP_ATTEMPTS`, then a loud residual) | none — no turn-completion hook; per-edit `PostToolUse` block is the only enforcement point | none — instructions ask the model to keep fixing until `verify` passes |
-| Host-model property generation | a property-generation subagent calls `forseti propose`/`submit` (#95) | the active turn's model calls `submit` (MCP) or `forseti submit-property` (CLI) directly — no subagent concept | the driving model calls `propose`/`submit` via MCP per its own prompt instructions |
+| Host-model property generation | a property-generation subagent calls `forseti semantic-loop --mode propose` (one composed call, #213; formerly separate `propose`+`check`, #95) | `AGENTS.md`'s semantic-property section (#213) tells the active turn's model to call the `semantic_loop` MCP tool with `mode: "submit"` directly — no subagent concept | the driving model calls `propose`/`submit` via MCP per its own prompt instructions |
 | Transport | CLI (hooks shell out to `forseti ... --json`) | CLI (hooks shell out to `forseti ... --json`) + MCP (`forseti mcp`) available to the model | MCP only |
 | Enforcement level | **Strong**: PostToolUse blocks on a counterexample, Stop-gate blocks turn completion up to a bounded number of attempts | **Medium**: PostToolUse blocks on a counterexample (VIOLATED), but nothing gates "done" — an UNKNOWN is reported (`systemMessage`), never silently passed, but does not block | **Weak**: purely convention — a model that ignores its own instructions can end the turn with an unverified edit; still never silently reports a fabricated pass, because nothing reports a verdict without calling Core |
 | Install | `forseti enable-project --harness claude-code [--shared]` → `.claude/settings(.local).json` | `forseti enable-project --harness codex` → `.codex/config.toml` (Codex 0.148+ requires `/hooks` trust after install) | no installer — wire the MCP server (`forseti mcp`) and the fallback prompt/command by hand |

@@ -9,6 +9,7 @@ from .check import (
     PropertyCheckRun,
     PropertyOutcome,
     PropertyVerdict,
+    RunOutcome,
     SemanticHarnessWriter,
     check_properties,
 )
@@ -62,6 +63,7 @@ __all__ = [
     "RecordedFixProvider",
     "RenderedHarness",
     "Report",
+    "RunOutcome",
     "SemanticHarnessWriter",
     "Unit",
     "VerifyPort",

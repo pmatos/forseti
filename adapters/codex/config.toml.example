@@ -34,8 +34,9 @@ command = "forseti codex-hook verify"
 timeout = 120
 statusMessage = "Forseti: verifying edited unit"
 
-# (3) Forseti Core over MCP (stdio) — lets the model call `verify`/`propose`
-# directly. `forseti mcp` starts the server (#49); it needs the `mcp` extra:
+# (3) Forseti Core over MCP (stdio) — lets the model call `verify`/`propose`/
+# `submit`/`check`/`semantic_loop` directly (./AGENTS.md's semantic-property
+# section, #213). `forseti mcp` starts the server (#49); it needs the `mcp` extra:
 #   pip install 'forseti[mcp]'
 # Equivalent CLI:  codex mcp add forseti -- forseti mcp
 [mcp_servers.forseti]
