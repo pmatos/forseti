@@ -6,7 +6,7 @@ same ideas. Reconciled against `gh` at the start of every run.
 
 ## precond-reachability-probe-tri-state
 
-- **Status**: in-flight
+- **Status**: landed
 - **Score**: 20/25 (leverage 4, locality 4, blast radius 2, heat 4)
 - **Files**: ~4–5 estimated
 - **Modules**: `src/forseti/precond/verify.py` (`_assess_non_vacuity`), `src/forseti/precond/discharge.py` (`_check_caller`), new leaf `src/forseti/precond/reachability.py`
@@ -22,6 +22,16 @@ same ideas. Reconciled against `gh` at the start of every run.
 - **Committed**: review report, design pass, the `refactor(precond)` implementation, and this backlog update.
 - **Evidence**: quality gate green — ruff check + ruff format --check + ty check + pytest (1494 passed, 1 skipped, ESBMC-gated included); project coverage 97.40% (gate 96%); PR #254.
 - **Next**: human review of PR #254. Natural next firing: the runner-up candidate `hook-verdict-report-two-hooks` (19/25, within 1 point), taken as pure extraction with its wire-format `gate.decision` gap filed as `canonical-gate-decision-helper`.
+
+## propose-submit-ingest-trace-seam
+
+- **Status**: proposed
+- **Score**: 20/25 (leverage 4, locality 4, blast radius 2, heat 4)
+- **Files**: ~6 estimated
+- **Modules**: `src/forseti/core/propose.py` (`propose_source`), `src/forseti/core/submit.py` (`submit_source`), `src/forseti/core/check.py` (`check_source`, store-open site), a new Core persistence-boundary leaf
+- **Summary**: Give the property-ingest persistence boundary one home — the `sqlite3.Error → PropertyStoreError` translation shared by propose/submit/check, plus the `persist=False` dry-run invariant and `record_property_proposed` trace dispatch shared by propose/submit — so the two proposer faces collapse to "read unit → build request → delegate" instead of each carrying a byte-identical epilogue held in lockstep by copied comments.
+- **First seen**: 2026-09-03
+- **Reason**: fresh candidate in the #252 semantic-loop churn; `submit.py` post-dates the prior firing's scan. Picked this run (top score); within 1 point of `hook-verdict-report-two-hooks`.
 
 ## hook-verdict-report-two-hooks
 
