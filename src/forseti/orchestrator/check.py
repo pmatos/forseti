@@ -212,7 +212,9 @@ class PropertyCheckRun:
         must not read as a clean pass just because it shares `held`'s exit
         code.
         """
-        counts = self.counts()
+        return self._outcome_for_counts(self.counts())
+
+    def _outcome_for_counts(self, counts: dict[str, int]) -> RunOutcome:
         if counts["violated"]:
             return "violated"
         if counts["unknown"]:
@@ -226,10 +228,11 @@ class PropertyCheckRun:
 
     def to_dict(self) -> dict[str, Any]:
         """A JSON-serializable dict (unit id, counts, outcome, and every verdict)."""
+        counts = self.counts()
         return {
             "unit_id": self.unit_id,
-            "counts": self.counts(),
-            "outcome": self.outcome,
+            "counts": counts,
+            "outcome": self._outcome_for_counts(counts),
             "verdicts": [verdict.to_dict() for verdict in self.verdicts],
         }
 

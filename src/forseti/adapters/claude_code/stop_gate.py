@@ -15,17 +15,25 @@ for every unit, not just one, and letting the turn end anyway would be exactly
 the silent-pass-on-bad-input this gate exists to prevent (`gate-fails-closed`).
 Fixing the env var, not editing code, is what ends that block.
 
-Also surfaces (never blocks on, issue #95): any stored semantic property whose
-`forseti check` verdict is VIOLATED for a unit the safety gate already verified
-— see `property_gate` for why this is loud-but-non-blocking rather than folded
-into `blocking_units`.
+Also blocks (issue #213) on any stored semantic property whose `forseti check`
+verdict is VIOLATED for a unit the safety gate already verified — a
+subagent-proposed contract falsified against real code, folded into the same
+`outstanding`/`stop_attempts`/`MAX_STOP_ATTEMPTS` machinery as `blocking_units`
+rather than a parallel persisted state map (see `property_gate`'s module
+docstring for why no reconciliation logic is needed for that to be safe). Every
+other semantic outcome — unresolved, failed, skipped, or deferred — stays
+loud-but-non-blocking, exactly as before (`_semantic_message`).
 """
 
 from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 from typing import Any
+
+from forseti.core.events import GATE_DECISION
+from forseti.core.events import record_event as record_core_event
 
 from . import event_log, property_gate
 from . import forseti_gate as gate
@@ -135,14 +143,17 @@ def _property_lines(
 
 
 def _semantic_message(summary: property_gate.SemanticCheckSummary) -> str:
-    """Loud, NON-blocking note for VIOLATED generated semantic properties.
+    """Loud note for every checked-semantic-property outcome; violations block.
 
     Distinct from `_residual`: a violated *semantic* property (issue #95) is a
-    subagent-proposed contract failing, not the built-in safety check the
-    turn actually blocks on (`property_gate` module docstring — this needs
-    the same prune/reconciliation machinery blocking_units already has before
-    it can safely gate the turn). Reported here so it is never silently
-    dropped even though it never contributes to `outstanding`.
+    subagent-proposed contract failing, not the built-in safety check —
+    but as of issue #213 it *does* contribute to `outstanding` the same way
+    `blocking_units` does (the outer block/residual header carries the verb;
+    this text stays neutral so it reads correctly whether the turn is
+    actually blocking on it now or reporting it as part of a residual after
+    `MAX_STOP_ATTEMPTS`). Every other outcome here (unresolved/failed/
+    skipped/deferred) never contributes to `outstanding` and is reported
+    purely so it is never silently dropped.
     """
     lines: list[str] = []
     if summary.violations:
@@ -150,7 +161,10 @@ def _semantic_message(summary: property_gate.SemanticCheckSummary) -> str:
         lines += _property_lines(
             f"⚠ Forseti: {n} generated semantic propert{_plural(n)} did NOT hold "
             "(`forseti check`, issue #95) — a subagent-proposed property failed "
-            "against real code. This is NOT currently blocking the turn:",
+            "against real code. Fix the code so the property holds; Forseti has "
+            "no command to withdraw or reclassify a stored property, so one that "
+            "is itself wrong (not a code bug) will keep blocking until the "
+            "attempt cap is hit — report that to the human if so:",
             summary.violations,
             "✗",
             lambda v: f"(k={v.get('k')})",
@@ -212,6 +226,27 @@ def _semantic_message(summary: property_gate.SemanticCheckSummary) -> str:
 def _emit(obj: dict[str, Any]) -> int:
     print(json.dumps(obj))
     return 0
+
+
+def _record_semantic_gate_decision(
+    project_dir: str, summary: property_gate.SemanticCheckSummary, decision: str
+) -> None:
+    """Core's canonical `gate.decision` event for a VIOLATED-property block (#213).
+
+    Mirrors `post_tool_use._record_gate_decision` -- the same event type Codex's
+    `verify_hook` already emits for its own gate -- so a violated-property Stop
+    decision reads the same in `events.jsonl` across harnesses. Only called when
+    `summary.violations` is non-empty; unresolved/failed/skipped/deferred never
+    drive a gate decision, so they never emit one.
+    """
+    record_core_event(
+        Path(project_dir) / ".forseti",
+        GATE_DECISION,
+        harness="claude-code",
+        adapter="claude-code-stop-gate",
+        unit_ids=[v.get("unit_id") for v in summary.violations],
+        decision=decision,
+    )
 
 
 def main() -> int:
@@ -295,17 +330,33 @@ def main() -> int:
             reason="not a git repository",
         )
 
-    # Best-effort, git-free, and never blocking on its own (module docstring):
-    # any stored semantic property for a unit the safety gate already verified.
-    # Computed once, outside the lock (it may shell out to esbmc), and folded
-    # into whichever message this call ends up emitting — allow or block.
+    # Best-effort, git-free: any stored semantic property for a unit the safety
+    # gate already verified. Computed once, outside the lock (it may shell out
+    # to esbmc) on the pruned `state` above -- `property_gate`'s own module
+    # docstring covers why a VIOLATED verdict here needs none of `state["units"]`'s
+    # persisted prune/reconciliation machinery to safely drive `outstanding`.
     semantic = property_gate.semantic_check_summary(project_dir, state)
+    semantic_blocking = bool(semantic.violations)
+
+    if semantic_blocking and not outstanding:
+        # The bookkeeping lock above ran before this (slow, esbmc-driven) check
+        # existed -- reacquire it just long enough to bump/persist the attempt
+        # counter, never to run a second slow subprocess inside a lock. Skipped
+        # when `outstanding` was already true: `attempts`/`state["stop_attempts"]`
+        # were already bumped and saved for this turn, and a violation riding
+        # along with an existing block needs no second bump (issue #213 review).
+        with gate.gate_lock(project_dir):
+            state = gate.load_state(project_dir)
+            attempts = int(state.get("stop_attempts", 0)) + 1
+            state["stop_attempts"] = attempts
+            gate.save_state(project_dir, state)
+    outstanding = outstanding or semantic_blocking
 
     # NEEDS_CONTRACT units (pointer/array, no harness yet) are honestly-unverified
-    # but a source fix can't resolve them, and a VIOLATED semantic property is a
-    # subagent-proposed contract failing rather than the built-in safety check
-    # (issue #95) — both are reported loudly here regardless of outstanding, never
-    # folded silently into either message.
+    # but a source fix can't resolve them -- reported loudly regardless of
+    # `outstanding`, never folded silently into either message. A VIOLATED
+    # semantic property is folded into `outstanding` above (issue #213); every
+    # other semantic outcome stays loud-but-non-blocking, same as needs-contract.
     notes = []
     if needs:
         notes.append(_needs_message(needs))
@@ -338,7 +389,8 @@ def main() -> int:
 
     # Fold the recorded-blocking residual, any out-of-band files, any divergent
     # staged/committed blobs, any NEEDS_CONTRACT note, and any semantic-property
-    # note into one message. Only blocking + oob + blob drive the block.
+    # note into one message. blocking + oob + blob + a VIOLATED semantic property
+    # drive the block (issue #213); everything else in `notes` rides along.
     sections = []
     if blocking:
         sections.append(_residual(blocking))
@@ -348,7 +400,7 @@ def main() -> int:
         sections.append(_blob_note(blob))
     sections += notes
     detail = "\n\n".join(sections)
-    n_out = len(blocking) + len(oob) + len(blob)
+    n_out = len(blocking) + len(oob) + len(blob) + len(semantic.violations)
 
     if attempts > gate.MAX_STOP_ATTEMPTS:
         # Allow the turn to end by OMITTING `decision` — the Stop schema only
@@ -368,6 +420,8 @@ def main() -> int:
             n_semantic_failed=semantic.failed,
             n_semantic_skipped=len(semantic.skipped),
         )
+        if semantic_blocking:
+            _record_semantic_gate_decision(project_dir, semantic, "residual")
         return _emit(
             {
                 "systemMessage": (
@@ -392,6 +446,8 @@ def main() -> int:
         n_semantic_failed=semantic.failed,
         n_semantic_skipped=len(semantic.skipped),
     )
+    if semantic_blocking:
+        _record_semantic_gate_decision(project_dir, semantic, "block")
     return _emit(
         {
             "decision": "block",

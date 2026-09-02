@@ -1,7 +1,7 @@
 {
   "name": "forseti",
   "version": "0.1.0",
-  "description": "Forseti verify-gate for Claude Code. After each C edit, ESBMC verifies the edited function at the function level (memory safety, overflow, bounds — no harness needed) and the turn cannot end until every touched unit is VERIFIED up to k. A property-check subagent (propose -> check) adds semantic/functional property checking on demand, surfaced loudly (non-blocking) at Stop. Forseti returns a verdict; the hooks own the fix loop.",
+  "description": "Forseti verify-gate for Claude Code. After each C edit, ESBMC verifies the edited function at the function level (memory safety, overflow, bounds — no harness needed) and the turn cannot end until every touched unit is VERIFIED up to k. A property-check subagent (propose -> check) adds semantic/functional property checking on demand; a VIOLATED property also blocks the turn at Stop, up to a bounded number of attempts. Forseti returns a verdict; the hooks own the fix loop.",
   "author": {
     "name": "Paulo Matos",
     "email": "p@ocmatos.com"

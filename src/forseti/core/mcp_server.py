@@ -21,7 +21,7 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-from forseti.properties import parse_candidate
+from forseti.properties import parse_candidate_list
 
 from .check import (
     DEFAULT_TIMEOUT_S as CHECK_TIMEOUT_S,
@@ -283,20 +283,10 @@ def semantic_loop_tool(
         worst-outcome-wins `outcome`: held | violated | unknown | error |
         empty -- the one field to key a gate/report decision on.
     """
-    if mode == "propose":
-        loop_mode: LoopMode = "propose"
-    elif mode == "submit":
-        loop_mode = "submit"
-    elif mode == "check_only":
-        loop_mode = "check_only"
-    else:
+    if mode not in ("propose", "submit", "check_only"):
         raise ValueError(f"mode must be one of propose|submit|check_only, got {mode!r}")
-    ladder = (
-        tuple(unwind_ladder)
-        if unwind_ladder is not None
-        else default_unwind_ladder_above(unwind)
-    )
-    specs = tuple(parse_candidate(c, i) for i, c in enumerate(candidates or ()))
+    loop_mode: LoopMode = mode
+    specs = parse_candidate_list(candidates or ())
     result = run_semantic_loop(
         Path(source),
         function=function,
@@ -312,7 +302,7 @@ def semantic_loop_tool(
         claude_bin=claude_bin,
         propose_timeout_s=propose_timeout_s,
         unwind=unwind,
-        unwind_ladder=ladder,
+        unwind_ladder=tuple(unwind_ladder) if unwind_ladder is not None else None,
         check_timeout_s=timeout_s,
         esbmc_bin=esbmc_bin,
     )

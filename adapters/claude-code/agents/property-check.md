@@ -92,7 +92,10 @@ following, in order:
 You do not decide whether the unit's *safety* verdict is clean — that is the
 v0 Stop-gate's job, already run before you were invoked. You also do not need
 to touch `.forseti/gate_state.json`: the Stop-gate itself will pick up any
-`VIOLATED` property you leave behind in the store on its own next run
-(non-blocking — it is reported loudly, not gated, until issue #95's follow-up
-lands) — your job is the semantic-loop → report loop for this one unit, right
-now, in this turn.
+`VIOLATED` property you leave behind in the store on its own next run and
+block the turn from ending on it (issue #213) — your job is the semantic-loop
+→ report loop for this one unit, right now, in this turn. Forseti has no
+command to withdraw or reclassify a stored property, so if you determine the
+property itself is wrong (not the unit's code), say so plainly to the human
+rather than repeatedly re-proposing — the Stop-gate's attempt cap is the exit
+in that case, not a code fix.
