@@ -66,7 +66,10 @@ omit = ["*/__main__.py"]
 
 [tool.coverage.report]
 show_missing = true
-exclude_also = ['if __name__ == "__main__":']
+# `case _: assert_never(x)` closes an exhaustive match over an Enum/Literal for
+# ty's benefit; by construction the match already covers every member, so the
+# wildcard clause can never run and its permanent 0% is noise, not a gap.
+exclude_also = ['if __name__ == "__main__":', "case _:\\s*$"]
 # Load-bearing, not cosmetic: coverage.py's fail-under test is
 # `round(total, precision) < fail_under`, and precision defaults to 0. At the
 # default, 95.5-95.99% rounds to 96 and passes `--cov-fail-under=96` — pytest-cov

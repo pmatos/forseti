@@ -163,6 +163,7 @@ import tempfile
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+from typing import assert_never
 
 from forseti.esbmc import (
     ListUnitsError,
@@ -176,6 +177,7 @@ from forseti.orchestrator.ladder import climb_to_terminal
 from forseti.orchestrator.ports import VerifyPort
 
 from .model import CallerCheck, CallerOutcome, DischargeResult
+from .reachability import ProbeReachability, classify_site_probe
 from .synth import (
     DEFAULT_MAX_LEN,
     OBLIGATION_LABEL_PREFIX,
@@ -682,31 +684,33 @@ def _check_caller(
     probe_harness = work_dir / f"{caller.name}__discharge_site.c"
     probe_harness.write_text(render_sidecar(plan, str(site), max_len=max_len))
     probe = raw(probe_harness, unwind=k)
-    if isinstance(probe, Violated) and OBLIGATION_SITE_LABEL_PREFIX in (
-        probe.raw_counterexample
-    ):
-        return CallerCheck(
-            caller.name,
-            CallerOutcome.DISCHARGED,
-            "reaches the call and satisfies the callee's precondition",
-            k,
-            result,
-        )
-    if isinstance(probe, Verified):
-        return CallerCheck(
-            caller.name,
-            CallerOutcome.UNREACHABLE,
-            "never reaches the call, so its pass discharges nothing",
-            k,
-            result,
-        )
-    return CallerCheck(
-        caller.name,
-        CallerOutcome.UNCHECKED,
-        f"could not confirm the call is reached ({probe.verdict.value})",
-        k,
-        result,
-    )
+    match r := classify_site_probe(probe, label=OBLIGATION_SITE_LABEL_PREFIX):
+        case ProbeReachability.REACHED:
+            return CallerCheck(
+                caller.name,
+                CallerOutcome.DISCHARGED,
+                "reaches the call and satisfies the callee's precondition",
+                k,
+                result,
+            )
+        case ProbeReachability.UNREACHABLE:
+            return CallerCheck(
+                caller.name,
+                CallerOutcome.UNREACHABLE,
+                "never reaches the call, so its pass discharges nothing",
+                k,
+                result,
+            )
+        case ProbeReachability.INCONCLUSIVE:
+            return CallerCheck(
+                caller.name,
+                CallerOutcome.UNCHECKED,
+                f"could not confirm the call is reached ({probe.verdict.value})",
+                k,
+                result,
+            )
+        case _:
+            assert_never(r)
 
 
 def _aggregate(
