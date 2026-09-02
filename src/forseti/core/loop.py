@@ -181,8 +181,14 @@ def run_semantic_loop(
         case "submit":
             assert provider is not None
             assert model is not None
-            ingestion = tuple(
-                submit_source(
+            # `submit_source` validates one candidate per call, so `max_candidates`
+            # must be tracked across calls here -- passing the same bound to every
+            # call would let each call's own 1-item batch pass `_accept_reject`'s
+            # `len(accepted) >= max_candidates` check and defeat the cap entirely.
+            submitted = []
+            accepted_count = 0
+            for candidate in candidates:
+                result = submit_source(
                     source,
                     function=function,
                     expression=candidate.expression,
@@ -195,10 +201,11 @@ def run_semantic_loop(
                     prompt_version=prompt_version,
                     persist=True,
                     store_root=store_root,
-                    max_candidates=max_candidates,
+                    max_candidates=max(max_candidates - accepted_count, 0),
                 )
-                for candidate in candidates
-            )
+                accepted_count += len(result.accepted)
+                submitted.append(result)
+            ingestion = tuple(submitted)
         case "check_only":
             ingestion = ()
         case _:

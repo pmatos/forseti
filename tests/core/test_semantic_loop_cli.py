@@ -230,6 +230,121 @@ def test_cli_propose_mode_rejects_candidates_json(
     assert "propose" in err
 
 
+def test_cli_submit_mode_all_rejected_exits_nonzero_despite_prior_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = _write_unit(tmp_path)
+    root = tmp_path / ".forseti"
+    good = tmp_path / "good.json"
+    good.write_text(
+        json.dumps([{"expression": "result >= 0", "domain": ["x > INT64_MIN"]}])
+    )
+    # One verify per submit-mode call: the second call's check phase
+    # re-verifies the still-CANDIDATE property the first call persisted.
+    _patch_verify(monkeypatch, FakeVerify([Verified(_meta()), Verified(_meta())]))
+    code = main(
+        [
+            "semantic-loop",
+            str(source),
+            "--function",
+            "my_abs",
+            "--mode",
+            "submit",
+            "--candidates-json",
+            str(good),
+            "--provider",
+            "codex",
+            "--model",
+            "gpt-5.1",
+            "--store-root",
+            str(root),
+        ]
+    )
+    assert code == 0
+    capsys.readouterr()
+
+    # A second submission where every candidate is rejected must not exit 0
+    # just because the store already holds an earlier HELD property.
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps([{"expression": "bogus_ident >= 0"}]))
+    code = main(
+        [
+            "semantic-loop",
+            str(source),
+            "--function",
+            "my_abs",
+            "--mode",
+            "submit",
+            "--candidates-json",
+            str(bad),
+            "--provider",
+            "codex",
+            "--model",
+            "gpt-5.1",
+            "--store-root",
+            str(root),
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["outcome"] == "held"
+    assert code == 1
+
+
+def test_cli_candidates_json_domain_must_be_a_list(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = _write_unit(tmp_path)
+    candidates = tmp_path / "candidates.json"
+    candidates.write_text(
+        json.dumps([{"expression": "result >= 0", "domain": "x > 0"}])
+    )
+    code = main(
+        [
+            "semantic-loop",
+            str(source),
+            "--function",
+            "my_abs",
+            "--mode",
+            "submit",
+            "--candidates-json",
+            str(candidates),
+            "--provider",
+            "codex",
+            "--model",
+            "gpt-5.1",
+        ]
+    )
+    assert code == 1
+    assert "list of strings" in capsys.readouterr().err
+
+
+def test_cli_candidates_json_null_expression(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = _write_unit(tmp_path)
+    candidates = tmp_path / "candidates.json"
+    candidates.write_text(json.dumps([{"expression": None}]))
+    code = main(
+        [
+            "semantic-loop",
+            str(source),
+            "--function",
+            "my_abs",
+            "--mode",
+            "submit",
+            "--candidates-json",
+            str(candidates),
+            "--provider",
+            "codex",
+            "--model",
+            "gpt-5.1",
+        ]
+    )
+    assert code == 1
+    assert "expression" in capsys.readouterr().err
+
+
 def test_cli_candidates_json_not_a_list(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

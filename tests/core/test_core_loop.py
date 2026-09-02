@@ -135,6 +135,36 @@ def test_submit_mode_batches_candidates_without_swallowing_a_rejection(
     assert result.check.counts()["held"] == 1
 
 
+def test_submit_mode_enforces_max_candidates_across_the_whole_batch(
+    tmp_path: Path,
+) -> None:
+    source = _write_unit(tmp_path)
+    root = tmp_path / ".forseti"
+
+    result = run_semantic_loop(
+        source,
+        function="my_abs",
+        mode="submit",
+        max_candidates=2,
+        candidates=(
+            CandidateSpec(expression="result >= 0", domain=("x > INT64_MIN",)),
+            CandidateSpec(expression="result >= x", domain=("x > INT64_MIN",)),
+            CandidateSpec(expression="result >= -x", domain=("x > INT64_MIN",)),
+        ),
+        provider="codex",
+        model="gpt-5.1",
+        store_root=root,
+        verify_port=FakeVerify([Verified(_meta()), Verified(_meta())]),
+    )
+
+    # Each `submit_source` call only ever sees a 1-item batch, so the cap must
+    # be tracked across calls -- a per-call `max_candidates` would never trip.
+    assert len(result.ingestion) == 3
+    assert sum(len(r.accepted) for r in result.ingestion) == 2
+    assert result.ingestion[2].rejected
+    assert result.ingestion[2].rejected[0].reason == "over max_candidates"
+
+
 def test_submit_mode_requires_at_least_one_candidate(tmp_path: Path) -> None:
     source = _write_unit(tmp_path)
     with pytest.raises(ValueError, match="at least one candidate"):

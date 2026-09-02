@@ -100,6 +100,7 @@ from forseti.properties import (
     PropertyStoreError,
     ProposalParseError,
     ProposalResult,
+    parse_candidate,
 )
 from forseti.update_notice import installed_version, update_notice
 
@@ -764,8 +765,11 @@ def _parse_candidates_json(path: Path) -> tuple[CandidateSpec, ...]:
     """A JSON array of candidate objects -> `CandidateSpec`s.
 
     Raises `ValueError` (malformed JSON, not a list, or a candidate missing
-    `expression`) so the CLI can report one clean diagnostic rather than a
-    bare `KeyError`/`TypeError` traceback.
+    `expression` or holding a wrongly-typed field) so the CLI can report one
+    clean diagnostic rather than a bare `KeyError`/`TypeError` traceback. Each
+    element is validated by `parse_candidate`, the same per-candidate parser
+    `parse_candidates` (LLM output) uses, so a host-submitted batch can't
+    bypass a type check an LLM-proposed one is held to.
     """
     try:
         raw = json.loads(path.read_text())
@@ -773,19 +777,10 @@ def _parse_candidates_json(path: Path) -> tuple[CandidateSpec, ...]:
         raise ValueError(f"{path}: invalid JSON ({exc})") from exc
     if not isinstance(raw, list):
         raise ValueError(f"{path}: must contain a JSON array of candidate objects")
-    candidates = []
-    for index, entry in enumerate(raw):
-        if not isinstance(entry, dict) or "expression" not in entry:
-            raise ValueError(f"{path}: candidate {index} is missing 'expression'")
-        candidates.append(
-            CandidateSpec(
-                expression=entry["expression"],
-                domain=tuple(entry.get("domain", ())),
-                referenced_params=tuple(entry.get("referenced_params", ())),
-                rationale=entry.get("rationale", ""),
-            )
-        )
-    return tuple(candidates)
+    try:
+        return tuple(parse_candidate(entry, index) for index, entry in enumerate(raw))
+    except ProposalParseError as exc:
+        raise ValueError(f"{path}: {exc}") from exc
 
 
 def _render_semantic_loop(result: SemanticLoopResult) -> str:
@@ -868,6 +863,13 @@ def _run_semantic_loop(args: argparse.Namespace) -> int:
         print(json.dumps(result.to_dict()))
     else:
         print(_render_semantic_loop(result))
+    if loop_mode == "submit" and not any(r.accepted for r in result.ingestion):
+        # Every submitted candidate was rejected -- `result.check`'s outcome
+        # reflects whatever the store already held before this call, which can
+        # read as a clean pass (e.g. an earlier HELD property) even though this
+        # submission accepted nothing. Mirror `_run_submit_property`'s own
+        # accepted-or-fail exit code instead of the unrelated check outcome.
+        return 1
     return _check_exit_code(result.check)
 
 

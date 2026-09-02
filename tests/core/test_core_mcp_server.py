@@ -247,6 +247,21 @@ def test_semantic_loop_tool_rejects_an_unknown_mode(tmp_path: Path) -> None:
         semantic_loop_tool(str(source), "my_abs", "bogus-mode")
 
 
+def test_semantic_loop_tool_submit_mode_rejects_non_list_domain(tmp_path: Path) -> None:
+    source = tmp_path / "abs_unit.c"
+    source.write_text(_ABS_SLICE)
+    with pytest.raises(ValueError, match="list of strings"):
+        semantic_loop_tool(
+            str(source),
+            "my_abs",
+            "submit",
+            store_root=str(tmp_path / ".forseti"),
+            candidates=[{"expression": "result >= 0", "domain": "x > 0"}],
+            provider="codex",
+            model="gpt-5.1",
+        )
+
+
 @needs_esbmc
 def test_semantic_loop_tool_propose_mode_ingests_via_the_llm_proposer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

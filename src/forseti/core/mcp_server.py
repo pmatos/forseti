@@ -21,7 +21,7 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-from forseti.properties import CandidateSpec
+from forseti.properties import parse_candidate
 
 from .check import (
     DEFAULT_TIMEOUT_S as CHECK_TIMEOUT_S,
@@ -296,15 +296,7 @@ def semantic_loop_tool(
         if unwind_ladder is not None
         else default_unwind_ladder_above(unwind)
     )
-    specs = tuple(
-        CandidateSpec(
-            expression=str(c["expression"]),
-            domain=tuple(str(d) for d in c.get("domain") or ()),
-            referenced_params=tuple(str(p) for p in c.get("referenced_params") or ()),
-            rationale=str(c.get("rationale") or ""),
-        )
-        for c in (candidates or ())
-    )
+    specs = tuple(parse_candidate(c, i) for i, c in enumerate(candidates or ()))
     result = run_semantic_loop(
         Path(source),
         function=function,
