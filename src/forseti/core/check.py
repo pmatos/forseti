@@ -46,13 +46,13 @@ harness triggered the check.
 
 from __future__ import annotations
 
-import sqlite3
 import uuid
 from collections.abc import Sequence
 from functools import partial
 from pathlib import Path
 
 from forseti.core.events import PROPERTY_CHECK_START, PROPERTY_VERDICT, record_event
+from forseti.core.persistence import open_store
 from forseti.core.propose import DEFAULT_STORE_ROOT
 from forseti.esbmc import verify
 from forseti.orchestrator import (
@@ -63,7 +63,6 @@ from forseti.orchestrator import (
     check_properties,
 )
 from forseti.precond.verify import escalating_port
-from forseti.properties import PropertyStore, PropertyStoreError
 
 # The CLI's own default: a human or a subagent invoking `forseti check`
 # directly owns its own time budget, so it can afford a short ladder — a
@@ -157,30 +156,25 @@ def check_source(
             no_unwinding_assertions=False,
         )
     )
-    try:
-        with PropertyStore.open(store_root) as store:
-            record_event(store_root, PROPERTY_CHECK_START, unit_id=unit.unit_id)
-            run = check_properties(
-                unit,
-                store=store,
-                render=SemanticHarnessWriter(),
-                verify=verify_fn,
-                # A per-invocation subdirectory, not the shared `check-work`
-                # root: `check_properties` derives a *deterministic* filename
-                # from the unit/property IDs, so two overlapping invocations
-                # against the same unit (a subagent's own `forseti check`
-                # racing the Stop-gate's) would otherwise write, read, and
-                # overwrite the same path -- one process could verify a
-                # harness the other just clobbered mid-write, or read a
-                # half-written file (issue #95 review).
-                work_dir=store_root / _WORK_SUBDIR / uuid.uuid4().hex,
-                unwind=unwind,
-                unwind_ladder=unwind_ladder,
-            )
-    except sqlite3.Error as exc:
-        raise PropertyStoreError(
-            f"property store error at {store_root}: {exc}"
-        ) from exc
+    with open_store(store_root) as store:
+        record_event(store_root, PROPERTY_CHECK_START, unit_id=unit.unit_id)
+        run = check_properties(
+            unit,
+            store=store,
+            render=SemanticHarnessWriter(),
+            verify=verify_fn,
+            # A per-invocation subdirectory, not the shared `check-work`
+            # root: `check_properties` derives a *deterministic* filename
+            # from the unit/property IDs, so two overlapping invocations
+            # against the same unit (a subagent's own `forseti check`
+            # racing the Stop-gate's) would otherwise write, read, and
+            # overwrite the same path -- one process could verify a
+            # harness the other just clobbered mid-write, or read a
+            # half-written file (issue #95 review).
+            work_dir=store_root / _WORK_SUBDIR / uuid.uuid4().hex,
+            unwind=unwind,
+            unwind_ladder=unwind_ladder,
+        )
     for verdict in run.verdicts:
         record_event(
             store_root,

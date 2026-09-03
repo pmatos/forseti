@@ -17,18 +17,15 @@ traceability -- never invoked, never guessed.
 
 from __future__ import annotations
 
-import sqlite3
 from collections.abc import Sequence
 from pathlib import Path
 
-from forseti.core.events import record_property_proposed
+from forseti.core.persistence import persist_proposal
 from forseti.core.propose import DEFAULT_STORE_ROOT
 from forseti.properties import (
     CandidateSpec,
     HarnessError,
     PromptTemplate,
-    PropertyStore,
-    PropertyStoreError,
     ProposalRequest,
     ProposalResult,
     UnitSignature,
@@ -97,32 +94,16 @@ def submit_source(
         rationale=rationale,
     )
 
-    if not persist:
-        # No event recorded: `record_event` would create `store_root` (its
-        # parent `mkdir`), breaking the "dry run touches nothing" contract
-        # `propose_source` also holds itself to -- a candidate never
-        # persisted has nothing durable to trace either.
-        return submit_candidates(
+    return persist_proposal(
+        lambda store: submit_candidates(
             request,
             (spec,),
             provider=provider,
             model=model,
+            store=store,
             max_candidates=max_candidates,
-        )
-
-    try:
-        with PropertyStore.open(store_root) as store:
-            result = submit_candidates(
-                request,
-                (spec,),
-                provider=provider,
-                model=model,
-                store=store,
-                max_candidates=max_candidates,
-            )
-    except sqlite3.Error as exc:
-        raise PropertyStoreError(
-            f"property store error at {store_root}: {exc}"
-        ) from exc
-    record_property_proposed(store_root, result, channel="submitted")
-    return result
+        ),
+        persist=persist,
+        store_root=store_root,
+        channel="submitted",
+    )
