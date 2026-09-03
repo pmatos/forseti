@@ -6,13 +6,23 @@ same ideas. Reconciled against `gh` at the start of every run.
 
 ## check-source-ladder-default
 
-- **Status**: proposed
+- **Status**: in-flight
 - **Score**: 20/25 (leverage 4, locality 4, blast radius 2, heat 4)
 - **Files**: ~4 estimated
 - **Modules**: `src/forseti/core/check.py` (`check_source`, `default_unwind_ladder_above`), `src/forseti/core/cli.py` (`_run_check`), `src/forseti/core/mcp_server.py` (`check_tool`), `src/forseti/core/loop.py` (`run_semantic_loop`)
 - **Summary**: Make `check_source` own its unwind-ladder default (`unwind_ladder=None → default_unwind_ladder_above(unwind)` internally) so its three callers stop repeating the `None → derive` branch and a direct `check_source(unwind=8)` stops raising on the `(8,8,16)` collision. Pure deepening, no wire change: the CLI/MCP boundaries already default to the derived ladder.
 - **First seen**: 2026-09-04
+- **PR**: #267
 - **Reason**: picked this run (top score, 20/25); within 1 point of the perennial runner-up `hook-verdict-report-two-hooks` (19/25), taken on the deterministic tie-break (heat) and on being pinnable esbmc-free.
+
+### Run 2026-09-04 — complete
+
+- **Outcome**: complete
+- **Stopped at**: step 6 — PR opened; work landed on branch
+- **Branch**: `pm-deepen/check-source-ladder-default` — *created* as `pm-deepen/run-2026-09-04-0102` from `origin/main` and renamed at step 2. Branch adoption was **refused** at step 0 on condition 3: the firing branch (`sym/forseti/routine/refactor-audit/01M1MR2N0S`) had an upstream (`@{u}` resolved to `origin/main`), so it was not a made-for-this-run, no-upstream branch.
+- **Committed**: review report + design pass, the `refactor(core)` implementation (check_source owns its ladder default; three callers forward through; new `test_core_check.py`/`test_core_loop.py` pins), and this backlog update.
+- **Evidence**: quality gate green — ruff check + ruff format --check + ty check + pytest (1552 passed, 1 skipped, ESBMC-gated included); project coverage 97.81% (gate 96%); PR #267.
+- **Next**: human review of PR #267 (do not merge as part of the routine). Natural next firing: the perennial runner-up `hook-verdict-report-two-hooks` (19/25) — but add an esbmc-free characterization test for `post_bash._report` first (pinned only behind `@skipif(not _HAVE_ESBMC)` today).
 
 ## precond-reachability-probe-tri-state
 
