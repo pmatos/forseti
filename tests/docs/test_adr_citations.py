@@ -1,5 +1,5 @@
-"""Every `ADR-NNNN` or `ADR-YYYY-MM-DD` cited in the tree must resolve to a
-`docs/adr/` record.
+"""Every `ADR-NNNN` or `ADR-YYYY-MM-DD-HHMM` cited in the tree must resolve to
+a `docs/adr/` record.
 
 #103: `ADR-0009` (D1-D4) was cited 22 times across `properties/`,
 `orchestrator/` and `core/propose.py` while `docs/adr/` stopped at 0008 -- the
@@ -22,11 +22,12 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ADR_DIR = REPO_ROOT / "docs" / "adr"
 
-# New ADRs are dated (YYYY-MM-DD-slug.md) instead of hand-numbered, so a
-# hand-picked number can no longer collide across concurrent PRs the way
-# 0001-0009 could have. Both forms are recognized: legacy numbers stay
-# frozen, new records key by date.
-_DATE = r"\d{4}-\d{2}-\d{2}"
+# New ADRs are timestamped (YYYY-MM-DD-HHMM-slug.md) instead of
+# hand-numbered, so a hand-picked number can no longer collide across
+# concurrent PRs the way 0001-0009 could have. A bare date is not enough --
+# more than one ADR can land in a day. Both forms are recognized: legacy
+# numbers stay frozen, new records key by minute-precision timestamp.
+_DATE = r"\d{4}-\d{2}-\d{2}-\d{4}"
 _CITATION = re.compile(rf"ADR-({_DATE}|\d+)")
 _RECORD_NAME = re.compile(rf"^({_DATE}|\d{{4}})-[a-z0-9-]+\.md$")
 _INDEX_LINK = re.compile(
@@ -161,17 +162,17 @@ def test_duplicate_numbers_are_reported_not_overwritten(tmp_path: Path) -> None:
 
 
 def test_dated_records_are_recognized(tmp_path: Path) -> None:
-    """A YYYY-MM-DD-slug.md record groups by date, same as NNNN-slug.md by number."""
-    for name in ("0001-legacy.md", "2026-09-03-dated.md"):
+    """A dated record groups by its timestamp, like NNNN-slug.md groups by number."""
+    for name in ("0001-legacy.md", "2026-09-03-1430-dated.md"):
         (tmp_path / name).write_text(f"# stub {name}\n", encoding="utf-8")
 
     records = _records(tmp_path)
-    assert sorted(records) == ["0001", "2026-09-03"]
+    assert sorted(records) == ["0001", "2026-09-03-1430"]
 
 
 def test_normalize_leaves_dated_ids_alone() -> None:
     assert _normalize("9") == "0009"
-    assert _normalize("2026-09-03") == "2026-09-03"
+    assert _normalize("2026-09-03-1430") == "2026-09-03-1430"
 
 
 def test_every_record_is_listed_in_the_index() -> None:

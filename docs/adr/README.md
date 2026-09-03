@@ -9,9 +9,10 @@ accepted — to change one, add a new ADR that supersedes it.
 Don't renumber or reuse a number from this range — they're cited elsewhere in the tree as
 `ADR-0007` etc., and `tests/docs/test_adr_citations.py` checks those citations resolve.
 
-New ADRs use `docs/adr/YYYY-MM-DD-slug.md` instead, dated the day the ADR is authored, and
-are cited as `ADR-YYYY-MM-DD`. Two authors can't independently pick the same real-world date
-and slug the way they could pick the same next integer, so there's no more numbering-collision
+New ADRs use `docs/adr/YYYY-MM-DD-HHMM-slug.md` instead (UTC, 24h clock), timestamped when
+the ADR is authored, and are cited as `ADR-YYYY-MM-DD-HHMM`. A bare date isn't enough — more
+than one ADR can land in a day — but two authors can't independently pick the same real-world
+minute the way they could pick the same next integer, so there's no more numbering-collision
 class for `test_no_two_records_share_a_number` to catch among new records — a genuine clash
 becomes an ordinary git filename conflict instead.
 
