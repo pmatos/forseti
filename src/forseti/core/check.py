@@ -81,10 +81,11 @@ _WORK_SUBDIR = "check-work"
 def default_unwind_ladder_above(unwind: int) -> tuple[int, ...]:
     """`DEFAULT_UNWIND_LADDER` rungs above `unwind`.
 
-    Callers that expose their own `--unwind`/`unwind` but not
-    `unwind_ladder` derive the ladder this way so a caller-chosen unwind
-    (e.g. `-k 8`) doesn't collide with the fixed default rungs and raise
-    ValueError in `check_source` (issue #95 review).
+    `check_source` derives its ladder this way when `unwind_ladder is None`, so a
+    caller-chosen unwind (e.g. `-k 8`) doesn't collide with the fixed default
+    rungs and raise `ValueError` (issue #95 review). Kept public because the CLI
+    and MCP faces name it in their `--unwind-ladder` help / tool-schema docs as
+    the documented default.
     """
     return tuple(k for k in DEFAULT_UNWIND_LADDER if k > unwind)
 
@@ -95,7 +96,7 @@ def check_source(
     function: str,
     store_root: Path = DEFAULT_STORE_ROOT,
     unwind: int = DEFAULT_UNWIND,
-    unwind_ladder: tuple[int, ...] = DEFAULT_UNWIND_LADDER,
+    unwind_ladder: tuple[int, ...] | None = None,
     timeout_s: float | None = DEFAULT_TIMEOUT_S,
     extra_flags: Sequence[str] = (),
     esbmc_bin: str = "esbmc",
@@ -110,6 +111,17 @@ def check_source(
     it along `(unwind, *unwind_ladder)` — escalating on `UNKNOWN`, never
     silently settling below the ladder's own terminal verdict. A reachability
     property is `SKIPPED` (deferred, ADR-0009 D2), never verified.
+
+    `unwind_ladder` defaults to `None`, meaning "derive
+    `default_unwind_ladder_above(unwind)`" — the rungs of `DEFAULT_UNWIND_LADDER`
+    strictly above `unwind`, so a caller-raised `unwind` (e.g. `-k 8`) never
+    collides with a fixed default rung to build a non-increasing ladder and raise
+    `ValueError` (issue #95 review). An explicit `unwind_ladder` — including `()`
+    ("verify once, no escalation") — passes through untouched, so a genuinely
+    bad *explicit* ladder still surfaces its clean `ValueError`. This is why the
+    three faces that expose their own `unwind` (the CLI, the MCP tool, and the
+    semantic loop) can forward their unset ladder straight through instead of
+    each re-deriving it.
 
     Verifies with unwinding assertions ON (`no_unwinding_assertions=False`,
     wrapped in `precond.verify.escalating_port` — the same combination S2's
@@ -147,6 +159,11 @@ def check_source(
     an esbmc binary on PATH.
     """
     unit = Unit.from_path(source, function)
+    ladder = (
+        unwind_ladder
+        if unwind_ladder is not None
+        else default_unwind_ladder_above(unwind)
+    )
     verify_fn = verify_port or escalating_port(
         partial(
             verify,
@@ -173,7 +190,7 @@ def check_source(
             # half-written file (issue #95 review).
             work_dir=store_root / _WORK_SUBDIR / uuid.uuid4().hex,
             unwind=unwind,
-            unwind_ladder=unwind_ladder,
+            unwind_ladder=ladder,
         )
     for verdict in run.verdicts:
         record_event(

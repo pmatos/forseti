@@ -55,7 +55,6 @@ from forseti.core.check import (
 )
 from forseti.core.check import (
     check_source,
-    default_unwind_ladder_above,
 )
 from forseti.core.propose import (
     DEFAULT_MAX_CANDIDATES,
@@ -143,9 +142,10 @@ def run_semantic_loop(
     `provider`/`model` (the same `BlankProvenanceError` guard `submit_source`
     itself enforces); `mode="propose"` and `mode="check_only"` take no
     `candidates` — passing any is a caller error (`ValueError`), not silently
-    ignored. `unwind_ladder` defaults to `default_unwind_ladder_above(unwind)`
-    exactly as the `check` CLI/MCP faces do, so a caller-chosen `unwind`
-    doesn't collide with the fixed default rungs.
+    ignored. `unwind_ladder` defaults to `None` and forwards through to
+    `check_source`, which derives the rungs above `unwind` itself — so a
+    caller-chosen `unwind` doesn't collide with the fixed default rungs, the
+    same as the `check` CLI/MCP faces.
 
     Every persisted candidate and every checked property still emits Core's
     own canonical events (`property.proposed`, `property.check.start`,
@@ -211,17 +211,14 @@ def run_semantic_loop(
         case _:
             assert_never(mode)
 
-    ladder = (
-        unwind_ladder
-        if unwind_ladder is not None
-        else default_unwind_ladder_above(unwind)
-    )
     check = check_source(
         source,
         function=function,
         store_root=store_root,
         unwind=unwind,
-        unwind_ladder=ladder,
+        # `None` forwards straight through: check_source derives the ladder
+        # above `unwind`, the same as the check CLI/MCP faces.
+        unwind_ladder=unwind_ladder,
         timeout_s=check_timeout_s,
         extra_flags=extra_flags,
         esbmc_bin=esbmc_bin,
