@@ -27,21 +27,6 @@ env:
   ESBMC_SHA256: "982097d9987c40cd66bfcf1c7cb12a27cab89903571fe815a566e403345f04ab"
 
 jobs:
-  adr-numbers:
-    name: ADR numbers
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Reject newly ambiguous ADR numbers
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: node scripts/check-adr-numbers.mjs --base "$BASE_SHA"
-
   test:
     runs-on: ubuntu-24.04
     steps:

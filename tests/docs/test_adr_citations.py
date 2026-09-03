@@ -1,4 +1,5 @@
-"""Every `ADR-NNNN` cited in the tree must resolve to a record in `docs/adr/`.
+"""Every `ADR-NNNN` or `ADR-YYYY-MM-DD` cited in the tree must resolve to a
+`docs/adr/` record.
 
 #103: `ADR-0009` (D1-D4) was cited 22 times across `properties/`,
 `orchestrator/` and `core/propose.py` while `docs/adr/` stopped at 0008 -- the
@@ -21,9 +22,16 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ADR_DIR = REPO_ROOT / "docs" / "adr"
 
-_CITATION = re.compile(r"ADR-(\d+)")
-_RECORD_NAME = re.compile(r"^(\d{4})-[a-z0-9-]+\.md$")
-_INDEX_LINK = re.compile(r"\[\d{4}\]\((\d{4}-[a-z0-9-]+\.md)\)")
+# New ADRs are dated (YYYY-MM-DD-slug.md) instead of hand-numbered, so a
+# hand-picked number can no longer collide across concurrent PRs the way
+# 0001-0009 could have. Both forms are recognized: legacy numbers stay
+# frozen, new records key by date.
+_DATE = r"\d{4}-\d{2}-\d{2}"
+_CITATION = re.compile(rf"ADR-({_DATE}|\d+)")
+_RECORD_NAME = re.compile(rf"^({_DATE}|\d{{4}})-[a-z0-9-]+\.md$")
+_INDEX_LINK = re.compile(
+    rf"\[(?:{_DATE}|\d{{4}})\]\(((?:{_DATE}|\d{{4}})-[a-z0-9-]+\.md)\)"
+)
 
 # semantic-release regenerates CHANGELOG.md from commit subjects; a citation
 # there is frozen history no contributor can fix without rewriting it.
@@ -31,8 +39,8 @@ _SKIPPED_FILES = frozenset({"CHANGELOG.md"})
 
 
 def _normalize(number: str) -> str:
-    """`9` and `0009` name the same record; compare on the canonical form."""
-    return f"{int(number):04d}"
+    """`9` and `0009` name the same legacy record; a dated id is already canonical."""
+    return number if "-" in number else f"{int(number):04d}"
 
 
 def _tracked_files(directory: Path = REPO_ROOT) -> list[Path]:
@@ -150,6 +158,20 @@ def test_duplicate_numbers_are_reported_not_overwritten(tmp_path: Path) -> None:
     ]
     assert sorted(records) == ["0010", "0011"]
     assert _duplicates(records) == {"0010": ["0010-first.md", "0010-second.md"]}
+
+
+def test_dated_records_are_recognized(tmp_path: Path) -> None:
+    """A YYYY-MM-DD-slug.md record groups by date, same as NNNN-slug.md by number."""
+    for name in ("0001-legacy.md", "2026-09-03-dated.md"):
+        (tmp_path / name).write_text(f"# stub {name}\n", encoding="utf-8")
+
+    records = _records(tmp_path)
+    assert sorted(records) == ["0001", "2026-09-03"]
+
+
+def test_normalize_leaves_dated_ids_alone() -> None:
+    assert _normalize("9") == "0009"
+    assert _normalize("2026-09-03") == "2026-09-03"
 
 
 def test_every_record_is_listed_in_the_index() -> None:
