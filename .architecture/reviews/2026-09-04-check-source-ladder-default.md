@@ -238,4 +238,66 @@ is pinnable esbmc-free through `check_source`'s own interface today.
 
 ## Design
 
-Written at step 4 (design-it-twice), after this report was first committed. See below.
+Design-it-twice, three parallel `Plan` sub-agents each briefed for a *radically
+different* interface, all constrained to keep the seam at `check_source` (per
+the blast-radius cap: pushing the default into `orchestrator/ladder.py` drags in
+`run_loop` and blows the ~4-file estimate). Adjudicated by this run, which
+authored none of the three.
+
+### Winner — sentinel-`None` (minimal surface)
+
+`check_source(..., unwind_ladder: tuple[int, ...] | None = None)`, resolved by
+one line at the top of the body:
+
+```python
+ladder = unwind_ladder if unwind_ladder is not None else default_unwind_ladder_above(unwind)
+```
+
+`None` is the sentinel for "not specified → derive rungs above `unwind`"; any
+explicit tuple — including `()` ("verify once, no escalation") — passes through
+verbatim to `validated_ladder`, which still raises cleanly on a bad *explicit*
+ladder. Each caller drops its `None → derive` branch and forwards its already-
+`None`-able param; the MCP face keeps only its `list → tuple` wire coercion.
+`default_unwind_ladder_above` stays a public helper of `check.py`, now called by
+`check_source` too. **4 files, no existing test changed** (a new direct-caller
+test is added). Two design agents (the "minimal surface" and "most common caller"
+briefs) converged on this shape independently.
+
+### Runner-up design — `Ladder` value object (maximum encapsulation)
+
+A frozen `Ladder(base, rungs)` dataclass owning validation and a
+`default_above(base)` / `resolve(base, rungs)` constructor, with
+`check_source(..., ladder: Ladder = DEFAULT_LADDER)`. It **lost** on three of the
+five criteria: (3) *seam placement* — `Ladder` has a single consumer;
+`check_source` unpacks it straight back to a `(base, rungs)` pair because the
+orchestrator (`validated_ladder`, `verify_ladder`, `run_loop`) still speaks
+pairs, so it is a hypothetical one-adapter seam, not a real one; (4) *test
+surface* — it churns the existing `unwind_ladder=` direct-call test
+(`test_core_check.py:125-129`) into a `ladder=Ladder(...)` call; (5) *blast
+radius* — ~5 files and a `DEFAULT_LADDER` constant, with validation running twice
+(the type's `__post_init__` and the downstream `validated_ladder`). Its
+encapsulation "depth" is illusory here: with only one consumer, the value object
+adds ceremony a caller must learn without a second caller to justify the seam.
+The right time to revisit it is when a second consumer needs a validated ladder
+that is *not* immediately unpacked.
+
+### Rejected sub-variant — auto-drop colliding rungs
+
+Having `check_source` silently drop rungs `<= unwind` from *any* ladder was
+considered and rejected: it repairs an explicitly-passed bad ladder instead of
+raising, breaking `test_cli_check_explicit_ladder_still_raises_a_clean_diagnostic`
+(and risking a false exit-1 that masks the missing ladder error). The seam must
+distinguish "not specified" (`None`) from "specified wrong" (raise) — which the
+sentinel-`None` winner does.
+
+### Test-first plan (step 5)
+
+Red test pinning the deepened interface: `check_source(source, function=…,
+unwind=8)` with **no** `unwind_ladder` — today raises `ValueError` on the
+`(8, 8, 16)` collision; after, derives `(16,)` and verifies (asserted esbmc-free
+via an injected `verify_port` fake, checking the ladder actually used). Caller-
+branch removals stay pinned by the existing
+`test_cli_check_unwind_above_default_ladder_floor_does_not_crash` (CLI derive),
+`test_check_tool_reports_held_and_violated` (MCP derive, calls `check_tool` with
+no ladder), and the loop suite; a loop-level characterization test asserting the
+derived ladder is added if the removal is otherwise unpinned there.
