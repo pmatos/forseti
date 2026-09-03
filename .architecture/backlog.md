@@ -4,6 +4,16 @@ Persisted candidate memory for `pm-deepen`. Statuses change; rows are never dele
 `landed`/`dropped`/`rejected` rows are the memory that stops a recurring run re-deriving the
 same ideas. Reconciled against `gh` at the start of every run.
 
+## check-source-ladder-default
+
+- **Status**: proposed
+- **Score**: 20/25 (leverage 4, locality 4, blast radius 2, heat 4)
+- **Files**: ~4 estimated
+- **Modules**: `src/forseti/core/check.py` (`check_source`, `default_unwind_ladder_above`), `src/forseti/core/cli.py` (`_run_check`), `src/forseti/core/mcp_server.py` (`check_tool`), `src/forseti/core/loop.py` (`run_semantic_loop`)
+- **Summary**: Make `check_source` own its unwind-ladder default (`unwind_ladder=None → default_unwind_ladder_above(unwind)` internally) so its three callers stop repeating the `None → derive` branch and a direct `check_source(unwind=8)` stops raising on the `(8,8,16)` collision. Pure deepening, no wire change: the CLI/MCP boundaries already default to the derived ladder.
+- **First seen**: 2026-09-04
+- **Reason**: picked this run (top score, 20/25); within 1 point of the perennial runner-up `hook-verdict-report-two-hooks` (19/25), taken on the deterministic tie-break (heat) and on being pinnable esbmc-free.
+
 ## precond-reachability-probe-tri-state
 
 - **Status**: landed
@@ -25,7 +35,7 @@ same ideas. Reconciled against `gh` at the start of every run.
 
 ## propose-submit-ingest-trace-seam
 
-- **Status**: in-flight
+- **Status**: landed
 - **Score**: 20/25 (leverage 4, locality 4, blast radius 2, heat 4)
 - **Files**: ~6 estimated
 - **Modules**: `src/forseti/core/propose.py` (`propose_source`), `src/forseti/core/submit.py` (`submit_source`), `src/forseti/core/check.py` (`check_source`, store-open site), new leaf `src/forseti/core/persistence.py`
@@ -43,6 +53,10 @@ same ideas. Reconciled against `gh` at the start of every run.
 - **Evidence**: quality gate green — ruff check + ruff format --check + ty check + pytest (1547 passed, 1 skipped, ESBMC-gated included); project coverage 97.82% (gate 96%), `core/persistence.py` 100%; PR #262.
 - **Next**: human review of PR #262 (do not merge as part of the routine). Natural next firing: the runner-up candidate `hook-verdict-report-two-hooks` (19/25, within 1 point), a pure extraction of the duplicated `UnitVerdict[] → report` transform across the two PostToolUse hooks.
 
+### Run 2026-09-04 — reconciled
+
+- **Outcome**: reconciled `in-flight` → `landed`. PR #262 merged 2026-09-03 (`gh pr view 262`); confirmed on `origin/main` as `5625201`.
+
 ## hook-verdict-report-two-hooks
 
 - **Status**: proposed
@@ -51,7 +65,17 @@ same ideas. Reconciled against `gh` at the start of every run.
 - **Modules**: `src/forseti/adapters/claude_code/post_tool_use.py`, `post_bash.py`, `stop_gate.py`
 - **Summary**: Extract the near-verbatim `UnitVerdict[] → (events, message, exit code)` transform copied across the two PostToolUse hooks into one `verdict_report` module; scored as pure deepening (the `post_bash` canonical-event fix is excluded as a wire-format change).
 - **First seen**: 2026-09-02
-- **Reason**: runner-up candidate, within 1 point of the pick — natural next firing.
+- **Reason**: runner-up candidate this run too (19/25, within 1 point of `check-source-ladder-default`) — the third firing in a row it has placed second; still the natural next firing. Before picking it, note `post_bash._report` is pinned only behind `@skipif(not _HAVE_ESBMC)` (`test_out_of_band.py`); an esbmc-free characterization test must be added first. #259 added a third partial site, `stop_gate._residual` (its own `_CEX_CLIP=1200` vs the hooks' `CEX_CLIP=1500`).
+
+## proposal-request-prologue
+
+- **Status**: proposed
+- **Score**: 18/25 (leverage 3, locality 4, blast radius 2, heat 4)
+- **Files**: ~3 estimated
+- **Modules**: `src/forseti/core/propose.py` (`propose_source`), `src/forseti/core/submit.py` (`submit_source`), a new/`persistence.py` builder
+- **Summary**: Extract the verbatim read-unit→`ProposalRequest` prologue (`read_text` → `unit_id` → best-effort `extract_signature` degrade → build request) shared by propose/submit into one `build_proposal_request` helper — the *head* complement of the store-open/dry-run/trace *tail* that PR #262 already absorbed into `core/persistence.py`.
+- **First seen**: 2026-09-04
+- **Reason**: absorbs the `read_unit`-preamble half of the now-superseded `core-store-session-boundary`.
 
 ## counterexample-fired-label-predicate
 
@@ -84,12 +108,13 @@ same ideas. Reconciled against `gh` at the start of every run.
 
 ## core-store-session-boundary
 
-- **Status**: proposed
+- **Status**: landed
 - **Score**: 15/25 (leverage 3, locality 3, blast radius 2, heat 2)
 - **Files**: ~4 estimated
 - **Modules**: `src/forseti/core/check.py`, `core/propose.py`, `core/submit.py`
 - **Summary**: Give the three Core faces one `store_session` context manager (owning the sqlite→`PropertyStoreError` translation) and one `read_unit` preamble helper, instead of three verbatim copies.
 - **First seen**: 2026-09-02
+- **Reason**: resolved incidentally — PR #262 landed the `store_session` half as `open_store` in `core/persistence.py` (the context manager owning the sqlite→`PropertyStoreError` translation, used by check/propose/submit). The `read_unit`-preamble half is re-filed fresh as `proposal-request-prologue` (18/25) with a build-request scope.
 
 ## gate-env-config-extraction
 
@@ -113,12 +138,22 @@ same ideas. Reconciled against `gh` at the start of every run.
 ## canonical-gate-decision-helper
 
 - **Status**: proposed
-- **Score**: 13/25 (leverage 2, locality 3, blast radius 2, heat 2)
+- **Score**: 17/25 (leverage 3, locality 3, blast radius 2, heat 4)
 - **Files**: ~4 estimated
-- **Modules**: `src/forseti/core/events.py`, `adapters/claude_code/post_tool_use.py`, `adapters/codex/verify_hook.py`
-- **Summary**: Move the canonical `gate.decision` event vocabulary into `core/events.py` beside its sibling `record_property_proposed`, preserving the deliberate `unit_ids` (Claude) vs `files` (Codex) field asymmetry.
+- **Modules**: `src/forseti/core/events.py`, `adapters/claude_code/post_tool_use.py` (`_record_gate_decision`), `adapters/codex/verify_hook.py`, `adapters/claude_code/stop_gate.py` (`_record_semantic_gate_decision`)
+- **Summary**: Move the canonical `gate.decision` event emitter into `core/events.py` beside its sibling `record_property_proposed`, as one `record_gate_decision(root, *, harness, adapter, decision, unit_ids=None, files=None)`, preserving the deliberate `unit_ids` (Claude) vs `files` (Codex) field asymmetry.
 - **First seen**: 2026-09-02
-- **Reason**: overlaps the `hook-verdict-report-two-hooks` post_bash gap; low leverage.
+- **Reason**: bumped 13→17 this run — PR #259 added a **third** copy (`stop_gate._record_semantic_gate_decision`, `:231-249`), whose docstring at `:236` literally says "Mirrors `post_tool_use._record_gate_decision`." Now three emit sites across two harnesses in hot code. Could fold in as the emit sub-seam of `hook-verdict-report-two-hooks`.
+
+## hook-stdin-envconfig-prologue
+
+- **Status**: proposed
+- **Score**: 16/25 (leverage 3, locality 3, blast radius 3, heat 4)
+- **Files**: ~5 estimated
+- **Modules**: `adapters/claude_code/post_tool_use.py`, `post_bash.py`, `stop_gate.py`, `session_start.py`, `adapters/codex/verify_hook.py`
+- **Summary**: Collapse the copied `read stdin → json` decode (4 Claude hooks + a divergent Codex 5th) into one `read_hook_input() → dict` seam, forcing one deliberate crash-vs-swallow decision. The stacked env-config fail-closed block only half-concentrates (detection collapses, emit stays per-harness), so overlaps `gate-env-config-extraction`.
+- **First seen**: 2026-09-04
+- **Reason**: partial deletion test — the env-config half's emit is harness-specific; take the stdin-decode half as the clean sub-seam.
 
 ## mcp-server-tool-wrappers
 
@@ -169,3 +204,23 @@ same ideas. Reconciled against `gh` at the start of every run.
 - **Summary**: A one-adapter seam whose `render` is a one-line delegation — a candidate to *inline*, not to deepen.
 - **First seen**: 2026-09-02
 - **Reason**: Not a deepening; the indirection defensibly keeps the driver from importing `properties` directly.
+
+## cli-json-or-render-epilogue
+
+- **Status**: dropped
+- **Score**: — (leverage 1)
+- **Files**: n/a
+- **Modules**: `src/forseti/core/cli.py` (`_run_propose`, `_run_submit_property`, `_run_check`, `_run_semantic_loop`, `_run_verify`)
+- **Summary**: Every Core CLI handler ends with `if args.json: print(json.dumps(result.to_dict())) else: print(_render_X(result))`.
+- **First seen**: 2026-09-04
+- **Reason**: Leverage 1 — the render fn and the exit-code policy differ per command; a shared helper would take both as injected params, relocating the variation to the call site rather than concentrating it.
+
+## codex-claude-verify-drift
+
+- **Status**: dropped
+- **Score**: — (fails deletion test)
+- **Files**: n/a
+- **Modules**: `src/forseti/adapters/codex/verify_hook.py`, `adapters/claude_code/post_tool_use.py`
+- **Summary**: The Codex whole-file `forseti verify` subprocess + JSON `decision` path and the Claude in-process per-function `verify_and_record` + stderr/exit path are parallel "verify edits → block on counterexample → report" pipelines that drifted (lowercase verdict strings vs `UnitVerdict`; file vs function granularity; no shared state persistence on the Codex side).
+- **First seen**: 2026-09-04
+- **Reason**: Fails the deletion test — the mechanisms genuinely differ, so a shared seam would be a param-heavy switch; complexity moves/parameterises, it does not concentrate.
