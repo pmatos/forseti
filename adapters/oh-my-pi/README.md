@@ -75,7 +75,7 @@ always needs it passed explicitly here.
   `Stop` hook or a way to block turn/session completion — `session_shutdown`,
   `turn_end`, and `agent_end` are not documented as cancelable. A VIOLATED
   semantic property is therefore reported at every edit but cannot suspend
-  "done" the way Claude Code's Stop-gate does; this puts Oh My Pi's
-  enforcement level between Claude Code's (post-edit block **and**
-  completion gate) and Codex's (post-edit block only) — the same as Codex's
-  own row in the capability matrix, honestly, not a faked parity.
+  "done" the way Claude Code's Stop-gate does; Oh My Pi's enforcement level is
+  therefore **Medium**, the same tier as Codex (post-edit block only, no
+  completion gate) — honestly, not a faked parity with Claude Code's
+  post-edit-block-**and**-completion-gate Strong tier.

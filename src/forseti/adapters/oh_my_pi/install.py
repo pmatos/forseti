@@ -69,35 +69,58 @@ _EXTENSION_SOURCE = """\
 // the legacy `HookToolWrapper` docs/hooks.md describes -- so a VIOLATED
 // verdict here reads to the model as the edit itself having failed, not
 // merely as an aside.
+//
+// `spawnSync` does not throw on a launch failure or a timeout -- it returns
+// normally with `error` set (Node.js semantics), so a killed/never-started
+// `forseti` process must be checked explicitly rather than relied on to
+// fall into a catch block. Only `ENOENT` (forseti not installed) fails open
+// silently, the same as every other adapter's hook; any other spawn
+// failure, a nonzero exit, or an unparseable reply is reported as an
+// inconclusive result instead of read as a silent pass -- the empty-stdout
+// case is a legitimate pass only when the process actually exited cleanly.
 
 import { spawnSync } from "node:child_process";
-import type { HookAPI } from "@oh-my-pi/pi-coding-agent/extensibility/hooks";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 const GATED_TOOLS = new Set(["write", "edit"]);
 
-export default function forsetiGate(pi: HookAPI): void {
+function notAPass(event: { content: unknown[] }, detail: string) {
+  const text = `Forseti gate did not complete (${detail}). Not a pass.`;
+  return { content: [...event.content, { type: "text" as const, text }] };
+}
+
+export default function forsetiGate(pi: ExtensionAPI): void {
   pi.on("tool_result", async (event, ctx) => {
     if (!GATED_TOOLS.has(event.toolName) || event.isError) return;
 
+    const proc = spawnSync("forseti", ["omp-hook", "tool-result"], {
+      cwd: ctx.cwd,
+      input: JSON.stringify({
+        toolName: event.toolName,
+        input: event.input,
+        isError: event.isError,
+        cwd: ctx.cwd,
+      }),
+      encoding: "utf-8",
+      timeout: 180_000,
+    });
+
+    if (proc.error) {
+      if ((proc.error as NodeJS.ErrnoException).code === "ENOENT") return;
+      return notAPass(event, proc.error.message);
+    }
+    if (proc.status !== 0) {
+      return notAPass(event, `forseti exited ${proc.status}`);
+    }
+
+    const stdout = proc.stdout?.trim();
+    if (!stdout) return; // main() printed nothing -- a legitimate pass
+
     let reply: { decision?: string; reason?: string; systemMessage?: string };
     try {
-      const proc = spawnSync("forseti", ["omp-hook", "tool-result"], {
-        cwd: ctx.cwd,
-        input: JSON.stringify({
-          toolName: event.toolName,
-          input: event.input,
-          isError: event.isError,
-          cwd: ctx.cwd,
-        }),
-        encoding: "utf-8",
-        timeout: 180_000,
-      });
-      if (!proc.stdout?.trim()) return;
-      reply = JSON.parse(proc.stdout);
+      reply = JSON.parse(stdout);
     } catch {
-      // A broken/missing `forseti` must not wedge the session over a
-      // best-effort gate -- fail open, same as every other adapter's hook.
-      return;
+      return notAPass(event, "unparseable reply");
     }
 
     const message = reply.decision === "block" ? reply.reason : reply.systemMessage;
