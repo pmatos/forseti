@@ -126,7 +126,7 @@ export default function forsetiGate(pi: ExtensionAPI): void {
 
     return {
       content: [...event.content, { type: "text" as const, text: message }],
-      isError: reply.decision === "block" ? true : event.isError,
+      isError: reply.decision === "block",
     };
   });
 }
@@ -161,43 +161,23 @@ def _is_forseti_extension(text: str) -> bool:
     return text.startswith(_MARKER_START)
 
 
-def _install_extension(project_dir: Path) -> tuple[Path, InstallOutcome]:
-    path = _extension_path(project_dir)
+def _reject_symlink(path: Path) -> None:
     if path.is_symlink():
         raise ProjectConfigError(
             f"{path} is a symlink -- refusing to replace it (an atomic "
             "rewrite would swap in a plain file, silently breaking the link)"
         )
-    existed = path.exists()
-    if existed:
-        try:
-            existing_text = path.read_text(encoding="utf-8")
-        except (OSError, ValueError) as exc:
-            raise ProjectConfigError(
-                f"{path}: cannot read existing extension ({exc})"
-            ) from exc
-        if not _is_forseti_extension(existing_text):
-            raise ProjectConfigError(
-                f"{path}: does not look like forseti's own managed extension "
-                "(missing its sentinel header) -- refusing to overwrite "
-                "hand-written content"
-            )
-        if existing_text == _EXTENSION_SOURCE:
-            return path, InstallOutcome.UNCHANGED
-
-    write_text_atomic(path, _EXTENSION_SOURCE)
-    return path, InstallOutcome.CREATED if not existed else InstallOutcome.UPDATED
 
 
-def _remove_extension(project_dir: Path) -> tuple[Path, RemoveOutcome]:
-    path = _extension_path(project_dir)
-    if path.is_symlink():
-        raise ProjectConfigError(
-            f"{path} is a symlink -- refusing to replace it (an atomic "
-            "rewrite would swap in a plain file, silently breaking the link)"
-        )
+def _read_owned_extension(path: Path, action: str) -> str | None:
+    """`path`'s text if it exists and carries forseti's own sentinel header.
+
+    `None` if `path` doesn't exist. Raises `ProjectConfigError` if it exists
+    but can't be read, or doesn't look like forseti's own managed extension --
+    hand-written content this `action` must not touch.
+    """
     if not path.exists():
-        return path, RemoveOutcome.UNCHANGED
+        return None
     try:
         existing_text = path.read_text(encoding="utf-8")
     except (OSError, ValueError) as exc:
@@ -207,8 +187,32 @@ def _remove_extension(project_dir: Path) -> tuple[Path, RemoveOutcome]:
     if not _is_forseti_extension(existing_text):
         raise ProjectConfigError(
             f"{path}: does not look like forseti's own managed extension "
-            "(missing its sentinel header) -- refusing to delete hand-written content"
+            f"(missing its sentinel header) -- refusing to {action} "
+            "hand-written content"
         )
+    return existing_text
+
+
+def _install_extension(project_dir: Path) -> tuple[Path, InstallOutcome]:
+    path = _extension_path(project_dir)
+    _reject_symlink(path)
+    existing_text = _read_owned_extension(path, "overwrite")
+    if existing_text == _EXTENSION_SOURCE:
+        return path, InstallOutcome.UNCHANGED
+
+    write_text_atomic(path, _EXTENSION_SOURCE)
+    return (
+        path,
+        InstallOutcome.CREATED if existing_text is None else InstallOutcome.UPDATED,
+    )
+
+
+def _remove_extension(project_dir: Path) -> tuple[Path, RemoveOutcome]:
+    path = _extension_path(project_dir)
+    _reject_symlink(path)
+    existing_text = _read_owned_extension(path, "delete")
+    if existing_text is None:
+        return path, RemoveOutcome.UNCHANGED
     path.unlink()
     return path, RemoveOutcome.REMOVED
 
@@ -291,11 +295,7 @@ def _strip_mcp_server(existing: dict[str, Any], config_path: Path) -> dict[str, 
 
 def _install_mcp_config(project_dir: Path) -> tuple[Path, InstallOutcome]:
     config_path = _mcp_config_path(project_dir)
-    if config_path.is_symlink():
-        raise ProjectConfigError(
-            f"{config_path} is a symlink -- refusing to replace it (an atomic "
-            "rewrite would swap in a plain file, silently breaking the link)"
-        )
+    _reject_symlink(config_path)
     existed = config_path.exists()
     existing = _read_existing_mcp_config(config_path)
     merged = merge_mcp_config(existing, config_path)
@@ -310,11 +310,7 @@ def _install_mcp_config(project_dir: Path) -> tuple[Path, InstallOutcome]:
 
 def _remove_mcp_config(project_dir: Path) -> tuple[Path, RemoveOutcome]:
     config_path = _mcp_config_path(project_dir)
-    if config_path.is_symlink():
-        raise ProjectConfigError(
-            f"{config_path} is a symlink -- refusing to replace it (an atomic "
-            "rewrite would swap in a plain file, silently breaking the link)"
-        )
+    _reject_symlink(config_path)
     if not config_path.exists():
         return config_path, RemoveOutcome.UNCHANGED
     existing = _read_existing_mcp_config(config_path)

@@ -77,7 +77,7 @@ export default function forsetiGate(pi: ExtensionAPI): void {
 
     return {
       content: [...event.content, { type: "text" as const, text: message }],
-      isError: reply.decision === "block" ? true : event.isError,
+      isError: reply.decision === "block",
     };
   });
 }

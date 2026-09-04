@@ -95,20 +95,18 @@ def _edited_sources(tool_name: str, tool_input: dict[str, object]) -> list[str]:
         path = tool_input.get("path")
         if isinstance(path, str) and path:
             seen.setdefault(path, None)
-        return [p for p in seen if Path(p).suffix in _SRC_SUFFIXES]
-
-    if tool_name != "edit":
-        return []
-    raw = tool_input.get("input")
-    if not isinstance(raw, str):
-        return []
-    headers = list(_HASHLINE_PATH_RE.finditer(raw))
-    for i, match in enumerate(headers):
-        section_end = headers[i + 1].start() if i + 1 < len(headers) else len(raw)
-        section = raw[match.end() : section_end]
-        mv = _MV_RE.search(section)
-        path = mv.group(1).strip() if mv else match.group(1).strip()
-        seen.setdefault(path, None)
+    elif tool_name == "edit":
+        raw = tool_input.get("input")
+        if isinstance(raw, str):
+            headers = list(_HASHLINE_PATH_RE.finditer(raw))
+            for i, match in enumerate(headers):
+                section_end = (
+                    headers[i + 1].start() if i + 1 < len(headers) else len(raw)
+                )
+                section = raw[match.end() : section_end]
+                mv = _MV_RE.search(section)
+                path = mv.group(1).strip() if mv else match.group(1).strip()
+                seen.setdefault(path, None)
     return [p for p in seen if Path(p).suffix in _SRC_SUFFIXES]
 
 
@@ -162,15 +160,16 @@ def _semantic_check(path: str, function: str, cwd: str) -> tuple[str, str]:
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return ("error", f"could not run forseti semantic-loop: {exc}")
+    fallback_evidence = (proc.stderr or proc.stdout).strip()[:400]
     try:
         payload = json.loads(proc.stdout)
     except ValueError:
-        return ("error", (proc.stderr or proc.stdout).strip()[:400])
+        return ("error", fallback_evidence)
     outcome = payload.get("outcome") if isinstance(payload, dict) else None
     if not isinstance(outcome, str):
-        return ("error", (proc.stderr or proc.stdout).strip()[:400])
+        return ("error", fallback_evidence)
     evidence = ""
-    check = payload.get("check") if isinstance(payload, dict) else None
+    check = payload.get("check")
     verdicts = check.get("verdicts") if isinstance(check, dict) else None
     if isinstance(verdicts, list):
         for verdict in verdicts:
@@ -218,8 +217,10 @@ def main() -> int:
     unresolved: list[tuple[str, str]] = []
     checked_units: list[str] = []
     any_path_existed = False
+    cwd_path = Path(cwd)
     for path in edited:
-        resolved = Path(path) if Path(path).is_absolute() else Path(cwd) / path
+        p = Path(path)
+        resolved = p if p.is_absolute() else cwd_path / path
         if not resolved.exists():
             continue
         any_path_existed = True
@@ -230,8 +231,6 @@ def main() -> int:
             # unresolved outcome; never let an enumeration failure read as
             # "nothing to check" (module docstring: never silently passed).
             unresolved.append((path, "list-units-failed"))
-            continue
-        if not functions:
             continue
         for function in functions:
             outcome, evidence = _semantic_check(path, function, cwd)
@@ -260,16 +259,11 @@ def main() -> int:
 
     if unresolved:
         residual = ", ".join(f"{u} [{o}]" for u, o in unresolved)
-        _record_gate_decision(cwd, checked_units, "unresolved")
-        print(
-            json.dumps(
-                {
-                    "systemMessage": (
-                        f"Forseti could not conclusively check: {residual}. "
-                        "Not a pass — raise k, add an entry/harness, or report."
-                    )
-                }
-            )
+        _report_unresolved(
+            cwd,
+            checked_units,
+            f"Forseti could not conclusively check: {residual}. "
+            "Not a pass — raise k, add an entry/harness, or report.",
         )
         return 0
 
@@ -278,22 +272,23 @@ def main() -> int:
         # rename's old name, or a REM'd file) -- nothing was actually
         # checked, so this must not read as a pass in the canonical trace
         # (mirrors the Codex adapter's own "nothing existed" branch).
-        _record_gate_decision(cwd, [], "unresolved")
-        print(
-            json.dumps(
-                {
-                    "systemMessage": (
-                        "Forseti: no edited source still exists to check "
-                        f"({', '.join(edited)}). Not a pass."
-                    )
-                }
-            )
+        _report_unresolved(
+            cwd,
+            [],
+            "Forseti: no edited source still exists to check "
+            f"({', '.join(edited)}). Not a pass.",
         )
         return 0
 
     if checked_units:
         _record_gate_decision(cwd, checked_units, "pass")
     return 0
+
+
+def _report_unresolved(cwd: str, unit_ids: list[str], message: str) -> None:
+    """Record an `unresolved` gate decision and print it as a `systemMessage`."""
+    _record_gate_decision(cwd, unit_ids, "unresolved")
+    print(json.dumps({"systemMessage": message}))
 
 
 def _record_gate_decision(cwd: str, unit_ids: list[str], decision: str) -> None:
