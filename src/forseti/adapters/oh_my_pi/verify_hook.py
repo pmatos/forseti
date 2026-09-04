@@ -224,6 +224,13 @@ def main() -> int:
             continue
         any_path_existed = True
         functions = _list_functions(path, cwd)
+        if functions is None:
+            # `list-units` itself failed to run/parse -- distinct from a file
+            # that genuinely has no functions. Surface it like any other
+            # unresolved outcome; never let an enumeration failure read as
+            # "nothing to check" (module docstring: never silently passed).
+            unresolved.append((path, "list-units-failed"))
+            continue
         if not functions:
             continue
         for function in functions:

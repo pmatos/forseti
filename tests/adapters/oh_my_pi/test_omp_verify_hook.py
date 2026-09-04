@@ -327,6 +327,39 @@ def _seed_store(tmp_path: Path) -> None:
 def test_main_path_exists_but_no_functions_found_is_silent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """`_list_functions` returning `[]` (genuinely no functions) is a pass."""
+    (tmp_path / "f.c").write_text("int f(void) { return 0; }\n")
+    _seed_store(tmp_path)
+    event = {
+        "toolName": "write",
+        "input": {"path": "f.c"},
+        "isError": False,
+        "cwd": str(tmp_path),
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+    monkeypatch.setattr(verify_hook, "_list_functions", lambda path, cwd: [])
+
+    def boom(*_a: object, **_kw: object) -> None:
+        raise AssertionError("must not check a unit that was never discovered")
+
+    monkeypatch.setattr(verify_hook, "_semantic_check", boom)
+    assert verify_hook.main() == 0
+    assert capsys.readouterr().out == ""
+
+    from forseti.core.events import events_path
+
+    assert not events_path(tmp_path / ".forseti").exists()
+
+
+def test_main_list_units_failure_is_unresolved_not_silent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`_list_functions` returning `None` (enumeration failed) must be surfaced.
+
+    `None` means `list-units` itself could not run or produce a usable
+    payload -- distinct from `[]` (file parsed, no functions). Conflating the
+    two would let a tooling failure silently read as a pass.
+    """
     (tmp_path / "f.c").write_text("int f(void) { return 0; }\n")
     _seed_store(tmp_path)
     event = {
@@ -343,11 +376,19 @@ def test_main_path_exists_but_no_functions_found_is_silent(
 
     monkeypatch.setattr(verify_hook, "_semantic_check", boom)
     assert verify_hook.main() == 0
-    assert capsys.readouterr().out == ""
+    payload = json.loads(capsys.readouterr().out)
+    assert "decision" not in payload
+    assert "f.c" in payload["systemMessage"]
+    assert "list-units-failed" in payload["systemMessage"]
 
     from forseti.core.events import events_path
 
-    assert not events_path(tmp_path / ".forseti").exists()
+    events = [
+        json.loads(line)
+        for line in events_path(tmp_path / ".forseti").read_text().splitlines()
+    ]
+    assert len(events) == 1
+    assert events[0]["decision"] == "unresolved"
 
 
 def test_main_blocks_on_violated_outcome(

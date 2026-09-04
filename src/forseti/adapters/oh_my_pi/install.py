@@ -73,9 +73,8 @@ _EXTENSION_SOURCE = """\
 // `spawnSync` does not throw on a launch failure or a timeout -- it returns
 // normally with `error` set (Node.js semantics), so a killed/never-started
 // `forseti` process must be checked explicitly rather than relied on to
-// fall into a catch block. Only `ENOENT` (forseti not installed) fails open
-// silently, the same as every other adapter's hook; any other spawn
-// failure, a nonzero exit, or an unparseable reply is reported as an
+// fall into a catch block. Every spawn failure (including `forseti` missing
+// from PATH), a nonzero exit, or an unparseable reply is reported as an
 // inconclusive result instead of read as a silent pass -- the empty-stdout
 // case is a legitimate pass only when the process actually exited cleanly.
 
@@ -106,7 +105,6 @@ export default function forsetiGate(pi: ExtensionAPI): void {
     });
 
     if (proc.error) {
-      if ((proc.error as NodeJS.ErrnoException).code === "ENOENT") return;
       return notAPass(event, proc.error.message);
     }
     if (proc.status !== 0) {
