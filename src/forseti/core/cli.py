@@ -44,21 +44,28 @@ Subcommands:
 - ``forseti codex-hook <name>`` — dispatch to the Codex adapter's
   ``PostToolUse`` verify-gate hook (#212). Internal: wired into a project's
   ``.codex/config.toml`` by ``enable-project --harness codex``.
-- ``forseti enable-project [DIR] [--harness codex|claude-code] [--shared]`` —
-  install/update the verify-gate hooks for one harness (RFC-0004, #212).
-  ``--harness`` defaults to auto-detection from the session's own env vars
-  (Codex's ``CODEX_SESSION_ID``/``CODEX_THREAD_ID``, Claude Code's
-  ``CLAUDECODE``); if that's ambiguous or the markers are absent, the command
-  fails rather than guessing. Idempotent: always regenerates forseti's own
-  hook entries from the currently installed version, leaving every other
-  hook/key in the target file untouched. Codex installs never create
-  ``.claude/``, and vice versa. Codex's project-local config cannot carry a
-  ``notify`` key (Codex 0.148); forseti never emits one.
-- ``forseti disable-project [DIR] --harness codex|claude-code [--shared]`` —
-  migration cleanup: remove *only* forseti's own hook entries for one harness
-  (e.g. after ``enable-project`` targeted the wrong one), leaving foreign
-  hooks and unrelated keys untouched. Requires an explicit ``--harness``;
-  never auto-detects, and never creates a file that wasn't already there.
+- ``forseti omp-hook <name>`` — dispatch to the Oh My Pi adapter's
+  ``tool_result`` verify-gate hook (#249). Internal: invoked by the packaged
+  ``forseti-gate.ts`` extension ``enable-project --harness oh-my-pi`` writes
+  into a project's ``.omp/extensions/``.
+- ``forseti enable-project [DIR] [--harness codex|claude-code|oh-my-pi]
+  [--shared]`` — install/update the verify-gate hooks for one harness
+  (RFC-0004, #212, #249). ``--harness`` defaults to auto-detection from the
+  session's own env vars (Codex's ``CODEX_SESSION_ID``/``CODEX_THREAD_ID``,
+  Claude Code's ``CLAUDECODE``; Oh My Pi has no such marker and always needs
+  an explicit ``--harness oh-my-pi``); if that's ambiguous or the markers are
+  absent, the command fails rather than guessing. Idempotent: always
+  regenerates forseti's own hook entries from the currently installed
+  version, leaving every other hook/key in the target file untouched. Each
+  harness's install only ever touches its own config path(s) (``.claude/``,
+  ``.codex/config.toml``, ``.omp/``). Codex's project-local config cannot
+  carry a ``notify`` key (Codex 0.148); forseti never emits one.
+- ``forseti disable-project [DIR] --harness codex|claude-code|oh-my-pi
+  [--shared]`` — migration cleanup: remove *only* forseti's own hook entries
+  for one harness (e.g. after ``enable-project`` targeted the wrong one),
+  leaving foreign hooks and unrelated keys untouched. Requires an explicit
+  ``--harness``; never auto-detects, and never creates a file that wasn't
+  already there.
 - ``forseti mcp`` — start the Core MCP server on stdio (needs the ``mcp`` extra;
   imported lazily so plain ``verify`` works without the SDK).
 
@@ -84,6 +91,9 @@ from forseti.adapters.codex import install as codex_install
 from forseti.adapters.codex import verify_hook as codex_verify_hook
 from forseti.adapters.codex.install import HOOK_NAMES as CODEX_HOOK_NAMES
 from forseti.adapters.harness import Harness, detect_harness
+from forseti.adapters.oh_my_pi import install as omp_install
+from forseti.adapters.oh_my_pi import verify_hook as omp_verify_hook
+from forseti.adapters.oh_my_pi.install import HOOK_NAMES as OMP_HOOK_NAMES
 from forseti.esbmc import (
     ListUnitsError,
     Verdict,
@@ -930,6 +940,30 @@ def _run_codex_hook(args: argparse.Namespace) -> int:
     raise AssertionError(f"unreachable: unknown hook {args.name!r} (argparse choices)")
 
 
+def _add_omp_hook_parser(
+    sub: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    p = sub.add_parser(
+        "omp-hook",
+        help="run an Oh My Pi verify-gate hook (internal; wired by enable-project)",
+        description=(
+            "Dispatch to the Oh My Pi adapter's `tool_result` hook handler, "
+            "reading the hook JSON payload from stdin the way the packaged "
+            "`forseti-gate.ts` extension sends it. Not meant to be invoked by "
+            "hand -- `forseti enable-project --harness oh-my-pi` wires this "
+            "into a project's `.omp/extensions/forseti-gate.ts` (#249)."
+        ),
+    )
+    p.add_argument("name", choices=sorted(OMP_HOOK_NAMES), help="which hook to run")
+    p.set_defaults(func=_run_omp_hook)
+
+
+def _run_omp_hook(args: argparse.Namespace) -> int:
+    if args.name == "tool-result":
+        return omp_verify_hook.main()
+    raise AssertionError(f"unreachable: unknown hook {args.name!r} (argparse choices)")
+
+
 def _add_enable_project_parser(
     sub: argparse._SubParsersAction[argparse.ArgumentParser],
 ) -> None:
@@ -963,7 +997,8 @@ def _add_enable_project_parser(
             "which harness to install for; default: auto-detect from the "
             "session's own env vars (Codex's CODEX_SESSION_ID/CODEX_THREAD_ID, "
             "Claude Code's CLAUDECODE), failing rather than guessing if that's "
-            "ambiguous or absent"
+            "ambiguous or absent -- Oh My Pi has no such marker and always "
+            "needs an explicit --harness oh-my-pi"
         ),
     )
     p.add_argument(
@@ -1006,7 +1041,7 @@ def _run_enable_project(args: argparse.Namespace) -> int:
             print(
                 "forseti enable-project: could not determine the harness "
                 "automatically (no unambiguous session env vars found); pass "
-                "--harness codex or --harness claude-code",
+                "--harness codex, --harness claude-code, or --harness oh-my-pi",
                 file=sys.stderr,
             )
             return 1
@@ -1028,6 +1063,24 @@ def _run_enable_project(args: argparse.Namespace) -> int:
                 f"Codex verify-gate hook {outcome.value} at {path} (harness: "
                 "codex). Codex skips a hook until you trust it -- run `/hooks` "
                 "in Codex and trust the PostToolUse entry."
+            ),
+        )
+
+    if harness == Harness.OH_MY_PI.value:
+        if args.shared:
+            print(
+                "forseti enable-project: --shared has no effect for "
+                "--harness oh-my-pi (there is only one project .omp/ dir)",
+                file=sys.stderr,
+            )
+            return 1
+        return _run_harness_action(
+            "enable-project",
+            lambda: omp_install.install(args.project_dir),
+            (omp_install.ProjectConfigError, OSError),
+            lambda path, outcome: (
+                f"Oh My Pi verify-gate extension {outcome.value} at {path} "
+                "(harness: oh-my-pi)"
             ),
         )
 
@@ -1095,6 +1148,23 @@ def _run_disable_project(args: argparse.Namespace) -> int:
             lambda path, outcome: f"Codex verify-gate hook {outcome.value} at {path}",
         )
 
+    if args.harness == Harness.OH_MY_PI.value:
+        if args.shared:
+            print(
+                "forseti disable-project: --shared has no effect for "
+                "--harness oh-my-pi",
+                file=sys.stderr,
+            )
+            return 1
+        return _run_harness_action(
+            "disable-project",
+            lambda: omp_install.remove(args.project_dir),
+            (omp_install.ProjectConfigError, OSError),
+            lambda path, outcome: (
+                f"Oh My Pi verify-gate extension {outcome.value} at {path}"
+            ),
+        )
+
     return _run_harness_action(
         "disable-project",
         lambda: claude_code_install.remove(args.project_dir, shared=args.shared),
@@ -1154,6 +1224,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_semantic_loop_parser(sub)
     _add_claude_code_hook_parser(sub)
     _add_codex_hook_parser(sub)
+    _add_omp_hook_parser(sub)
     _add_enable_project_parser(sub)
     _add_disable_project_parser(sub)
     _add_mcp_parser(sub)
@@ -1162,7 +1233,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if not arguments or arguments[0] not in {"claude-code-hook", "codex-hook", "mcp"}:
+    if not arguments or arguments[0] not in {
+        "claude-code-hook",
+        "codex-hook",
+        "omp-hook",
+        "mcp",
+    }:
         notice = update_notice()
         if notice is not None:
             print(notice, file=sys.stderr)

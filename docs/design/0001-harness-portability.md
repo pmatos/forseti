@@ -14,6 +14,7 @@ model:
 | **Claude Code** | hooks (PreToolUse/PostToolUse/Stop), subagents, skills, slash commands, plugins | MCP, CLI |
 | **Codex** | `AGENTS.md`, `notify` hook (limited) | MCP, CLI |
 | **opencode** | plugin API, custom commands, agents/modes — **no tool-use hooks** | MCP, CLI |
+| **Oh My Pi** | native TS extensions with a `tool_call`/`tool_result` pre/post pair, project `.omp/` config — **no completion/Stop-gate event** (#249) | MCP (`.omp/mcp.json`), CLI |
 
 Hooks differ everywhere; the one substrate **all three share is MCP (+ a plain CLI).**
 
@@ -126,8 +127,9 @@ names, distinct at a glance from an adapter's own short local names (`edit`, `ga
 | `property.verdict` | `core.check.check_source` | `unit_id`, `property_id`, `outcome`, `k` |
 | `gate.decision` | Claude Code's `post_tool_use` | `harness`, `adapter`, `unit_ids` (`path::symbol`, per verified function), `decision` |
 | `gate.decision` | Codex's `verify_hook` | `harness`, `adapter`, `files` (raw edited paths — the hook verifies a whole file at a time, no per-function enumeration), `decision` |
+| `gate.decision` | Oh My Pi's `verify_hook` (#249) | `harness`, `adapter`, `unit_ids` (`path::symbol`, per checked function — the hook calls `forseti list-units` before checking, same granularity as Claude Code's), `decision` |
 
-All four append to `<store_root>/events.jsonl` — the project's `.forseti/events.jsonl` when
+All five append to `<store_root>/events.jsonl` — the project's `.forseti/events.jsonl` when
 `store_root` is the default, the same file the Claude Code adapter's own
 `adapters.claude_code.event_log` trace already writes to (`edit`/`verify`/`gate`/`stop`/
 `session`, keyed by `type`). **One trace file, two vocabularies**, not three incompatible
@@ -137,15 +139,17 @@ happened in Core, independent of which harness asked for it. A dry run (`persist
 records nothing — `record_event`'s own `mkdir` would otherwise violate the documented
 "a dry run touches nothing" contract `propose_source`/`submit_source` hold themselves to.
 
-Both adapters emit `gate.decision` at their own per-edit gate point: Claude Code's
-`adapters.claude_code.post_tool_use` (pass/block after verifying an edited file's functions)
-and Codex's `adapters.codex.verify_hook` (pass/unresolved/block after an `apply_patch`). The
-two differ in granularity, and the event says so honestly rather than faking parity: Claude
-Code enumerates and verifies each function, so its `unit_ids` are real `path::symbol` keys
-joinable with `property.proposed`/`property.verdict`; Codex verifies a whole edited file at a
-time (no per-function enumeration), so its event carries `files` — raw source paths — instead
-of `unit_ids`. Recording is best-effort and never raises — a trace failure must not turn a
-real verdict into a hook crash.
+All three adapters emit `gate.decision` at their own per-edit gate point: Claude Code's
+`adapters.claude_code.post_tool_use` (pass/block after verifying an edited file's functions),
+Codex's `adapters.codex.verify_hook` (pass/unresolved/block after an `apply_patch`), and Oh My
+Pi's `adapters.oh_my_pi.verify_hook` (pass/unresolved/block after a `write`/`edit`
+`tool_result`, #249). Granularity differs, and each event says so honestly rather than faking
+parity: Claude Code and Oh My Pi both enumerate and check each function in the edited file
+(`forseti list-units`), so their `unit_ids` are real `path::symbol` keys joinable with
+`property.proposed`/`property.verdict`; Codex verifies a whole edited file at a time (no
+per-function enumeration), so its event carries `files` — raw source paths — instead of
+`unit_ids`. Recording is best-effort and never raises — a trace failure must not turn a real
+verdict into a hook crash.
 
 ### The composed semantic-loop operation (implemented, #213)
 
@@ -181,19 +185,22 @@ Adapters differ in what their harness lets them do, not in which Core operations
 Every row below calls the same `forseti verify` / `propose` / `submit` / `check` /
 `semantic-loop` (CLI or MCP); only the trigger and gate strictness change per harness.
 
-| Capability | Claude Code | Codex | opencode (fallback) |
-|---|---|---|---|
-| Post-edit trigger | `PostToolUse` hook, native | `PostToolUse` hook (`apply_patch` matcher), native | none — prompt+tools only |
-| Completion / Stop-gate | `Stop` hook, blocks the turn (`MAX_STOP_ATTEMPTS`, then a loud residual) on either an unverified safety unit **or** a VIOLATED stored semantic property (#213 — previously reported the latter but never blocked on it) | none — no turn-completion hook; per-edit `PostToolUse` block is the only enforcement point | none — instructions ask the model to keep fixing until `verify` passes |
-| Host-model property generation | a property-generation subagent calls `forseti semantic-loop --mode propose` (one composed call, #213; formerly separate `propose`+`check`, #95) | `AGENTS.md`'s semantic-property section (#213) tells the active turn's model to call the `semantic_loop` MCP tool with `mode: "submit"` directly — no subagent concept | the driving model calls `propose`/`submit` via MCP per its own prompt instructions |
-| Transport | CLI (hooks shell out to `forseti ... --json`) | CLI (hooks shell out to `forseti ... --json`) + MCP (`forseti mcp`) available to the model | MCP only |
-| Enforcement level | **Strong**: PostToolUse blocks on a counterexample, Stop-gate blocks turn completion up to a bounded number of attempts on either an unverified safety unit or a VIOLATED semantic property (unresolved/failed/skipped/deferred semantic outcomes stay loud-but-non-blocking) | **Medium**: PostToolUse blocks on a counterexample (VIOLATED), but nothing gates "done" — an UNKNOWN is reported (`systemMessage`), never silently passed, but does not block; a VIOLATED semantic property from `submit`/`check` is likewise reported to the active turn, not gated | **Weak**: purely convention — a model that ignores its own instructions can end the turn with an unverified edit; still never silently reports a fabricated pass, because nothing reports a verdict without calling Core |
-| Install | `forseti enable-project --harness claude-code [--shared]` → `.claude/settings(.local).json` | `forseti enable-project --harness codex` → `.codex/config.toml` (Codex 0.148+ requires `/hooks` trust after install) | no installer — wire the MCP server (`forseti mcp`) and the fallback prompt/command by hand |
+| Capability | Claude Code | Codex | Oh My Pi | opencode (fallback) |
+|---|---|---|---|---|
+| Post-edit trigger | `PostToolUse` hook, native | `PostToolUse` hook (`apply_patch` matcher), native | `tool_result` handler on `write`/`edit` (#249) — post-execution, so it rewrites the tool's own result rather than blocking the edit itself | none — prompt+tools only |
+| Completion / Stop-gate | `Stop` hook, blocks the turn (`MAX_STOP_ATTEMPTS`, then a loud residual) on either an unverified safety unit **or** a VIOLATED stored semantic property (#213 — previously reported the latter but never blocked on it) | none — no turn-completion hook; per-edit `PostToolUse` block is the only enforcement point | none — Oh My Pi's documented event surface (`docs/extensions.md`/`docs/hooks.md`) has no analogue to a `Stop` hook; `session_shutdown`/`turn_end`/`agent_end` are not documented as cancelable (#249) | none — instructions ask the model to keep fixing until `verify` passes |
+| Host-model property generation | a property-generation subagent calls `forseti semantic-loop --mode propose` (one composed call, #213; formerly separate `propose`+`check`, #95) | `AGENTS.md`'s semantic-property section (#213) tells the active turn's model to call the `semantic_loop` MCP tool with `mode: "submit"` directly — no subagent concept | the driving model calls `semantic_loop`/`check`/`propose`/`submit` via the Core MCP server `enable-project` registers in `.omp/mcp.json` (#249) — no subagent concept, same shape as Codex's | the driving model calls `propose`/`submit` via MCP per its own prompt instructions |
+| Transport | CLI (hooks shell out to `forseti ... --json`) | CLI (hooks shell out to `forseti ... --json`) + MCP (`forseti mcp`) available to the model | CLI (the extension shells out to `forseti omp-hook tool-result`) + MCP (`forseti mcp`, registered in `.omp/mcp.json`) available to the model | MCP only |
+| Enforcement level | **Strong**: PostToolUse blocks on a counterexample, Stop-gate blocks turn completion up to a bounded number of attempts on either an unverified safety unit or a VIOLATED semantic property (unresolved/failed/skipped/deferred semantic outcomes stay loud-but-non-blocking) | **Medium**: PostToolUse blocks on a counterexample (VIOLATED), but nothing gates "done" — an UNKNOWN is reported (`systemMessage`), never silently passed, but does not block; a VIOLATED semantic property from `submit`/`check` is likewise reported to the active turn, not gated | **Medium**: the `tool_result` gate sets `isError: true` on a VIOLATED stored semantic property — verified against Oh My Pi's current `ExtensionToolWrapper` source to actually apply a handler's returned `isError`, unlike the legacy `HookToolWrapper` its own docs describe (#249) — comparable in strength to Codex's block, but (like Codex) nothing gates turn/session completion; UNKNOWN/error are reported, never silently passed, never blocking | **Weak**: purely convention — a model that ignores its own instructions can end the turn with an unverified edit; still never silently reports a fabricated pass, because nothing reports a verdict without calling Core |
+| Install | `forseti enable-project --harness claude-code [--shared]` → `.claude/settings(.local).json` | `forseti enable-project --harness codex` → `.codex/config.toml` (Codex 0.148+ requires `/hooks` trust after install) | `forseti enable-project --harness oh-my-pi` → `.omp/extensions/forseti-gate.ts` + `.omp/mcp.json`'s `mcpServers.forseti` (#249; no auto-detection — Oh My Pi sets no session env var, always needs `--harness oh-my-pi` explicitly) | no installer — wire the MCP server (`forseti mcp`) and the fallback prompt/command by hand |
 
 "Honest degradation" is the operative rule from the strawman above: a harness without a given
 hook does not get a fake version of it — it drops to the next weaker enforcement level
-(prompt+tools) while calling the exact same Core. #249 (Oh My Pi) extends this table with its
-own row once its adapter lands; the columns above are what a new adapter needs to fill in.
+(prompt+tools) while calling the exact same Core. #249 (Oh My Pi) fills in this table's own
+row: strong per-edit enforcement (the current `ExtensionToolWrapper` applies a `tool_result`
+handler's `isError`) paired with no completion gate at all (Oh My Pi's event surface has
+nothing analogous to Claude Code's `Stop` hook) — an honest degradation between Claude Code's
+two-gate strength and Codex's single-gate one, not a faked parity with either.
 
 ## What ESBMC actually returns (terminology — read this first)
 

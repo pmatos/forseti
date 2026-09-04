@@ -132,6 +132,80 @@ def test_codex_hook_unknown_name_exits_two() -> None:
     assert excinfo.value.code == 2
 
 
+def test_omp_hook_tool_result_dispatches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # isError -> tool_result's own early-return path; this test's job is only
+    # to confirm `omp-hook tool-result` reaches `verify_hook.main()` at all
+    # (its own logic is covered by tests/adapters/oh_my_pi/test_omp_verify_hook.py).
+    event = {
+        "toolName": "write",
+        "input": {"path": "f.c"},
+        "isError": True,
+        "cwd": str(tmp_path),
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+    code = main(["omp-hook", "tool-result"])
+    assert code == 0
+
+
+def test_omp_hook_unknown_name_exits_two() -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(["omp-hook", "does-not-exist"])
+    assert excinfo.value.code == 2
+
+
+def test_enable_project_harness_oh_my_pi_creates_omp_dir_only(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main(["enable-project", "--harness", "oh-my-pi", str(tmp_path)])
+    assert code == 0
+    assert (tmp_path / ".omp" / "extensions" / "forseti-gate.ts").exists()
+    assert (tmp_path / ".omp" / "mcp.json").exists()
+    assert not (tmp_path / ".claude").exists()
+    assert not (tmp_path / ".codex").exists()
+    out = capsys.readouterr().out
+    assert "Oh My Pi" in out
+
+
+def test_enable_project_harness_oh_my_pi_rejects_shared(tmp_path: Path) -> None:
+    code = main(["enable-project", "--harness", "oh-my-pi", str(tmp_path), "--shared"])
+    assert code == 1
+    assert not (tmp_path / ".omp").exists()
+
+
+def test_disable_project_harness_oh_my_pi_shared_flag_errors(tmp_path: Path) -> None:
+    code = main(["disable-project", "--harness", "oh-my-pi", str(tmp_path), "--shared"])
+    assert code == 1
+
+
+def test_disable_project_oh_my_pi_removes_only_forseti_entries(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    main(["enable-project", "--harness", "oh-my-pi", str(tmp_path)])
+
+    code = main(["disable-project", "--harness", "oh-my-pi", str(tmp_path)])
+    assert code == 0
+    assert not (tmp_path / ".omp" / "extensions" / "forseti-gate.ts").exists()
+    mcp_config = json.loads((tmp_path / ".omp" / "mcp.json").read_text())
+    assert "mcpServers" not in mcp_config
+    assert "removed" in capsys.readouterr().out
+
+
+def test_enable_project_harness_oh_my_pi_does_not_touch_other_harnesses(
+    tmp_path: Path,
+) -> None:
+    main(["enable-project", "--harness", "claude-code", str(tmp_path)])
+    main(["enable-project", "--harness", "codex", str(tmp_path)])
+    claude_before = (tmp_path / ".claude" / "settings.local.json").read_text()
+    codex_before = (tmp_path / ".codex" / "config.toml").read_text()
+
+    code = main(["enable-project", "--harness", "oh-my-pi", str(tmp_path)])
+    assert code == 0
+    assert (tmp_path / ".claude" / "settings.local.json").read_text() == claude_before
+    assert (tmp_path / ".codex" / "config.toml").read_text() == codex_before
+
+
 def test_enable_project_harness_codex_creates_codex_config_only(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

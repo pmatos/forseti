@@ -16,6 +16,7 @@ import pytest
 
 from forseti.adapters.claude_code.install import HOOK_NAMES as CLAUDE_CODE_HOOK_NAMES
 from forseti.adapters.codex.install import HOOK_NAMES as CODEX_HOOK_NAMES
+from forseti.adapters.oh_my_pi.install import HOOK_NAMES as OMP_HOOK_NAMES
 from forseti.core import cli
 from forseti.core.cli import _build_parser, main
 
@@ -46,6 +47,7 @@ def test_every_subcommand_binds_a_callable_handler() -> None:
         "semantic-loop",
         "claude-code-hook",
         "codex-hook",
+        "omp-hook",
         "enable-project",
         "disable-project",
         "mcp",
@@ -81,6 +83,15 @@ def test_codex_hook_choices_match_install_hook_names() -> None:
     subparsers = _registered_subparsers(_build_parser())
     name_action = next(a for a in subparsers["codex-hook"]._actions if a.dest == "name")
     assert set(name_action.choices or []) == CODEX_HOOK_NAMES
+
+
+def test_omp_hook_choices_match_install_hook_names() -> None:
+    # Same pin as above, for `omp-hook <name>` against
+    # `oh_my_pi.install.HOOK_NAMES` (what `enable-project --harness oh-my-pi`
+    # wires into the packaged `forseti-gate.ts` extension).
+    subparsers = _registered_subparsers(_build_parser())
+    name_action = next(a for a in subparsers["omp-hook"]._actions if a.dest == "name")
+    assert set(name_action.choices or []) == OMP_HOOK_NAMES
 
 
 def test_main_dispatches_to_the_bound_handler(
