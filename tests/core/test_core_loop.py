@@ -105,6 +105,36 @@ def test_submit_mode_ingests_and_checks(tmp_path: Path) -> None:
     assert result.check.counts()["held"] == 1
 
 
+def test_submit_mode_raised_unwind_without_ladder_derives_above_it(
+    tmp_path: Path,
+) -> None:
+    """A raised `unwind` and no `unwind_ladder` forwards `None` to `check_source`,
+    which derives the rungs above it — `(16,)` for `unwind=8`, not the fixed
+    `(8, 16)` that would build a non-increasing `(8, 8, 16)` and crash. Scripting
+    an UNKNOWN at 8 then a Verified proves the derived rung is climbed."""
+    source = _write_unit(tmp_path)
+    root = tmp_path / ".forseti"
+
+    result = run_semantic_loop(
+        source,
+        function="my_abs",
+        mode="submit",
+        candidates=(
+            CandidateSpec(expression="result >= 0", domain=("x > INT64_MIN",)),
+        ),
+        provider="codex",
+        model="gpt-5.1",
+        store_root=root,
+        unwind=8,
+        verify_port=FakeVerify(
+            [Unknown(_meta(8), UnknownReason.TIMEOUT), Verified(_meta(16))]
+        ),
+    )
+
+    assert result.outcome == "held"  # escalated 8 -> derived rung 16 and resolved
+    assert result.check.counts()["held"] == 1
+
+
 def test_submit_mode_batches_candidates_without_swallowing_a_rejection(
     tmp_path: Path,
 ) -> None:

@@ -134,6 +134,50 @@ def test_check_source_ladders_on_unknown(tmp_path: Path) -> None:
     assert run.counts()["held"] == 1
 
 
+def test_check_source_derives_default_ladder_above_a_raised_unwind(
+    tmp_path: Path,
+) -> None:
+    """A raised `unwind` with no explicit `unwind_ladder` must not collide.
+
+    `check_source` owns its ladder default: given `unwind=8` and no
+    `unwind_ladder`, it derives the rungs *above* 8 (`(16,)`) rather than reusing
+    the fixed `(8, 16)` default, which would build the non-increasing `(8, 8, 16)`
+    and raise `ValueError` in `validated_ladder`. Before this seam owned the
+    default, only the CLI wrapper's copy of the rule stopped the crash; a direct
+    `check_source(unwind=8)` raised (issue #95 review)."""
+    source = _write_unit(tmp_path)
+    unit_id = f"{source}::my_abs"
+    root = tmp_path / ".forseti"
+    _seed_store(root, _semantic(unit_id, "result >= 0", ("x > INT64_MIN",)))
+
+    fake = FakeVerify([Verified(_meta(8))])
+    run = check_source(
+        source, function="my_abs", store_root=root, unwind=8, verify_port=fake
+    )
+
+    assert fake.unwinds == [8]  # base 8 held; derived rung (16,) never needed
+    assert run.counts()["held"] == 1
+
+
+def test_check_source_explicit_empty_ladder_verifies_once(tmp_path: Path) -> None:
+    """An explicit `()` is "verify once, no escalation" — distinct from `None`.
+
+    The `None` sentinel means "derive"; an explicit empty tuple must pass through
+    untouched, so the ladder is just `(unwind,)` and no rung is tried on UNKNOWN."""
+    source = _write_unit(tmp_path)
+    unit_id = f"{source}::my_abs"
+    root = tmp_path / ".forseti"
+    _seed_store(root, _semantic(unit_id, "result >= 0", ("x > INT64_MIN",)))
+
+    fake = FakeVerify([Unknown(_meta(4), UnknownReason.TIMEOUT)])
+    run = check_source(
+        source, function="my_abs", store_root=root, unwind_ladder=(), verify_port=fake
+    )
+
+    assert fake.unwinds == [4]  # settled at the base bound, no escalation
+    assert run.counts()["unknown"] == 1
+
+
 def test_check_source_no_properties_is_empty_run(tmp_path: Path) -> None:
     source = _write_unit(tmp_path)
     root = tmp_path / ".forseti"

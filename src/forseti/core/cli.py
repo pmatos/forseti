@@ -128,7 +128,7 @@ from .check import (
 from .check import (
     DEFAULT_UNWIND_LADDER as CHECK_DEFAULT_UNWIND_LADDER,
 )
-from .check import check_source, default_unwind_ladder_above
+from .check import check_source
 from .loop import LoopMode, SemanticLoopResult, run_semantic_loop
 from .propose import (
     DEFAULT_MAX_CANDIDATES,
@@ -600,20 +600,17 @@ def _render_check(run: PropertyCheckRun) -> str:
 
 
 def _run_check(args: argparse.Namespace) -> int:
-    unwind_ladder = args.unwind_ladder
-    if unwind_ladder is None:
-        # --unwind-ladder wasn't given: derive it from the chosen --unwind so
-        # `-k 8` (or higher) doesn't collide with the fixed default rungs and
-        # raise ValueError below (issue #95 review) -- an explicit
-        # --unwind-ladder (including "" -> ()) always passes through as-is.
-        unwind_ladder = default_unwind_ladder_above(args.unwind)
     try:
         result = check_source(
             args.source,
             function=args.function,
             store_root=args.store_root,
             unwind=args.unwind,
-            unwind_ladder=unwind_ladder,
+            # `None` when --unwind-ladder is unset: check_source then derives the
+            # rungs above --unwind itself (so `-k 8` alone can't build a
+            # non-increasing ladder). An explicit ladder, including "" -> (),
+            # passes straight through.
+            unwind_ladder=args.unwind_ladder,
             timeout_s=args.timeout,
             extra_flags=tuple(args.esbmc_args),
             esbmc_bin=args.esbmc_bin,

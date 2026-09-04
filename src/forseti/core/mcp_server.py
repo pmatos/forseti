@@ -29,7 +29,7 @@ from .check import (
 from .check import (
     DEFAULT_UNWIND as CHECK_DEFAULT_UNWIND,
 )
-from .check import check_source, default_unwind_ladder_above
+from .check import check_source
 from .loop import LoopMode, run_semantic_loop
 from .propose import (
     DEFAULT_MAX_CANDIDATES,
@@ -212,17 +212,14 @@ def check_tool(
         A JSON object with the unit id, per-outcome counts, and one verdict
         per checked property: held | violated | unknown | error | skipped.
     """
-    ladder = (
-        tuple(unwind_ladder)
-        if unwind_ladder is not None
-        else default_unwind_ladder_above(unwind)
-    )
     run = check_source(
         Path(source),
         function=function,
         store_root=Path(store_root),
         unwind=unwind,
-        unwind_ladder=ladder,
+        # `None` passes through so check_source derives the ladder above
+        # `unwind` itself; a supplied list is coerced to the tuple it expects.
+        unwind_ladder=tuple(unwind_ladder) if unwind_ladder is not None else None,
         timeout_s=timeout_s,
         esbmc_bin=esbmc_bin,
     )
