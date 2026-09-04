@@ -9,6 +9,12 @@ Markers are the *exact* env var names each harness's own CLI sets, not a
 prefix match: e.g. a `CODEX_COMPANION_SESSION_ID` set by an unrelated
 in-session tool must not be mistaken for genuine Codex CLI session env
 (`CODEX_SESSION_ID` / `CODEX_THREAD_ID`).
+
+Oh My Pi (#249) has no documented session env var of its own (checked
+against its `docs/environment-variables.md`), so it participates in the
+`Harness` enum but not in `detect_harness` -- a project onboarding it always
+needs an explicit `--harness oh-my-pi`, the same fail-closed default this
+module already applies to an ambiguous or absent session.
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ class Harness(StrEnum):
 
     CLAUDE_CODE = "claude-code"
     CODEX = "codex"
+    OH_MY_PI = "oh-my-pi"
 
 
 def detect_harness(env: Mapping[str, str] | None = None) -> Harness | None:
