@@ -1,3 +1,14 @@
+# [1.9.0](https://github.com/pmatos/forseti/compare/v1.8.1...v1.9.0) (2026-09-06)
+
+
+### Features
+
+* **adapters:** harness-aware enable-project + packaged Codex adapter ([#250](https://github.com/pmatos/forseti/issues/250)) ([af0c186](https://github.com/pmatos/forseti/commit/af0c186b87261296ea71672e8286043713722c9f))
+* **adapters:** Oh My Pi native adapter for the semantic-property loop ([#249](https://github.com/pmatos/forseti/issues/249)) ([#270](https://github.com/pmatos/forseti/issues/270)) ([dfee1c8](https://github.com/pmatos/forseti/commit/dfee1c83f7eec04698d837b5bafa6436d418c75b))
+* **claude-adapter:** block the Stop-gate turn on a VIOLATED semantic property ([#213](https://github.com/pmatos/forseti/issues/213)) ([#259](https://github.com/pmatos/forseti/issues/259)) ([7b61cd9](https://github.com/pmatos/forseti/commit/7b61cd947fb574d5fbb0208aa85965a9d5f7f3d0))
+* **core:** composed semantic-loop operation; wire Codex into it ([#213](https://github.com/pmatos/forseti/issues/213)) ([#255](https://github.com/pmatos/forseti/issues/255)) ([69b9664](https://github.com/pmatos/forseti/commit/69b9664ef29fcbadb8abfe268dce59d062b3812f))
+* **core:** submit-property, MCP check/submit, canonical loop events ([#213](https://github.com/pmatos/forseti/issues/213)) ([#252](https://github.com/pmatos/forseti/issues/252)) ([32ec33a](https://github.com/pmatos/forseti/commit/32ec33ab36cc1db3508e694651e7b72386b44dd7))
+
 ## [1.8.1](https://github.com/pmatos/forseti/compare/v1.8.0...v1.8.1) (2026-08-30)
 
 
