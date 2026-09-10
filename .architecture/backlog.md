@@ -73,13 +73,23 @@ same ideas. Reconciled against `gh` at the start of every run.
 
 ## hook-verdict-report-two-hooks
 
-- **Status**: proposed
+- **Status**: in-flight
+- **PR**: #275
 - **Score**: 19/25 (leverage 4, locality 4, blast radius 2, heat 3)
 - **Files**: ~5 estimated
 - **Modules**: `src/forseti/adapters/claude_code/post_tool_use.py`, `post_bash.py`, `stop_gate.py`
 - **Summary**: Extract the near-verbatim `UnitVerdict[] → (events, message, exit code)` transform copied across the two PostToolUse hooks into one `verdict_report` module; scored as pure deepening (the `post_bash` canonical-event fix is excluded as a wire-format change).
 - **First seen**: 2026-09-02
 - **Reason**: **picked 2026-09-11** — top-scoring eligible candidate (19/25) now that PR #267 cleared the in-flight slot; the fourth firing it surfaced, first it was taken. Ties the fresh `unit-id-value-type` (19/25) but wins the tie-break on lower blast radius (2 < 3). Scope: the two full sites (`post_tool_use` inline + `post_bash._report`) only; `stop_gate._residual` (a `dict`-shaped partial, own `_CEX_CLIP=1200` vs the hooks' `CEX_CLIP=1500`) is out of scope — different shape, folding it in would be a wire/shape change. Test-first precondition (satisfied this run): add esbmc-free pins for `post_bash._report`'s failure branch, today reachable only behind `@skipif(not _HAVE_ESBMC)` (`test_out_of_band.py`).
+
+### Run 2026-09-11 — complete
+
+- **Outcome**: complete
+- **Stopped at**: step 6 — PR #275 opened; work landed on branch
+- **Branch**: `pm-deepen/hook-verdict-report-two-hooks` — *created* as `pm-deepen/run-2026-09-11-0104` from `origin/main` and renamed at step 2. Branch adoption was **refused** at step 0 on condition 3: the firing branch (`sym/forseti/routine/refactor-audit/01M26RZFXK`) had an upstream (`@{u}` resolved to `origin/main`), so it was not a made-for-this-run, no-upstream branch.
+- **Committed**: review report + design pass (winner: config-as-data / style object; runner-up design C lost on locality), the ESBMC-free byte-for-byte oracle (`test_out_of_band`/`test_post_tool_use`), the `refactor(claude_code)` implementation (new `verdict_report.py` seam: `ReportStyle`/`partition`/`render`/`emit`; both hooks rewired; new `test_verdict_report.py`), and this backlog update.
+- **Evidence**: quality gate green — ruff check + ruff format --check + ty check + pytest (1650 passed, 1 skipped, ESBMC-gated included); project coverage 97.98% (gate 96%); `verdict_report.py`/`post_tool_use.py`/`post_bash.py` all 100%; PR #275. Diff 6 files vs ~5 estimate (within the 2× bail threshold); no public/wire interface touched; `stop_gate` untouched.
+- **Next**: human review of PR #275 (do not merge as part of the routine). Natural next firing: the runner-up candidate `unit-id-value-type` (19/25, tied, lost the blast-radius tie-break) — pick a scope (broad UnitId type vs its narrow `proposal-request-prologue` subset) before implementing so the two don't collide.
 
 ## unit-id-value-type
 
