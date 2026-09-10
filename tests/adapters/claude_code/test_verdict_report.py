@@ -9,6 +9,9 @@ directly and free of ESBMC, stdin, and subprocess.
 
 from __future__ import annotations
 
+import io
+import sys
+
 import pytest
 
 from forseti.adapters.claude_code import forseti_gate as gate
@@ -168,3 +171,22 @@ def test_emit_empty_message_prints_nothing(capsys: pytest.CaptureFixture[str]) -
     cap = capsys.readouterr()
     assert cap.out == ""
     assert cap.err == ""
+
+
+def test_emit_resolves_streams_at_call_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    # emit reads sys.stderr when called, not at import — a redirect installed after
+    # import must still be honoured (the module docstring claims this).
+    buf = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", buf)
+    report = verdict_report.render([_v("a::f", "violated", counterexample="c")], _STYLE)
+    assert verdict_report.emit(report) == 2
+    assert buf.getvalue() == report.message + "\n"
+
+
+def test_render_unknown_is_a_blocking_failure() -> None:
+    # UNKNOWN is not a pass (never silently allowed): it lands in failures, blocks.
+    v = _v("a::f", "unknown", detail="timeout after 110s")
+    report = verdict_report.render([v], _STYLE)
+    assert report.exit_code == 2
+    assert report.partition.failures == [v]
+    assert "✗ a::f — UNKNOWN (k=8)" in report.message
