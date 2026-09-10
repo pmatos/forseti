@@ -225,4 +225,56 @@ adds those ESBMC-free pins **before** the extraction. The candidate is therefore
 
 ## Design
 
-*(written in step 4; appended after this section was committed.)*
+Four interfaces were produced by parallel design sub-agents (design-it-twice), each briefed to a
+radically different philosophy, then adjudicated by an advisor against the fixed criteria in order:
+**depth → locality → seam placement → test surface → blast radius**. A fifth (ports-and-adapters)
+was not generated: no dependency crosses a seam here — the transform is pure text + exit code — so
+that philosophy is N/A, recorded rather than forced.
+
+**Winner: D — config-as-data / style object.**
+
+- **Interface** — a new leaf `adapters/claude_code/verdict_report.py`:
+  - `ReportStyle(fail_header, pass_prefix, trailer)` — a frozen value naming the entire per-hook
+    variation axis. The two instances (`_EDIT_STYLE`, `_OOB_STYLE`) live **in the hooks**, not the
+    seam.
+  - `Partition(verified, failures, needs)` and `partition(verdicts) -> Partition` — the sole home
+    of the `not v.passed and v.verdict != NEEDS_CONTRACT` predicate (today re-typed 3×).
+  - `render(verdicts, style) -> Report` — pure; assembles the exact message and exit code, carries
+    the `Partition` so callers read `report.partition.failures` for their events (this removes the
+    "double partition" the C/D drafts noted).
+  - `emit(report) -> int` — the single sanctioned I/O boundary: prints `message` to stderr iff
+    failure else stdout, nothing if empty, returns `exit_code`.
+- **Why it won.**
+  - *Depth (tie C=D, beats A, B).* B leaves the message assembly (the pass-`"\n"` vs
+    fail-`"\n\n"` needs-note join, stream, exit code) in both callers — its own author concedes it
+    "relocates wiring." A's two-name surface looks deepest but leaks the hook convention
+    (`if msg: print(msg, file=stderr if code else stdout)`) back into both hooks and collapses only
+    2 of 3 predicate copies — under-delivering its own card. C and D hide the same behaviour.
+  - *Locality (D beats C — the deciding axis).* C places the wording constants **in the seam**, so
+    `verdict_report.py` enumerates its consumers and a post_bash wording change edits the seam. D
+    keeps `_OOB_STYLE` beside `post_bash.main`: the seam owns the *grammar*, each hook owns its
+    *bytes*. A post_bash wording change touches post_bash only.
+  - *Seam placement.* Both put the seam exactly where the two hooks vary (a real two-adapter seam,
+    not hypothetical). Even split.
+  - *Test surface.* `render`/`partition` are pure `list[UnitVerdict] → value`, testable with a
+    synthetic `ReportStyle`, no ESBMC / stdin / subprocess — directly closing the standing gap that
+    `post_bash._report`'s failure branch was reachable only behind `@skipif(not _HAVE_ESBMC)`.
+    Even split C=D.
+  - *Blast radius.* Equal (~6 files incl. tests); did not need to break the tie.
+- **Runner-up design: C — caller-optimized value object.** Same behaviour hidden and the same
+  branch-collapse in `post_tool_use`, but it needs a 6-property value object plus an impure
+  `.deliver()` method whose properties (`n_failures`, `all_unit_ids`, …) are one-line derivations —
+  interface added without behaviour hidden — and it puts the style constants in the seam, losing the
+  locality axis to D. **A** (minimal) and **B** (composable primitives) lost on depth as above.
+- **Honest cost carried into the PR.** D's surface is `ReportStyle` + `Partition` + `Report` + three
+  functions, not one function; the depth comes from `partition` + the shared grammar, and
+  `ReportStyle` is the price of a two-parameter `render` that names the variation axis, not depth in
+  itself. The "someday third caller" (`stop_gate._residual`) does **not** fit: it consumes
+  `list[dict]`, not `UnitVerdict`, and keeps its own `_CEX_CLIP=1200` — so it stays out of scope and
+  the seam earns its keep on "the variation is now data, adding a variant is a constant" rather than
+  on a stop_gate reuse the types rule out.
+- **Byte-for-byte guardrails (applied in step 5).** Pin *exact* stdout/stderr (not substrings) for
+  both hooks over {violated+counterexample, detail-only, needs-only, mixed, empty} against the
+  current code first, as the oracle; confirm the post_bash failure-branch pins run ESBMC-free; keep
+  the collapsed `event_log.log_event` kwarg order identical; keep the needs-note join asymmetry
+  inside `render`; give `test_verdict_report.py` a globally-unique basename.
