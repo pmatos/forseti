@@ -6,14 +6,14 @@ same ideas. Reconciled against `gh` at the start of every run.
 
 ## check-source-ladder-default
 
-- **Status**: in-flight
+- **Status**: landed
 - **Score**: 20/25 (leverage 4, locality 4, blast radius 2, heat 4)
 - **Files**: ~4 estimated
 - **Modules**: `src/forseti/core/check.py` (`check_source`, `default_unwind_ladder_above`), `src/forseti/core/cli.py` (`_run_check`), `src/forseti/core/mcp_server.py` (`check_tool`), `src/forseti/core/loop.py` (`run_semantic_loop`)
 - **Summary**: Make `check_source` own its unwind-ladder default (`unwind_ladder=None → default_unwind_ladder_above(unwind)` internally) so its three callers stop repeating the `None → derive` branch and a direct `check_source(unwind=8)` stops raising on the `(8,8,16)` collision. Pure deepening, no wire change: the CLI/MCP boundaries already default to the derived ladder.
 - **First seen**: 2026-09-04
 - **PR**: #267
-- **Reason**: picked this run (top score, 20/25); within 1 point of the perennial runner-up `hook-verdict-report-two-hooks` (19/25), taken on the deterministic tie-break (heat) and on being pinnable esbmc-free.
+- **Reason**: picked its run (top score, 20/25); within 1 point of the perennial runner-up `hook-verdict-report-two-hooks` (19/25), taken on the deterministic tie-break (heat) and on being pinnable esbmc-free.
 
 ### Run 2026-09-04 — complete
 
@@ -23,6 +23,10 @@ same ideas. Reconciled against `gh` at the start of every run.
 - **Committed**: review report + design pass, the `refactor(core)` implementation (check_source owns its ladder default; three callers forward through; new `test_core_check.py`/`test_core_loop.py` pins), and this backlog update.
 - **Evidence**: quality gate green — ruff check + ruff format --check + ty check + pytest (1552 passed, 1 skipped, ESBMC-gated included); project coverage 97.81% (gate 96%); PR #267.
 - **Next**: human review of PR #267 (do not merge as part of the routine). Natural next firing: the perennial runner-up `hook-verdict-report-two-hooks` (19/25) — but add an esbmc-free characterization test for `post_bash._report` first (pinned only behind `@skipif(not _HAVE_ESBMC)` today).
+
+### Run 2026-09-11 — reconciled
+
+- **Outcome**: reconciled `in-flight` → `landed`. PR #267 merged 2026-09-04T08:11Z (`gh pr view 267 --json state,mergedAt`).
 
 ## precond-reachability-probe-tri-state
 
@@ -75,7 +79,46 @@ same ideas. Reconciled against `gh` at the start of every run.
 - **Modules**: `src/forseti/adapters/claude_code/post_tool_use.py`, `post_bash.py`, `stop_gate.py`
 - **Summary**: Extract the near-verbatim `UnitVerdict[] → (events, message, exit code)` transform copied across the two PostToolUse hooks into one `verdict_report` module; scored as pure deepening (the `post_bash` canonical-event fix is excluded as a wire-format change).
 - **First seen**: 2026-09-02
-- **Reason**: runner-up candidate this run too (19/25, within 1 point of `check-source-ladder-default`) — the third firing in a row it has placed second; still the natural next firing. Before picking it, note `post_bash._report` is pinned only behind `@skipif(not _HAVE_ESBMC)` (`test_out_of_band.py`); an esbmc-free characterization test must be added first. #259 added a third partial site, `stop_gate._residual` (its own `_CEX_CLIP=1200` vs the hooks' `CEX_CLIP=1500`).
+- **Reason**: **picked 2026-09-11** — top-scoring eligible candidate (19/25) now that PR #267 cleared the in-flight slot; the fourth firing it surfaced, first it was taken. Ties the fresh `unit-id-value-type` (19/25) but wins the tie-break on lower blast radius (2 < 3). Scope: the two full sites (`post_tool_use` inline + `post_bash._report`) only; `stop_gate._residual` (a `dict`-shaped partial, own `_CEX_CLIP=1200` vs the hooks' `CEX_CLIP=1500`) is out of scope — different shape, folding it in would be a wire/shape change. Test-first precondition (satisfied this run): add esbmc-free pins for `post_bash._report`'s failure branch, today reachable only behind `@skipif(not _HAVE_ESBMC)` (`test_out_of_band.py`).
+
+## unit-id-value-type
+
+- **Status**: proposed
+- **Score**: 19/25 (leverage 4, locality 4, blast radius 3, heat 4)
+- **Files**: ~10 estimated
+- **Modules**: construction at `core/propose.py:70`, `core/submit.py:77`, `orchestrator/ports.py:107`, `adapters/claude_code/property_gate.py:234`, `adapters/claude_code/forseti_gate.py:1662,1832,1912`, `adapters/oh_my_pi/verify_hook.py:239`, `core/_precond_cli.py:123,182`; inverse parse `properties/proposer.py:87`; a new `UnitId`/`make_unit_id`/`split_unit_id` seam (likely `properties/model.py`)
+- **Summary**: The `path::symbol` unit-id convention has no owning module — ~10 sites hand-format it and one consumer (`proposer.py:87`) re-parses it with a silent malformed-id fallback, so producers and consumer can drift with no enforcement. Give it one constructor/parser with a pinned round-trip.
+- **First seen**: 2026-09-11
+- **Reason**: fresh this run from the hot `properties/` sweep. Ties the pick `hook-verdict-report-two-hooks` at 19/25 but loses the deterministic tie-break on blast radius (2 < 3) — natural next firing. Its narrow 2-core-face subset is `proposal-request-prologue` (18/25); pick a scope before implementing so the two don't collide.
+
+## proposalresult-provenance-reflatten
+
+- **Status**: proposed
+- **Score**: 17/25 (leverage 3, locality 4, blast radius 2, heat 4)
+- **Files**: ~3–4 estimated
+- **Modules**: `properties/proposer.py:125-152` (`ProposalResult`), `:252-277` (`propose_properties`), `:311-337` (`submit_candidates`); docstring fix `core/propose.py:13-16`
+- **Summary**: `ProposalResult` re-declares the exact four fields of `Provenance` (`model.py:52-66`) and both proposer faces restate them when building result + provenance. Carry a `Provenance` behind `@property` shims (keeping the flat #44 `to_dict` wire shape and the `result.provider`/`result.model` readers) instead of restating. Folds in a live docstring drift: `core/propose.py:13-16` claims it "does not wire the #64 renderability gate" but it does (`propose.py:73` → `proposer.py:413`).
+- **First seen**: 2026-09-11
+
+## store-column-registry
+
+- **Status**: proposed
+- **Score**: 15/25 (leverage 2, locality 4, blast radius 2, heat 3)
+- **Files**: ~2 estimated
+- **Modules**: `properties/store.py:29-143` (`_SCHEMA`, `_INSERT`, `_MIGRATED_COLUMNS`, `_property_to_row`, `_row_to_property`), `tests/properties/test_store.py`
+- **Summary**: The 14-column property shape is restated five times; adding one field is a five-site lockstep edit. Derive schema/insert/migration/both mappers from one column registry.
+- **First seen**: 2026-09-11
+- **Reason**: leverage bounded — locality is already good (all five sites in one file), so this concentrates a lockstep edit but does not turn a shallow module deep. Nice-to-have.
+
+## signature-reexport-indirection
+
+- **Status**: dropped
+- **Score**: — (leverage 1)
+- **Files**: n/a
+- **Modules**: `properties/__init__.py:14-28`, `properties/harness.py:29-36`, `properties/signature.py`, `properties/proposer.py:34-39`
+- **Summary**: `UnitSignature`/`BufferParam`/`ScalarParam`/`Param`/`HarnessError`/`extract_signature` are defined in `signature.py` but imported "from `.harness`", so finding where they live is a two-hop bounce. Redirect the six names to `from .signature import ...`.
+- **First seen**: 2026-09-11
+- **Reason**: Leverage 1 — `__init__.py` is a facade for ~10 external importers (deleting it scatters), and redirecting six names is interface hygiene, not a shallow→deep change; nothing concentrates.
 
 ## proposal-request-prologue
 
