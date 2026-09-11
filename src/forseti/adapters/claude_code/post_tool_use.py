@@ -23,8 +23,21 @@ from pathlib import Path
 from forseti.core.events import GATE_DECISION
 from forseti.core.events import record_event as record_core_event
 
-from . import event_log
+from . import event_log, verdict_report
 from . import forseti_gate as gate
+
+_EDIT_STYLE = verdict_report.ReportStyle(
+    fail_header=(
+        "Forseti: {n} unit(s) did not verify (function-level ESBMC, safety properties)."
+    ),
+    pass_prefix="Forseti:",
+    trailer=(
+        "Fix the unit(s) to eliminate the counterexample; they will be "
+        "re-verified automatically on the next edit. Do not report the task "
+        "done until every unit is VERIFIED up to k. An UNKNOWN is not a pass — "
+        "raise k (FORSETI_UNWIND) or simplify the unit."
+    ),
+)
 
 
 def _record_gate_decision(
@@ -112,67 +125,23 @@ def main() -> int:
 
     # NEEDS_CONTRACT (pointer/array units the gate can't check without a harness)
     # is honestly-unverified but NOT a fixable counterexample — never feed it back
-    # or block on it; report it loudly instead (issue #122).
-    needs = [v for v in verdicts if v.verdict == gate.NEEDS_CONTRACT]
-    failures = [
-        v for v in verdicts if not v.passed and v.verdict != gate.NEEDS_CONTRACT
-    ]
+    # or block on it; `verdict_report` reports it loudly instead (issue #122).
+    report = verdict_report.render(verdicts, _EDIT_STYLE)
+    part = report.partition
 
-    if not failures:
-        verified = [v for v in verdicts if v.passed]
-        event_log.log_event(
-            project_dir,
-            event_log.GATE,
-            file=rel,
-            decision="pass",
-            n_failures=0,
-            n_needs_contract=len(needs),
-            exit_code=0,
-        )
-        _record_gate_decision(project_dir, rel, [v.unit_id for v in verdicts], "pass")
-        out = []
-        if verified:
-            oks = ", ".join(f"{v.unit_id} (k={v.k})" for v in verified)
-            out.append(f"Forseti: VERIFIED up to k — {oks}")
-        if needs:
-            out.append(gate.needs_note(needs))
-        if out:
-            print("\n".join(out))
-        return 0
-
-    lines = [
-        f"Forseti: {len(failures)} unit(s) did not verify "
-        f"(function-level ESBMC, safety properties).",
-        "",
-    ]
-    for v in failures:
-        lines.append(f"✗ {v.unit_id} — {v.verdict.upper()} (k={v.k})")
-        if v.counterexample:
-            lines.append("Counterexample:")
-            lines.append(v.counterexample.strip()[: gate.CEX_CLIP])
-        elif v.detail:
-            lines.append(f"  {v.detail}")
-        lines.append("")
-    lines.append(
-        "Fix the unit(s) to eliminate the counterexample; they will be "
-        "re-verified automatically on the next edit. Do not report the task "
-        "done until every unit is VERIFIED up to k. An UNKNOWN is not a pass — "
-        "raise k (FORSETI_UNWIND) or simplify the unit."
-    )
-    if needs:
-        lines += ["", gate.needs_note(needs)]
+    decision = "block" if report.is_failure else "pass"
     event_log.log_event(
         project_dir,
         event_log.GATE,
         file=rel,
-        decision="block",
-        n_failures=len(failures),
-        n_needs_contract=len(needs),
-        exit_code=2,
+        decision=decision,
+        n_failures=len(part.failures),
+        n_needs_contract=len(part.needs),
+        exit_code=report.exit_code,
     )
-    _record_gate_decision(project_dir, rel, [v.unit_id for v in failures], "block")
-    print("\n".join(lines), file=sys.stderr)
-    return 2
+    decided = part.failures if report.is_failure else verdicts
+    _record_gate_decision(project_dir, rel, [v.unit_id for v in decided], decision)
+    return verdict_report.emit(report)
 
 
 if __name__ == "__main__":

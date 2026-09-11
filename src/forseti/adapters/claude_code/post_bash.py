@@ -22,8 +22,22 @@ from __future__ import annotations
 import json
 import sys
 
-from . import event_log
+from . import event_log, verdict_report
 from . import forseti_gate as gate
+
+_OOB_STYLE = verdict_report.ReportStyle(
+    fail_header=(
+        "Forseti: {n} unit(s) written out-of-band (Bash) did not "
+        "verify (function-level ESBMC, safety properties)."
+    ),
+    pass_prefix="Forseti (out-of-band):",
+    trailer=(
+        "Fix the unit(s) to eliminate the counterexample; they will be "
+        "re-verified automatically on the next edit or Bash write. Do not report "
+        "the task done until every unit is VERIFIED up to k. An UNKNOWN is not a "
+        "pass — raise k (FORSETI_UNWIND) or simplify the unit."
+    ),
+)
 
 
 def _verify_file(project_dir: str, file_path: str) -> list[gate.UnitVerdict]:
@@ -47,63 +61,22 @@ def _verify_file(project_dir: str, file_path: str) -> list[gate.UnitVerdict]:
             duration_s=v.duration_s,
             argv=list(v.argv) if v.argv else None,
         )
-    failures = [
-        v for v in verdicts if not v.passed and v.verdict != gate.NEEDS_CONTRACT
-    ]
+    part = verdict_report.partition(verdicts)
     event_log.log_event(
         project_dir,
         event_log.GATE,
         file=rel,
-        decision="block" if failures else "pass",
-        n_failures=len(failures),
-        n_needs_contract=sum(1 for v in verdicts if v.verdict == gate.NEEDS_CONTRACT),
-        exit_code=2 if failures else 0,
+        decision="block" if part.failures else "pass",
+        n_failures=len(part.failures),
+        n_needs_contract=len(part.needs),
+        exit_code=2 if part.failures else 0,
     )
     return verdicts
 
 
 def _report(verdicts: list[gate.UnitVerdict]) -> int:
     """Aggregate verdicts across all scanned files into one message + exit code."""
-    needs = [v for v in verdicts if v.verdict == gate.NEEDS_CONTRACT]
-    failures = [
-        v for v in verdicts if not v.passed and v.verdict != gate.NEEDS_CONTRACT
-    ]
-    verified = [v for v in verdicts if v.passed]
-
-    if not failures:
-        out = []
-        if verified:
-            oks = ", ".join(f"{v.unit_id} (k={v.k})" for v in verified)
-            out.append(f"Forseti (out-of-band): VERIFIED up to k — {oks}")
-        if needs:
-            out.append(gate.needs_note(needs))
-        if out:
-            print("\n".join(out))
-        return 0
-
-    lines = [
-        f"Forseti: {len(failures)} unit(s) written out-of-band (Bash) did not "
-        "verify (function-level ESBMC, safety properties).",
-        "",
-    ]
-    for v in failures:
-        lines.append(f"✗ {v.unit_id} — {v.verdict.upper()} (k={v.k})")
-        if v.counterexample:
-            lines.append("Counterexample:")
-            lines.append(v.counterexample.strip()[: gate.CEX_CLIP])
-        elif v.detail:
-            lines.append(f"  {v.detail}")
-        lines.append("")
-    lines.append(
-        "Fix the unit(s) to eliminate the counterexample; they will be "
-        "re-verified automatically on the next edit or Bash write. Do not report "
-        "the task done until every unit is VERIFIED up to k. An UNKNOWN is not a "
-        "pass — raise k (FORSETI_UNWIND) or simplify the unit."
-    )
-    if needs:
-        lines += ["", gate.needs_note(needs)]
-    print("\n".join(lines), file=sys.stderr)
-    return 2
+    return verdict_report.emit(verdict_report.render(verdicts, _OOB_STYLE))
 
 
 def main() -> int:

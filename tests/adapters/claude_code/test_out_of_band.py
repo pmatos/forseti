@@ -2154,3 +2154,112 @@ def test_prune_deleted_units_clears_blob_baseline(tmp_path: Path) -> None:
     assert gate.prune_deleted_units(state, str(tmp_path)) == ["foo.c::f"]
     assert "foo.c" not in state["scanned"]
     assert "foo.c" not in state["baseline_blobs"]
+
+
+# --- post_bash._report exact-output oracle (ESBMC-free) -----------------------
+# These pin the byte-for-byte reviewer message + exit code of the out-of-band
+# report BEFORE the verdict->report transform is extracted into `verdict_report`.
+# The failure branch was previously reachable only behind `@skipif(_HAVE_ESBMC)`;
+# calling `_report` directly with synthetic verdicts exercises it without ESBMC.
+
+_OOB_TRAILER = (
+    "Fix the unit(s) to eliminate the counterexample; they will be "
+    "re-verified automatically on the next edit or Bash write. Do not report "
+    "the task done until every unit is VERIFIED up to k. An UNKNOWN is not a "
+    "pass — raise k (FORSETI_UNWIND) or simplify the unit."
+)
+
+
+def test_report_empty_prints_nothing_returns_zero(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert post_bash._report([]) == 0
+    cap = capsys.readouterr()
+    assert cap.out == ""
+    assert cap.err == ""
+
+
+def test_report_all_verified_prints_kernel_to_stdout(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    verdicts = [
+        gate.UnitVerdict("a.c::f", "a.c", "f", "verified", 8),
+        gate.UnitVerdict("a.c::g", "a.c", "g", "verified", 8),
+    ]
+    assert post_bash._report(verdicts) == 0
+    cap = capsys.readouterr()
+    assert cap.out == (
+        "Forseti (out-of-band): VERIFIED up to k — a.c::f (k=8), a.c::g (k=8)\n"
+    )
+    assert cap.err == ""
+
+
+def test_report_violation_with_counterexample_exact_stderr(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    v = gate.UnitVerdict(
+        "bad.c::f", "bad.c", "f", "violated", 8, counterexample="  state 1\n  state 2  "
+    )
+    assert post_bash._report([v]) == 2
+    cap = capsys.readouterr()
+    assert cap.out == ""
+    assert cap.err == (
+        "Forseti: 1 unit(s) written out-of-band (Bash) did not verify "
+        "(function-level ESBMC, safety properties).\n"
+        "\n"
+        "✗ bad.c::f — VIOLATED (k=8)\n"
+        "Counterexample:\n"
+        "state 1\n  state 2\n"  # counterexample.strip() drops the outer spaces
+        "\n" + _OOB_TRAILER + "\n"
+    )
+
+
+def test_report_detail_only_failure_exact_stderr(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    v = gate.UnitVerdict(
+        "e.c::g", "e.c", "g", "error", 4, detail="parse error at line 3"
+    )
+    assert post_bash._report([v]) == 2
+    cap = capsys.readouterr()
+    assert cap.err == (
+        "Forseti: 1 unit(s) written out-of-band (Bash) did not verify "
+        "(function-level ESBMC, safety properties).\n"
+        "\n"
+        "✗ e.c::g — ERROR (k=4)\n"
+        "  parse error at line 3\n"
+        "\n" + _OOB_TRAILER + "\n"
+    )
+
+
+def test_report_needs_contract_only_is_a_loud_pass(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    v = gate.UnitVerdict("p.c::h", "p.c", "h", gate.NEEDS_CONTRACT, 8)
+    assert post_bash._report([v]) == 0
+    cap = capsys.readouterr()
+    assert cap.out == gate.needs_note([v]) + "\n"
+    assert cap.err == ""
+
+
+def test_report_mixed_failure_verified_and_needs_exact_stderr(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    verified = gate.UnitVerdict("m.c::ok", "m.c", "ok", "verified", 8)
+    failure = gate.UnitVerdict(
+        "m.c::bug", "m.c", "bug", "violated", 8, counterexample="x == 0"
+    )
+    needs = gate.UnitVerdict("m.c::ptr", "m.c", "ptr", gate.NEEDS_CONTRACT, 8)
+    assert post_bash._report([verified, failure, needs]) == 2
+    cap = capsys.readouterr()
+    assert cap.out == ""
+    assert cap.err == (
+        "Forseti: 1 unit(s) written out-of-band (Bash) did not verify "
+        "(function-level ESBMC, safety properties).\n"
+        "\n"
+        "✗ m.c::bug — VIOLATED (k=8)\n"
+        "Counterexample:\n"
+        "x == 0\n"
+        "\n" + _OOB_TRAILER + "\n"
+        "\n" + gate.needs_note([needs]) + "\n"
+    )

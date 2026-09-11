@@ -275,3 +275,66 @@ def test_mixed_failure_and_needs_contract_reports_both(
     assert "mixed.c::f" in err
     assert "NOT gated" in err
     assert "mixed.c::g" in err
+
+
+# --- exact-output oracle (ESBMC-free) ----------------------------------------
+# Pin the byte-for-byte reviewer message + exit code of the edit hook BEFORE the
+# verdict->report transform moves into `verdict_report`, so a dropped blank line
+# or a changed em-dash is caught, not just a missing substring.
+
+_EDIT_TRAILER = (
+    "Fix the unit(s) to eliminate the counterexample; they will be "
+    "re-verified automatically on the next edit. Do not report the task "
+    "done until every unit is VERIFIED up to k. An UNKNOWN is not a pass — "
+    "raise k (FORSETI_UNWIND) or simplify the unit."
+)
+
+
+def test_verified_file_exact_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src = tmp_path / "clean.c"
+    src.write_text("int f(void){return 0;}\n")
+    _enumerate_one_unit(monkeypatch)
+    monkeypatch.setattr(
+        gate,
+        "verify_function",
+        lambda fp, fn, *, project_dir, k=gate.DEFAULT_K, verify_path=None: (
+            gate.UnitVerdict("clean.c::f", "clean.c", "f", "verified", 8)
+        ),
+    )
+
+    assert _run(tmp_path, monkeypatch, file_path=str(src)) == 0
+    cap = capsys.readouterr()
+    assert cap.out == "Forseti: VERIFIED up to k — clean.c::f (k=8)\n"
+    assert cap.err == ""
+
+
+def test_violation_exact_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src = tmp_path / "buggy.c"
+    src.write_text("int f(void){return 1 / 0;}\n")
+    _enumerate_one_unit(monkeypatch)
+    monkeypatch.setattr(
+        gate,
+        "verify_function",
+        lambda fp, fn, *, project_dir, k=gate.DEFAULT_K, verify_path=None: (
+            gate.UnitVerdict(
+                "buggy.c::f", "buggy.c", "f", "violated", 8, counterexample="  x / 0  "
+            )
+        ),
+    )
+
+    assert _run(tmp_path, monkeypatch, file_path=str(src)) == 2
+    cap = capsys.readouterr()
+    assert cap.out == ""
+    assert cap.err == (
+        "Forseti: 1 unit(s) did not verify "
+        "(function-level ESBMC, safety properties).\n"
+        "\n"
+        "✗ buggy.c::f — VIOLATED (k=8)\n"
+        "Counterexample:\n"
+        "x / 0\n"
+        "\n" + _EDIT_TRAILER + "\n"
+    )
