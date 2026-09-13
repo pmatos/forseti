@@ -27,6 +27,7 @@ from forseti.esbmc import (
     rename_all_declarations_and_definitions,
 )
 from forseti.properties import Property, PropertyStatus
+from forseti.unit_id import make_unit_id
 
 _RENAMED_MAIN = "__forseti_unused_main"
 
@@ -104,7 +105,7 @@ class Unit:
             path.read_text(), "main", _RENAMED_MAIN
         )
         effective_symbol = _RENAMED_MAIN if symbol == "main" else symbol
-        return cls(f"{path}::{symbol}", path, effective_symbol, source_text)
+        return cls(make_unit_id(path, symbol), path, effective_symbol, source_text)
 
 
 @dataclass(frozen=True)

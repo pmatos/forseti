@@ -26,6 +26,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
+from forseti.unit_id import unit_id_symbol
+
 from .cexpr import identifiers, unsafe_reason
 
 # The macro allowlist (`HARNESS_MACROS`) is owned by the harness writer -- the
@@ -84,7 +86,7 @@ class ProposalRequest:
     @property
     def symbol(self) -> str:
         """The function name -- the ``symbol`` half of ``path::symbol``."""
-        return self.unit_id.split("::", 1)[1] if "::" in self.unit_id else self.unit_id
+        return unit_id_symbol(self.unit_id)
 
 
 @dataclass(frozen=True)
