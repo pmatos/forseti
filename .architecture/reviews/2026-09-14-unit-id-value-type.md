@@ -8,7 +8,7 @@ harness adapters — plus a reconciliation of the persisted `.architecture/backl
 merged, plus dependency bumps), so this run is mostly friction re-confirmation on the standing
 candidates.
 
-**Picked**: `unit-id-value-type` — see PR (opened at step 6) and `.architecture/backlog.md`.
+**Picked**: `unit-id-value-type` — see [PR #281](https://github.com/pmatos/forseti/pull/281) and `.architecture/backlog.md`.
 
 **Degradations**: The `advisor` was rate-limited at the step-2 pick and (as recorded in
 `## Design`) at the step-4 adjudication; adjudication was done against the written designs per

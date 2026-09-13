@@ -97,13 +97,23 @@ same ideas. Reconciled against `gh` at the start of every run.
 
 ## unit-id-value-type
 
-- **Status**: proposed
+- **Status**: in-flight
+- **PR**: #281
 - **Score**: 19/25 (leverage 4, locality 4, blast radius 3, heat 4)
 - **Files**: ~10 estimated
 - **Modules**: construction at `core/propose.py:70`, `core/submit.py:77`, `orchestrator/ports.py:107`, `adapters/claude_code/property_gate.py:234`, `adapters/claude_code/forseti_gate.py:1662,1832,1912,2055,2254`, `adapters/oh_my_pi/verify_hook.py:239`; inverse parse `properties/proposer.py:87`; a new `make_unit_id`/`unit_id_symbol`/`unit_id_prefix` seam at top-level `src/forseti/unit_id.py` (stdlib-only leaf — top-level, not under `properties/`, so the two hooks that don't import `forseti.properties` today don't newly drag its eager `ClaudeCliClient`+sqlite init)
 - **Summary**: The `path::symbol` unit-id convention has no owning module — ~10 sites hand-format it and one consumer (`proposer.py:87`) re-parses it with a silent malformed-id fallback, so producers and consumer can drift with no enforcement. Give it one constructor/parser with a pinned round-trip. Scope is the `::` **join + split** only; each caller keeps its current left-operand path spelling, so every produced string and DB key is byte-identical.
 - **First seen**: 2026-09-11
 - **Reason**: **picked 2026-09-14** — top-scoring eligible candidate (19/25) now that PR #275 landed and cleared the in-flight slot. Within 1 point of the runner-up candidate `proposal-request-prologue` (18/25), which overlaps only at the two Core producer lines (`propose.py:70`, `submit.py:77`). Scope settled at **join+split concentration, no normalization change**: the Core(raw `source`)-vs-gate(`..`-resolved rel via `forseti_gate.unit_id()`) left-operand asymmetry (`property_gate.py:44-55`) is a *deliberate, documented* residual — unifying it is a behaviour/wire change, out of scope for an unattended run and reported for a human. The consumer-side slug derivations (`orchestrator/persistence.py`, `orchestrator/check.py`) are filed separately as `unit-id-slug-derivations`, not folded in.
+
+### Run 2026-09-14 — complete
+
+- **Outcome**: complete
+- **Stopped at**: step 6 — PR #281 opened; work landed on branch
+- **Branch**: `pm-deepen/unit-id-value-type` — *created* as `pm-deepen/run-2026-09-14-0103` from `origin/main` and renamed at step 2. Branch adoption was **refused** at step 0 on condition 3: the firing branch (`sym/forseti/routine/refactor-audit/01M2EG403Q`) had an upstream (`@{u}` resolved to `origin/main`), so it was not a made-for-this-run, no-upstream branch.
+- **Committed**: review report + design pass (winner: string-first free functions `forseti.unit_id`; runner-up design C — the rich `UnitId` value type — lost on the str-currency/blast-radius axes), the `refactor` implementation (new top-level leaf `src/forseti/unit_id.py` with `make_unit_id`/`unit_id_symbol`/`unit_id_prefix`; 8 producer/consumer files rewired; new `tests/properties/test_unit_id.py`), and this backlog update.
+- **Evidence**: quality gate green — ruff check + ruff format --check + ty check + pytest (1672 passed, 1 skipped, ESBMC-gated included); project coverage 97.98% (gate 96%), `unit_id.py` 100%; PR #281. Diff 9 files vs ~10 estimate; no public/wire interface touched (every produced string byte-identical). The `advisor` was rate-limited at the pick and the design adjudication; the no-advisor fallback was used.
+- **Next**: human review of PR #281 (do not merge as part of the routine). Natural next firing: the runner-up candidate `proposal-request-prologue` (18/25, within 1 point) — it overlaps only at the two Core `unit_id =` lines this PR swapped for `make_unit_id`, so the rest of its prologue is still extractable. `unit-id-slug-derivations` (18/25) becomes cleanly implementable once this leaf lands (a `slug()` then has a home).
 
 ## proposalresult-provenance-reflatten
 
