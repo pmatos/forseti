@@ -296,5 +296,84 @@ so the Core-vs-gate left-operand asymmetry is reported (above) but not touched.
 
 ## Design
 
-_Written at step 4, after this report was first committed; the file is amended and committed
-again there._
+Three interfaces were produced by parallel design sub-agents (design-it-twice), then adjudicated.
+The **advisor was rate-limited** at this step, so adjudication used the skill's no-advisor
+fallback: judged against the written designs (below), in the fixed criteria order (depth →
+locality → seam placement → test surface → blast radius).
+
+### Placement (decided first, orthogonal to A/B/C)
+
+All three designs independently flagged an import-cost hazard: `properties/__init__.py` eagerly
+imports `.llm` (`ClaudeCliClient`) and `.store` (`sqlite3`), and `forseti_gate.py` /
+`oh_my_pi/verify_hook.py` import nothing from `forseti.properties` today. Putting the seam under
+`properties/` would drag that weight into two hot hooks at import time. `forseti/__init__.py` is a
+one-line docstring, so the seam lands at top-level **`src/forseti/unit_id.py`** — a genuinely
+dependency-free leaf (stdlib-only, no forseti imports) that every tier (`core`, `orchestrator`,
+`properties`, all adapters) can import with no cycle and no weight. This supersedes the backlog's
+tentative `properties/unit_id.py` note.
+
+### The three designs
+
+- **A — minimal `UnitId` dataclass** with two stored fields `(path, symbol)`, `__str__`, `parse`.
+  Small surface, but the two-field layout makes `str(parse("loose")) == "::loose" != "loose"` (a
+  malformed non-round-trip wart) and equality is over `(path, symbol)` rather than the wire string.
+- **B — string-first free functions** (winner): `make_unit_id(path, symbol) -> str`,
+  `unit_id_symbol(unit_id) -> str`, `unit_id_prefix(path) -> str`. The unit-id's currency stays
+  `str` at every seam it already crosses; no wrap/unwrap; the `::` literal, the first-`::` split
+  (so a C++ `Foo::bar` survives), the silent no-`::` fallback, and the empty-symbol prefix all
+  live in one leaf.
+- **C — rich `UnitId` value type** with a single `value: str` field, `.path`/`.symbol` derived
+  `@property` views, `of`/`parse`/`prefix_for`/`symbol_under`, and a reserved (unshipped) `slug()`.
+  The single-field layout is genuinely elegant — `.value` is unconditionally byte-identical and
+  equality equals the wire key — and it leaves a clean hook for the `unit-id-slug-derivations`
+  follow-up.
+
+### Verdict — B wins
+
+**Depth.** The unit-id is a `str` at *every* boundary it crosses — SQLite keys, JSON `unit_id`
+fields, `state["units"]` keys, and the typed `Property.unit_id` / `UnitVerdict.unit_id` /
+`ProposalRequest.unit_id` slots — and **all three designs keep it `str` there** (C keeps
+`ProposalRequest.unit_id: str` and writes `.value` at the boundary). A value type is therefore
+constructed and immediately unwrapped at every producer and never lives as a type across a seam:
+it adds ceremony (the "`.value` at every boundary" discipline, which `ty` cannot enforce because
+`state` is `dict[str, Any]` — C's own admission) without adding enforcement. B's three-function
+interface hides the same rules with the least for a caller to learn — the higher
+behaviour-per-unit-of-interface for the scope actually chosen. (A type would be the right seam
+only if the id flowed as a first-class typed value through the store and wire — which is exactly
+the out-of-scope, ~30-site wire change this candidate excludes.)
+
+**Locality.** All three concentrate the `::` rule into one file. B introduces no new dispersed
+obligation; C spreads a `.value`-at-every-boundary obligation across ~12 sites. Edge B.
+
+**Seam placement.** Equal — a real seam (many producers + one consumer of one rule). B declines
+C's speculative `slug()` hook: the two existing slug derivations produce *different* on-disk names
+(`_unit_slug` vs `_harness_filename`), so a shared `slug()` is a behaviour change owned by the
+separate `unit-id-slug-derivations` firing, not something to anchor a hook for now (altitude).
+
+**Test surface.** Equal — each gets a dedicated `test_unit_id.py` exercising the rule without
+reaching past the interface. C's single-field round-trip is unconditional (a minor elegance edge);
+B's round-trip carries a `::`-free-path precondition that is real-world-vacuous (filesystem paths
+never contain `::`) and is documented. A's malformed non-round-trip is the weakest here.
+
+**Blast radius.** B is smallest: `str` → `str`, no unwrap threading, every existing `unit_id: str`
+slot and test literal (`"f.c::my_abs"`, `f"{source}::my_abs"`, …) untouched; core/`property_gate`
+fold `make_unit_id` into their existing `from forseti...` blocks. C is largest (`.value` at every
+producer, the `symbol_under` rewrite at `forseti_gate.py:1832`, the value-type footgun).
+
+**Runner-up design: C.** It has the most depth in the abstract and the nicer single-field
+round-trip, but the str-currency reality turns its type into a transient wrapper, so its extra
+surface buys ceremony rather than enforcement, and it loses decisively on blast radius. **A** is
+weakest — the two-field malformed wart with no offsetting gain over B.
+
+### Scope carried into implementation
+
+New leaf `src/forseti/unit_id.py` with `make_unit_id` / `unit_id_symbol` / `unit_id_prefix`;
+producers at `core/propose.py:70`, `core/submit.py:77`, `orchestrator/ports.py:107`,
+`property_gate.py:234`, `forseti_gate.py:1662,1832,1912,2055,2254`, `oh_my_pi/verify_hook.py:239`
+swap their f-strings for the seam (the gate's `unit_id()` rel-path function is untouched and does
+not collide — the imports are the three `*_unit_*` names, not `unit_id`); the consumer
+`proposer.py:87` reads through `unit_id_symbol`. The `_precond_cli.py:123,182` *display* headlines
+(`f"{source}::{function}: {label}"`) are a printed label, not a key, and are left out to hold the
+diff to the ~10 key-producing sites. No normalization change — the Core-vs-gate left-operand
+asymmetry is preserved. Pinned by `tests/properties/test_unit_id.py` (round-trip, byte-identity vs
+the legacy f-string, C++-symbol survival, `?` sentinel, malformed fallback, prefix `startswith`).
