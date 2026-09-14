@@ -6,12 +6,12 @@ workflow:
       template: builtin:single-agent-pr
       with:
         provider: claude
-        prompt: WORKFLOW.md
+        prompt: prompts/impl.md
       exits:
         # builtin:single-agent-pr's own transitions only check
         # provider_success + branch_ahead_of_base, which only prove the agent
         # committed something -- not that it ever pushed and opened the PR
-        # WORKFLOW.md tells it to (vow-lang/vow#1277: an implement run
+        # prompts/impl.md tells it to (vow-lang/vow#1277: an implement run
         # backgrounded the quality gate, ended its turn waiting on it, and
         # never reached the "open the PR" step -- yet still satisfied that
         # predicate). Route the template's success exit through
