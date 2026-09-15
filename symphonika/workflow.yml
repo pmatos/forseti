@@ -6,11 +6,44 @@ workflow:
       template: builtin:single-agent-pr
       with:
         provider: claude
-        prompt: WORKFLOW.md
+        prompt: prompts/impl.md
       exits:
-        success: code_review_fix
+        # builtin:single-agent-pr's own transitions only check
+        # provider_success + branch_ahead_of_base, which only prove the agent
+        # committed something -- not that it ever pushed and opened the PR
+        # prompts/impl.md tells it to (vow-lang/vow#1277: an implement run
+        # backgrounded the quality gate, ended its turn waiting on it, and
+        # never reached the "open the PR" step -- yet still satisfied that
+        # predicate). Route the template's success exit through
+        # wait_for_pr_open rather than straight to code_review_fix so a PR
+        # is actually observed before proceeding, mirroring the state
+        # symphonika's own workflow.yml added for the same failure class
+        # (symphonika issue #730, #1255).
+        success: wait_for_pr_open
         blocked: failed
   states:
+    # pr_signal predicates (pr_open/pr_merged/...) are only projected for
+    # kind: wait states, so this check cannot live on shipit's own template
+    # transitions. This dedicated wait state is the supported way to gate on
+    # PR existence: it reuses the same tracked-PR polling and
+    # no-PR-ever-tracked escalation to sym:blocked/sym:human-needed that
+    # wait_for_pr already relies on, but fails fast right after shipit
+    # instead of silently burning a code_review_fix and a simplify run
+    # against a branch with no PR first.
+    wait_for_pr_open:
+      action:
+        kind: wait
+      transitions:
+        - to: merged
+          when:
+            pr_merged: true
+        - to: code_review_fix
+          when:
+            pr_open: true
+        - to: failed
+          when:
+            pr_open: false
+
     code_review_fix:
       action:
         kind: agent
