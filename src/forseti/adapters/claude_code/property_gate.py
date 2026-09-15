@@ -46,7 +46,7 @@ cost, checked before opening (and, load-bearing, before it could ever
 *create*) the store.
 
 Known residual: a property's `unit_id` is keyed by whatever path string
-`forseti propose` was given (`core/propose.py`: ``f"{source}::{function}"``,
+`forseti propose` was given (`core/propose.py`: ``make_unit_id(source, function)``,
 unnormalized). This module matches it against the gate's own `rel::function`
 spelling -- the same `unit_id(project_dir, file_path)` the safety verdicts are
 already keyed by (`state["units"]`'s own `file` field). A subagent that
@@ -72,6 +72,7 @@ from forseti.properties import (
     PropertyStore,
     PropertyStoreError,
 )
+from forseti.unit_id import make_unit_id
 
 from . import forseti_gate as gate
 
@@ -231,7 +232,7 @@ def _units_with_candidates(
             rel, function = unit.get("file"), unit.get("function")
             if not rel or not function:
                 continue
-            unit_id = f"{rel}::{function}"
+            unit_id = make_unit_id(rel, function)
             checkable = store.list_for_unit(unit_id, CHECKABLE_STATUSES)
             if any(p.status == PropertyStatus.CANDIDATE for p in checkable):
                 out.append((unit, len(checkable)))
@@ -286,7 +287,7 @@ def _check_unit(
     """
     rel, function = unit["file"], unit["function"]
     # `rel`, unchanged: the subprocess already runs with `cwd=project_dir`, so
-    # `Unit.from_path` there builds `unit_id = f"{rel}::{function}"` -- the same
+    # `Unit.from_path` there builds `unit_id = make_unit_id(rel, function)` -- the same
     # spelling `_units_with_candidates` just proved has a stored candidate.
     # Resolving to an absolute path here would key the check's store lookup
     # under a different string than the one that selected this unit, making

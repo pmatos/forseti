@@ -33,6 +33,7 @@ from forseti.properties import (
     submit_candidates,
 )
 from forseti.properties.prompts import MAX_CANDIDATES_DEFAULT
+from forseti.unit_id import make_unit_id
 
 DEFAULT_MAX_CANDIDATES = MAX_CANDIDATES_DEFAULT
 DEFAULT_PROMPT_ID = "host-submitted"
@@ -74,7 +75,7 @@ def submit_source(
     `propose_source`/`check_source`.
     """
     source_text = source.read_text()
-    unit_id = f"{source}::{function}"
+    unit_id = make_unit_id(source, function)
     signature: UnitSignature | None
     try:
         signature = extract_signature(source_text, function)

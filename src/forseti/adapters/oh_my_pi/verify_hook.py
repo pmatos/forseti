@@ -66,6 +66,7 @@ from pathlib import Path
 
 from forseti.core.events import GATE_DECISION
 from forseti.core.events import record_event as record_core_event
+from forseti.unit_id import make_unit_id
 
 # Source kinds Forseti (ESBMC) targets or plans to: C -> C++ -> Python (ADR-0003).
 _SRC_SUFFIXES = {".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".py"}
@@ -236,7 +237,7 @@ def main() -> int:
             outcome, evidence = _semantic_check(path, function, cwd)
             if outcome == "empty":
                 continue
-            unit_id = f"{path}::{function}"
+            unit_id = make_unit_id(path, function)
             checked_units.append(unit_id)
             if outcome == "violated":
                 violated.append((unit_id, evidence))

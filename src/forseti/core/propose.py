@@ -33,6 +33,7 @@ from forseti.properties import (
     extract_signature,
     propose_properties,
 )
+from forseti.unit_id import make_unit_id
 
 DEFAULT_MODEL = "sonnet"
 DEFAULT_TIMEOUT_S = 240.0
@@ -67,7 +68,7 @@ def propose_source(
     domain-level failure instead of an uncaught SQLite traceback.
     """
     source_text = source.read_text()
-    unit_id = f"{source}::{function}"
+    unit_id = make_unit_id(source, function)
     signature: UnitSignature | None
     try:
         signature = extract_signature(source_text, function)

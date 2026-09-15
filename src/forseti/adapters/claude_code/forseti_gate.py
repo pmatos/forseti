@@ -33,6 +33,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from forseti.unit_id import make_unit_id, unit_id_prefix
+
 from . import event_log
 from .git import (
     _git,
@@ -1659,7 +1661,7 @@ def verify_function(
     Omitting it verifies `file_path` directly, unchanged from before.
     """
     rel = unit_id(project_dir, file_path)
-    uid = f"{rel}::{function}"
+    uid = make_unit_id(rel, function)
     source = file_path if verify_path is None else verify_path
     try:
         # Same build flags the enumeration parsed with, so the verify sees the
@@ -1829,7 +1831,7 @@ def prune_missing_units(
     by blanket-pruning up front — clears those without a mid-run hook kill being
     able to drop a still-unverified violation.
     """
-    prefix = f"{unit_id(project_dir, file_path)}::"
+    prefix = unit_id_prefix(unit_id(project_dir, file_path))
     stale = [
         u
         for u in state["units"]
@@ -1909,7 +1911,7 @@ def needs_contract_units(state: dict[str, Any]) -> list[dict[str, Any]]:
 def _needs_contract_verdict(rel: str, function: str, k: int) -> UnitVerdict:
     """The `NEEDS_CONTRACT` verdict for a pointer/array-taking unit (no ESBMC run)."""
     return UnitVerdict(
-        f"{rel}::{function}",
+        make_unit_id(rel, function),
         rel,
         function,
         NEEDS_CONTRACT,
@@ -2052,7 +2054,9 @@ def verify_and_record(
         `charge` inert either way. The counter is bumped by the next run that scans
         whatever the file now holds.
         """
-        verdict = UnitVerdict(f"{rel}::?", rel, "?", "error", k, detail=detail)
+        verdict = UnitVerdict(
+            make_unit_id(rel, "?"), rel, "?", "error", k, detail=detail
+        )
         with gate_lock(project_dir):
             state = load_state(project_dir)
             on_disk_now = content_hash(file_path)
@@ -2251,7 +2255,7 @@ def verify_and_record(
                     record(
                         state,
                         UnitVerdict(
-                            f"{rel}::{d.name}",
+                            make_unit_id(rel, d.name),
                             rel,
                             d.name,
                             "unknown",
