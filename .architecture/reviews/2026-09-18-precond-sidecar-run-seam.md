@@ -759,3 +759,46 @@ existing driver suites dispatch on filename and **ignore `unwind` entirely**:
 
 ### Adjudication
 
+**Winner: Design C, with Design B's `ProbeSite` enum adopted.**
+
+Adjudicated by the advisor against the five fixed criteria in order (depth, locality, seam placement,
+test surface, blast radius). The discriminator is **criterion 3, seam placement**, which fires before
+the later tiebreaks and settles it outright.
+
+**Why Design B lost.** It binds `plan` to the runner, but `discharge._check_caller` computes
+`plan_unit(caller)` fresh per caller (`discharge.py:620`) — so B forces a runner construction *inside*
+the per-caller loop. That places the seam at a granularity at which nothing actually varies: the
+runner's own fields (`work_dir`, `max_len`, `ladder_cap`, `raw`) are constant across exactly the span B
+makes non-constant. C's split matches where variation really is — runner per driver run, plan per call.
+Secondarily, B's `attempts` forces deleting `climb_to_terminal` from `orchestrator/ladder.py`, a shared
+module outside this candidate's scope and outside the blast-radius-2 band the pick was scored on.
+
+**Why Design A lost — on depth, the criterion it optimised for.** Hiding `k` entirely is the strongest
+single move any of the three makes. But A buys it by fusing two ESBMC questions into one verb, and the
+`Verified ⇒ probed` invariant then has to be recovered at both call sites with
+`assert probe is not None and reach is not None`. Depth is behaviour per unit of interface *a caller
+must learn*; a caller that must learn "these two fields are non-`None` iff the result verified, and I
+assert that myself" has not had the complexity hidden, only relocated into an invariant stated in
+prose. Seven keyword arguments per call site compounds it. C's `at: SettledRun` earns the same
+protection for `k` — you cannot name a bound the ladder never settled on — without the fusion.
+
+**What was carried over from the runner-up design.** B's `ProbeSite` enum is a real finding that C
+lacks: `label` and `non_vacuity` are not two independent knobs but one decision — *who emits the assert*
+(`render_sidecar(non_vacuity=True)` into the harness `main`, vs `inject_obligations` into the included
+TU copy) ↔ *which label reads it back*. Left separable, a mis-pairing fails **quietly** as
+`INCONCLUSIVE`, which every caller correctly fails closed on — the worst failure shape in this stack,
+because it is indistinguishable from an honest inconclusive. So C's
+`probe(..., label: str, non_vacuity: bool = False)` becomes `probe(..., site: ProbeSite)`. One extra
+name; the mis-pairing becomes unrepresentable; C's seam placement and 5-file estimate are undisturbed.
+
+**Two bounds set at adjudication time:**
+
+- `sidecar_verify_port` **stays in `verify.py`**. The relocation of `escalating_port`,
+  `_is_under_unwound` and `precondition_ladder` is forced by the import direction (`verify.py` will
+  import `run.py`). `sidecar_verify_port` is not forced — it is outer-seam *construction* that knows
+  `esbmc_bin`, `timeout_s` and `--force-malloc-success`, and `discharge.py:413` already imports it
+  directly. Moving it would widen the diff without concentrating anything.
+- The **acceptance criterion** is zero edits to `tests/precond/test_precond_verify.py` and
+  `tests/precond/test_discharge.py`. Both dispatch canned verdicts by sniffing the exact emitted
+  filenames, so their passing untouched *is* the behaviour-preservation proof for constraints 2 and 6.
+  If either needs editing, the refactor has changed behaviour.
