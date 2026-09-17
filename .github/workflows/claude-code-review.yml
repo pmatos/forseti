@@ -14,16 +14,17 @@ jobs:
   claude-review:
     # Skip bot-authored PRs (e.g. Dependabot): the review action refuses to run
     # for non-human actors, and an AI review adds no value to a mechanical
-    # dependency bump. Human-authored PRs are unaffected.
-    if: github.event.pull_request.user.type != 'Bot'
+    # dependency bump. Human-authored PRs are unaffected. Also skip pmatos's
+    # own PRs — self-reviewing adds no value either.
+    if: github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login != 'pmatos'
 
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       pull-requests: write
       issues: write
       id-token: write
-      statuses: write
+      actions: read
 
     steps:
       - name: Checkout repository
