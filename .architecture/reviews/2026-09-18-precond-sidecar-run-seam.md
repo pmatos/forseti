@@ -633,4 +633,129 @@ equivalence, which is more verification than one unattended firing can carry.
 
 ## Design
 
-Written at step 4 — see below.
+Three interfaces were designed in parallel by sub-agents, each briefed to optimise for a radically
+different thing, and each given the same six hard constraints:
+
+1. The escalate-vs-raw asymmetry is load-bearing — the laddered run goes through `escalating_port`,
+   the probe calls `raw` directly at the already-settled `k`.
+2. Emitted filenames stay byte-identical (`{function}__precond.c`, `{function}__precond_nonvacuity.c`,
+   `{caller.name}__discharge.c`, `{caller.name}__discharge_site.c`) — two test modules dispatch canned
+   verdicts by sniffing them.
+3. `render_sidecar`'s second positional argument means something different at each site; keep it opaque.
+4. Only verify's probe passes `non_vacuity=True`.
+5. Each driver keeps its own outcome interpretation (`Assessment` vs `CallerOutcome`).
+6. Behaviour-preserving: same ESBMC questions, same order, same bounds.
+
+All three converge on a `SidecarRunner` binding the values a driver run holds fixed. They diverge on
+**how many verbs**, **what the runner binds**, and **how the settled `k` reaches the probe**.
+
+### Design A — minimal interface surface
+
+Two public names. One verb: `SidecarRunner(work_dir, raw, max_len, ladder_cap)` with
+
+```python
+def run(self, plan, stem, include, *, probe_stem, probe_include,
+        probe_label, probe_non_vacuity=False) -> SidecarRun
+```
+
+fusing climb and probe on the observation that both drivers already probe **iff** the ladder settled
+`Verified`. `SidecarRun(result, k, probe=None, reachability=None)` carries both fields as `None` unless
+the run verified.
+
+*What it hides*: the ladder's existence and shape, `escalating_port`, `climb_to_terminal`, the
+`settled.result, settled.k` unpack, **and `k` entirely** — the probe's bound is not a parameter, so it
+cannot be passed wrong. `precondition_ladder` becomes private, a public name deleted rather than moved.
+
+*Dependency strategy*: one injected seam (`raw: VerifyPort`). `escalating_port` and `_is_under_unwound`
+relocate into `run.py` (forced: `verify.py` will import `run.py`).
+
+*Trade-offs*: seven keyword arguments at each call site, which is not "small" by the measure that
+matters to a reader. The `Verified ⇒ probed` invariant is asserted (`assert probe is not None`) at both
+call sites rather than typed. A future caller wanting a laddered run **without** a probe must pass four
+probe arguments it does not need, or the seam grows a sentinel. Estimate **5 files**.
+
+### Design B — ports and adapters / maximum testability
+
+Two verbs, and the asymmetry is *which method you called*:
+
+```python
+@dataclass(frozen=True, kw_only=True)
+class SidecarRunner:
+    work_dir: Path; plan: UnitPlan; max_len: int; raw: VerifyPort; ladder_cap: int = DEFAULT_LADDER_CAP
+    def climb(self, stem: str, include: str) -> SettledRun
+    def probe(self, stem: str, include: str, *, site: ProbeSite, after: SettledRun) -> SiteProbe
+```
+
+Adds a `ProbeSite` enum (`AFTER_SIDECAR_CALL` / `AT_OBLIGATION_ENTRY`) whose `.label` and `.non_vacuity`
+properties make the label↔flag pairing unrepresentable-wrong. `SettledRun` carries
+`attempts: tuple[LadderAttempt, ...]` — the protocol as data, so a test asserts on which bounds ESBMC
+was actually asked about rather than snooping the work dir.
+
+*What it hides*: everything A hides, plus the label/`non_vacuity` pairing and the deliberate choice that
+the obligation-site label is a bare prefix.
+
+*Dependency strategy*: `raw: VerifyPort` is the one real seam (two production adapters — verify's, and
+discharge's with an extra `-I`). `work_dir` is explicitly **not** given a writer port: ESBMC has no
+stdin, so an in-memory writer could never serve production and would be a test-only fake masquerading
+as an adapter. `render_sidecar` and `classify_site_probe` seams are declined as hypothetical.
+
+*Trade-offs*: binds `plan` to the runner, but `discharge._check_caller` computes `plan_unit(caller)`
+**fresh per caller**, so discharge must construct a runner inside its loop. Switching from
+`climb_to_terminal` to `verify_ladder` to obtain `attempts` leaves `climb_to_terminal` with **zero**
+callers, so the same change deletes it from `orchestrator/ladder.py` — reaching outside `precond/` into
+a shared module. `attempts` also retains every rung's `EsbmcResult` for the run's lifetime. Estimate
+**7 files**.
+
+### Design C — optimised for the most common caller
+
+Two verbs, and the runner binds only what is genuinely constant over a driver run — deliberately
+**not** `plan`:
+
+```python
+@dataclass(frozen=True)
+class SidecarRunner:
+    work_dir: Path; max_len: int; ladder_cap: int; raw: VerifyPort
+    def climb(self, *, stem: str, plan: UnitPlan, include: str) -> SettledRun
+    def probe(self, *, stem, plan, include, at: SettledRun, label: str,
+              non_vacuity: bool = False) -> ProbeRun
+
+@contextmanager
+def sidecar_runner(*, work_dir: Path | None, max_len, ladder_cap, raw, prefix) -> Iterator[SidecarRunner]
+```
+
+`at: SettledRun` — rather than a bare `k: int` — makes "the probe runs at the bound the ladder already
+settled on" a type-level fact. The `sidecar_runner` context manager absorbs the identical
+`work_dir or TemporaryDirectory` five-liner both drivers carry today, and with it discharge's 8-element
+`args` tuple that exists only to avoid writing an argument list twice.
+
+*What it hides*: everything A hides, plus where harnesses land and that the directory may be a temporary
+one with a lifetime, plus `--force-malloc-success` + assertions-on (`sidecar_verify_port` moves too).
+
+*Dependency strategy*: `raw: VerifyPort` stays the single ESBMC seam; both drivers keep their
+`raw_verify` parameters. `escalating_port`, `_is_under_unwound`, `sidecar_verify_port` and
+`precondition_ladder` relocate into `run.py`; `core/check.py:65` retargets its import and its prose at
+`:127`, `:132`, `:138` is respelled. `precond/__init__.py` needs **no edit** — none of the moved names
+is in its `__all__` (verified).
+
+*Trade-offs*: more names than A. `label` and `non_vacuity` stay two independent knobs where B's
+`ProbeSite` closes that pairing. Reading a driver signature no longer answers "where does this write" —
+you open `run.py`. The runner holds `work_dir` without owning its lifetime, so a runner escaping the
+`with` block points at a deleted directory. Estimate **5 files**.
+
+### What none of the existing tests can catch
+
+All three designs surfaced the same three holes, which the seam's own test module must close — the
+existing driver suites dispatch on filename and **ignore `unwind` entirely**:
+
+1. **Nothing asserts the probe runs at the settled `k`.** A refactor probing at `ladder[0]` leaves every
+   existing test green.
+2. **No existing fixture discriminates the escalating port from the raw one.** A label-only `Violated`
+   reads `REACHED` either way; a bare `Unknown` reads `INCONCLUSIVE` either way. The one fixture that
+   separates them is a `Violated` whose `raw_counterexample` carries **both** the probe label **and**
+   `"unwinding assertion"`: raw → `REACHED`, escalated → `Unknown` → `INCONCLUSIVE`. That fixture does
+   not exist today, and it is constraint 1 made assertable.
+3. **Whether a caller-supplied `work_dir` survives the run** (Design C's context manager only) — every
+   existing test would pass either way, since results are computed before any cleanup.
+
+### Adjudication
+
