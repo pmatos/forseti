@@ -159,7 +159,6 @@ discharge is spelled out in the label.
 
 from __future__ import annotations
 
-import tempfile
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -173,21 +172,19 @@ from forseti.esbmc import (
     list_caller_openings,
     list_units,
 )
-from forseti.orchestrator.ladder import climb_to_terminal
 from forseti.orchestrator.ports import VerifyPort
 
 from .model import CallerCheck, CallerOutcome, DischargeResult
-from .reachability import ProbeReachability, classify_site_probe
+from .reachability import ProbeReachability
+from .run import ProbeSite, SidecarRunner, sidecar_runner
 from .synth import (
     DEFAULT_MAX_LEN,
     OBLIGATION_LABEL_PREFIX,
-    OBLIGATION_SITE_LABEL_PREFIX,
     ParamRole,
     SynthError,
     UnitPlan,
     inject_obligations,
     plan_unit,
-    render_sidecar,
 )
 from .verify import (
     DEFAULT_LADDER_CAP,
@@ -195,9 +192,7 @@ from .verify import (
     Assessment,
     PreconditionResult,
     PreconditionUnavailable,
-    escalating_port,
     plan_for,
-    precondition_ladder,
     sidecar_verify_port,
     verify_precondition,
 )
@@ -420,20 +415,16 @@ def discharge_precondition(
             src, sym, esbmc_bin=esbmc_bin, timeout_s=timeout_s
         )
     )
-    args = (
-        source,
-        function,
-        unit_result,
-        lister(source),
-        open_callers,
-        max_len,
-        ladder_cap,
-        raw,
-    )
-    if work_dir is not None:
-        return _discharge(*args, work_dir)
-    with tempfile.TemporaryDirectory(prefix="forseti-discharge-") as tmp:
-        return _discharge(*args, Path(tmp))
+    with sidecar_runner(
+        work_dir=work_dir,
+        max_len=max_len,
+        ladder_cap=ladder_cap,
+        raw=raw,
+        prefix="forseti-discharge-",
+    ) as runner:
+        return _discharge(
+            source, function, unit_result, lister(source), open_callers, runner
+        )
 
 
 def _discharge(
@@ -442,10 +433,7 @@ def _discharge(
     unit_result: PreconditionResult,
     units: list[Unit],
     open_callers_fn: Callable[[Path, str], tuple[CallerCheck, ...]],
-    max_len: int,
-    ladder_cap: int,
-    raw: VerifyPort,
-    work_dir: Path,
+    runner: SidecarRunner,
 ) -> DischargeResult:
     plan = unit_result.plan
     assert plan is not None  # an ASSUMED_VERIFIED always carries its plan
@@ -519,17 +507,15 @@ def _discharge(
             unit_result,
         )
 
-    obligations_path = work_dir / f"{function}__obligations.c"
+    obligations_path = runner.work_dir / f"{function}__obligations.c"
     obligations_path.write_text(obligations)
-    site_path = work_dir / f"{function}__obligation_site.c"
+    site_path = runner.work_dir / f"{function}__obligation_site.c"
     site_path.write_text(site_probe)
 
     callers = reentrant + referrers
     checks = _attributed(
         tuple(
-            _check_caller(
-                caller, obligations_path, site_path, max_len, ladder_cap, raw, work_dir
-            )
+            _check_caller(caller, obligations_path, site_path, runner)
             for caller in callers
         ),
         function,
@@ -608,13 +594,7 @@ def _weakest_read_pointers(plan: UnitPlan) -> tuple[str, ...]:
 
 
 def _check_caller(
-    caller: Unit,
-    obligations: Path,
-    site: Path,
-    max_len: int,
-    ladder_cap: int,
-    raw: VerifyPort,
-    work_dir: Path,
+    caller: Unit, obligations: Path, site: Path, runner: SidecarRunner
 ) -> CallerCheck:
     """Verify `caller`'s own sidecar against the obligation-injected copy."""
     plan = plan_unit(caller)
@@ -626,13 +606,8 @@ def _check_caller(
             f"{', '.join(plan.unresolved_params)}",
         )
 
-    harness = work_dir / f"{caller.name}__discharge.c"
-    harness.write_text(render_sidecar(plan, str(obligations), max_len=max_len))
-
-    settled = climb_to_terminal(
-        harness,
-        verify=escalating_port(raw),
-        ladder=precondition_ladder(max_len, ladder_cap),
+    settled = runner.climb(
+        stem=f"{caller.name}__discharge", plan=plan, include=str(obligations)
     )
     result, k = settled.result, settled.k
 
@@ -681,10 +656,14 @@ def _check_caller(
             result,
         )
 
-    probe_harness = work_dir / f"{caller.name}__discharge_site.c"
-    probe_harness.write_text(render_sidecar(plan, str(site), max_len=max_len))
-    probe = raw(probe_harness, unwind=k)
-    match r := classify_site_probe(probe, label=OBLIGATION_SITE_LABEL_PREFIX):
+    probe = runner.probe(
+        stem=f"{caller.name}__discharge_site",
+        plan=plan,
+        include=str(site),
+        at=settled,
+        site=ProbeSite.AT_OBLIGATION_ENTRY,
+    )
+    match r := probe.reachability:
         case ProbeReachability.REACHED:
             return CallerCheck(
                 caller.name,
@@ -705,7 +684,7 @@ def _check_caller(
             return CallerCheck(
                 caller.name,
                 CallerOutcome.UNCHECKED,
-                f"could not confirm the call is reached ({probe.verdict.value})",
+                f"could not confirm the call is reached ({probe.result.verdict.value})",
                 k,
                 result,
             )

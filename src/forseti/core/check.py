@@ -62,7 +62,7 @@ from forseti.orchestrator import (
     VerifyPort,
     check_properties,
 )
-from forseti.precond.verify import escalating_port
+from forseti.precond.run import escalating_port
 
 # The CLI's own default: a human or a subagent invoking `forseti check`
 # directly owns its own time budget, so it can afford a short ladder — a
@@ -124,7 +124,7 @@ def check_source(
     each re-deriving it.
 
     Verifies with unwinding assertions ON (`no_unwinding_assertions=False`,
-    wrapped in `precond.verify.escalating_port` — the same combination S2's
+    wrapped in `precond.run.escalating_port` — the same combination S2's
     memory-precondition sidecar already uses), unlike `forseti.esbmc.verify`'s
     own default: with assertions off, an under-unwound loop is silently
     *assumed* to have exited, so a postcondition past the loop can settle
