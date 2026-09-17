@@ -332,7 +332,8 @@ same ideas. Reconciled against `gh` at the start of every run.
 
 ## precond-sidecar-run-seam
 
-- **Status**: proposed
+- **Status**: in-flight
+- **PR**: #294
 - **Score**: 21/25 (leverage 4, locality 5, blast radius 2, heat 4)
 - **Files**: ~4–6 estimated
 - **Modules**: `src/forseti/precond/verify.py:315-332` (`_run`), `:367-383` (`_assess_non_vacuity`), `src/forseti/precond/discharge.py:628-637` and `:684-687` (`_check_caller`), a new leaf `src/forseti/precond/run.py`
@@ -449,3 +450,12 @@ same ideas. Reconciled against `gh` at the start of every run.
 - **Summary**: Two same-named private `_nondet_slug` functions with the same stated purpose — name the `nondet_*` generator ESBMC will model for a C type — implemented with different regexes, and they disagree: `_Bool` → `nondet__Bool` vs `nondet_Bool`; `const char *` → `nondet_const_char__` vs `nondet_const_char`; `_Atomic(int)` → `nondet__Atomic_int_` vs `nondet_Atomic_int`. Neither is broken today (each emitter uses its own slug for both prototype and call site), but the one external fact is stated twice, plus a gratuitous `extern` divergence.
 - **First seen**: 2026-09-18
 - **Reason**: weakest concentration — only the naming/declaration convention. The two emitters build genuinely different artefacts (`render_semantic_harness` inlines the unit source, `render_sidecar` `#include`s it), so there is no deep "one harness writer" hiding here. The fix must *pick* a spelling, which changes emitted C on one side.
+
+### Run 2026-09-18 — complete
+
+- **Outcome**: complete
+- **Stopped at**: step 6 — PR #294 opened; work landed on branch
+- **Branch**: `pm-deepen/precond-sidecar-run-seam` — *created* as `pm-deepen/run-2026-09-18-0102` from `origin/main` and renamed at step 2. Branch adoption was **refused** at step 0 on condition 3: the firing branch (`sym/forseti/routine/refactor-audit/01M2RSMHC9`) had an upstream (`@{u}` resolved to `origin/main`), so it was not a made-for-this-run, no-upstream branch.
+- **Committed**: review report + design pass (winner: Design C — `SidecarRunner` binding work_dir/max_len/ladder_cap/raw with `climb`+`probe` and a `sidecar_runner` context manager; runner-up design B — the plan-binding, `attempts`-exposing variant — lost on seam placement, since discharge re-plans per caller; B's `ProbeSite` enum was adopted into C), the `refactor(precond)` implementation (new `precond/run.py` + `tests/precond/test_precond_run.py`, verify/discharge rewired, `core/check.py` import retargeted), and this backlog update.
+- **Evidence**: quality gate green — ruff check + ruff format --check + ty check + pytest (1686 passed, 1 skipped, ESBMC-gated included, esbmc 8.3.0 on PATH); project coverage 97.99% (gate 96%), `precond/run.py` 100%; PR #294. Diff **5 files** vs the ~4–6 estimate. Behaviour preservation proved by `tests/precond/test_precond_verify.py` and `tests/precond/test_discharge.py` passing **untouched** (both dispatch canned verdicts by sniffing the emitted harness filenames). The escalate-vs-raw test was **mutation-checked**: routing `probe` through `escalating_port` fails exactly that one test and no other, while both driver suites stay green — they ignore `unwind` entirely.
+- **Next**: human review of PR #294 (do not merge as part of the routine). Natural next firing: the runner-up candidate `forseti-cli-json-subprocess-seam` (20/25, within 1 point) — it also carries a **live bug** for a human, independent of the refactor: the Codex and Oh-My-Pi hooks forward no `FORSETI_BUILD_FLAGS`, so on any project with `-I`/`-D` they report `skipped`/`error` where the Claude gate gets a real verdict. Note its argv half is unpinned at two of three harnesses (both suites stub `fake_run(*_a, **_kw)` and ignore their arguments), so argv-shape assertions must land before that extraction.
