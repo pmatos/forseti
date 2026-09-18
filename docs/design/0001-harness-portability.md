@@ -128,8 +128,9 @@ names, distinct at a glance from an adapter's own short local names (`edit`, `ga
 | `gate.decision` | Claude Code's `post_tool_use` | `harness`, `adapter`, `unit_ids` (`path::symbol`, per verified function), `decision` |
 | `gate.decision` | Codex's `verify_hook` | `harness`, `adapter`, `files` (raw edited paths — the hook verifies a whole file at a time, no per-function enumeration), `decision` |
 | `gate.decision` | Oh My Pi's `verify_hook` (#249) | `harness`, `adapter`, `unit_ids` (`path::symbol`, per checked function — the hook calls `forseti list-units` before checking, same granularity as Claude Code's), `decision` |
+| `cli.command` | `forseti synth` / `discharge` (`core._precond_cli`), `forseti semantic-loop` (`core.cli`) (#301) | `command`, `source`, `function`, `exit_code`, `duration_s`; `synth`/`discharge` add `emit_only` and `assessment` (the `Assessment` value, `null` for a successful `--emit-only`); `semantic-loop` adds `mode`, `unit_id`, `outcome` (both `null` when no run completed) |
 
-All five append to `<store_root>/events.jsonl` — the project's `.forseti/events.jsonl` when
+All six append to `<store_root>/events.jsonl` — the project's `.forseti/events.jsonl` when
 `store_root` is the default, the same file the Claude Code adapter's own
 `adapters.claude_code.event_log` trace already writes to (`edit`/`verify`/`gate`/`stop`/
 `session`, keyed by `type`). **One trace file, two vocabularies**, not three incompatible
@@ -150,6 +151,20 @@ parity: Claude Code and Oh My Pi both enumerate and check each function in the e
 per-function enumeration), so its event carries `files` — raw source paths — instead of
 `unit_ids`. Recording is best-effort and never raises — a trace failure must not turn a real
 verdict into a hook crash.
+
+`cli.command` (#301) covers the CLI-only paths that had no Core event of their own: one event
+per `synth`/`discharge`/`semantic-loop` invocation, on every exit path (`--emit-only`, a
+`PreconditionUnavailable`, an argument error, a verdict). It is **not** in #15's event list,
+which is loop-level; #15 should be extended with it. The instrumentation is **per-handler, not a
+central hook in `cli.main`**: only the handlers that take a store root can key the event by it
+(`verify`/`list-units`/`enable-project`/`mcp` have none), and the three hook subcommands
+already trace themselves (`gate.decision`), so a central dispatch point would need its own
+exclusion list. It lives in the CLI handler, not the engine (`run_semantic_loop` documents that
+it adds no event of its own; `verify_precondition`/`discharge_precondition` take no store
+root), so library and MCP callers stay silent. `synth`/`discharge` gained `--store-root`
+(default `.forseti`, the same relative default `propose`/`check` use) for the trace only — a
+relative default is still resolved against the cwd, so a caller in another directory passes an
+absolute `--store-root`.
 
 ### The composed semantic-loop operation (implemented, #213)
 

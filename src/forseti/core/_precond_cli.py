@@ -15,6 +15,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 from forseti.esbmc import Violated
@@ -31,6 +33,9 @@ from forseti.precond import (
 from forseti.precond import (
     DEFAULT_TIMEOUT_S as SYNTH_TIMEOUT_S,
 )
+
+from .events import CLI_COMMAND, record_event
+from .propose import DEFAULT_STORE_ROOT
 
 
 def _add_precondition_arguments(p: argparse.ArgumentParser, *, emit_help: str) -> None:
@@ -65,6 +70,16 @@ def _add_precondition_arguments(p: argparse.ArgumentParser, *, emit_help: str) -
         default="esbmc",
         help="esbmc binary to invoke (default: esbmc on PATH)",
     )
+    p.add_argument(
+        "--store-root",
+        type=Path,
+        default=DEFAULT_STORE_ROOT,
+        metavar="DIR",
+        help=(
+            "the .forseti directory the event trace (events.jsonl) is written "
+            f"to (default: {DEFAULT_STORE_ROOT})"
+        ),
+    )
     p.add_argument("--emit-only", action="store_true", help=emit_help)
     p.add_argument(
         "--json",
@@ -95,7 +110,39 @@ def _add_synth_parser(
     p.set_defaults(func=_run_synth)
 
 
+def _traced(
+    command: str,
+    run: Callable[[argparse.Namespace], tuple[int, Assessment | None]],
+    args: argparse.Namespace,
+) -> int:
+    """Run `run(args)` and record one `cli.command` event for it (#301).
+
+    Every return path of `run` -- `--emit-only`, `PreconditionUnavailable`, a
+    verdict -- lands here, so no path can skip the trace. The assessment rides
+    along as a field rather than living only in stdout for a consumer to scrape;
+    it is `None` only for a successful `--emit-only` (nothing was assessed).
+    """
+    started = time.monotonic()
+    exit_code, assessment = run(args)
+    record_event(
+        args.store_root,
+        CLI_COMMAND,
+        command=command,
+        source=str(args.source),
+        function=args.function,
+        emit_only=args.emit_only,
+        assessment=assessment.value if assessment is not None else None,
+        exit_code=exit_code,
+        duration_s=time.monotonic() - started,
+    )
+    return exit_code
+
+
 def _run_synth(args: argparse.Namespace) -> int:
+    return _traced("synth", _synth, args)
+
+
+def _synth(args: argparse.Namespace) -> tuple[int, Assessment | None]:
     if args.emit_only:
         try:
             text = synthesize(
@@ -106,9 +153,9 @@ def _run_synth(args: argparse.Namespace) -> int:
             )
         except PreconditionUnavailable as exc:
             print(f"forseti synth: {exc.detail}", file=sys.stderr)
-            return ASSESSMENT_EXIT_CODES[exc.assessment]
+            return ASSESSMENT_EXIT_CODES[exc.assessment], exc.assessment
         print(text, end="")
-        return 0
+        return 0, None
 
     result = verify_precondition(
         args.source,
@@ -125,7 +172,7 @@ def _run_synth(args: argparse.Namespace) -> int:
             result.esbmc_result, Violated
         ):
             print(f"\n{result.esbmc_result.raw_counterexample}")
-    return ASSESSMENT_EXIT_CODES[result.assessment]
+    return ASSESSMENT_EXIT_CODES[result.assessment], result.assessment
 
 
 def _add_discharge_parser(
@@ -156,6 +203,10 @@ def _add_discharge_parser(
 
 
 def _run_discharge(args: argparse.Namespace) -> int:
+    return _traced("discharge", _discharge, args)
+
+
+def _discharge(args: argparse.Namespace) -> tuple[int, Assessment | None]:
     if args.emit_only:
         try:
             text = emit_obligations(
@@ -165,9 +216,9 @@ def _run_discharge(args: argparse.Namespace) -> int:
             )
         except PreconditionUnavailable as exc:
             print(f"forseti discharge: {exc.detail}", file=sys.stderr)
-            return ASSESSMENT_EXIT_CODES[exc.assessment]
+            return ASSESSMENT_EXIT_CODES[exc.assessment], exc.assessment
         print(text, end="")
-        return 0
+        return 0, None
 
     result = discharge_precondition(
         args.source,
@@ -182,4 +233,4 @@ def _run_discharge(args: argparse.Namespace) -> int:
         print(f"{args.source}::{args.function}: {result.label}")
         for check in result.callers:
             print(f"  {check.caller}(): {check.outcome.value} — {check.detail}")
-    return ASSESSMENT_EXIT_CODES[result.assessment]
+    return ASSESSMENT_EXIT_CODES[result.assessment], result.assessment

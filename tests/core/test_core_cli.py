@@ -21,6 +21,13 @@ EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
 FIXTURES = Path(__file__).resolve().parents[1] / "esbmc" / "fixtures"
 
 
+@pytest.fixture(autouse=True)
+def _trace_in_tmp_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`synth`/`discharge` write their `cli.command` trace under the default
+    relative `.forseti`; keep it out of the repo checkout (#301)."""
+    monkeypatch.chdir(tmp_path)
+
+
 def test_verify_verified_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
     code = main(["verify", str(EXAMPLES / "abs_fixed.c"), "-k", "1"])
     assert code == 0

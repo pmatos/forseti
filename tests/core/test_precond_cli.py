@@ -17,12 +17,15 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from forseti.core import _precond_cli, cli
 from forseti.core.cli import _build_parser, main
+from forseti.core.events import CLI_COMMAND, events_path
 from forseti.esbmc import Violated
 from forseti.esbmc.result import RunMeta
 from forseti.precond import (
@@ -31,6 +34,13 @@ from forseti.precond import (
     PreconditionResult,
     PreconditionUnavailable,
 )
+
+
+@pytest.fixture(autouse=True)
+def _trace_in_tmp_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests that omit `--store-root` trace under the default relative `.forseti`;
+    keep that out of the repo checkout (#301)."""
+    monkeypatch.chdir(tmp_path)
 
 
 def test_precond_cli_module_exposes_the_synth_and_discharge_cluster() -> None:
@@ -210,3 +220,99 @@ def test_discharge_json_emits_the_result_payload(
     code = main(["discharge", "x.c", "--function", "foo", "--json"])
     assert code == ASSESSMENT_EXIT_CODES[Assessment.VIOLATED]
     assert json.loads(capsys.readouterr().out) == {"assessment": "violated"}
+
+
+# --- cli.command trace (#301) ----------------------------------------------
+
+
+def _cli_events(store_root: Path) -> list[dict[str, Any]]:
+    lines = events_path(store_root).read_text().splitlines()
+    return [e for e in map(json.loads, lines) if e["type"] == CLI_COMMAND]
+
+
+def _stub_engine(monkeypatch: pytest.MonkeyPatch, command: str, path: str) -> None:
+    def unavailable(*a: object, **k: object) -> str:
+        raise PreconditionUnavailable(Assessment.NEEDS_CONTRACT, "no pointer plan")
+
+    verdict = SimpleNamespace(
+        label="x", assessment=Assessment.VIOLATED, callers=[], esbmc_result=None
+    )
+    engine = {
+        ("synth", "emit"): ("synthesize", lambda *a, **k: "SIDECAR_C\n"),
+        ("synth", "unavailable"): ("synthesize", unavailable),
+        ("synth", "verdict"): ("verify_precondition", lambda *a, **k: verdict),
+        ("discharge", "emit"): ("emit_obligations", lambda *a, **k: "INJECTED\n"),
+        ("discharge", "unavailable"): ("emit_obligations", unavailable),
+        ("discharge", "verdict"): ("discharge_precondition", lambda *a, **k: verdict),
+    }
+    name, fn = engine[(command, path)]
+    monkeypatch.setattr(_precond_cli, name, fn)
+
+
+@pytest.mark.parametrize("command", ["synth", "discharge"])
+@pytest.mark.parametrize(
+    ("path", "emit_only", "assessment", "exit_code"),
+    [
+        ("emit", True, None, 0),
+        (
+            "unavailable",
+            True,
+            "needs_contract",
+            ASSESSMENT_EXIT_CODES[Assessment.NEEDS_CONTRACT],
+        ),
+        ("verdict", False, "violated", ASSESSMENT_EXIT_CODES[Assessment.VIOLATED]),
+    ],
+)
+def test_synth_and_discharge_record_one_cli_command_event_per_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command: str,
+    path: str,
+    emit_only: bool,
+    assessment: str | None,
+    exit_code: int,
+) -> None:
+    _stub_engine(monkeypatch, command, path)
+    root = tmp_path / "elsewhere" / ".forseti"
+    argv = [command, "x.c", "--function", "foo", "--store-root", str(root)]
+    code = main([*argv, "--emit-only"] if emit_only else argv)
+
+    assert code == exit_code
+    (event,) = _cli_events(root)
+    assert event["command"] == command
+    assert event["source"] == "x.c"
+    assert event["function"] == "foo"
+    assert event["emit_only"] is emit_only
+    assert event["assessment"] == assessment
+    assert event["exit_code"] == exit_code
+    assert event["duration_s"] >= 0
+    # Keyed by --store-root, not the cwd (the demo shim's cwd-keyed gap).
+    assert not (tmp_path / ".forseti").exists()
+
+
+def test_synth_trace_defaults_to_the_relative_forseti_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _stub_engine(monkeypatch, "synth", "emit")
+    assert main(["synth", "x.c", "--function", "foo", "--emit-only"]) == 0
+    (event,) = _cli_events(tmp_path / ".forseti")
+    assert event["command"] == "synth"
+
+
+def test_a_failing_trace_write_never_changes_the_exit_code(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _stub_engine(monkeypatch, "discharge", "verdict")
+    blocked = tmp_path / "not_a_dir"
+    blocked.write_text("")
+    code = main(
+        [
+            "discharge",
+            "x.c",
+            "--function",
+            "foo",
+            "--store-root",
+            str(blocked / ".forseti"),
+        ]
+    )
+    assert code == ASSESSMENT_EXIT_CODES[Assessment.VIOLATED]
