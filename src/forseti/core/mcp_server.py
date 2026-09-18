@@ -211,7 +211,8 @@ def check_tool(
         esbmc_bin: The esbmc binary to invoke.
         max_len: Cap on a `(ptr, len)` buffer length the property's domain does
             not constrain; a verdict is then scoped to `len<=max_len` (reported
-            in its `length_bounds`) and needs `unwind` above it to settle.
+            in its `length_bounds`); an explicit `unwind`/`unwind_ladder` must
+            reach `max_len + 1` to settle (the default ladder is extended).
 
     Returns:
         A JSON object with the unit id, per-outcome counts, and one verdict
@@ -282,7 +283,8 @@ def semantic_loop_tool(
         esbmc_bin: The esbmc binary to invoke.
         max_len: Cap on a `(ptr, len)` buffer length the property's domain does
             not constrain; a verdict is then scoped to `len<=max_len` (reported
-            in its `length_bounds`) and needs `unwind` above it to settle.
+            in its `length_bounds`); an explicit `unwind`/`unwind_ladder` must
+            reach `max_len + 1` to settle (the default ladder is extended).
 
     Returns:
         A JSON object with the unit id, `mode`, the per-candidate ingestion

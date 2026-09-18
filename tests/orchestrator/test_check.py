@@ -688,7 +688,7 @@ def test_semantic_writer_reports_the_cap_it_applied() -> None:
     assert SemanticHarnessWriter().render(unit, prop).length_bounds == ()
     capped = SemanticHarnessWriter(max_len=4).render(unit, prop)
     assert capped.length_bounds == (("n", 4),)
-    assert "__ESBMC_assume((n) <= 4);" in capped.source_text
+    assert "__ESBMC_assume((n >= 0 && n <= 4));" in capped.source_text
 
 
 def test_persist_property_check_writes_jsonl(tmp_path: Path) -> None:

@@ -522,7 +522,8 @@ def _add_max_len_argument(p: argparse.ArgumentParser) -> None:
         help=(
             "cap on a `(ptr, len)` buffer length the property's domain does not "
             f"constrain (default: {DEFAULT_MAX_LEN}); a held/violated is then "
-            "scoped to len<=N, and N needs -k above it to settle (a domain "
+            "scoped to len<=N. The default ladder is extended past N; an "
+            "explicit -k/--unwind-ladder must reach N+1 to settle (a domain "
             "clause naming the length overrides the cap)"
         ),
     )
