@@ -97,7 +97,7 @@ same ideas. Reconciled against `gh` at the start of every run.
 
 ## unit-id-value-type
 
-- **Status**: in-flight
+- **Status**: landed
 - **PR**: #281
 - **Score**: 19/25 (leverage 4, locality 4, blast radius 3, heat 4)
 - **Files**: ~10 estimated
@@ -114,6 +114,11 @@ same ideas. Reconciled against `gh` at the start of every run.
 - **Committed**: review report + design pass (winner: string-first free functions `forseti.unit_id`; runner-up design C — the rich `UnitId` value type — lost on the str-currency/blast-radius axes), the `refactor` implementation (new top-level leaf `src/forseti/unit_id.py` with `make_unit_id`/`unit_id_symbol`/`unit_id_prefix`; 8 producer/consumer files rewired; new `tests/properties/test_unit_id.py`), and this backlog update.
 - **Evidence**: quality gate green — ruff check + ruff format --check + ty check + pytest (1672 passed, 1 skipped, ESBMC-gated included); project coverage 97.98% (gate 96%), `unit_id.py` 100%; PR #281. Diff 9 files vs ~10 estimate; no public/wire interface touched (every produced string byte-identical). The `advisor` was rate-limited at the pick and the design adjudication; the no-advisor fallback was used.
 - **Next**: human review of PR #281 (do not merge as part of the routine). Natural next firing: the runner-up candidate `proposal-request-prologue` (18/25, within 1 point) — it overlaps only at the two Core `unit_id =` lines this PR swapped for `make_unit_id`, so the rest of its prologue is still extractable. `unit-id-slug-derivations` (18/25) becomes cleanly implementable once this leaf lands (a `slug()` then has a home).
+
+### Run 2026-09-18 — reconciled
+
+- **Outcome**: reconciled `in-flight` → `landed`. PR #281 merged 2026-09-15T19:13:53Z (`gh pr view 281 --json state,mergedAt`); on `origin/main` as `c17d557`.
+- **Consequence for `unit-id-slug-derivations`**: partially unmet. #281 landed `src/forseti/unit_id.py` as **free functions** (`make_unit_id`, and the symbol/prefix accessors) — **not** a `UnitId` value type. That entry's premise, "once a `UnitId` type exists, a single `UnitId.slug()` concentrates both rules", therefore still has no class to hang `.slug()` on; a slug helper would have to land as another free function in the same leaf. Leverage held at 3, score held at 18/25.
 
 ## proposalresult-provenance-reflatten
 
@@ -153,6 +158,7 @@ same ideas. Reconciled against `gh` at the start of every run.
 - **Summary**: Extract the verbatim read-unit→`ProposalRequest` prologue (`read_text` → `unit_id` → best-effort `extract_signature` degrade → build request) shared by propose/submit into one `build_proposal_request` helper — the *head* complement of the store-open/dry-run/trace *tail* that PR #262 already absorbed into `core/persistence.py`.
 - **First seen**: 2026-09-04
 - **Reason**: absorbs the `read_unit`-preamble half of the now-superseded `core-store-session-boundary`.
+- **Re-check 2026-09-18**: friction intact — the `read_text` → `extract_signature` → `ProposalRequest(...)` prologue still stands at `core/propose.py:74-78` and `core/submit.py:81-85` after #262 and #281. Stays `proposed` at 18/25.
 
 ## counterexample-fired-label-predicate
 
@@ -211,6 +217,7 @@ same ideas. Reconciled against `gh` at the start of every run.
 - **Modules**: `src/forseti/adapters/claude_code/install.py`, `adapters/codex/install.py`, a new `adapters/_install.py`
 - **Summary**: Extract the shared idempotent managed-block install/remove skeleton (with the byte-identical outcome enums) so each adapter supplies only its merge/strip strategy and error type.
 - **First seen**: 2026-09-02
+- **Re-check 2026-09-18**: now **three** harnesses, not two — `adapters/oh_my_pi/install.py` joined `claude_code/install.py` and `codex/install.py` when #270 landed. All three agree on the `tuple[Path, Enum]` return contract and each defines byte-identical `InstallOutcome`/`RemoveOutcome` enums. Leverage raised 3 → 4, so the score moves **14/25 → 17/25** (leverage 4, locality 3, blast radius 3, heat 3). Still below this run's pick; stays `proposed`.
 
 ## canonical-gate-decision-helper
 
@@ -241,6 +248,7 @@ same ideas. Reconciled against `gh` at the start of every run.
 - **Summary**: Two independent, non-identical sanitizations turn the same `path::symbol` key into a filesystem-safe name — `_unit_slug` does `.replace("::", "__").replace("/", "_")` + a hash suffix; `_harness_filename` does `re.sub(r"[^A-Za-z0-9_.-]", "_", unit_id)`. The **consumer** complement of `unit-id-value-type`: once a `UnitId` type exists, a single `UnitId.slug()` concentrates both rules.
 - **First seen**: 2026-09-14
 - **Reason**: fresh this run from the exploration's consumer-side sweep. Deliberately **not** folded into the `unit-id-value-type` pick — that pick is scoped to `::` join+split only; extending it to slugging would inflate its blast radius past the score it was picked on. Natural firing after the `UnitId` type lands, so `.slug()` has a home. Blast radius 1 (2-3 contained files, no published interface).
+- **Re-check 2026-09-18**: friction intact — `orchestrator/persistence.py:30` (`_unit_slug`) and `orchestrator/check.py:417` (`_harness_filename`) both still exist and still sanitize differently. Premise only partly satisfied by #281 (free functions, no `UnitId` type — see that entry's 2026-09-18 reconciliation). Stays `proposed` at 18/25.
 
 ## precond-cli-subcommand-skeleton
 
@@ -321,3 +329,133 @@ same ideas. Reconciled against `gh` at the start of every run.
 - **Summary**: The Codex whole-file `forseti verify` subprocess + JSON `decision` path and the Claude in-process per-function `verify_and_record` + stderr/exit path are parallel "verify edits → block on counterexample → report" pipelines that drifted (lowercase verdict strings vs `UnitVerdict`; file vs function granularity; no shared state persistence on the Codex side).
 - **First seen**: 2026-09-04
 - **Reason**: Fails the deletion test — the mechanisms genuinely differ, so a shared seam would be a param-heavy switch; complexity moves/parameterises, it does not concentrate.
+
+## precond-sidecar-run-seam
+
+- **Status**: in-flight
+- **PR**: #294
+- **Score**: 21/25 (leverage 4, locality 5, blast radius 2, heat 4)
+- **Files**: ~4–6 estimated
+- **Modules**: `src/forseti/precond/verify.py:315-332` (`_run`), `:367-383` (`_assess_non_vacuity`), `src/forseti/precond/discharge.py:628-637` and `:684-687` (`_check_caller`), a new leaf `src/forseti/precond/run.py`
+- **Summary**: "Run a sidecar" is one recipe — derive a filename under `work_dir`, `write_text(render_sidecar(...))`, climb `precondition_ladder` through `escalating_port`, then re-render the probe variant and run it **unescalated** at the settled `k` — and it is written out twice in full. The escalate-vs-don't-escalate asymmetry between the laddered run and the probe is load-bearing and stated nowhere; it survives only because both copies happen to agree. Give it one tested home so both drivers shrink to "render this, read the verdict".
+- **First seen**: 2026-09-18
+- **Reason**: **picked 2026-09-18** — top score. Separated from a four-way 20/25 tie (`forseti-cli-json-subprocess-seam`, `cli-check-phase-argument-block`, `verify-port-test-doubles`, `scanned-source-carrier`) by locality alone: the protocol spans two source files today, so it earns the rubric's "several files → one file" 5, where `cli-check-phase-argument-block`'s two blocks sit inside one file and cap at 4. Also the only one of the five that is fully esbmc-free (both drivers take an injected `VerifyPort`; `tests/precond` runs 126 tests in 0.54s) and touches no published interface.
+
+## forseti-cli-json-subprocess-seam
+
+- **Status**: proposed
+- **Score**: 20/25 (leverage 4, locality 5, blast radius 3, heat 4)
+- **Files**: ~10 estimated
+- **Modules**: `adapters/claude_code/forseti_gate.py:803-846` (`_list_units`) and `:1675-1734` (`verify_function`), `adapters/claude_code/property_gate.py:295-349` (`_check_unit`), `adapters/codex/verify_hook.py:81-103` (`_verify`), `adapters/oh_my_pi/verify_hook.py:114-134` (`_list_functions`) and `:137-186` (`_semantic_check`), a new `adapters/_forseti_cli.py`
+- **Summary**: Six sites across three harnesses hand-roll the same four decisions — argv assembly, timeout, failure bucketing, JSON decode — and have already drifted four ways: codex and oh-my-pi forward **no** `FORSETI_BUILD_FLAGS` where `property_gate.py:311-317` documents why they must; the `verdict`/`counterexample or reason or message` decoder exists twice; the stderr-fallback clip is `[:800]`/`[:400]`/`[:400]`; and the launch/timeout/decode failure taxonomy is three-way on the Claude side and one-way on the other two. A leaf returning a structured run outcome lets each caller keep its own translation tail.
+- **First seen**: 2026-09-18
+- **Reason**: runner-up candidate this run, within 1 point; the natural next firing. **Not** a re-run of the dropped `codex-claude-verify-drift` — that entry judged the *pipelines* irreconcilable (per-file vs per-function), which still holds; this is only the subprocess boundary underneath them, identical in all six sites. Carries one **behaviour** finding an unattended run must not bundle in: forwarding build flags on the codex/oh-my-pi paths changes their verdicts on any project with `-I`/`-D`. File that as a bug for a human; keep the extraction behaviour-preserving. Note also the argv half is currently **unpinned** at two of three harnesses (both suites stub `fake_run(*_a, **_kw)` and ignore their arguments), so argv-shape assertions must land before the change.
+
+## cli-check-phase-argument-block
+
+- **Status**: proposed
+- **Score**: 20/25 (leverage 3, locality 4, blast radius 1, heat 5)
+- **Files**: ~1 estimated
+- **Modules**: `src/forseti/core/cli.py:524-561` (the `check` subparser) and `:730-767` (the `semantic-loop` subparser); existing precedent at `:274-289` (`_add_unit_store_arguments`) and `core/_precond_cli.py:36-73` (`_add_precondition_arguments`)
+- **Summary**: The two check-phase flag blocks are character-for-character identical apart from two prose strings, including the 6-line f-string help that interpolates `CHECK_DEFAULT_UNWIND_LADDER` — so changing the documented ladder default has to be done twice or the two subcommands silently document different defaults. The extraction was already started twice in this codebase and stopped one block short.
+- **First seen**: 2026-09-18
+- **Reason**: tied at 20/25, in the hottest source file in the tree (16 of the last 60 commits), and the lowest-risk of the band (one file, argparse surface unchanged, both parsers already exercised through `cli.main`). Lost the pick on locality only: both sites are inside `cli.py`, so the rubric's "several **files** → one file" clause that earns a 5 is definitionally unavailable to it.
+
+## verify-port-test-doubles
+
+- **Status**: proposed
+- **Score**: 20/25 (leverage 4, locality 5, blast radius 3, heat 4)
+- **Files**: ~15 estimated
+- **Modules**: `class FakeVerify` verbatim in 11 modules (`tests/orchestrator/test_loop.py`, `test_ladder.py`, `test_check.py`, `test_telemetry.py`, `test_report.py`, `test_transcript.py`, `test_persistence.py`, `test_fix.py`; `tests/core/test_core_check.py`, `test_core_loop.py`, `test_semantic_loop_cli.py`), 35 hand-rolled `RunMeta`/`_meta` sites; `tests/esbmc/conftest.py` is 0 bytes and `tests/orchestrator/`, `tests/core/` have no conftest
+- **Summary**: Every driver test pays ~30 lines of scaffolding before its first assertion, and the copies have drifted — some record `calls`, some `unwinds`, `test_telemetry.py:61` records neither. "What a scripted ESBMC verdict looks like" is one concept spread over ~18 files; a shared `ScriptedVerify` plus verdict/`RunMeta` builders is where it wants to live.
+- **First seen**: 2026-09-18
+- **Reason**: tied at 20/25. Test-only, so leverage caps at 4 — no production interface gets deeper. One constraint for whoever takes it: `tests/orchestrator/test_report.py:127` (`test_k_reflects_the_escalated_bound_not_the_argv`) deliberately relies on the meta's `argv` being *stale* relative to `k`, so a shared builder must let the caller fix `argv` rather than deriving it from `unwind`.
+
+## scanned-source-carrier
+
+- **Status**: proposed
+- **Score**: 20/25 (leverage 4, locality 4, blast radius 3, heat 5)
+- **Files**: ~3 estimated (but see the scope warning)
+- **Modules**: `src/forseti/esbmc/units.py:1466-1506` (`_with_predefined_guards`), `:1210-1236` (`_annotate_array_extents`), `:1199-1209` (`_candidates_by_name`), `:1508-1550` (`list_units`), `:900-975` (`_select_definition`), `:32-35` (four private imports from `preprocessor`); `_stripped_for_scan` re-derived at `:1001`, `:1082`, `:1194`, `:1533`
+- **Summary**: There is no carrier for "this source, scanned". The masked text, per-name definition candidates, `#line` breakpoints and the measured `predefined` guard seed are four artifacts derived from one string, and every function in the chain either re-derives them or takes them as extra positional parameters — a 4-deep hand-threading plus a second, uncoordinated derivation path for the public entry points.
+- **First seen**: 2026-09-18
+- **Reason**: tied at 20/25 but **deliberately not picked**: highest regression risk of the band. `units.py`'s scan heuristics have historically required differential runs against a `clang __LINE__` oracle to prove equivalence — more verification than one unattended firing can carry. Scope warning: `find_definition_brace` is called from `precond/synth.py:575` and `properties/harness.py:517`, so the change must either freeze that public signature or accept a wider blast radius.
+
+## harness-reply-triage-two-hooks
+
+- **Status**: proposed
+- **Score**: 19/25 (leverage 4, locality 4, blast radius 2, heat 3)
+- **Files**: ~4 estimated
+- **Modules**: `adapters/codex/verify_hook.py:120-181`, `adapters/oh_my_pi/verify_hook.py:217-292`; in-repo template at `adapters/claude_code/verdict_report.py:25-119` (`ReportStyle`/`partition`/`render`/`emit`)
+- **Summary**: Both gates own an identical triage-and-reply grammar — partition into violated/inconclusive, `### VIOLATED: {id}` blocks, an "Also inconclusive (do not ignore)" tail, the same "Not a pass — raise k, add an entry/harness, or report." sentence — and they have already drifted ("could not conclusively **verify**" vs "**check**"). The residual builder `", ".join(f"{x} [{y}]")` appears four times.
+- **First seen**: 2026-09-18
+- **Reason**: distinct from the landed `hook-verdict-report-two-hooks`, which was `UnitVerdict[]` → stderr/exit-code *inside* Claude Code; this is `(id, evidence)[]` → stdout JSON across two *other* harnesses, and `verdict_report.ReportStyle` is the in-repo template for the target shape. Well pinned already.
+
+## open-caller-checks-openings-record
+
+- **Status**: proposed
+- **Score**: 18/25 (leverage 3, locality 4, blast radius 1, heat 3)
+- **Files**: ~3 estimated
+- **Modules**: `precond/discharge.py:206-215` (signature), `:234-285` (five near-identical comprehensions), `:305-316` (`find_open_callers`); the record `CallerOpenings` already exists at `esbmc/units.py:1411-1436`; test helpers at `tests/precond/test_open_callers.py:23-33`, `tests/precond/test_discharge.py:124-145`
+- **Summary**: `open_caller_checks` takes the five openings as five separate keyword-only `tuple[str, ...]` params, and `find_open_callers` destructures a `CallerOpenings` it already holds back into those five keywords — interface tax as complex as the implementation it fronts. Adding a sixth way the caller set can be open is a four-site lockstep edit rather than one table row.
+- **First seen**: 2026-09-18
+- **Reason**: the **consumer-side** shape; deliberately not folded into `esbmc-caller-openings-module-split`, which relocates the ~460 LOC of parsing inside `units.py`. Pinned by `tests/precond/test_open_callers.py:76` (`test_the_concatenation_order_is_stable`), exactly the invariant a table-driven rewrite must preserve.
+
+## harness-registry-dispatch-table
+
+- **Status**: proposed
+- **Score**: 17/25 (leverage 3, locality 3, blast radius 2, heat 4)
+- **Files**: ~3 estimated
+- **Modules**: `adapters/harness.py:30-35` (the enum that names harnesses but carries no facts), `core/cli.py:1035-1094` (`_run_enable_project`), `:1130-1173` (`_run_disable_project`), `:894-915`, `:937-941`, `:961-965` (three near-identical hook dispatchers)
+- **Summary**: Install fn, remove fn, error type, whether `--shared` applies, and the CLI prose are spread across six branches in two handlers, with the `--shared has no effect` guard copied four times. All three harnesses already agree on the `tuple[Path, Enum]` return contract, so the registry is one dataclass per harness away.
+- **First seen**: 2026-09-18
+- **Reason**: weak concentration — the outcome-enum half of the win overlaps `adapter-install-skeleton-two-harnesses`. Adjacent to the dropped `cli-run-handler-shape`, but distinct: that entry was about the generic `try/except/print/return 1` shape (already extracted as `_run_harness_action` at `core/cli.py:1015-1032`), not the per-harness facts table.
+
+## pointer-length-pairing-two-parsers
+
+- **Status**: proposed
+- **Score**: 17/25 (leverage 4, locality 4, blast radius 4, heat 3)
+- **Files**: ~5 estimated
+- **Modules**: `properties/signature.py:189-223`, `:96-100`, `:232-236`; `precond/synth.py:87-88`, `:175-176`, `:185-194`, `:258-295`
+- **Summary**: Both modules answer "does this pointer parameter pair with the next integer, and in what units?" and have drifted into different answers. `signature.py` pairs any following non-pointer integer and always treats the length as an **element count**; `synth.py` pairs only on a name allowlist and distinguishes **byte length** from **element count**. So `f(int *p, size_t nbytes)` gets an `nbytes`-element object on the properties path and an `nbytes`-*byte* object on the precond path. The integer predicates also disagree: `synth.py:176` is a bare substring scan, so a `point_t count` parameter reads as an integer length because `"int" in "point_t"`.
+- **First seen**: 2026-09-18
+- **Reason**: blast radius 4 — reconciling byte-length against element-count decides **what a generated harness allocates**, which is a behaviour decision, not a refactor. An unattended run must not settle it silently; it wants a human and a before/after differential. Only the pure ordered-parameter → (buffer, length, units) rule concentrates — merging the two *parsers* (regex over a source slice vs a clang `Param` list) gains nothing.
+
+## update-notice-emission-policy
+
+- **Status**: proposed
+- **Score**: 16/25 (leverage 3, locality 4, blast radius 2, heat 2)
+- **Files**: ~4 estimated
+- **Modules**: `src/forseti/update_notice.py:35-65`, `core/cli.py:1236-1244`, `esbmc/cli.py:37-40`
+- **Summary**: `update_notice()` returns a banner and leaves "may I print this, and where" to every caller, so the policy lives nowhere: one inline `if` in `core/cli.py` suppressing four subcommands, and no suppression at all in `esbmc/cli.py`. `verify`, `list-units` and `semantic-loop` are *not* suppressed and are exactly the commands the three hook adapters shell out to — while all three read stderr as evidence on the failure path (`codex/verify_hook.py:95`, `oh_my_pi/verify_hook.py:164`, `forseti_gate.py:1730`), so the banner can become the reported skip reason handed back to the model.
+- **First seen**: 2026-09-18
+- **Reason**: two emit sites = a real seam, not a hypothetical one, but cold code (heat 2). The *suppression* behaviour has no existing assertion — a test that `forseti codex-hook` emits no banner while `forseti verify` does must land first.
+
+## esbmc-run-boundary
+
+- **Status**: proposed
+- **Score**: 15/25 (leverage 2, locality 3, blast radius 2, heat 4)
+- **Files**: ~3 estimated
+- **Modules**: `esbmc/units.py:1237-1262` (`_parse_tree`), `:325-331` (`_error_line`), `:1296-1412` (`probe_predefined_guards`); `esbmc/runner.py:209-285` (`verify`), `:58-63` (`_error_message`)
+- **Summary**: The `subprocess.run` invocation shape, "esbmc's output is stdout ⧺ stderr", and "an error is the first `ERROR:` line" are each spelled twice, and the `ERROR:` extractor has drifted on its fallback (`""` vs `"esbmc reported an error"`). Timeout policy has three answers in three places (`+ VERIFY_GRACE_S`, raw, `min(…, cap)`).
+- **First seen**: 2026-09-18
+- **Reason**: leverage 2 — once the divergent translation policy (fail-loud raise vs typed verdict) is subtracted, the shared core is roughly 12 lines. A drift/tidiness candidate, not a leverage one.
+
+## nondet-generator-convention-two-slugs
+
+- **Status**: proposed
+- **Score**: 14/25 (leverage 2, locality 3, blast radius 2, heat 3)
+- **Files**: ~4 estimated
+- **Modules**: `properties/harness.py:331-338`, `:341-358`, `:175-182`; `precond/synth.py:319-322`, `:413-421`
+- **Summary**: Two same-named private `_nondet_slug` functions with the same stated purpose — name the `nondet_*` generator ESBMC will model for a C type — implemented with different regexes, and they disagree: `_Bool` → `nondet__Bool` vs `nondet_Bool`; `const char *` → `nondet_const_char__` vs `nondet_const_char`; `_Atomic(int)` → `nondet__Atomic_int_` vs `nondet_Atomic_int`. Neither is broken today (each emitter uses its own slug for both prototype and call site), but the one external fact is stated twice, plus a gratuitous `extern` divergence.
+- **First seen**: 2026-09-18
+- **Reason**: weakest concentration — only the naming/declaration convention. The two emitters build genuinely different artefacts (`render_semantic_harness` inlines the unit source, `render_sidecar` `#include`s it), so there is no deep "one harness writer" hiding here. The fix must *pick* a spelling, which changes emitted C on one side.
+
+### Run 2026-09-18 — complete
+
+- **Outcome**: complete
+- **Stopped at**: step 6 — PR #294 opened; work landed on branch
+- **Branch**: `pm-deepen/precond-sidecar-run-seam` — *created* as `pm-deepen/run-2026-09-18-0102` from `origin/main` and renamed at step 2. Branch adoption was **refused** at step 0 on condition 3: the firing branch (`sym/forseti/routine/refactor-audit/01M2RSMHC9`) had an upstream (`@{u}` resolved to `origin/main`), so it was not a made-for-this-run, no-upstream branch.
+- **Committed**: review report + design pass (winner: Design C — `SidecarRunner` binding work_dir/max_len/ladder_cap/raw with `climb`+`probe` and a `sidecar_runner` context manager; runner-up design B — the plan-binding, `attempts`-exposing variant — lost on seam placement, since discharge re-plans per caller; B's `ProbeSite` enum was adopted into C), the `refactor(precond)` implementation (new `precond/run.py` + `tests/precond/test_precond_run.py`, verify/discharge rewired, `core/check.py` import retargeted), and this backlog update.
+- **Evidence**: quality gate green — ruff check + ruff format --check + ty check + pytest (1686 passed, 1 skipped, ESBMC-gated included, esbmc 8.3.0 on PATH); project coverage 97.99% (gate 96%), `precond/run.py` 100%; PR #294. Diff **5 files** vs the ~4–6 estimate. Behaviour preservation proved by `tests/precond/test_precond_verify.py` and `tests/precond/test_discharge.py` passing **untouched** (both dispatch canned verdicts by sniffing the emitted harness filenames). The escalate-vs-raw test was **mutation-checked**: routing `probe` through `escalating_port` fails exactly that one test and no other, while both driver suites stay green — they ignore `unwind` entirely.
+- **Next**: human review of PR #294 (do not merge as part of the routine). Natural next firing: the runner-up candidate `forseti-cli-json-subprocess-seam` (20/25, within 1 point) — it also carries a **live bug** for a human, independent of the refactor: the Codex and Oh-My-Pi hooks forward no `FORSETI_BUILD_FLAGS`, so on any project with `-I`/`-D` they report `skipped`/`error` where the Claude gate gets a real verdict. Note its argv half is unpinned at two of three harnesses (both suites stub `fake_run(*_a, **_kw)` and ignore their arguments), so argv-shape assertions must land before that extraction.
