@@ -60,6 +60,8 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
+from _shared import TailState, compute_replay_delays
+
 # --------------------------------------------------------------------------
 # ANSI styling -- plain codes only, no external libraries.
 # --------------------------------------------------------------------------
@@ -418,21 +420,20 @@ def tail_events(path: Path, poll_interval: float = 0.3) -> Iterator[dict[str, An
     """Yield parsed events appended to `path`, live, forever.
 
     Handles the file not existing yet (polls until it appears), in-place
-    truncation (size shrinks -- reset to the start), and rotation (a new
-    inode at the same path -- reopen from the start). A torn trailing line
-    from a write still in flight is buffered until its newline arrives rather
-    than parsed early.
+    truncation (size shrinks -- reset to the start), rotation (a new inode at
+    the same path -- reopen from the start), and a truncate-then-rewrite that
+    leaves the file no smaller than before (`TailState`, shared with
+    `canvas/server.py`'s own live tail -- see its docstring). A torn trailing
+    line from a write still in flight is buffered until its newline arrives
+    rather than parsed early.
     """
-    _PREFIX_PROBE_BYTES = 64
-
-    inode: int | None = None
+    tail_state = TailState()
     pos = 0
     buf = ""
-    known_prefix = b""
     waiting = False
     while True:
         try:
-            st = path.stat()
+            reset, st = tail_state.observe(path)
         except OSError:
             if not waiting:
                 print(c(f"-- waiting for {path} --", DIM))
@@ -443,33 +444,8 @@ def tail_events(path: Path, poll_interval: float = 0.3) -> Iterator[dict[str, An
             print(c(f"-- {path} appeared, tailing --", DIM))
             waiting = False
 
-        try:
-            with open(path, "rb") as probe_fh:
-                prefix = probe_fh.read(_PREFIX_PROBE_BYTES)
-        except OSError:
-            prefix = b""
-
-        reset = False
-        if inode is None:
-            inode = st.st_ino
-        elif st.st_ino != inode:
-            inode = st.st_ino
-            reset = True
-            print(c("-- trace file rotated, resuming from start --", DIM))
-
-        if st.st_size < pos:
-            reset = True
-            print(c("-- trace file truncated, resuming from start --", DIM))
-        elif known_prefix and prefix != known_prefix and pos > 0:
-            # A truncate immediately followed by a rewrite can leave the file
-            # no smaller than it was at the last read, defeating the
-            # size-only check above; a changed prefix means the bytes at the
-            # start of the file are no longer the ones already read.
-            reset = True
-            print(c("-- trace file content changed, resuming from start --", DIM))
-
-        known_prefix = prefix
         if reset:
+            print(c("-- trace file changed, resuming from start --", DIM))
             pos = 0
             buf = ""
 
@@ -502,12 +478,12 @@ def tail_events(path: Path, poll_interval: float = 0.3) -> Iterator[dict[str, An
 _MAX_REPLAY_DELAY_S = 3.0
 
 
-def run_live(project_dir: Path, poll_interval: float) -> int:
+def run_live(project_dir: Path) -> int:
     events_path = project_dir / ".forseti" / "events.jsonl"
     print(c(f"forseti demo renderer -- tailing {events_path}", DIM))
     state: dict[str, Any] = {}
     try:
-        for ev in tail_events(events_path, poll_interval=poll_interval):
+        for ev in tail_events(events_path):
             line = render_event(ev, state)
             if line is not None:
                 print(line)
@@ -524,21 +500,11 @@ def run_replay(trace_file: Path, speed: float | None) -> int:
     banner += f"({len(events)} events, {pace})"
     print(c(banner, DIM))
     state: dict[str, Any] = {}
-    prev_ts: float | None = None
+    delays = compute_replay_delays(events, speed, _MAX_REPLAY_DELAY_S)
     try:
-        for ev in events:
-            ts = ev.get("ts")
-            if (
-                speed
-                and speed > 0
-                and prev_ts is not None
-                and isinstance(ts, (int, float))
-            ):
-                delta = ts - prev_ts
-                if delta > 0:
-                    time.sleep(min(_MAX_REPLAY_DELAY_S, delta / speed))
-            if isinstance(ts, (int, float)):
-                prev_ts = ts
+        for delay, ev in zip(delays, events, strict=True):
+            if delay > 0:
+                time.sleep(delay)
             line = render_event(ev, state)
             if line is not None:
                 print(line)
@@ -577,12 +543,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--no-color", action="store_true", help="disable ANSI colors")
-    p.add_argument(
-        "--poll-interval",
-        type=float,
-        default=0.3,
-        help=argparse.SUPPRESS,  # internal knob, mainly for tests
-    )
     return p
 
 
@@ -614,7 +574,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    return run_live(Path(args.project_dir), poll_interval=args.poll_interval)
+    return run_live(Path(args.project_dir))
 
 
 if __name__ == "__main__":

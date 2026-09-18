@@ -372,6 +372,17 @@
   }
   function tsPrefix(ev) { return '<span class="ts">[' + esc(fmtTs(ev)) + "]</span> "; }
 
+  // Whether a `gate.decision` event is the same one the preceding `gate`
+  // line for this file already showed (within 5s) -- used to collapse the
+  // duplicate from both the log (RENDERERS) and the diagram (CHOREOGRAPHY).
+  function sameAsLastGate(ev, state) {
+    var decision = String(ev.decision || "?");
+    var last = state.lastGate;
+    if (ev.file == null || !last) return false;
+    var closeInTime = Math.abs((ev.ts || 0) - (last.ts || 0)) <= 5.0;
+    return last.file === ev.file && last.decision === decision && closeInTime;
+  }
+
   var RENDERERS = {
     session: function (ev) {
       return tsPrefix(ev) + '<span class="tag tag-forseti">SESSION</span> ' +
@@ -405,11 +416,7 @@
     },
     "gate.decision": function (ev, state) {
       var decision = String(ev.decision || "?");
-      var last = state.lastGate;
-      if (ev.file != null && last) {
-        var closeInTime = Math.abs((ev.ts || 0) - (last.ts || 0)) <= 5.0;
-        if (last.file === ev.file && last.decision === decision && closeInTime) return null;
-      }
+      if (sameAsLastGate(ev, state)) return null;
       var unitIds = ev.unit_ids || [];
       var scope = ev.file ? ev.file : unitIds.length + " unit(s)";
       return tsPrefix(ev) + '<span class="tag tag-forseti">GATE</span> [' + esc(ev.adapter) + "] " +
@@ -505,11 +512,7 @@
       // Suppress the animation for the same collapsed decision the log
       // already skips (see RENDERERS["gate.decision"]).
       var decision = String(ev.decision || "?");
-      var last = state.lastGate;
-      if (ev.file != null && last) {
-        var closeInTime = Math.abs((ev.ts || 0) - (last.ts || 0)) <= 5.0;
-        if (last.file === ev.file && last.decision === decision && closeInTime) return;
-      }
+      if (sameAsLastGate(ev, state)) return;
       spawnPulse("agent-forseti", "rev", colorVar(GATE_DECISION_COLOR[decision]), false);
       showBadge("agent-forseti", "gate[" + (ev.adapter || "?") + "]: " + decision, GATE_DECISION_COLOR[decision], false);
     },
@@ -525,18 +528,17 @@
       spawnPulse("agent-forseti", "fwd", "#4aa3ff", false);
       showBadge("agent-forseti", cmd, null, false);
       var assessment = parseAssessment(String(ev.output_tail || ""));
+      var unresolved = assessment ? !!UNRESOLVED[assessment] : ev.exit_code !== 0;
+      var cls = assessment ? ASSESSMENT_COLOR[assessment] : (ev.exit_code === 0 ? "v-green" : "v-yellow");
       setTimeout(function () {
         spawnPulse("forseti-esbmc", "fwd", "#5c6b7a", false);
       }, 350);
       setTimeout(function () {
-        var unresolved = assessment ? !!UNRESOLVED[assessment] : ev.exit_code !== 0;
-        var cls = assessment ? ASSESSMENT_COLOR[assessment] : (ev.exit_code === 0 ? "v-green" : "v-yellow");
         spawnPulse("forseti-esbmc", "rev", colorVar(cls), unresolved);
         showBadge("forseti-esbmc", assessment ? ("assessment: " + assessment) : (ev.exit_code === 0 ? "ok" : "failed"), cls, unresolved);
       }, 750);
       setTimeout(function () {
-        var cls2 = assessment ? ASSESSMENT_COLOR[assessment] : (ev.exit_code === 0 ? "v-green" : "v-yellow");
-        spawnPulse("agent-forseti", "rev", colorVar(cls2), assessment ? !!UNRESOLVED[assessment] : ev.exit_code !== 0);
+        spawnPulse("agent-forseti", "rev", colorVar(cls), unresolved);
       }, 1150);
     },
     "property.proposed": function (ev) {
@@ -588,6 +590,14 @@
     }
   }
   setInterval(function () {
+    // `tick()` (the only code that removes a completed pulse from
+    // activePulses/the SVG DOM) runs on requestAnimationFrame, which browsers
+    // pause in a genuinely hidden tab -- but this setInterval keeps firing
+    // regardless. Draining into spawnPulse while hidden would grow
+    // activePulses and the DOM unboundedly with nothing to clean them up
+    // until the tab is shown again; leave the queue untouched instead (still
+    // bounded by the poll rate) and drain it once visibility returns.
+    if (document.visibilityState === "hidden") return;
     // Drain faster than one-per-tick once the backlog grows past MAX_QUEUED
     // (initial page load, or a fast --replay delivering a whole trace in one
     // batch) so every event still gets its animation -- played back-to-back

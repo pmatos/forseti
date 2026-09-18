@@ -135,8 +135,8 @@ def run(events: list[dict]) -> None:
             f"got {call['exit_code']}",
         )
         check(
-            '"outcome": "unknown"' in tail,
-            "semantic-loop output must report outcome: unknown",
+            outcome == "unknown",
+            f"recorded run's semantic-loop outcome must be unknown, got {outcome!r}",
         )
 
     # Vocabulary/verdict discipline: this trace is honest. Neither the safety

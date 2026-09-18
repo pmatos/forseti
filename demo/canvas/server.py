@@ -36,6 +36,7 @@ rendering (kept in sync with `render.py`'s color/label policy by hand).
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import sys
 import threading
@@ -49,6 +50,13 @@ _CANVAS_DIR = Path(__file__).resolve().parent
 _INDEX_FILE = _CANVAS_DIR / "index.html"
 _MAX_REPLAY_DELAY_S = 3.0  # matches demo/render.py's own per-gap cap
 _DEFAULT_PORT = 8765
+
+# `server.py` runs standalone (`python3 demo/canvas/server.py`, per its own
+# README/run_demo.sh), so `demo/` -- one level up from this file -- is not on
+# sys.path the way it is when `demo/render.py` runs as a script in its own
+# directory; put it there before importing the sibling module both share.
+sys.path.insert(0, str(_CANVAS_DIR.parent))
+from _shared import TailState, compute_replay_delays  # noqa: E402
 
 
 def _parse_line(raw: bytes) -> dict[str, Any] | None:
@@ -76,24 +84,22 @@ class LiveTailSource(EventSource):
     """Tails `<project_dir>/.forseti/events.jsonl`; cursor is a byte offset.
 
     Tolerates the file not existing yet (`waiting: true`, cursor stays 0),
-    in-place truncation and inode rotation -- a fresh demo run reusing the
-    same project dir (`reset: true`, served from byte 0), and a torn
-    trailing write still in flight from a concurrent appender: bytes after
-    the last complete `\\n` are held back and the returned cursor never
-    advances past them, so the next poll (after the writer's next flush)
-    picks the now-completed line up. Binary reads throughout, since a
-    counterexample can carry arbitrary bytes that a text-mode/character
-    offset would desync on.
+    in-place truncation, inode rotation, and a truncate-then-rewrite that
+    leaves the file no smaller than before (`TailState`, shared with
+    `render.py`'s own live tail) -- a fresh demo run reusing the same project
+    dir (`reset: true`, served from byte 0) -- and a torn trailing write
+    still in flight from a concurrent appender: bytes after the last
+    complete `\\n` are held back and the returned cursor never advances past
+    them, so the next poll (after the writer's next flush) picks the
+    now-completed line up. Binary reads throughout, since a counterexample
+    can carry arbitrary bytes that a text-mode/character offset would desync
+    on.
     """
-
-    _PREFIX_PROBE_BYTES = 64
 
     def __init__(self, project_dir: Path) -> None:
         self._path = project_dir / ".forseti" / "events.jsonl"
         self._lock = threading.Lock()
-        self._known_inode: int | None = None
-        self._known_size = 0
-        self._known_prefix = b""
+        self._tail_state = TailState()
 
     def describe(self) -> dict[str, Any]:
         return {"mode": "live", "target": str(self._path)}
@@ -101,11 +107,9 @@ class LiveTailSource(EventSource):
     def poll(self, since: int) -> dict[str, Any]:
         with self._lock:
             try:
-                st = self._path.stat()
+                reset, st = self._tail_state.observe(self._path)
             except OSError:
-                self._known_inode = None
-                self._known_size = 0
-                self._known_prefix = b""
+                self._tail_state = TailState()
                 return {
                     "events": [],
                     "cursor": 0,
@@ -113,26 +117,16 @@ class LiveTailSource(EventSource):
                     "waiting": True,
                 }
 
-            try:
-                with open(self._path, "rb") as fh:
-                    prefix = fh.read(self._PREFIX_PROBE_BYTES)
-            except OSError:
-                prefix = b""
-
-            rotated = self._known_inode is not None and st.st_ino != self._known_inode
-            truncated = st.st_size < self._known_size
-            # A truncate immediately followed by a rewrite can leave the file
-            # no smaller than it was at the last poll, defeating the size
-            # checks above; a changed prefix means the bytes at the start of
-            # the file are no longer the ones already served, regardless of
-            # the current size.
-            content_changed = bool(self._known_prefix) and prefix != self._known_prefix
-            reset = rotated or truncated or content_changed or since > st.st_size
-            self._known_inode = st.st_ino
-            self._known_size = st.st_size
-            self._known_prefix = prefix
-
+            reset = reset or since > st.st_size
             start = 0 if reset else since
+
+            if not reset and start == st.st_size:
+                # Nothing new since the client's own cursor -- the common
+                # case at this polling cadence -- so skip the second open()
+                # + read() below entirely; TailState's own prefix probe
+                # (above) already covers the truncate-then-rewrite-to-the-
+                # same-size case this would otherwise miss.
+                return {"events": [], "cursor": start, "reset": False, "waiting": False}
 
             try:
                 with open(self._path, "rb") as fh:
@@ -166,13 +160,12 @@ class ReplaySource(EventSource):
     """Replays a saved trace; cursor is an event index into it.
 
     Release offsets (seconds from replay start) are precomputed once, at
-    construction, exactly mirroring `demo/render.py::run_replay`'s pacing:
-    the delay before each event is its recorded `ts` delta from the
-    previous one, divided by `speed`, capped per-gap at
-    `_MAX_REPLAY_DELAY_S` -- with `speed` omitted or falsy, every event's
-    offset is 0 (instant). Each poll then just compares wall-clock elapsed
-    time against that fixed table -- no background thread, no timer drift,
-    and trivially safe under concurrent requests from multiple tabs.
+    construction, via the same `compute_replay_delays` (`_shared.py`)
+    `demo/render.py::run_replay` sleeps through directly -- accumulated here
+    into a fixed table instead, since a poll can't sleep. Each poll then just
+    compares wall-clock elapsed time against that table -- no background
+    thread, no timer drift, and trivially safe under concurrent requests from
+    multiple tabs.
     """
 
     def __init__(self, trace_file: Path, speed: float | None) -> None:
@@ -188,23 +181,8 @@ class ReplaySource(EventSource):
             if ev is not None:
                 events.append(ev)
 
-        offsets: list[float] = []
-        cumulative = 0.0
-        prev_ts: float | None = None
-        for ev in events:
-            ts = ev.get("ts")
-            if (
-                speed
-                and speed > 0
-                and prev_ts is not None
-                and isinstance(ts, (int, float))
-            ):
-                delta = ts - prev_ts
-                if delta > 0:
-                    cumulative += min(_MAX_REPLAY_DELAY_S, delta / speed)
-            offsets.append(cumulative)
-            if isinstance(ts, (int, float)):
-                prev_ts = ts
+        delays = compute_replay_delays(events, speed, _MAX_REPLAY_DELAY_S)
+        offsets = list(itertools.accumulate(delays))
 
         self._trace_file = trace_file
         self._speed = speed

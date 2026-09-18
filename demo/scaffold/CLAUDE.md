@@ -75,8 +75,11 @@ Read the top-level `outcome`:
   if the property itself looks like an incorrect assumption, say so plainly
   rather than "fixing" the code to satisfy an arbitrary guess. Never fix
   silently and never ignore silently — report which it was.
-- `unknown` — at least one property could not be settled. Not a pass, same
-  as the safety gate's own `unknown`.
+- `unknown` — at least one property could not be settled. Not a pass. Unlike
+  `synth`, `semantic-loop` has no `--max-len` (or equivalent) to bound an
+  unconstrained length param yet (issue #299) — raising `--timeout`/`-k`
+  will not help an `unknown` caused by this. Report it as an unresolved
+  unit; there is no remediation available today beyond that.
 - `error` — a tooling failure (report it, don't retry blindly).
 - `empty` — no checkable properties were proposed or survived validation;
   this is not evidence of anything about the function.

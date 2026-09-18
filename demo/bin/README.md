@@ -7,6 +7,8 @@ which the Forseti package does not instrument today -- unlike the Claude Code
 adapter's hooks and Forseti Core's `propose`/`check` calls, which already log
 to `.forseti/events.jsonl` on their own (see
 `src/forseti/adapters/claude_code/event_log.py` and `src/forseti/core/events.py`).
+Tracked as a real product gap in issue #301 -- once `synth`/`discharge`/
+`semantic-loop` emit their own events, this shim becomes unnecessary for them.
 
 This is **not a product feature**. It does not modify, wrap, or replace
 anything inside `src/forseti/`; it is a shell-out wrapper that lives entirely

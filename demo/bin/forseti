@@ -100,9 +100,21 @@ def _pump(src: BinaryIO, dst: BinaryIO, buf: bytearray, lock: threading.Lock) ->
                 # Keep advancing past any UTF-8 continuation bytes (0x80-0xBF)
                 # so the buffer always starts on a clean character boundary --
                 # a plain byte-count cut can otherwise land mid-character and
-                # leave a stray replacement character in the decoded tail.
-                while cut < len(buf) and 0x80 <= buf[cut] <= 0xBF:
-                    cut += 1
+                # leave a stray replacement character in the decoded tail. A
+                # valid encoded character has at most 3 continuation bytes
+                # (a 4-byte sequence), so bound the scan there: past that,
+                # the bytes aren't UTF-8 continuations of anything and
+                # advancing further would risk wiping the whole buffer --
+                # not just the trimmed portion -- on non-UTF-8/binary output.
+                boundary = cut
+                while (
+                    boundary < len(buf)
+                    and boundary - cut < 3
+                    and 0x80 <= buf[boundary] <= 0xBF
+                ):
+                    boundary += 1
+                if boundary >= len(buf) or not (0x80 <= buf[boundary] <= 0xBF):
+                    cut = boundary
                 del buf[:cut]
 
 
