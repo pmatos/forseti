@@ -9,11 +9,20 @@ the true case is non-vacuous (the assert site is reachable).
 from __future__ import annotations
 
 import shutil
+from functools import partial
 from pathlib import Path
 
 import pytest
 
-from forseti.esbmc import Verified, Violated, verify
+from forseti.esbmc import (
+    EsbmcResult,
+    Unknown,
+    UnknownReason,
+    Verified,
+    Violated,
+    verify,
+)
+from forseti.precond.run import escalating_port
 from forseti.properties import (
     BufferParam,
     ScalarParam,
@@ -151,3 +160,74 @@ def test_true_property_is_non_vacuous(tmp_path: Path) -> None:
     # was a real pass and not a vacuous one.
     source = _render(SemanticSpec("0", ("x > INT64_MIN",)), tmp_path)
     assert isinstance(verify(source, unwind=1), Violated)
+
+
+# --- default length cap (#299) ------------------------------------------------
+
+_COUNT_ODD_SLICE = (
+    "int count_odd(const unsigned char *a, unsigned n) {\n"
+    "    int s = 0;\n"
+    "    for (unsigned i = 0; i < n; i++) s += a[i] & 1;\n"
+    "    return s;\n"
+    "}\n"
+)
+_COUNT_ODD_SIG = UnitSignature(
+    "count_odd",
+    "int",
+    (BufferParam("unsigned char", "a", "n", const=True), ScalarParam("unsigned", "n")),
+)
+
+
+def _count_odd_verdict(
+    postcondition: str, tmp_path: Path, *, max_len: int | None, unwind: int
+) -> EsbmcResult:
+    """The verdict `check_source` would reach for one property over `count_odd`:
+    unwinding assertions ON, wrapped in `escalating_port` (so an under-unwound
+    loop is `Unknown`, not a bare `Violated`)."""
+    source = tmp_path / "count_odd.c"
+    source.write_text(
+        render_semantic_harness(
+            unit_source=_COUNT_ODD_SLICE,
+            signature=_COUNT_ODD_SIG,
+            spec=SemanticSpec(postcondition),
+            max_len=max_len,
+        )
+    )
+    port = escalating_port(partial(verify, no_unwinding_assertions=False))
+    return port(source, unwind=unwind)
+
+
+def test_uncapped_unconstrained_length_is_unknown_at_any_unwind(
+    tmp_path: Path,
+) -> None:
+    # The #299 ceiling: with no domain bound the fill loop and the unit's own
+    # loop run a symbolic number of times, so even a generous unwind cannot
+    # settle a genuinely true property.
+    result = _count_odd_verdict(
+        "result >= 0 && (unsigned)result <= n", tmp_path, max_len=None, unwind=64
+    )
+    assert isinstance(result, Unknown)
+    assert result.reason is UnknownReason.UNDER_UNWOUND
+
+
+def test_capped_unconstrained_length_settles_a_true_property(tmp_path: Path) -> None:
+    # The fix: with `len <= 8` a genuinely true property over an unconstrained
+    # `(ptr, len)` buffer settles to a real verdict instead of UNKNOWN.
+    result = _count_odd_verdict(
+        "result >= 0 && (unsigned)result <= n", tmp_path, max_len=8, unwind=16
+    )
+    assert isinstance(result, Verified)
+
+
+def test_capped_unconstrained_length_settles_a_false_property(tmp_path: Path) -> None:
+    result = _count_odd_verdict("result < 0", tmp_path, max_len=8, unwind=16)
+    assert isinstance(result, Violated)
+
+
+def test_cap_below_the_unwind_is_needed_to_settle(tmp_path: Path) -> None:
+    # A fill loop over up to N elements needs k > N: at k == max_len the honest
+    # verdict is still UNKNOWN (the ladder's job to climb), never a false HELD.
+    result = _count_odd_verdict(
+        "result >= 0 && (unsigned)result <= n", tmp_path, max_len=8, unwind=8
+    )
+    assert isinstance(result, Unknown)

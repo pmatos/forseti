@@ -55,6 +55,7 @@ from forseti.core.check import (
 )
 from forseti.core.check import (
     check_source,
+    validated_max_len,
 )
 from forseti.core.propose import (
     DEFAULT_MAX_CANDIDATES,
@@ -73,6 +74,7 @@ from forseti.core.submit import (
     submit_source,
 )
 from forseti.orchestrator import PropertyCheckRun, RunOutcome, VerifyPort
+from forseti.precond import DEFAULT_MAX_LEN
 from forseti.properties import CandidateSpec, LLMClient, ProposalResult
 
 LoopMode = Literal["propose", "submit", "check_only"]
@@ -135,6 +137,7 @@ def run_semantic_loop(
     extra_flags: Sequence[str] = (),
     esbmc_bin: str = "esbmc",
     verify_port: VerifyPort | None = None,
+    max_len: int | None = DEFAULT_MAX_LEN,
 ) -> SemanticLoopResult:
     """Ingest (per `mode`), then check `source`::`function`'s stored properties.
 
@@ -145,7 +148,9 @@ def run_semantic_loop(
     ignored. `unwind_ladder` defaults to `None` and forwards through to
     `check_source`, which derives the rungs above `unwind` itself — so a
     caller-chosen `unwind` doesn't collide with the fixed default rungs, the
-    same as the `check` CLI/MCP faces.
+    same as the `check` CLI/MCP faces. `max_len` is `check_source`'s: the cap on
+    `(ptr, len)` buffer lengths a property's domain leaves unconstrained (#299),
+    validated up front so a bad value fails before the proposer's LLM call.
 
     Every persisted candidate and every checked property still emits Core's
     own canonical events (`property.proposed`, `property.check.start`,
@@ -154,6 +159,7 @@ def run_semantic_loop(
     its own; a `gate.decision` from `SemanticLoopResult.outcome` stays the
     adapter's job (capability-specific gating action, not Core policy).
     """
+    validated_max_len(max_len)
     if mode == "submit":
         if not candidates:
             raise ValueError("mode='submit' requires at least one candidate")
@@ -223,6 +229,7 @@ def run_semantic_loop(
         extra_flags=extra_flags,
         esbmc_bin=esbmc_bin,
         verify_port=verify_port,
+        max_len=max_len,
     )
     return SemanticLoopResult(
         unit_id=check.unit_id, mode=mode, ingestion=ingestion, check=check

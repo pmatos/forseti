@@ -62,6 +62,7 @@ from forseti.orchestrator import (
     VerifyPort,
     check_properties,
 )
+from forseti.precond import DEFAULT_MAX_LEN
 from forseti.precond.run import escalating_port
 
 # The CLI's own default: a human or a subagent invoking `forseti check`
@@ -78,16 +79,39 @@ DEFAULT_TIMEOUT_S = 110.0
 _WORK_SUBDIR = "check-work"
 
 
-def default_unwind_ladder_above(unwind: int) -> tuple[int, ...]:
-    """`DEFAULT_UNWIND_LADDER` rungs above `unwind`.
+def default_unwind_ladder_above(
+    unwind: int, max_len: int | None = None
+) -> tuple[int, ...]:
+    """`DEFAULT_UNWIND_LADDER` rungs above `unwind`, reaching past `max_len`.
 
     `check_source` derives its ladder this way when `unwind_ladder is None`, so a
     caller-chosen unwind (e.g. `-k 8`) doesn't collide with the fixed default
     rungs and raise `ValueError` (issue #95 review). Kept public because the CLI
     and MCP faces name it in their `--unwind-ladder` help / tool-schema docs as
     the documented default.
+
+    A `(ptr, len)` fill loop over up to `max_len` elements needs ``k > max_len``
+    (#299), so when no rung clears `max_len` -- a raised `--max-len` against the
+    fixed ``(4, 8, 16)`` ladder -- one final ``max_len + 1`` rung is appended,
+    else that flag value could never settle and would only ever report `unknown`.
+    The same coupling `precond.run.precondition_ladder` derives for `synth`.
     """
-    return tuple(k for k in DEFAULT_UNWIND_LADDER if k > unwind)
+    rungs = tuple(k for k in DEFAULT_UNWIND_LADDER if k > unwind)
+    if max_len is not None and max_len >= (rungs[-1] if rungs else unwind):
+        rungs += (max_len + 1,)
+    return rungs
+
+
+def validated_max_len(max_len: int | None) -> int | None:
+    """`max_len` unchanged, or `ValueError` if negative.
+
+    ``len <= -1`` on an unsigned length assumes `false`, which would settle every
+    such property vacuously `held`. Called at the top of the Core faces so a bad
+    value fails before any LLM call or event, mirroring `validated_ladder`.
+    """
+    if max_len is not None and max_len < 0:
+        raise ValueError(f"max_len must be >= 0, got {max_len}")
+    return max_len
 
 
 def check_source(
@@ -101,6 +125,7 @@ def check_source(
     extra_flags: Sequence[str] = (),
     esbmc_bin: str = "esbmc",
     verify_port: VerifyPort | None = None,
+    max_len: int | None = DEFAULT_MAX_LEN,
 ) -> PropertyCheckRun:
     """Check `source`::`function`'s stored, checkable properties with ESBMC.
 
@@ -137,6 +162,22 @@ def check_source(
 
     Passing `verify_port` bypasses `escalating_port` and this default outright.
 
+    `max_len` (default `DEFAULT_MAX_LEN`, the same 8 `forseti synth --max-len`
+    uses) caps every `(ptr, len)` buffer length a property's domain leaves
+    unconstrained at ``len <= max_len`` before the allocation (#299). Without
+    it that length is a symbolic, effectively unbounded loop trip count no
+    finite `unwind` can settle, so such a property could only ever report
+    `unknown`. The cap is *reported*, never silent: each verdict carries the
+    `length_bounds` it was checked under, so `held` reads as "held up to k,
+    len<=N". A domain clause that mentions the length is authoritative and
+    suppresses the cap for that length (`properties.plan_length_bounds`).
+    `None` restores the genuinely unconstrained length. The fill loop over `len`
+    elements needs ``k > max_len``, so a derived default ladder gains a
+    ``max_len + 1`` rung when its own top rung does not clear `max_len`
+    (`default_unwind_ladder_above`); an *explicit* `unwind`/`unwind_ladder` is
+    taken as given, so one that never exceeds `max_len` reports `unknown`. A
+    negative `max_len` raises `ValueError` before any event.
+
     Harnesses are written under a fresh, per-call subdirectory of
     `store_root/"check-work"` (module docstring: never beside `source`, never
     shared with a concurrent invocation); `-I<source's resolved parent>` is
@@ -159,10 +200,11 @@ def check_source(
     an esbmc binary on PATH.
     """
     unit = Unit.from_path(source, function)
+    writer = SemanticHarnessWriter(max_len=validated_max_len(max_len))
     ladder = (
         unwind_ladder
         if unwind_ladder is not None
-        else default_unwind_ladder_above(unwind)
+        else default_unwind_ladder_above(unwind, max_len)
     )
     verify_fn = verify_port or escalating_port(
         partial(
@@ -178,7 +220,7 @@ def check_source(
         run = check_properties(
             unit,
             store=store,
-            render=SemanticHarnessWriter(),
+            render=writer,
             verify=verify_fn,
             # A per-invocation subdirectory, not the shared `check-work`
             # root: `check_properties` derives a *deterministic* filename

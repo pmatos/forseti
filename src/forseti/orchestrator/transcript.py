@@ -45,8 +45,9 @@ def property_check_transcript(run: PropertyCheckRun) -> str:
     """Render a `PropertyCheckRun` as a readable transcript (pure, total).
 
     One line per property in check order — the outcome, the bound `k` it settled
-    at (`-` when SKIPPED), the property id and kind, and a skip reason when
-    relevant — followed by a per-outcome counts footer.
+    at (`-` when SKIPPED), the property id and kind, the length bounds the
+    harness applied (``len<=8``) so a bounded verdict is never read as unbounded,
+    and a skip reason when relevant — followed by a per-outcome counts footer.
     """
     lines = [f"Forseti property check — {run.unit_id}", "Properties:"]
     for verdict in run.verdicts:
@@ -55,6 +56,11 @@ def property_check_transcript(run: PropertyCheckRun) -> str:
             f"  {verdict.outcome.value.upper():9} {k:6} "
             f"{verdict.property_id} {verdict.kind}"
         )
+        if verdict.length_bounds:
+            bounds = ", ".join(
+                f"{name}<={bound}" for name, bound in verdict.length_bounds
+            )
+            row += f"  ({bounds})"
         if verdict.skip_reason is not None:
             row += f"  ({verdict.skip_reason})"
         lines.append(row)

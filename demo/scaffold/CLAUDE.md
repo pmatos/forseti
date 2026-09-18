@@ -75,11 +75,16 @@ Read the top-level `outcome`:
   if the property itself looks like an incorrect assumption, say so plainly
   rather than "fixing" the code to satisfy an arbitrary guess. Never fix
   silently and never ignore silently — report which it was.
-- `unknown` — at least one property could not be settled. Not a pass. Unlike
-  `synth`, `semantic-loop` has no `--max-len` (or equivalent) to bound an
-  unconstrained length param yet (issue #299) — raising `--timeout`/`-k`
-  will not help an `unknown` caused by this. Report it as an unresolved
-  unit; there is no remediation available today beyond that.
+- `unknown` — at least one property could not be settled. Not a pass.
+  `semantic-loop` bounds a `(ptr, len)` buffer's length to `--max-len`
+  (default 8, as in `synth`) unless the property's own `domain` already
+  names the length, and each verdict's `length_bounds` (`{"len": 8}`) says
+  what it was checked under — so `held` means "up to k, len<=8". An
+  `unknown` that remains is either a `k` at or below the length bound (the
+  fill loop needs `-k` above `--max-len`), a `domain` that names the length
+  without an upper bound (`len >= 16` alone), or a genuinely hard
+  property. Raise `-k`, or make the `domain` bound the length; otherwise
+  report it as an unresolved unit.
 - `error` — a tooling failure (report it, don't retry blindly).
 - `empty` — no checkable properties were proposed or survived validation;
   this is not evidence of anything about the function.

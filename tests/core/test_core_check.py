@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from forseti.core import check_source
+from forseti.core.check import default_unwind_ladder_above
 from forseti.core.cli import main
 from forseti.esbmc import (
     EXIT_CODES,
@@ -28,6 +29,8 @@ from forseti.esbmc import (
     Verdict,
     Verified,
 )
+from forseti.orchestrator import PropertyVerdict
+from forseti.precond import DEFAULT_MAX_LEN
 from forseti.properties import (
     Property,
     PropertyKind,
@@ -267,6 +270,161 @@ def test_check_source_translates_store_error(tmp_path: Path) -> None:
         check_source(
             source, function="my_abs", store_root=root, verify_port=FakeVerify([])
         )
+
+
+# --- default length cap (#299) -----------------------------------------------
+
+BUF_SLICE = "int count(const unsigned char *a, unsigned n) {\n    return 0;\n}\n"
+
+
+def _buf_verdict(
+    tmp_path: Path,
+    domain: tuple[str, ...] = (),
+    *,
+    max_len: int | None = DEFAULT_MAX_LEN,
+) -> PropertyVerdict:
+    source = tmp_path / "buf_unit.c"
+    source.write_text(BUF_SLICE)
+    root = tmp_path / ".forseti"
+    _seed_store(root, _semantic(f"{source}::count", "result == 0", domain))
+    run = check_source(
+        source,
+        function="count",
+        store_root=root,
+        max_len=max_len,
+        verify_port=FakeVerify([Verified(_meta(4))]),
+    )
+    (verdict,) = run.verdicts
+    return verdict
+
+
+def test_check_source_caps_an_unconstrained_length_by_default_and_reports_it(
+    tmp_path: Path,
+) -> None:
+    verdict = _buf_verdict(tmp_path)
+    assert verdict.length_bounds == (("n", 8),)  # synth's DEFAULT_MAX_LEN
+    assert verdict.harness_source is not None
+    assert "__ESBMC_assume((n >= 0 && n <= 8));" in verdict.harness_source
+    assert verdict.to_dict()["length_bounds"] == {"n": 8}
+
+
+def test_check_source_max_len_overrides_the_default_cap(tmp_path: Path) -> None:
+    verdict = _buf_verdict(tmp_path, max_len=3)
+    assert verdict.length_bounds == (("n", 3),)
+    assert verdict.harness_source is not None
+    assert "__ESBMC_assume((n >= 0 && n <= 3));" in verdict.harness_source
+
+
+def test_check_source_max_len_none_leaves_the_length_unconstrained(
+    tmp_path: Path,
+) -> None:
+    verdict = _buf_verdict(tmp_path, max_len=None)
+    assert verdict.length_bounds == ()
+    assert verdict.to_dict()["length_bounds"] == {}
+    assert verdict.harness_source is not None
+    assert "<= 8" not in verdict.harness_source
+
+
+def test_check_source_reports_no_cap_when_the_domain_bounds_the_length(
+    tmp_path: Path,
+) -> None:
+    verdict = _buf_verdict(tmp_path, ("n >= 1 && n <= 4",))
+    assert verdict.length_bounds == ()
+
+
+@pytest.mark.parametrize(
+    ("unwind", "max_len", "expected"),
+    [
+        (4, None, (8, 16)),
+        (4, 8, (8, 16)),  # the 16 rung already clears a cap of 8
+        (4, 15, (8, 16)),
+        (4, 16, (8, 16, 17)),  # k must exceed the fill loop's trip count
+        (4, 32, (8, 16, 33)),
+        (8, 8, (16,)),
+        (16, 16, (17,)),  # no default rung above -k 16: derive one
+        (20, 25, (26,)),
+        (20, 10, ()),  # -k already clears the cap
+    ],
+)
+def test_default_ladder_reaches_past_max_len(
+    unwind: int, max_len: int | None, expected: tuple[int, ...]
+) -> None:
+    ladder = default_unwind_ladder_above(unwind, max_len)
+    assert ladder == expected
+    assert all(a < b for a, b in zip((unwind, *ladder), ladder, strict=False))
+
+
+def test_check_source_extends_the_default_ladder_for_a_raised_max_len(
+    tmp_path: Path,
+) -> None:
+    """`--max-len 16` against the fixed (4, 8, 16) ladder could never settle: the
+    fill loop needs k > 16. The derived default gains a 17 rung instead."""
+    source = tmp_path / "buf_unit.c"
+    source.write_text(BUF_SLICE)
+    root = tmp_path / ".forseti"
+    _seed_store(root, _semantic(f"{source}::count", "result == 0"))
+    fake = FakeVerify(
+        [Unknown(_meta(k), UnknownReason.TIMEOUT) for k in (4, 8, 16)]
+        + [Verified(_meta(17))]
+    )
+
+    run = check_source(
+        source, function="count", store_root=root, max_len=16, verify_port=fake
+    )
+
+    assert fake.unwinds == [4, 8, 16, 17]
+    assert run.counts()["held"] == 1
+
+
+def test_check_source_explicit_ladder_is_not_extended_for_max_len(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "buf_unit.c"
+    source.write_text(BUF_SLICE)
+    root = tmp_path / ".forseti"
+    _seed_store(root, _semantic(f"{source}::count", "result == 0"))
+    fake = FakeVerify([Unknown(_meta(4), UnknownReason.TIMEOUT)])
+
+    run = check_source(
+        source,
+        function="count",
+        store_root=root,
+        max_len=16,
+        unwind_ladder=(),
+        verify_port=fake,
+    )
+
+    assert fake.unwinds == [4]
+    assert run.counts()["unknown"] == 1
+
+
+def test_check_source_scalar_only_unit_reports_no_cap(tmp_path: Path) -> None:
+    source = _write_unit(tmp_path)
+    root = tmp_path / ".forseti"
+    _seed_store(root, _semantic(f"{source}::my_abs", "result >= 0", ("x > INT64_MIN",)))
+    run = check_source(
+        source,
+        function="my_abs",
+        store_root=root,
+        verify_port=FakeVerify([Verified(_meta(4))]),
+    )
+    assert run.verdicts[0].length_bounds == ()
+
+
+def test_check_source_rejects_a_negative_max_len_before_any_event(
+    tmp_path: Path,
+) -> None:
+    source = _write_unit(tmp_path)
+    root = tmp_path / ".forseti"
+    with pytest.raises(ValueError, match="max_len"):
+        check_source(
+            source,
+            function="my_abs",
+            store_root=root,
+            max_len=-1,
+            verify_port=FakeVerify([]),
+        )
+    assert not (root / "events.jsonl").exists()
 
 
 # --- CLI (`forseti check`) ---------------------------------------------------
@@ -519,3 +677,46 @@ def test_parse_ladder_rejects_non_int() -> None:
                 "8,not-a-number",
             ]
         )
+
+
+def test_cli_check_max_len_flag_caps_and_reports_the_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "buf_unit.c"
+    source.write_text(BUF_SLICE)
+    root = tmp_path / ".forseti"
+    _seed_store(root, _semantic(f"{source}::count", "result == 0"))
+    monkeypatch.setattr(
+        "forseti.core.cli.check_source",
+        partial(check_source, verify_port=FakeVerify([Verified(_meta(4))] * 2)),
+    )
+    argv = ["check", str(source), "--function", "count", "--store-root", str(root)]
+
+    assert main([*argv, "--max-len", "3", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["verdicts"][0]["length_bounds"] == {"n": 3}
+
+    assert main(argv) == 0  # default: synth's 8, shown in the human transcript
+    assert "(n<=8)" in capsys.readouterr().out
+
+
+def test_cli_check_rejects_a_negative_max_len(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = _write_unit(tmp_path)
+    code = main(
+        [
+            "check",
+            str(source),
+            "--function",
+            "my_abs",
+            "--store-root",
+            str(tmp_path / ".forseti"),
+            "--max-len",
+            "-1",
+        ]
+    )
+    assert code == 1
+    assert "max_len" in capsys.readouterr().err

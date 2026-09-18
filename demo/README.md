@@ -120,10 +120,11 @@ cd /tmp/my-demo && claude
 ## Why the loop sometimes ends in UNKNOWN, honestly
 
 `forseti synth` (deterministic memory-safety) reliably settles. `forseti
-semantic-loop --mode propose` (the LLM-invariant path) currently cannot
-bound a `(ptr, len)` buffer's length the way `synth` does with `--max-len`
-(issue #299), so a proposed property over such a buffer often reports
-`UNKNOWN` rather than `held`/`violated` — not a defect in the code under
-test, a real tooling ceiling. The demo doesn't work around this: an honest
-`UNKNOWN`, correctly identified as such and never treated as a pass, is
-itself part of what the loop is supposed to show.
+semantic-loop --mode propose` (the LLM-invariant path) also bounds a
+`(ptr, len)` buffer's length to `--max-len` (default 8, as `synth` does; issue
+#299) unless the proposed property's own `domain` already names the length, and
+each verdict says which bound it was checked under (`len<=8`). Before that fix
+such a property could only ever report `UNKNOWN`, which is what the recorded run
+below shows. An `UNKNOWN` that remains is still reported honestly rather than
+treated as a pass — a `-k` at or below the length bound, or a `domain` that
+gives a lower bound on the length but no upper one, are the usual causes.

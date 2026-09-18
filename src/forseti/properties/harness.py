@@ -109,6 +109,23 @@ HARNESS_MACROS: frozenset[str] = frozenset(
 )
 
 
+LengthBounds = tuple[tuple[str, int], ...]
+
+
+@dataclass(frozen=True)
+class PropertyHarness:
+    """A rendered harness plus the default length bounds it applied.
+
+    `length_bounds` is ``((param, max_len), ...)``: every length parameter the
+    renderer capped with ``__ESBMC_assume(param <= max_len)`` because the
+    property's own domain did not constrain it. Empty when nothing was capped, so
+    a caller can always tell whether a verdict is scoped to ``len <= N``.
+    """
+
+    source_text: str
+    length_bounds: LengthBounds = ()
+
+
 @dataclass(frozen=True)
 class SemanticSpec:
     """The checkable content of a semantic Property, as harness-ready C exprs.
@@ -132,6 +149,7 @@ def render_semantic_harness(
     signature: UnitSignature,
     spec: SemanticSpec,
     includes: Sequence[str] = DEFAULT_INCLUDES,
+    max_len: int | None = None,
 ) -> str:
     """Return a compilable ESBMC harness (C text) for one semantic property.
 
@@ -143,7 +161,18 @@ def render_semantic_harness(
     filled), calls the unit, and asserts the postcondition. Raises
     `HarnessError` on an un-renderable input (empty postcondition, `result_var`
     clashing a param name, a void return referenced by `result_var`, a
-    `unit_source` that defines its own ``main``, or an unknown Param subtype).
+    `unit_source` that defines its own ``main``, an unknown Param subtype, or a
+    negative `max_len`).
+
+    `max_len` caps every buffer-length parameter the property's domain leaves
+    unconstrained (`plan_length_bounds`) with
+    ``__ESBMC_assume(len >= 0 && len <= max_len)`` before the allocation (the
+    ``>= 0`` is a tautology for an unsigned length; for a signed one it keeps a
+    negative length out of the fill loop, which the allocation's overflow guard
+    only prunes when ``sizeof(elem) > 1``). ``None`` (the default) leaves such a
+    length genuinely unconstrained -- sound, but the nondet-fill loop then
+    iterates an unbounded number of times, so no finite unwind settles it and the
+    verdict is always UNKNOWN (#299); the check path passes a small bound instead.
     """
     # The source-level guard needs `unit_source`, so it stays here; every
     # `(signature, spec)` guard -- empty postcondition, `result_var` clash, void
@@ -194,6 +223,8 @@ def render_semantic_harness(
     pre_buffer, post_buffer = _split_assumptions(spec.preconditions, buffers)
     for pre in pre_buffer:
         lines.append(f"    __ESBMC_assume(({pre}));")
+    for name, bound in plan_length_bounds(signature, spec, max_len):
+        lines.append(f"    __ESBMC_assume(({name} >= 0 && {name} <= {bound}));")
     for buf in buffers:
         lines += _render_buffer(buf)
     for pre in post_buffer:
@@ -211,7 +242,9 @@ def render_semantic_harness(
     return "\n".join(lines) + "\n"
 
 
-def render_property_harness(*, unit_source: str, symbol: str, prop: Property) -> str:
+def render_property_harness(
+    *, unit_source: str, symbol: str, prop: Property, max_len: int | None = None
+) -> str:
     """Render a stored semantic Property into a compilable ESBMC harness (C text).
 
     The "I only have the source slice + symbol" entry point over the writer:
@@ -227,12 +260,28 @@ def render_property_harness(*, unit_source: str, symbol: str, prop: Property) ->
     Fail-loud: a `HarnessError` from any leg -- an unparseable signature, a
     non-semantic (reachability) property, or an un-renderable postcondition --
     propagates unchanged, so a bad unit/property is never turned into a silent
-    mis-harness.
+    mis-harness. `max_len` is `render_semantic_harness`'s.
+    """
+    return build_property_harness(
+        unit_source=unit_source, symbol=symbol, prop=prop, max_len=max_len
+    ).source_text
+
+
+def build_property_harness(
+    *, unit_source: str, symbol: str, prop: Property, max_len: int | None = None
+) -> PropertyHarness:
+    """`render_property_harness`, plus the length bounds the harness applied.
+
+    The check phase reports those bounds on each verdict so a result scoped to
+    ``len <= N`` is never mistaken for one over every length.
     """
     signature = extract_signature(unit_source, symbol)
     spec = spec_from_property(prop)
-    return render_semantic_harness(
-        unit_source=unit_source, signature=signature, spec=spec
+    return PropertyHarness(
+        source_text=render_semantic_harness(
+            unit_source=unit_source, signature=signature, spec=spec, max_len=max_len
+        ),
+        length_bounds=plan_length_bounds(signature, spec, max_len),
     )
 
 
@@ -338,6 +387,94 @@ def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | 
     )
 
 
+def plan_length_bounds(
+    signature: UnitSignature, spec: SemanticSpec, max_len: int | None
+) -> LengthBounds:
+    """The ``(param, max_len)`` caps the harness applies to unconstrained lengths.
+
+    A malloc-backed buffer's length is a nondet scalar bounded only by the
+    allocation's overflow guard, so the nondet-fill loop iterates a symbolic,
+    effectively unbounded number of times and no finite unwind settles it: every
+    property over a ``(ptr, len)`` buffer reports UNKNOWN (#299). The cap is what
+    ``synth --max-len`` already does for the safety path.
+
+    Only a *scalar parameter* named in a buffer's length expression is capped (a
+    macro or literal length is not nondet, and assuming a bound on it could make
+    the harness vacuous), and only when the domain leaves the cap room: every
+    clause mentioning it outside a buffer subscript must be a plain literal lower
+    bound the cap can still satisfy (``len >= 1``, ``len > 0``, ``len != 0``;
+    `_length_floor`). Any other clause is the property's own size constraint and
+    stays authoritative -- capping on top could contradict it (``len >= 16`` with
+    a cap of 8 assumes ``false``) and silently turn the check into a vacuous HELD.
+    The trade-off is that such a domain stays unbounded above and reports UNKNOWN
+    until it names its own upper bound.
+
+    Deduplicated in first-seen order, so two buffers sharing one length emit one
+    assume. ``max_len=None`` plans nothing; a negative one is a `HarnessError`
+    (``len <= -1`` on an unsigned length assumes ``false``).
+    """
+    if max_len is None:
+        return ()
+    if max_len < 0:
+        raise HarnessError(f"max_len must be >= 0, got {max_len}")
+    scalar_names = {p.name for p in signature.params if isinstance(p, ScalarParam)}
+    buffers = [p for p in signature.params if isinstance(p, BufferParam)]
+    buffer_names = {buf.name for buf in buffers}
+    constraining = [
+        _strip_buffer_subscripts(pre, buffer_names) for pre in spec.preconditions
+    ]
+    capped: list[str] = []
+    for buf in buffers:
+        if _is_scalar_backed(buf):
+            continue
+        for ident in identifiers(buf.length):
+            if (
+                ident in scalar_names
+                and ident not in capped
+                and all(_leaves_room(pre, ident, max_len) for pre in constraining)
+            ):
+                capped.append(ident)
+    return tuple((ident, max_len) for ident in capped)
+
+
+def _leaves_room(clause: str, ident: str, max_len: int) -> bool:
+    """Whether `clause` is compatible with capping `ident` at `max_len`.
+
+    True if it does not mention `ident`, or is a plain literal lower bound whose
+    smallest satisfying length still fits under the cap.
+    """
+    if not references(clause, ident):
+        return True
+    floor = _length_floor(clause, ident)
+    return floor is not None and floor <= max_len
+
+
+def _length_floor(clause: str, ident: str) -> int | None:
+    """The smallest length a literal lower-bound `clause` on `ident` allows.
+
+    Recognises only ``ident >= N``, ``ident > N``, ``ident != N`` and their
+    mirrored forms (``N <= ident``), with a decimal literal `N` and optional
+    integer suffix; returns None for anything else (a conjunction, an upper bound,
+    a hex literal, an expression), which the caller treats as authoritative. The
+    fullmatch keeps it conservative: ``(a >= 1) && (b >= 1)`` loses its outer
+    parentheses to a non-match rather than being misread as one bound.
+    """
+    text = clause.strip()
+    while text.startswith("(") and text.endswith(")"):
+        text = text[1:-1].strip()
+    name = re.escape(ident)
+    literal = r"(\d+)[uUlL]*"
+    if match := re.fullmatch(rf"{name}\s*(>=|>|!=)\s*{literal}", text):
+        op, value = match.group(1), int(match.group(2))
+    elif match := re.fullmatch(rf"{literal}\s*(<=|<|!=)\s*{name}", text):
+        op, value = match.group(2), int(match.group(1))
+    else:
+        return None
+    return {">=": value, ">": value + 1, "<=": value, "<": value + 1}.get(
+        op, 1 if value == 0 else 0
+    )
+
+
 def _nondet_slug(ctype: str) -> str:
     """Nondet generator name for a C type: ``int64_t`` -> ``nondet_int64_t``.
 
@@ -389,11 +526,13 @@ def _render_buffer(buf: BufferParam) -> list[str]:
     `size_t`/`unsigned long` length param) -- the same failure class relocated
     into the size computation, confirmed with `esbmc`. `precond/synth.py`
     sidesteps this by bounding every length to a small `max_len` before it ever
-    reaches `malloc` (`_length_bound`); this harness must support a genuinely
-    unconstrained length (the point of #297), so it guards the multiplication
-    itself instead, the same shape `precond/synth.py`'s `obligation_expr` uses
-    to guard its own count-based allocation. Input buffers are nondet-filled
-    element by element; output buffers are left for the unit to write.
+    reaches `malloc` (`_length_bound`), and the check path does the same by
+    default (`plan_length_bounds`); but this renderer must still support a
+    genuinely unconstrained length (`max_len=None`, the point of #297), so it
+    guards the multiplication itself as well, the same shape `precond/synth.py`'s
+    `obligation_expr` uses to guard its own count-based allocation. Input buffers
+    are nondet-filled element by element; output buffers are left for the unit to
+    write.
     """
     if _is_scalar_backed(buf):
         return [f"    {buf.elem_ctype} {buf.name};"]

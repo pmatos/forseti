@@ -21,6 +21,7 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
+from forseti.precond import DEFAULT_MAX_LEN
 from forseti.properties import parse_candidate_list
 
 from .check import (
@@ -195,6 +196,7 @@ def check_tool(
     unwind_ladder: list[int] | None = None,
     timeout_s: float = CHECK_TIMEOUT_S,
     esbmc_bin: str = "esbmc",
+    max_len: int = DEFAULT_MAX_LEN,
 ) -> dict[str, object]:
     """Check a unit's stored, checkable properties against ESBMC.
 
@@ -207,6 +209,10 @@ def check_tool(
             (default: `default_unwind_ladder_above(unwind)`).
         timeout_s: Per-attempt esbmc timeout in seconds.
         esbmc_bin: The esbmc binary to invoke.
+        max_len: Cap on a `(ptr, len)` buffer length the property's domain does
+            not constrain; a verdict is then scoped to `len<=max_len` (reported
+            in its `length_bounds`); an explicit `unwind`/`unwind_ladder` must
+            reach `max_len + 1` to settle (the default ladder is extended).
 
     Returns:
         A JSON object with the unit id, per-outcome counts, and one verdict
@@ -222,6 +228,7 @@ def check_tool(
         unwind_ladder=tuple(unwind_ladder) if unwind_ladder is not None else None,
         timeout_s=timeout_s,
         esbmc_bin=esbmc_bin,
+        max_len=max_len,
     )
     return run.to_dict()
 
@@ -244,6 +251,7 @@ def semantic_loop_tool(
     unwind_ladder: list[int] | None = None,
     timeout_s: float = CHECK_TIMEOUT_S,
     esbmc_bin: str = "esbmc",
+    max_len: int = DEFAULT_MAX_LEN,
 ) -> dict[str, object]:
     """The composed semantic-property loop (#213): ingest, then check -- one call.
 
@@ -273,6 +281,10 @@ def semantic_loop_tool(
             (default: `default_unwind_ladder_above(unwind)`).
         timeout_s: Per-attempt esbmc timeout in seconds.
         esbmc_bin: The esbmc binary to invoke.
+        max_len: Cap on a `(ptr, len)` buffer length the property's domain does
+            not constrain; a verdict is then scoped to `len<=max_len` (reported
+            in its `length_bounds`); an explicit `unwind`/`unwind_ladder` must
+            reach `max_len + 1` to settle (the default ladder is extended).
 
     Returns:
         A JSON object with the unit id, `mode`, the per-candidate ingestion
@@ -302,6 +314,7 @@ def semantic_loop_tool(
         unwind_ladder=tuple(unwind_ladder) if unwind_ladder is not None else None,
         check_timeout_s=timeout_s,
         esbmc_bin=esbmc_bin,
+        max_len=max_len,
     )
     return result.to_dict()
 
