@@ -74,7 +74,10 @@ def test_void_return_omits_result_binding() -> None:
     assert "result" not in out
 
 
-def test_buffer_param_vla_fill() -> None:
+_ALLOC_A_N = "int *a = (int *)malloc((n) * sizeof(int));"
+
+
+def test_buffer_param_malloc_fill() -> None:
     out = render_semantic_harness(
         unit_source="int sum(const int *a, unsigned n) { return 0; }",
         signature=UnitSignature(
@@ -87,11 +90,18 @@ def test_buffer_param_vla_fill() -> None:
         ),
         spec=SemanticSpec("result >= result", ("n <= 4",)),
     )
-    assert "int a[n];" in out
+    # malloc, not a stack VLA: a VLA's size must be > 0 under ESBMC's model, so
+    # an unconstrained nondet `n` (no domain excludes 0) made every property
+    # over this buffer spuriously VIOLATE at n == 0 regardless of what it
+    # actually asserted (#297); malloc(0) is well-defined C.
+    assert "#include <stdlib.h>" in out
+    assert _ALLOC_A_N in out
+    assert "__ESBMC_assume(a != NULL);" in out
     assert "for (size_t _i = 0; _i < (n); _i++) a[_i] = nondet_int();" in out
-    # the length scalar and its assumption precede the VLA that depends on them
-    assert out.index("unsigned n = nondet_unsigned();") < out.index("int a[n];")
-    assert out.index("__ESBMC_assume((n <= 4));") < out.index("int a[n];")
+    # the length scalar and its assumption precede the allocation that depends
+    # on them
+    assert out.index("unsigned n = nondet_unsigned();") < out.index(_ALLOC_A_N)
+    assert out.index("__ESBMC_assume((n <= 4));") < out.index(_ALLOC_A_N)
     assert "sum(a, n)" in out
 
 
@@ -105,20 +115,21 @@ def test_buffer_content_precondition_ordered_around_buffer() -> None:
         ),
         spec=SemanticSpec("result == a[0]", ("n <= 4", "a[0] >= 0")),
     )
-    # a length-only assume precedes the VLA it sizes; a buffer-content assume
-    # follows the declaration/fill so it references an in-scope identifier.
+    # a length-only assume precedes the allocation it sizes; a buffer-content
+    # assume follows the declaration/fill so it references an in-scope
+    # identifier.
     fill = "a[_i] = nondet_int();"
     content_assume = "__ESBMC_assume((a[0] >= 0));"
-    assert out.index("__ESBMC_assume((n <= 4));") < out.index("int a[n];")
+    assert out.index("__ESBMC_assume((n <= 4));") < out.index(_ALLOC_A_N)
     assert out.index(fill) < out.index(content_assume)
     assert out.index(content_assume) < out.index("first(a, n)")
 
 
 def test_mixed_length_and_buffer_precondition_is_error() -> None:
     # A single clause constraining both the length `n` and the buffer `a` cannot
-    # be ordered correctly (the `n` bound must precede `int a[n]`, the `a`
-    # predicate must follow it), so it is rejected -- the caller splits it into
-    # separate domain entries (see the ordering test above).
+    # be ordered correctly (the `n` bound must precede the malloc that sizes
+    # `a`, the `a` predicate must follow it), so it is rejected -- the caller
+    # splits it into separate domain entries (see the ordering test above).
     with pytest.raises(HarnessError):
         render_semantic_harness(
             unit_source="int first(const int *a, unsigned n) { return a[0]; }",
@@ -136,8 +147,9 @@ def test_mixed_length_and_buffer_precondition_is_error() -> None:
 
 def test_last_element_precondition_renders_after_the_buffer() -> None:
     # `a[n - 1]` names the length only as an *index*, so it is a buffer-content
-    # predicate like `a[0] >= 0`: emitted after the VLA + fill, where `n` is an
-    # already-bound scalar. The genuine size bound is its own domain entry.
+    # predicate like `a[0] >= 0`: emitted after the allocation + fill, where `n`
+    # is an already-bound scalar. The genuine size bound is its own domain
+    # entry.
     out = render_semantic_harness(
         unit_source="int last(const int *a, unsigned n) { return a[n - 1]; }",
         signature=UnitSignature(
@@ -149,7 +161,7 @@ def test_last_element_precondition_renders_after_the_buffer() -> None:
     )
     content_assume = "__ESBMC_assume((a[n - 1] >= 0));"
     assert content_assume in out
-    assert out.index("__ESBMC_assume((n >= 1 && n <= 4));") < out.index("int a[n];")
+    assert out.index("__ESBMC_assume((n >= 1 && n <= 4));") < out.index(_ALLOC_A_N)
     assert out.index("a[_i] = nondet_int();") < out.index(content_assume)
     assert out.index(content_assume) < out.index("last(a, n)")
 
@@ -360,15 +372,15 @@ def test_static_gate_and_renderer_agree_on_mixed_clause() -> None:
 
 def test_renderability_reason_allows_length_used_only_as_an_index() -> None:
     # A length identifier inside a subscript is an index use, not a size
-    # constraint, so `a[n - 1] >= 0` has a valid emission point (after the VLA +
-    # fill) and the static gate must not discard it (#123).
+    # constraint, so `a[n - 1] >= 0` has a valid emission point (after the
+    # allocation + fill) and the static gate must not discard it (#123).
     spec = SemanticSpec("result == a[n - 1]", ("n >= 1", "a[n - 1] >= 0"))
     assert renderability_reason(_BUF_SIG, spec) is None
 
 
 def test_renderability_reason_flags_index_use_mixed_with_a_size_bound() -> None:
     # The index use is fine on its own, but `&& n >= 1` is a genuine size bound
-    # that must precede the VLA -- one clause, two required positions.
+    # that must precede the allocation -- one clause, two required positions.
     reason = renderability_reason(
         _BUF_SIG, SemanticSpec("result == a[n - 1]", ("a[n - 1] >= 0 && n >= 1",))
     )
@@ -539,7 +551,7 @@ def test_render_property_harness_infers_buffer_and_output_from_source() -> None:
     # length) and trailing-output classification is inferred from the slice. A
     # `uint32_t *cp` with no following length becomes a scalar-backed output
     # (`uint32_t cp;`, passed by address), and `const unsigned char *b` with a
-    # following `unsigned len` becomes a nondet-filled VLA.
+    # following `unsigned len` becomes a nondet-filled, malloc-backed buffer.
     slice_ = (
         "int decode(const unsigned char *b, unsigned len, uint32_t *cp)"
         " { *cp = 0; return 1; }"
@@ -551,7 +563,11 @@ def test_render_property_harness_infers_buffer_and_output_from_source() -> None:
             "result <= 0 || cp <= 0x10FFFF", ("len >= 1 && len <= 4",)
         ),
     )
-    assert "unsigned char b[len];" in out  # (buffer, length) idiom inferred
+    # (buffer, length) idiom inferred
+    assert (
+        "unsigned char *b = (unsigned char *)malloc((len) * sizeof(unsigned char));"
+        in out
+    )
     assert "uint32_t cp;" in out  # scalar-backed output, not an array
     assert "int result = decode(b, len, &cp);" in out  # output passed by address
 

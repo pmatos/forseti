@@ -66,9 +66,9 @@ def test_false_property_is_violated(tmp_path: Path) -> None:
 
 def test_buffer_content_precondition_renders_valid_c(tmp_path: Path) -> None:
     # A domain precondition over buffer *contents* must be emitted after the
-    # buffer is declared/filled. If it leaks before the VLA declaration the
-    # harness references an undeclared identifier and esbmc returns a parse
-    # Error (not a verdict) -- so a clean Verified proves the C is well-formed.
+    # buffer is declared/filled. If it leaks before the allocation the harness
+    # references an undeclared identifier and esbmc returns a parse Error (not
+    # a verdict) -- so a clean Verified proves the C is well-formed.
     source = tmp_path / "buffer.c"
     source.write_text(
         render_semantic_harness(
@@ -82,6 +82,30 @@ def test_buffer_content_precondition_renders_valid_c(tmp_path: Path) -> None:
                 ),
             ),
             spec=SemanticSpec("result == a[0]", ("n >= 1 && n <= 2", "a[0] >= 0")),
+        )
+    )
+    assert isinstance(verify(source, unwind=2), Verified)
+
+
+def test_unconstrained_length_buffer_verifies(tmp_path: Path) -> None:
+    # #297: a tautologically-true property over a (ptr, len) buffer with no
+    # domain entry bounding `len` (so `len == 0` is reachable) must VERIFY.
+    # The buffer used to be a raw stack VLA, and ESBMC treats a zero-size VLA
+    # as its own violation independent of the checked property -- every such
+    # property spuriously VIOLATED regardless of whether it actually held.
+    source = tmp_path / "unconstrained.c"
+    source.write_text(
+        render_semantic_harness(
+            unit_source="int first(const int *a, unsigned n) { return 0; }",
+            signature=UnitSignature(
+                "first",
+                "int",
+                (
+                    BufferParam("int", "a", "n", const=True),
+                    ScalarParam("unsigned", "n"),
+                ),
+            ),
+            spec=SemanticSpec("result == result"),
         )
     )
     assert isinstance(verify(source, unwind=2), Verified)

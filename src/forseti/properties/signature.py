@@ -35,14 +35,14 @@ class ScalarParam:
 
 @dataclass(frozen=True)
 class BufferParam:
-    """A pointer parameter backed by a nondet-filled (or output) VLA.
+    """A pointer parameter backed by a nondet-filled (or output) heap buffer.
 
     `length` is a C expression for the element count (usually another param's
     name, e.g. "len"); `out=True` means an output buffer -- allocated but NOT
     nondet-filled, referenced by `name` in the postcondition after the call. A
     single-element output (`length == "1"`) is backed by a scalar and passed by
-    address (e.g. utf8's ``uint32_t *cp``); anything else is an array that decays
-    to a pointer at the call.
+    address (e.g. utf8's ``uint32_t *cp``); anything else is `malloc`-allocated,
+    already a pointer at the call.
     """
 
     elem_ctype: str  # e.g. "unsigned char", "int"
