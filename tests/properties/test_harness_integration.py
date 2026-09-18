@@ -66,9 +66,9 @@ def test_false_property_is_violated(tmp_path: Path) -> None:
 
 def test_buffer_content_precondition_renders_valid_c(tmp_path: Path) -> None:
     # A domain precondition over buffer *contents* must be emitted after the
-    # buffer is declared/filled. If it leaks before the VLA declaration the
-    # harness references an undeclared identifier and esbmc returns a parse
-    # Error (not a verdict) -- so a clean Verified proves the C is well-formed.
+    # buffer is declared/filled. If it leaks before the allocation the harness
+    # references an undeclared identifier and esbmc returns a parse Error (not
+    # a verdict) -- so a clean Verified proves the C is well-formed.
     source = tmp_path / "buffer.c"
     source.write_text(
         render_semantic_harness(
@@ -84,6 +84,64 @@ def test_buffer_content_precondition_renders_valid_c(tmp_path: Path) -> None:
             spec=SemanticSpec("result == a[0]", ("n >= 1 && n <= 2", "a[0] >= 0")),
         )
     )
+    assert isinstance(verify(source, unwind=2), Verified)
+
+
+def _render_unconstrained_length_buffer(length_ctype: str, tmp_path: Path) -> Path:
+    """A tautologically-true property over a `(ptr, length_ctype)` buffer with
+    no domain entry bounding the length -- the shared shape #297's regression
+    tests check against, varying only the length param's width."""
+    source = tmp_path / "unconstrained.c"
+    source.write_text(
+        render_semantic_harness(
+            unit_source=f"int first(const int *a, {length_ctype} n) {{ return 0; }}",
+            signature=UnitSignature(
+                "first",
+                "int",
+                (
+                    BufferParam("int", "a", "n", const=True),
+                    ScalarParam(length_ctype, "n"),
+                ),
+            ),
+            spec=SemanticSpec("result == result"),
+        )
+    )
+    return source
+
+
+def test_unconstrained_length_buffer_verifies(tmp_path: Path) -> None:
+    # #297: len == 0 is reachable with no domain bound. The buffer used to be
+    # a raw stack VLA, and ESBMC treats a zero-size VLA as its own violation
+    # independent of the checked property -- every such property spuriously
+    # VIOLATED regardless of whether it actually held.
+    source = _render_unconstrained_length_buffer("unsigned", tmp_path)
+    assert isinstance(verify(source, unwind=2), Verified)
+
+
+def test_unconstrained_length_buffer_is_freed(tmp_path: Path) -> None:
+    # Follow-up to #297/#298: the malloc'd buffer must be `free`d, or a
+    # leak-checking run reports every buffer-bearing property VIOLATED
+    # regardless of the postcondition -- the same "harness artifact fails
+    # independent of the property" failure class as the zero-length VLA, just
+    # relocated from the allocation itself to a forgotten one.
+    source = _render_unconstrained_length_buffer("unsigned", tmp_path)
+    result = verify(source, unwind=2, extra_flags=("--memory-leak-check",))
+    assert isinstance(result, Verified)
+
+
+def test_wide_unconstrained_length_does_not_overflow_the_allocation(
+    tmp_path: Path,
+) -> None:
+    # A `size_t`-typed length is exactly as wide as `size_t` itself, so
+    # `length * sizeof(elem_ctype)` can wrap to a small value when `length` is
+    # domain-unconstrained: `malloc` would then succeed with a too-small object
+    # and the fill loop writes past it -- VIOLATED independent of the
+    # postcondition, the same failure class as #297 relocated into the
+    # allocation's own size arithmetic. The overflow guard in `_render_buffer`
+    # must keep this sound. (A 32-bit `unsigned` length, as in the test above,
+    # cannot wrap a 64-bit `size_t` multiply, which is why that case alone
+    # never surfaced this.)
+    source = _render_unconstrained_length_buffer("size_t", tmp_path)
     assert isinstance(verify(source, unwind=2), Verified)
 
 

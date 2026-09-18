@@ -172,7 +172,14 @@ def render_semantic_harness(
         else:
             raise HarnessError(f"unknown Param subtype: {type(param).__name__}")
 
+    # The buffers `_render_buffer` will `malloc`/`free`, computed once and
+    # reused for both: whether the harness needs `<stdlib.h>` and which names
+    # need a matching `free()` at the end are the same question.
+    malloc_buffers = [buf for buf in buffers if not _is_scalar_backed(buf)]
+
     lines: list[str] = [f"#include <{inc}>" for inc in includes]
+    if malloc_buffers and "stdlib.h" not in includes:
+        lines.append("#include <stdlib.h>")
     lines.append("")
     lines.append(unit_source.strip("\n"))
     lines.append("")
@@ -197,6 +204,8 @@ def render_semantic_harness(
     else:
         lines.append(f"    {signature.return_ctype} {spec.result_var} = {call};")
     lines.append(f'    __ESBMC_assert(({postcondition}), "forseti:semantic");')
+    for buf in malloc_buffers:
+        lines.append(f"    free({buf.name});")
     lines.append("    return 0;")
     lines.append("}")
     return "\n".join(lines) + "\n"
@@ -272,10 +281,11 @@ def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | 
     * a **precondition mixing a buffer and its length** -- a single clause naming
       both a buffer and a buffer-length identifier *outside a subscript index*
       (``n >= 1 && a[0] >= 0``) has no correct emission point: the length bound must
-      precede the ``int a[n]`` VLA and the buffer-content predicate must follow it,
-      so it is rejected rather than mis-ordered. A length named only as an index
-      (``a[n - 1] >= 0``) is a buffer-content predicate like any other and is
-      accepted (the renderer's `_split_assumptions` reuses this very predicate).
+      precede the ``int *a = malloc(n * sizeof(int))`` allocation and the
+      buffer-content predicate must follow it, so it is rejected rather than
+      mis-ordered. A length named only as an index (``a[n - 1] >= 0``) is a
+      buffer-content predicate like any other and is accepted (the renderer's
+      `_split_assumptions` reuses this very predicate).
 
     Best-effort and conservative on the emission rules: it may over-reject an exotic
     postcondition, but a rejected *renderable* property is safe whereas emitting
@@ -362,14 +372,37 @@ def _render_buffer(buf: BufferParam) -> list[str]:
     """Decl (+ nondet fill for inputs) for one buffer param.
 
     A single-element output is a plain scalar (passed by address at the call
-    site); everything else is a VLA sized to the *logical* length, so a read past
-    it is a genuine out-of-bounds rather than a read into slack. Input buffers are
-    nondet-filled element by element; output buffers are left for the unit to
-    write.
+    site); everything else is heap-allocated via `malloc` and sized to the
+    *logical* length, so a read past it is a genuine out-of-bounds rather than a
+    read into slack. `malloc` here, not a stack VLA: a VLA's size must be > 0
+    under ESBMC's model, so an unconstrained nondet `length` (no domain entry
+    excludes 0) made *every* property over such a buffer spuriously VIOLATE at
+    `length == 0`, regardless of what the property actually asserted (#297).
+    `malloc(0)` is well-defined C, so the length-can-be-zero case is now sound.
+    The caller (`render_semantic_harness`) `free`s every such buffer after the
+    call, for the same reason: an unfreed one reports VIOLATED ("forgotten
+    memory") under `--memory-leak-check`, independent of the checked property.
+
+    A leading `__ESBMC_assume` guards the allocation's own size arithmetic:
+    `length * sizeof(elem_ctype)`, computed in `length`'s type, can wrap when
+    that type is as wide as `size_t` (nothing here restricts against a
+    `size_t`/`unsigned long` length param) -- the same failure class relocated
+    into the size computation, confirmed with `esbmc`. `precond/synth.py`
+    sidesteps this by bounding every length to a small `max_len` before it ever
+    reaches `malloc` (`_length_bound`); this harness must support a genuinely
+    unconstrained length (the point of #297), so it guards the multiplication
+    itself instead, the same shape `precond/synth.py`'s `obligation_expr` uses
+    to guard its own count-based allocation. Input buffers are nondet-filled
+    element by element; output buffers are left for the unit to write.
     """
     if _is_scalar_backed(buf):
         return [f"    {buf.elem_ctype} {buf.name};"]
-    lines = [f"    {buf.elem_ctype} {buf.name}[{buf.length}];"]
+    lines = [
+        f"    __ESBMC_assume(({buf.length}) <= SIZE_MAX / sizeof({buf.elem_ctype}));",
+        f"    {buf.elem_ctype} *{buf.name} = "
+        f"malloc(({buf.length}) * sizeof({buf.elem_ctype}));",
+        f"    __ESBMC_assume({buf.name} != NULL);",
+    ]
     if not buf.out:
         lines.append(
             f"    for (size_t _i = 0; _i < ({buf.length}); _i++) "
@@ -380,7 +413,7 @@ def _render_buffer(buf: BufferParam) -> list[str]:
 
 def _call_arg(param: Param) -> str:
     """The call-site argument for a param: name, or ``&name`` for a scalar-backed
-    output buffer (arrays decay to pointers on their own)."""
+    output buffer (every other buffer is already a `malloc`-allocated pointer)."""
     if isinstance(param, ScalarParam):
         return param.name
     if isinstance(param, BufferParam):
@@ -417,21 +450,21 @@ def _strip_buffer_subscripts(expr: str, buffer_names: Collection[str]) -> str:
 def _mixed_buffer_length_reason(
     preconditions: Sequence[str], buffers: Sequence[BufferParam]
 ) -> str | None:
-    """Why a precondition cannot be ordered around its VLA, or None if all can.
+    """Why a precondition cannot be ordered around its allocation, or None if all can.
 
     A single clause that constrains *both* a buffer and the buffer's *size*
     (e.g. ``n >= 1 && n <= 2 && a[0] >= 0``) has no correct emission point: the
-    length bound must precede the ``int a[n]`` VLA declaration, the buffer-content
-    predicate must follow the nondet fill, and splitting arbitrary C on ``&&`` is
-    unsound under ``||`` precedence.
+    length bound must precede the ``int *a = malloc(n * sizeof(int))``
+    allocation, the buffer-content predicate must follow the nondet fill, and
+    splitting arbitrary C on ``&&`` is unsound under ``||`` precedence.
 
     Naming the length identifier is *not* itself a size constraint: in
     ``a[n - 1] >= 0`` the `n` is an index into an already-declared buffer, so the
-    whole clause emits after the VLA and fill. Only a length identifier appearing
-    **outside** a buffer subscript forces pre-VLA ordering, so the check strips
-    ``a[...]`` (`_strip_buffer_subscripts`) before looking for one -- an index-use
-    is renderable, an index-use combined with a genuine bound
-    (``a[n - 1] >= 0 && n >= 1``) is still not.
+    whole clause emits after the allocation and fill. Only a length identifier
+    appearing **outside** a buffer subscript forces pre-allocation ordering, so
+    the check strips ``a[...]`` (`_strip_buffer_subscripts`) before looking for
+    one -- an index-use is renderable, an index-use combined with a genuine
+    bound (``a[n - 1] >= 0 && n >= 1``) is still not.
 
     This decides *emission ordering* only, never index bounds: whether ``n - 1``
     is in range for ``a[n]`` is ESBMC's to catch in the emitted harness, exactly as
@@ -452,8 +485,8 @@ def _mixed_buffer_length_reason(
             return (
                 f"precondition {stripped!r} constrains both a buffer and a "
                 "buffer-length identifier outside a subscript index; split it into "
-                "separate domain entries so the length bound can precede the VLA it "
-                "sizes"
+                "separate domain entries so the length bound can precede the "
+                "allocation it sizes"
             )
     return None
 
@@ -467,7 +500,7 @@ def _split_assumptions(
     can only be emitted once the buffer is declared and nondet-filled, so it goes
     *after* `_render_buffer` -- including when its index names the length, which by
     then is a bound scalar. A length/scalar-only precondition (e.g. ``len <= 4``)
-    must stay *before* the VLA declaration it sizes. Blank entries are dropped.
+    must stay *before* the allocation it sizes. Blank entries are dropped.
     Returns ``(pre_buffer, post_buffer)``.
 
     A single clause constraining *both* a buffer and the buffer's size cannot be
