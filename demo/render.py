@@ -126,6 +126,13 @@ OUTCOME_COLOR = {
     "skipped": YELLOW,
 }
 
+# Subcommands whose exit code follows forseti's own VERIFIED=0/VIOLATED=1/
+# UNKNOWN=2/ERROR=3 contract (src/forseti/esbmc/render.py's EXIT_CODES,
+# src/forseti/precond/verify.py's ASSESSMENT_EXIT_CODES agrees on 0-3) --
+# used by render_cli's fallback when a `cli` event's output_tail has no
+# regex-matchable `assessment` (i.e. not a `--json` invocation).
+_VERDICT_EXIT_SUBCOMMANDS = {"verify", "check", "semantic-loop", "synth", "discharge"}
+
 GATE_DECISION_COLOR = {"pass": GREEN, "block": RED}
 
 STOP_DECISION_COLOR = {
@@ -168,7 +175,7 @@ def _ts(ev: dict[str, Any]) -> str:
         return "??:??:??"
     try:
         return time.strftime("%H:%M:%S", time.localtime(raw))
-    except (ValueError, OSError):
+    except (ValueError, OSError, OverflowError):
         return "??:??:??"
 
 
@@ -259,12 +266,19 @@ def render_stop(ev: dict[str, Any]) -> str:
     for key, label in (
         ("n_needs_contract", "needs_contract"),
         ("n_semantic_violations", "semantic_violated"),
+        ("n_semantic_unresolved", "semantic_unresolved"),
+        ("n_semantic_failed", "semantic_failed"),
+        ("n_semantic_skipped", "semantic_skipped"),
         ("n_unverified", "unverified"),
         ("n_oob", "oob"),
         ("attempt", "attempt"),
     ):
         v = ev.get(key)
-        if v:
+        # `attempt` is a real 0-based counter (0 == the first attempt), so it
+        # must show even when falsy; every other field here is a count where
+        # 0 genuinely means "nothing to report" and should stay hidden.
+        show = v is not None if key == "attempt" else bool(v)
+        if show:
             bits.append(f"{label}={v}")
     suffix = f" ({', '.join(bits)})" if bits else ""
     return f"{tag('STOP', CYAN)} {c(decision, color)}{suffix}"
@@ -284,9 +298,26 @@ def render_cli(ev: dict[str, Any]) -> str:
     if assessment is not None:
         color = ASSESSMENT_COLOR.get(assessment, YELLOW)
         result = f"assessment: {c(assessment, color)}"
+    elif exit_code == 0:
+        result = c("ok", GREEN)
+    elif str(ev.get("subcommand") or "") in _VERDICT_EXIT_SUBCOMMANDS and exit_code in (
+        1,
+        2,
+        3,
+    ):
+        # These subcommands share forseti's own VIOLATED=1/UNKNOWN=2/ERROR=3
+        # exit-code contract (src/forseti/esbmc/render.py's EXIT_CODES); a
+        # bare exit-code check would otherwise collapse VIOLATED and UNKNOWN
+        # into the same "failed" label -- exactly the distinction the rest
+        # of this file's verdict/assessment color maps exist to preserve.
+        label, color = {
+            1: ("VIOLATED", RED),
+            2: ("UNKNOWN", YELLOW),
+            3: ("ERROR", YELLOW),
+        }[exit_code]
+        result = c(label, color)
     else:
-        ok = exit_code == 0
-        result = c("ok", GREEN) if ok else c("failed", YELLOW)
+        result = c("failed", YELLOW)
     return f"{tag('CLI', BLUE)} {cmd} -> {result} (exit {exit_code}, {dur_s})"
 
 
@@ -392,9 +423,12 @@ def tail_events(path: Path, poll_interval: float = 0.3) -> Iterator[dict[str, An
     from a write still in flight is buffered until its newline arrives rather
     than parsed early.
     """
+    _PREFIX_PROBE_BYTES = 64
+
     inode: int | None = None
     pos = 0
     buf = ""
+    known_prefix = b""
     waiting = False
     while True:
         try:
@@ -409,18 +443,35 @@ def tail_events(path: Path, poll_interval: float = 0.3) -> Iterator[dict[str, An
             print(c(f"-- {path} appeared, tailing --", DIM))
             waiting = False
 
+        try:
+            with open(path, "rb") as probe_fh:
+                prefix = probe_fh.read(_PREFIX_PROBE_BYTES)
+        except OSError:
+            prefix = b""
+
+        reset = False
         if inode is None:
             inode = st.st_ino
         elif st.st_ino != inode:
             inode = st.st_ino
-            pos = 0
-            buf = ""
+            reset = True
             print(c("-- trace file rotated, resuming from start --", DIM))
 
         if st.st_size < pos:
+            reset = True
+            print(c("-- trace file truncated, resuming from start --", DIM))
+        elif known_prefix and prefix != known_prefix and pos > 0:
+            # A truncate immediately followed by a rewrite can leave the file
+            # no smaller than it was at the last read, defeating the
+            # size-only check above; a changed prefix means the bytes at the
+            # start of the file are no longer the ones already read.
+            reset = True
+            print(c("-- trace file content changed, resuming from start --", DIM))
+
+        known_prefix = prefix
+        if reset:
             pos = 0
             buf = ""
-            print(c("-- trace file truncated, resuming from start --", DIM))
 
         if st.st_size == pos:
             time.sleep(poll_interval)

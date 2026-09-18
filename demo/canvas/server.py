@@ -86,12 +86,14 @@ class LiveTailSource(EventSource):
     offset would desync on.
     """
 
+    _PREFIX_PROBE_BYTES = 64
+
     def __init__(self, project_dir: Path) -> None:
         self._path = project_dir / ".forseti" / "events.jsonl"
-        self._project_dir = project_dir
         self._lock = threading.Lock()
         self._known_inode: int | None = None
         self._known_size = 0
+        self._known_prefix = b""
 
     def describe(self) -> dict[str, Any]:
         return {"mode": "live", "target": str(self._path)}
@@ -103,6 +105,7 @@ class LiveTailSource(EventSource):
             except OSError:
                 self._known_inode = None
                 self._known_size = 0
+                self._known_prefix = b""
                 return {
                     "events": [],
                     "cursor": 0,
@@ -110,11 +113,24 @@ class LiveTailSource(EventSource):
                     "waiting": True,
                 }
 
+            try:
+                with open(self._path, "rb") as fh:
+                    prefix = fh.read(self._PREFIX_PROBE_BYTES)
+            except OSError:
+                prefix = b""
+
             rotated = self._known_inode is not None and st.st_ino != self._known_inode
             truncated = st.st_size < self._known_size
-            reset = rotated or truncated or since > st.st_size
+            # A truncate immediately followed by a rewrite can leave the file
+            # no smaller than it was at the last poll, defeating the size
+            # checks above; a changed prefix means the bytes at the start of
+            # the file are no longer the ones already served, regardless of
+            # the current size.
+            content_changed = bool(self._known_prefix) and prefix != self._known_prefix
+            reset = rotated or truncated or content_changed or since > st.st_size
             self._known_inode = st.st_ino
             self._known_size = st.st_size
+            self._known_prefix = prefix
 
             start = 0 if reset else since
 
@@ -194,7 +210,10 @@ class ReplaySource(EventSource):
         self._speed = speed
         self._events = events
         self._offsets = offsets
-        self._start = time.monotonic()
+        # Lazily started on the first poll (i.e. the first client request),
+        # not at construction: replay pacing shouldn't count setup time
+        # (server startup, waiting for a browser to be opened) as elapsed.
+        self._start: float | None = None
 
     def describe(self) -> dict[str, Any]:
         pace = f"speed={self._speed}" if self._speed else "instant"
@@ -206,6 +225,8 @@ class ReplaySource(EventSource):
         }
 
     def poll(self, since: int) -> dict[str, Any]:
+        if self._start is None:
+            self._start = time.monotonic()
         elapsed = time.monotonic() - self._start
         due = 0
         for offset in self._offsets:

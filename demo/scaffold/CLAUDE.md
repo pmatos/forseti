@@ -21,14 +21,22 @@ over it by itself.
 For every function taking a pointer or array parameter, you must
 additionally, yourself:
 
-1. Run `forseti synth --function <name> <file>` against it (run
+1. Run `forseti synth --function <name> <file> --json` against it (run
    `forseti synth --help` if you need other flags, e.g. `--max-len` or
-   `--timeout`).
+   `--timeout`). Always pass `--json`: without it, `synth` only prints a
+   human-readable label with no `"assessment"` field, and the demo's
+   observability pane (`render.py`/`canvas/`) can't extract or color-code
+   the verdict from that output.
 2. Read the verdict: `assumed_verified`, `discharged_verified`, `violated`,
    `vacuous`, `unknown`, `needs_contract`, or `error`.
 3. If the verdict is `violated`, fix the function's implementation and
    re-run `forseti synth` on it. Repeat until the verdict is
    `assumed_verified` or `discharged_verified`.
+4. If the verdict is `vacuous`, that is **not a pass** — it means the
+   precondition made the call site unreachable, so nothing was actually
+   exercised. Loosen the harness (e.g. raise `--max-len`) or check for an
+   overly-strong caller assumption, then re-run; treat it like `unknown`
+   below and never move on as if it were `assumed_verified`.
 
 Never consider the task done while any pointer/array-taking function still
 has a `violated` synth verdict. A `needs_contract` verdict from the

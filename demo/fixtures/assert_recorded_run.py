@@ -22,8 +22,15 @@ assertions check the *shape* of an honest trace, not a forced pass.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
+
+# Mirrors `forseti.core.EXIT_CODES` (VERIFIED=0, VIOLATED=1, UNKNOWN=2,
+# ERROR=3) -- only the `unknown` outcome exits 2; a `violated` or `error`
+# semantic-loop outcome would exit 1 or 3 respectively.
+_OUTCOME_EXIT_CODE = {"violated": 1, "unknown": 2, "error": 3}
+_OUTCOME_RE = re.compile(r'"outcome":\s*"(\w+)"')
 
 
 class TraceAssertionError(AssertionError):
@@ -43,13 +50,6 @@ def load_events(path: Path) -> list[dict]:
                 f"{path}:{lineno}: malformed JSON: {exc}"
             ) from exc
     return events
-
-
-def first(events: list[dict], **fields: object) -> dict | None:
-    for e in events:
-        if all(e.get(k) == v for k, v in fields.items()):
-            return e
-    return None
 
 
 def index_of(events: list[dict], **fields: object) -> int:
@@ -119,9 +119,23 @@ def run(events: list[dict]) -> None:
     ]
     check(len(semantic_loop_calls) >= 1, "no semantic-loop --mode invocation recorded")
     for call in semantic_loop_calls:
-        check(call["exit_code"] == 2, "semantic-loop's non-held outcome exits 2")
+        tail = call.get("output_tail", "")
+        match = _OUTCOME_RE.search(tail)
+        check(match is not None, "semantic-loop output must report an outcome")
+        assert match is not None  # for type-checkers; `check` already raised otherwise
+        outcome = match.group(1)
+        expected_exit = _OUTCOME_EXIT_CODE.get(outcome)
         check(
-            '"outcome": "unknown"' in call.get("output_tail", ""),
+            expected_exit is not None,
+            f"semantic-loop outcome {outcome!r} has no known non-held exit code",
+        )
+        check(
+            call["exit_code"] == expected_exit,
+            f"semantic-loop outcome {outcome!r} should exit {expected_exit}, "
+            f"got {call['exit_code']}",
+        )
+        check(
+            '"outcome": "unknown"' in tail,
             "semantic-loop output must report outcome: unknown",
         )
 

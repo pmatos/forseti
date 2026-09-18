@@ -194,6 +194,11 @@
     pruned_deleted: "v-yellow", oob_scan_skipped: "v-yellow"
   };
   var UNRESOLVED = { unknown: true, error: true, needs_contract: true };
+  // Subcommands sharing forseti's own VERIFIED=0/VIOLATED=1/UNKNOWN=2/ERROR=3
+  // exit-code contract (mirrors demo/render.py's _VERDICT_EXIT_SUBCOMMANDS).
+  var VERDICT_EXIT_SUBCOMMANDS = {
+    verify: true, check: true, "semantic-loop": true, synth: true, discharge: true
+  };
 
   var KNOWN_ASSESSMENTS = Object.keys(ASSESSMENT_COLOR).reduce(function (s, k) {
     s[k] = true; return s;
@@ -322,10 +327,18 @@
     if (edge.ax === edge.bx) mx += 90;
     var wrap = document.getElementById("diagram-wrap");
     var rect = svg.getBoundingClientRect();
-    var scale = rect.width / VB_W;
-    var left = (mx / VB_W) * 100;
+    // The SVG's `preserveAspectRatio` default (xMidYMid meet) letterboxes
+    // whichever axis ends up *not* being the tighter fit. With
+    // `max-height: 42vh` clamping the rendered height below what the width
+    // would otherwise imply, the rendered box is usually *wider* than the
+    // viewBox's 3:1 ratio, which makes height the binding axis and produces
+    // horizontal letterboxing -- so both `left` and `top` need the same
+    // min()-scale correction; neither axis is safe to assume unletterboxed.
+    var scale = Math.min(rect.width / VB_W, rect.height / VB_H);
+    var left = ((mx * scale + (rect.width - VB_W * scale) / 2) / rect.width) * 100;
     var top = ((my * scale + (rect.height - VB_H * scale) / 2) / rect.height) * 100;
     // Fallback if the above (accounting for letterboxing) misbehaves: clamp.
+    if (!(left >= 0 && left <= 100)) left = (mx / VB_W) * 100;
     if (!(top >= 0 && top <= 100)) top = (my / VB_H) * 100;
 
     var badge = document.createElement("div");
@@ -383,8 +396,8 @@
     gate: function (ev, state) {
       var decision = String(ev.decision || "?");
       var parts = [];
-      if (ev.n_failures) parts.push("failures=" + ev.n_failures);
-      if (ev.n_needs_contract) parts.push("needs_contract=" + ev.n_needs_contract);
+      if (ev.n_failures) parts.push("failures=" + esc(ev.n_failures));
+      if (ev.n_needs_contract) parts.push("needs_contract=" + esc(ev.n_needs_contract));
       var suffix = parts.length ? " (" + parts.join(", ") + ")" : "";
       state.lastGate = { file: ev.file, decision: decision, ts: ev.ts };
       return tsPrefix(ev) + '<span class="tag tag-forseti">GATE</span> ' +
@@ -406,8 +419,15 @@
       var decision = String(ev.decision || "?");
       var bits = [];
       [["n_needs_contract", "needs_contract"], ["n_semantic_violations", "semantic_violated"],
+       ["n_semantic_unresolved", "semantic_unresolved"], ["n_semantic_failed", "semantic_failed"],
+       ["n_semantic_skipped", "semantic_skipped"],
        ["n_unverified", "unverified"], ["n_oob", "oob"], ["attempt", "attempt"]].forEach(function (p) {
-        if (ev[p[0]]) bits.push(p[1] + "=" + ev[p[0]]);
+        // `attempt` is a real 0-based counter (0 == the first attempt), so it
+        // must show even when falsy; every other field here is a count where
+        // 0 genuinely means "nothing to report" and should stay hidden.
+        var v = ev[p[0]];
+        var show = p[0] === "attempt" ? (v !== undefined && v !== null) : !!v;
+        if (show) bits.push(p[1] + "=" + esc(v));
       });
       var suffix = bits.length ? " (" + bits.join(", ") + ")" : "";
       return tsPrefix(ev) + '<span class="tag tag-forseti">STOP</span> ' +
@@ -420,9 +440,16 @@
       var result;
       if (assessment) {
         result = "assessment: " + verdictSpan(assessment, ASSESSMENT_COLOR[assessment]);
+      } else if (ev.exit_code === 0) {
+        result = '<span class="verdict v-green">ok</span>';
+      } else if (VERDICT_EXIT_SUBCOMMANDS[ev.subcommand] && (ev.exit_code === 1 || ev.exit_code === 2 || ev.exit_code === 3)) {
+        // Same VIOLATED=1/UNKNOWN=2/ERROR=3 exit-code contract render.py's
+        // render_cli uses -- keep VIOLATED/UNKNOWN/ERROR distinct instead of
+        // collapsing them into one generic "failed".
+        result = verdictSpan({ 1: "violated", 2: "unknown", 3: "error" }[ev.exit_code],
+          { 1: "v-red", 2: "v-yellow", 3: "v-yellow" }[ev.exit_code]);
       } else {
-        result = ev.exit_code === 0 ?
-          '<span class="verdict v-green">ok</span>' : '<span class="verdict v-yellow">failed</span>';
+        result = '<span class="verdict v-yellow">failed</span>';
       }
       return tsPrefix(ev) + '<span class="tag tag-forseti">CLI</span> ' + esc(cmd) + " -> " +
         result + " (exit " + esc(ev.exit_code) + ", " + fmtDur(ev.duration_s) + ")";
@@ -545,24 +572,50 @@
     var type = String(ev.type || "");
     var renderFn = RENDERERS[type];
     if (renderFn) {
-      var html = renderFn(ev, uiState);
-      if (html != null) appendLog(html);
+      // Never let one surprising event payload (a field of an unexpected
+      // shape -- three independent producers write to this file) crash the
+      // poll loop; mirrors render.py's own per-line try/except.
+      try {
+        var html = renderFn(ev, uiState);
+        if (html != null) appendLog(html);
+      } catch (e) {
+        /* skip this line */
+      }
     }
     var chorFn = CHOREOGRAPHY[type];
     if (chorFn) {
       animQueue.push({ fn: chorFn, ev: ev });
-      if (animQueue.length > MAX_QUEUED) animQueue.splice(0, animQueue.length - MAX_QUEUED);
     }
   }
   setInterval(function () {
-    var item = animQueue.shift();
-    if (item) item.fn(item.ev, uiState);
+    // Drain faster than one-per-tick once the backlog grows past MAX_QUEUED
+    // (initial page load, or a fast --replay delivering a whole trace in one
+    // batch) so every event still gets its animation -- played back-to-back
+    // instead of at the nominal 180ms cadence -- rather than silently
+    // dropping the oldest ones to keep the queue short.
+    var batch = animQueue.length > MAX_QUEUED ? Math.ceil(animQueue.length / MAX_QUEUED) : 1;
+    for (var i = 0; i < batch; i++) {
+      var item = animQueue.shift();
+      if (!item) break;
+      try {
+        item.fn(item.ev, uiState);
+      } catch (e) {
+        /* skip this animation */
+      }
+    }
   }, 180);
 
   function resetAll() {
     logEl.innerHTML = "";
     uiState = {};
     animQueue.length = 0;
+    // Also drop anything mid-flight from the previous trace, or its pulses
+    // and fading badges would keep animating over the freshly cleared log.
+    for (var i = activePulses.length - 1; i >= 0; i--) {
+      activePulses[i].el.remove();
+    }
+    activePulses.length = 0;
+    badgeLayer.innerHTML = "";
     var div = document.createElement("div");
     div.className = "log-divider";
     div.textContent = "── session reset (new trace) ──";
@@ -589,10 +642,19 @@
     var bits = [m.mode];
     if (m.target) bits.push(m.target);
     if (m.pace) bits.push(m.pace);
+    if (typeof m.n_events === "number") bits.push(m.n_events + " events");
     metaText.textContent = bits.join(" · ");
   }).catch(function () {});
 
+  var pollInFlight = false;
   function pollOnce() {
+    // Guard against an overlapping request: if a slow response is still
+    // outstanding when the next interval fires, skip this tick rather than
+    // racing two requests against the same shared `cursor` (which can
+    // double-render events or move `cursor` backwards depending on which
+    // response resolves first).
+    if (pollInFlight) return;
+    pollInFlight = true;
     fetch("/events?since=" + cursor, { cache: "no-store" }).then(function (res) {
       if (!res.ok) throw new Error("bad status " + res.status);
       return res.json();
@@ -603,6 +665,8 @@
       (data.events || []).forEach(handleEvent);
     }).catch(function () {
       setStatus("down", "disconnected, retrying…");
+    }).then(function () {
+      pollInFlight = false;
     });
   }
   setInterval(pollOnce, POLL_MS);

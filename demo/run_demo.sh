@@ -28,7 +28,7 @@ TARGET_DIR=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --port)
-            PORT="$2"
+            PORT="${2:?--port requires a value}"
             shift 2
             ;;
         *)
@@ -45,6 +45,15 @@ done
 if [[ -z "${TARGET_DIR}" ]]; then
     TARGET_DIR="$(mktemp -d -t forseti-demo-XXXXXX)"
     echo "No target-dir given -- using a fresh workspace: ${TARGET_DIR}"
+else
+    # Canonicalize a user-supplied target-dir to absolute right away: the
+    # tmux render.py pane below is started with its cwd forced to the repo
+    # root (not wherever this script was invoked from), so a relative path
+    # here would resolve against the wrong base for that pane while still
+    # resolving correctly for canvas/server.py and scaffold/init.sh (both
+    # invoked from this same shell before any cwd changes).
+    mkdir -p -- "${TARGET_DIR}"
+    TARGET_DIR="$(cd -- "${TARGET_DIR}" && pwd)"
 fi
 
 bash "${SCRIPT_DIR}/scaffold/init.sh" "${TARGET_DIR}"
@@ -78,9 +87,22 @@ fi
 
 if command -v tmux >/dev/null 2>&1 && [[ -z "${TMUX:-}" ]]; then
     SESSION="forseti-demo-$$"
-    tmux new-session -d -s "${SESSION}" -c "${TARGET_DIR}" "claude"
-    tmux split-window -h -t "${SESSION}" -c "${SCRIPT_DIR}/.." \
-        "python3 ${SCRIPT_DIR}/render.py '${TARGET_DIR}'"
+    # Re-source env.sh inside each pane rather than relying on tmux to carry
+    # this shell's just-modified PATH into it: `new-session`/`split-window`
+    # only inherit the *server's* environment (captured whenever the tmux
+    # server itself first started), not this shell's current one, unless a
+    # server is started fresh right here. A dev with an already-running tmux
+    # server (a common state) would otherwise silently get whatever `forseti`
+    # was on PATH at server-start time -- a separately-installed release
+    # build, not this checkout -- defeating env.sh's whole purpose. Each
+    # `printf %q` shell-quotes its argument so a TARGET_DIR/SCRIPT_DIR
+    # containing spaces or quote characters still round-trips correctly
+    # through tmux's own `$SHELL -c` re-parse of the pane command string.
+    ENV_SH_Q="$(printf '%q' "${SCRIPT_DIR}/env.sh")"
+    tmux new-session -d -s "${SESSION}" -c "${TARGET_DIR}" \
+        "bash -c \"source ${ENV_SH_Q} && exec claude\""
+    RENDER_CMD="source ${ENV_SH_Q} && exec python3 $(printf '%q' "${SCRIPT_DIR}/render.py") $(printf '%q' "${TARGET_DIR}")"
+    tmux split-window -h -t "${SESSION}" -c "${SCRIPT_DIR}/.." "bash -c \"${RENDER_CMD}\""
     tmux select-pane -t "${SESSION}.0"
     echo "tmux session: ${SESSION} (left: claude, right: render.py)"
     # `tmux attach` fails outright with no controlling TTY (e.g. this script
@@ -96,5 +118,7 @@ else
     echo " run 'python3 ${SCRIPT_DIR}/render.py ${TARGET_DIR}' in another"
     echo " terminal for the textual view.)"
     cd "${TARGET_DIR}"
-    exec claude
+    # Not `exec`: replacing this shell's process image would skip the EXIT
+    # trap above, leaking the background canvas server once claude exits.
+    claude
 fi

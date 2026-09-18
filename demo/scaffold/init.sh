@@ -51,7 +51,12 @@ if [[ ! -f "${CLAUDE_MD_TEMPLATE}" ]]; then
     exit 1
 fi
 
-mkdir -p "${TARGET_DIR}"
+mkdir -p -- "${TARGET_DIR}"
+
+# Canonicalize to absolute: the enable-project call below runs from inside
+# ${TARGET_DIR} (see its own comment), so a relative TARGET_DIR would
+# otherwise resolve against the wrong base after that `cd`.
+TARGET_DIR="$(cd "${TARGET_DIR}" && pwd)"
 
 git -C "${TARGET_DIR}" init -q
 
@@ -71,6 +76,12 @@ fi
 
 cp "${CLAUDE_MD_TEMPLATE}" "${TARGET_DIR}/CLAUDE.md"
 
-forseti enable-project "${TARGET_DIR}" --harness claude-code
+# Run from inside ${TARGET_DIR} (in a subshell, so our own cwd is untouched):
+# the demo/bin/forseti shim logs its own `cli` bookkeeping event to
+# <cwd>/.forseti/events.jsonl, and this is the one scaffold-time call to a
+# shimmed `forseti` that would otherwise run from whatever directory this
+# script itself was invoked from (typically the repo root) instead of the
+# workspace being built -- see demo/bin/README.md's "cwd-keyed" limitation.
+(cd "${TARGET_DIR}" && forseti enable-project "${TARGET_DIR}" --harness claude-code)
 
 echo "Demo workspace ready at ${TARGET_DIR}"

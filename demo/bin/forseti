@@ -96,7 +96,14 @@ def _pump(src: BinaryIO, dst: BinaryIO, buf: bytearray, lock: threading.Lock) ->
         with lock:
             buf.extend(chunk)
             if len(buf) > _BUF_CAP_BYTES:
-                del buf[: len(buf) - _BUF_CAP_BYTES]
+                cut = len(buf) - _BUF_CAP_BYTES
+                # Keep advancing past any UTF-8 continuation bytes (0x80-0xBF)
+                # so the buffer always starts on a clean character boundary --
+                # a plain byte-count cut can otherwise land mid-character and
+                # leave a stray replacement character in the decoded tail.
+                while cut < len(buf) and 0x80 <= buf[cut] <= 0xBF:
+                    cut += 1
+                del buf[:cut]
 
 
 def main(argv: list[str]) -> int:
@@ -104,7 +111,7 @@ def main(argv: list[str]) -> int:
     real_forseti = _find_real_forseti(self_path)
 
     subcommand = argv[1] if len(argv) > 1 else None
-    is_hook = subcommand == "claude-code-hook"
+    is_hook = subcommand in ("claude-code-hook", "codex-hook", "omp-hook")
 
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
@@ -121,11 +128,15 @@ def main(argv: list[str]) -> int:
     combined = bytearray()
     lock = threading.Lock()
     assert proc.stdout is not None and proc.stderr is not None
+    # Daemon: if the main thread ever exits without joining these (e.g. a
+    # KeyboardInterrupt during proc.wait()), the interpreter can still shut
+    # down instead of hanging on a pump thread stuck reading a child that
+    # didn't fully close its pipes on SIGINT.
     t_out = threading.Thread(
-        target=_pump, args=(proc.stdout, sys.stdout.buffer, combined, lock)
+        target=_pump, args=(proc.stdout, sys.stdout.buffer, combined, lock), daemon=True
     )
     t_err = threading.Thread(
-        target=_pump, args=(proc.stderr, sys.stderr.buffer, combined, lock)
+        target=_pump, args=(proc.stderr, sys.stderr.buffer, combined, lock), daemon=True
     )
     t_out.start()
     t_err.start()

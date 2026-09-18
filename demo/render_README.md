@@ -51,10 +51,10 @@ One line per recognized event, prefixed with a dim `[HH:MM:SS]` timestamp:
 [10:02:16] AGENT wrote utf8.c (functions: utf8_decode)
 [10:02:17] ESBMC verify utf8.c::utf8_decode -> NEEDS_CONTRACT (k=?, 0.05s) (gate: no harness for pointer/array param -- not evidence of safety)
 [10:02:17] GATE pass utf8.c (needs_contract=1)
-[10:02:21] CLI forseti synth utf8.c --function utf8_decode -> assessment: violated (exit 1, 0.42s)
+[10:02:21] CLI forseti synth utf8.c --function utf8_decode --json -> assessment: violated (exit 1, 0.42s)
 [10:02:31] AGENT edited utf8.c (functions: utf8_decode)
 [10:02:41] CLI forseti synth utf8.c --function utf8_decode --json -> assessment: assumed_verified (exit 0, 0.38s)
-[10:02:42] STOP allow_needs_contract (needs_contract=1)
+[10:02:42] STOP allow_needs_contract (needs_contract=1, attempt=0)
 ```
 
 Colors: green = verified / pass / held; red = violated / block; yellow =
