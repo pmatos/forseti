@@ -42,9 +42,10 @@ from forseti.esbmc import (
 from forseti.properties import (
     CHECKABLE_STATUSES,
     HarnessError,
+    LengthBounds,
     Property,
     PropertyKind,
-    render_property_harness,
+    build_property_harness,
 )
 
 from .ladder import LadderAttempt, validated_ladder, verify_ladder
@@ -82,6 +83,9 @@ class PropertyVerdict:
     the raw typed ESBMC result (`None` when `SKIPPED`); `harness_source` is the
     exact harness checked, kept as provenance so #4 can re-render it against
     mutants. `skip_reason` explains a `SKIPPED` outcome or a render-failure `ERROR`.
+    `length_bounds` are the ``(param, max_len)`` caps the harness applied to
+    buffer lengths the property's domain left unconstrained, so the verdict reads
+    as scoped to ``len <= N`` rather than to every length (empty when none).
     """
 
     property_id: str
@@ -92,6 +96,7 @@ class PropertyVerdict:
     result: EsbmcResult | None
     harness_source: str | None
     skip_reason: str | None = None
+    length_bounds: LengthBounds = ()
 
     @classmethod
     def skipped(
@@ -143,6 +148,7 @@ class PropertyVerdict:
         k: int | None,
         result: EsbmcResult,
         harness_source: str,
+        length_bounds: LengthBounds = (),
     ) -> PropertyVerdict:
         """A property verified to a terminal `outcome` along the k-ladder: the
         settled bound `k`, the raw `result` (kept for #4 to re-render against
@@ -157,6 +163,7 @@ class PropertyVerdict:
             k=k,
             result=result,
             harness_source=harness_source,
+            length_bounds=length_bounds,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -169,6 +176,7 @@ class PropertyVerdict:
             "k": self.k,
             "harness_source": self.harness_source,
             "skip_reason": self.skip_reason,
+            "length_bounds": dict(self.length_bounds),
             "result": (
                 _result_payload(self.result, self.k)
                 if self.result is not None
@@ -249,13 +257,27 @@ class SemanticHarnessWriter:
     `HarnessError` rather than emit a silent mis-harness. Non-semantic properties
     are skipped by the driver *before* this is reached (ADR-0009 D2), so `render`
     only ever sees semantic ones.
+
+    `max_len` (default `None`: no cap) is forwarded to the harness so a
+    `(ptr, len)` buffer the property's domain leaves unbounded is capped at
+    ``len <= max_len`` (#299); the caps actually applied ride back on the
+    `RenderedHarness`. A negative `max_len` is a per-property render `ERROR`
+    (the harness's own `HarnessError`); the Core faces reject it up front.
     """
 
+    def __init__(self, max_len: int | None = None) -> None:
+        self._max_len = max_len
+
     def render(self, unit: Unit, prop: Property) -> RenderedHarness:
-        text = render_property_harness(
-            unit_source=unit.source_text, symbol=unit.symbol, prop=prop
+        harness = build_property_harness(
+            unit_source=unit.source_text,
+            symbol=unit.symbol,
+            prop=prop,
+            max_len=self._max_len,
         )
-        return RenderedHarness(source_text=text)
+        return RenderedHarness(
+            source_text=harness.source_text, length_bounds=harness.length_bounds
+        )
 
 
 def check_properties(
@@ -368,6 +390,7 @@ def check_properties(
                 k=final.k,
                 result=final.result,
                 harness_source=rendered.source_text,
+                length_bounds=rendered.length_bounds,
             )
         )
         emit(

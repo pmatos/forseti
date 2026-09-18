@@ -382,3 +382,41 @@ def test_to_dict_shape(tmp_path: Path) -> None:
     assert payload["outcome"] == "held"
     assert len(payload["ingestion"]) == 1
     assert payload["check"]["counts"]["held"] == 1
+
+
+def test_negative_max_len_fails_before_the_proposer_is_called(
+    tmp_path: Path,
+) -> None:
+    class ExplodingClient(FakeLLMClient):
+        def complete(self, prompt: str) -> str:
+            raise AssertionError("the LLM must not be called for a bad max_len")
+
+    with pytest.raises(ValueError, match="max_len"):
+        run_semantic_loop(
+            _write_unit(tmp_path),
+            function="my_abs",
+            mode="propose",
+            store_root=tmp_path / ".forseti",
+            client=ExplodingClient(),
+            max_len=-1,
+        )
+
+
+def test_max_len_reaches_the_check_phase(tmp_path: Path) -> None:
+    source = tmp_path / "buf_unit.c"
+    source.write_text("int count(const unsigned char *a, unsigned n) { return 0; }\n")
+
+    result = run_semantic_loop(
+        source,
+        function="count",
+        mode="submit",
+        store_root=tmp_path / ".forseti",
+        candidates=(CandidateSpec(expression="result == 0"),),
+        provider="codex",
+        model="gpt-5.1",
+        max_len=5,
+        verify_port=FakeVerify([Verified(_meta())]),
+    )
+
+    assert result.check.verdicts[0].length_bounds == (("n", 5),)
+    assert result.to_dict()["check"]["verdicts"][0]["length_bounds"] == {"n": 5}

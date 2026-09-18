@@ -549,3 +549,40 @@ def test_cli_store_error_exits_one(
     )
     assert code == 1
     assert "forseti semantic-loop:" in capsys.readouterr().err
+
+
+def test_cli_max_len_flag_reaches_the_check_phase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "buf_unit.c"
+    source.write_text("int count(const unsigned char *a, unsigned n) { return 0; }\n")
+    candidates = tmp_path / "candidates.json"
+    candidates.write_text(json.dumps([{"expression": "result == 0"}]))
+    _patch_verify(monkeypatch, FakeVerify([Verified(_meta())]))
+
+    code = main(
+        [
+            "semantic-loop",
+            str(source),
+            "--function",
+            "count",
+            "--mode",
+            "submit",
+            "--candidates-json",
+            str(candidates),
+            "--provider",
+            "codex",
+            "--model",
+            "gpt-5.1",
+            "--store-root",
+            str(tmp_path / ".forseti"),
+            "--max-len",
+            "5",
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["check"]["verdicts"][0]["length_bounds"] == {"n": 5}

@@ -34,6 +34,7 @@ from forseti.orchestrator import (
     PropertyOutcome,
     PropertyVerdict,
     RenderedHarness,
+    SemanticHarnessWriter,
     Unit,
     check_properties,
     persist_property_check,
@@ -628,6 +629,66 @@ def test_transcript_shows_every_outcome(tmp_path: Path) -> None:
     assert "VIOLATED" in text
     assert "SKIPPED" in text
     assert "Counts: held=1, violated=1, unknown=0, error=0, skipped=1" in text
+
+
+def test_transcript_shows_the_length_bounds_a_verdict_was_checked_under() -> None:
+    bounded = PropertyVerdict.settled(
+        "p1",
+        "u.c::f",
+        "semantic",
+        PropertyOutcome.HELD,
+        k=16,
+        result=Verified(meta()),
+        harness_source="/* h */",
+        length_bounds=(("n", 8), ("m", 8)),
+    )
+    unbounded = PropertyVerdict.settled(
+        "p2",
+        "u.c::f",
+        "semantic",
+        PropertyOutcome.HELD,
+        k=16,
+        result=Verified(meta()),
+        harness_source="/* h */",
+    )
+    text = property_check_transcript(PropertyCheckRun("u.c::f", (bounded, unbounded)))
+    rows = {line.split()[2]: line for line in text.splitlines() if "semantic" in line}
+    assert rows["p1"].endswith("(n<=8, m<=8)")
+    assert "<=" not in rows["p2"]
+    assert bounded.to_dict()["length_bounds"] == {"n": 8, "m": 8}
+    assert unbounded.to_dict()["length_bounds"] == {}
+
+
+def test_check_properties_carries_the_writers_length_bounds_onto_the_verdict(
+    tmp_path: Path,
+) -> None:
+    class BoundedWriter:
+        def render(self, unit: Unit, prop: Property) -> RenderedHarness:
+            return RenderedHarness(source_text="/* h */", length_bounds=(("n", 8),))
+
+    run = check_properties(
+        UNIT,
+        store=InMemoryPropertyStore([semantic_prop("p1")]),
+        render=BoundedWriter(),
+        verify=FakeVerify([Verified(meta())]),
+        work_dir=tmp_path / "work",
+        unwind=8,
+    )
+    assert run.verdicts[0].length_bounds == (("n", 8),)
+
+
+def test_semantic_writer_reports_the_cap_it_applied() -> None:
+    unit = Unit(
+        "u.c::f",
+        Path("u.c"),
+        "f",
+        "int f(const int *a, unsigned n) { return 0; }",
+    )
+    prop = semantic_prop("p1")
+    assert SemanticHarnessWriter().render(unit, prop).length_bounds == ()
+    capped = SemanticHarnessWriter(max_len=4).render(unit, prop)
+    assert capped.length_bounds == (("n", 4),)
+    assert "__ESBMC_assume((n) <= 4);" in capped.source_text
 
 
 def test_persist_property_check_writes_jsonl(tmp_path: Path) -> None:

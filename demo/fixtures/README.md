@@ -14,9 +14,9 @@ write a UTF-8 decoder with no hint about bugs or verification. This is the
   `forseti semantic-loop --mode propose` asks an LLM for a semantic
   invariant, gets one, and checks it → `UNKNOWN` at k=16. The session raised
   the bound to k=64 by hand and got the same `UNKNOWN` in under a second,
-  correctly diagnosing it as a harness ceiling (issue #299 — `semantic-loop`
-  has no `--max-len` equivalent to bound an unconstrained length, unlike
-  `synth`) rather than a search that needed more time, and reported the
+  correctly diagnosing it as a harness ceiling (issue #299 — at the time,
+  `semantic-loop` had no `--max-len` equivalent to bound an unconstrained
+  length, unlike `synth`; it has since gained one) rather than a search that needed more time, and reported the
   unresolved result honestly rather than treating it as a pass. Local
   scratch-directory paths are redacted to `/demo/workspace`.
 - `recorded_run.c` — the generated `utf8.c`, for context (not itself
