@@ -111,6 +111,61 @@ def test_unconstrained_length_buffer_verifies(tmp_path: Path) -> None:
     assert isinstance(verify(source, unwind=2), Verified)
 
 
+def test_unconstrained_length_buffer_is_freed(tmp_path: Path) -> None:
+    # Follow-up to #297/#298: the malloc'd buffer must be `free`d, or a
+    # leak-checking run reports every buffer-bearing property VIOLATED
+    # regardless of the postcondition -- the same "harness artifact fails
+    # independent of the property" failure class as the zero-length VLA, just
+    # relocated from the allocation itself to a forgotten one.
+    source = tmp_path / "freed.c"
+    source.write_text(
+        render_semantic_harness(
+            unit_source="int first(const int *a, unsigned n) { return 0; }",
+            signature=UnitSignature(
+                "first",
+                "int",
+                (
+                    BufferParam("int", "a", "n", const=True),
+                    ScalarParam("unsigned", "n"),
+                ),
+            ),
+            spec=SemanticSpec("result == result"),
+        )
+    )
+    result = verify(source, unwind=2, extra_flags=("--memory-leak-check",))
+    assert isinstance(result, Verified)
+
+
+def test_wide_unconstrained_length_does_not_overflow_the_allocation(
+    tmp_path: Path,
+) -> None:
+    # A `size_t`-typed length is exactly as wide as `size_t` itself, so
+    # `length * sizeof(elem_ctype)` can wrap to a small value when `length` is
+    # domain-unconstrained: `malloc` would then succeed with a too-small object
+    # and the fill loop writes past it -- VIOLATED independent of the
+    # postcondition, the same failure class as #297 relocated into the
+    # allocation's own size arithmetic. The overflow guard in `_render_buffer`
+    # must keep this sound. (A 32-bit `unsigned` length, as in the test above,
+    # cannot wrap a 64-bit `size_t` multiply, which is why that case alone
+    # never surfaced this.)
+    source = tmp_path / "wide_length.c"
+    source.write_text(
+        render_semantic_harness(
+            unit_source="int first(const int *a, size_t n) { return 0; }",
+            signature=UnitSignature(
+                "first",
+                "int",
+                (
+                    BufferParam("int", "a", "n", const=True),
+                    ScalarParam("size_t", "n"),
+                ),
+            ),
+            spec=SemanticSpec("result == result"),
+        )
+    )
+    assert isinstance(verify(source, unwind=2), Verified)
+
+
 def test_true_property_is_non_vacuous(tmp_path: Path) -> None:
     # An always-false postcondition under the true-case precondition must be
     # VIOLATED: that proves the assert site is reachable, so the true case above

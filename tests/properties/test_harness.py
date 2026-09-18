@@ -74,7 +74,7 @@ def test_void_return_omits_result_binding() -> None:
     assert "result" not in out
 
 
-_ALLOC_A_N = "int *a = (int *)malloc((n) * sizeof(int));"
+_ALLOC_A_N = "int *a = malloc((n) * sizeof(int));"
 
 
 def test_buffer_param_malloc_fill() -> None:
@@ -564,10 +564,7 @@ def test_render_property_harness_infers_buffer_and_output_from_source() -> None:
         ),
     )
     # (buffer, length) idiom inferred
-    assert (
-        "unsigned char *b = (unsigned char *)malloc((len) * sizeof(unsigned char));"
-        in out
-    )
+    assert "unsigned char *b = malloc((len) * sizeof(unsigned char));" in out
     assert "uint32_t cp;" in out  # scalar-backed output, not an array
     assert "int result = decode(b, len, &cp);" in out  # output passed by address
 
