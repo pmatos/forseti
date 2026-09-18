@@ -7,8 +7,11 @@ which the Forseti package does not instrument today -- unlike the Claude Code
 adapter's hooks and Forseti Core's `propose`/`check` calls, which already log
 to `.forseti/events.jsonl` on their own (see
 `src/forseti/adapters/claude_code/event_log.py` and `src/forseti/core/events.py`).
-Tracked as a real product gap in issue #301 -- once `synth`/`discharge`/
-`semantic-loop` emit their own events, this shim becomes unnecessary for them.
+`synth`/`discharge`/`semantic-loop` now emit their own `cli.command` event
+(issue #301, `src/forseti/core/events.py`), but neither `demo/render.py` nor
+`demo/canvas/index.html` renders that type yet -- both still consume this
+shim's `cli` event -- so the shim stays until they do (it is then still needed
+only for the subcommands that remain uninstrumented, e.g. `enable-project`).
 
 This is **not a product feature**. It does not modify, wrap, or replace
 anything inside `src/forseti/`; it is a shell-out wrapper that lives entirely

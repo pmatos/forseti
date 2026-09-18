@@ -14,10 +14,12 @@ from __future__ import annotations
 import json
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from forseti.core.cli import main
+from forseti.core.events import CLI_COMMAND, events_path
 from forseti.core.loop import run_semantic_loop
 from forseti.esbmc import EsbmcResult, RunMeta, Verified
 
@@ -58,6 +60,18 @@ class FakeVerify:
     def __call__(self, source: Path, *, unwind: int) -> EsbmcResult:
         assert self._results, "FakeVerify over-popped: script exhausted"
         return self._results.pop(0)
+
+
+@pytest.fixture(autouse=True)
+def _trace_in_tmp_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests that omit `--store-root` trace under the default relative `.forseti`;
+    keep that out of the repo checkout (#301)."""
+    monkeypatch.chdir(tmp_path)
+
+
+def _cli_events(store_root: Path) -> list[dict[str, Any]]:
+    lines = events_path(store_root).read_text().splitlines()
+    return [e for e in map(json.loads, lines) if e["type"] == CLI_COMMAND]
 
 
 def _write_unit(tmp_path: Path) -> Path:
@@ -549,3 +563,103 @@ def test_cli_store_error_exits_one(
     )
     assert code == 1
     assert "forseti semantic-loop:" in capsys.readouterr().err
+
+
+def test_cli_records_one_cli_command_event_keyed_by_store_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _write_unit(tmp_path)
+    root = tmp_path / "elsewhere" / ".forseti"
+    candidates = tmp_path / "candidates.json"
+    candidates.write_text(json.dumps([{"expression": "result >= 0"}]))
+    _patch_verify(monkeypatch, FakeVerify([Verified(_meta())]))
+
+    code = main(
+        [
+            "semantic-loop",
+            str(source),
+            "--function",
+            "my_abs",
+            "--mode",
+            "submit",
+            "--candidates-json",
+            str(candidates),
+            "--provider",
+            "codex",
+            "--model",
+            "gpt-5.1",
+            "--store-root",
+            str(root),
+        ]
+    )
+
+    assert code == 0
+    (event,) = _cli_events(root)
+    assert event["command"] == "semantic-loop"
+    assert event["source"] == str(source)
+    assert event["function"] == "my_abs"
+    assert event["mode"] == "submit"
+    assert event["unit_id"].endswith("::my_abs")
+    assert event["outcome"] == "held"
+    assert event["exit_code"] == 0
+    assert event["duration_s"] >= 0
+    assert not (tmp_path / ".forseti").exists()
+
+
+def test_cli_records_the_event_for_an_argument_error(tmp_path: Path) -> None:
+    source = _write_unit(tmp_path)
+    root = tmp_path / ".forseti"
+
+    code = main(
+        [
+            "semantic-loop",
+            str(source),
+            "--function",
+            "my_abs",
+            "--mode",
+            "submit",
+            "--store-root",
+            str(root),
+        ]
+    )
+
+    assert code == 1
+    (event,) = _cli_events(root)
+    assert event["exit_code"] == 1
+    assert event["mode"] == "submit"
+    assert event["unit_id"] is None
+    assert event["outcome"] is None
+
+
+def test_cli_records_the_event_when_every_submitted_candidate_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _write_unit(tmp_path)
+    root = tmp_path / ".forseti"
+    candidates = tmp_path / "candidates.json"
+    candidates.write_text(json.dumps([{"expression": "no_such_symbol > 0"}]))
+    _patch_verify(monkeypatch, FakeVerify([]))
+
+    code = main(
+        [
+            "semantic-loop",
+            str(source),
+            "--function",
+            "my_abs",
+            "--mode",
+            "submit",
+            "--candidates-json",
+            str(candidates),
+            "--provider",
+            "codex",
+            "--model",
+            "gpt-5.1",
+            "--store-root",
+            str(root),
+        ]
+    )
+
+    assert code == 1
+    (event,) = _cli_events(root)
+    assert event["exit_code"] == 1
+    assert event["outcome"] == "empty"

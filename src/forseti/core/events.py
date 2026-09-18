@@ -35,6 +35,11 @@ PROPERTY_PROPOSED = "property.proposed"
 PROPERTY_CHECK_START = "property.check.start"
 PROPERTY_VERDICT = "property.verdict"
 GATE_DECISION = "gate.decision"
+# One per invocation of `synth`/`discharge`/`semantic-loop`, on every exit path.
+# Emitted by the CLI handler, not the engine: `precond` takes no store_root and
+# `run_semantic_loop` adds no event of its own (its per-property events are
+# unchanged), so library/MCP callers stay silent.
+CLI_COMMAND = "cli.command"
 
 
 def events_path(store_root: Path) -> Path:

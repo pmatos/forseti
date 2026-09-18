@@ -68,7 +68,7 @@ release.
 |---|---|
 | `env.sh` | Puts `demo/bin` (the CLI event-logging shim) and this checkout's `.venv/bin` ahead of everything else on `PATH`. Source it before any manual step below. |
 | `scaffold/` | `CLAUDE.md` (the workflow contract copied into every demo workspace) + `init.sh` (materializes one). |
-| `bin/forseti` | A PATH shim logging every `forseti` CLI call as a `.forseti/events.jsonl` event (`synth`/`discharge`/`semantic-loop`/etc aren't self-instrumented today). |
+| `bin/forseti` | A PATH shim logging every `forseti` CLI call as a `.forseti/events.jsonl` event (`synth`/`discharge`/`semantic-loop` now emit their own `cli.command` event, #301, but the demo renderers don't consume it yet). |
 | `render.py` | Stdlib-only terminal renderer: live-tails or replays `.forseti/events.jsonl` as a colored one-line-per-event sequence. |
 | `canvas/` | Browser-based diagrammatic view of the same event stream (4-actor node diagram + full scrollable log), live or replay. |
 | `fixtures/` | A real recorded run + a standalone e2e assertion script pinning its shape. |

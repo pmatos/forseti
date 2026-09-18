@@ -78,6 +78,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
@@ -139,6 +140,7 @@ from .check import (
     DEFAULT_UNWIND_LADDER as CHECK_DEFAULT_UNWIND_LADDER,
 )
 from .check import check_source
+from .events import CLI_COMMAND, record_event
 from .loop import LoopMode, SemanticLoopResult, run_semantic_loop
 from .propose import (
     DEFAULT_MAX_CANDIDATES,
@@ -797,6 +799,34 @@ def _render_semantic_loop(result: SemanticLoopResult) -> str:
 
 
 def _run_semantic_loop(args: argparse.Namespace) -> int:
+    """Run the loop and record one `cli.command` event for it (#301).
+
+    Emitted here, not in `run_semantic_loop`, which documents that it adds no
+    event of its own (its per-candidate/per-property Core events are unchanged).
+    Wrapping the whole body means the early argument errors and the caught
+    engine errors are traced too; `unit_id`/`outcome` are `None` when no run
+    completed.
+    """
+    started = time.monotonic()
+    exit_code, result = _semantic_loop(args)
+    record_event(
+        args.store_root,
+        CLI_COMMAND,
+        command="semantic-loop",
+        source=str(args.source),
+        function=args.function,
+        mode=args.mode,
+        unit_id=result.unit_id if result is not None else None,
+        outcome=result.outcome if result is not None else None,
+        exit_code=exit_code,
+        duration_s=time.monotonic() - started,
+    )
+    return exit_code
+
+
+def _semantic_loop(
+    args: argparse.Namespace,
+) -> tuple[int, SemanticLoopResult | None]:
     candidates: tuple[CandidateSpec, ...] = ()
     if args.mode == "submit":
         if args.candidates_json is None:
@@ -804,12 +834,12 @@ def _run_semantic_loop(args: argparse.Namespace) -> int:
                 "forseti semantic-loop: --mode submit requires --candidates-json",
                 file=sys.stderr,
             )
-            return 1
+            return 1, None
         try:
             candidates = _parse_candidates_json(args.candidates_json)
         except (ValueError, OSError) as exc:
             print(f"forseti semantic-loop: {exc}", file=sys.stderr)
-            return 1
+            return 1, None
     elif args.candidates_json is not None:
         # Caught here, not left to run_semantic_loop's own "does not take
         # candidates" ValueError: a --mode propose/check-only caller passing
@@ -820,7 +850,7 @@ def _run_semantic_loop(args: argparse.Namespace) -> int:
             f"not --mode {args.mode}",
             file=sys.stderr,
         )
-        return 1
+        return 1, None
 
     # argparse's --mode choices use a hyphen ("check-only"); LoopMode spells
     # it with an underscore -- "propose"/"submit" need no respelling.
@@ -856,7 +886,7 @@ def _run_semantic_loop(args: argparse.Namespace) -> int:
         OSError,
     ) as exc:
         print(f"forseti semantic-loop: {exc}", file=sys.stderr)
-        return 1
+        return 1, None
 
     if args.json:
         print(json.dumps(result.to_dict()))
@@ -868,8 +898,8 @@ def _run_semantic_loop(args: argparse.Namespace) -> int:
         # read as a clean pass (e.g. an earlier HELD property) even though this
         # submission accepted nothing. Mirror `_run_submit_property`'s own
         # accepted-or-fail exit code instead of the unrelated check outcome.
-        return 1
-    return _check_exit_code(result.check)
+        return 1, result
+    return _check_exit_code(result.check), result
 
 
 def _add_claude_code_hook_parser(
