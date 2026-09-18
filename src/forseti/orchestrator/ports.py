@@ -26,7 +26,7 @@ from forseti.esbmc import (
     Violated,
     rename_all_declarations_and_definitions,
 )
-from forseti.properties import Property, PropertyStatus
+from forseti.properties import LengthBounds, Property, PropertyStatus
 from forseti.unit_id import make_unit_id
 
 _RENAMED_MAIN = "__forseti_unused_main"
@@ -116,11 +116,15 @@ class RenderedHarness:
     unit slice + a nondet `main` + the property encoded as an `__ESBMC_assert`;
     `check_properties` verifies this single file. `language` selects the esbmc
     frontend (C only for now, ADR-0003) and is provenance for the widening to
-    come.
+    come. `length_bounds` are the ``(param, max_len)`` caps the harness applied
+    to buffer lengths its property's domain left unconstrained (empty if none),
+    carried through to the verdict so a bounded result is never reported as
+    unbounded.
     """
 
     source_text: str
     language: str = "c"
+    length_bounds: LengthBounds = ()
 
 
 class PropertyStorePort(Protocol):

@@ -16,11 +16,13 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from forseti.core import check_source
 from forseti.core.cli import main
+from forseti.orchestrator import PropertyOutcome, PropertyVerdict
 from forseti.properties import (
     Property,
     PropertyKind,
@@ -250,6 +252,81 @@ def test_check_source_detects_violation_past_the_default_unwind_bound(
     assert run.counts()["held"] == 0  # never a spurious pass
     assert run.counts()["violated"] == 1
     assert run.verdicts[0].k == 8  # settled past the default unwind, on escalation
+
+
+_COUNT_ODD = (
+    "int count_odd(const unsigned char *a, unsigned n) {\n"
+    "    int s = 0;\n"
+    "    for (unsigned i = 0; i < n; i++) s += a[i] & 1;\n"
+    "    return s;\n"
+    "}\n"
+)
+
+
+def _count_odd_run(
+    tmp_path: Path,
+    expression: str,
+    domain: tuple[str, ...] = (),
+    **kwargs: Any,
+) -> PropertyVerdict:
+    unit = tmp_path / "count_odd.c"
+    unit.write_text(_COUNT_ODD)
+    root = tmp_path / ".forseti"
+    store = PropertyStore.open(root)
+    store.add(_semantic(f"{unit}::count_odd", expression, domain))
+    store.close()
+    (verdict,) = check_source(
+        unit, function="count_odd", store_root=root, **kwargs
+    ).verdicts
+    return verdict
+
+
+def test_check_source_settles_a_true_property_over_an_unconstrained_ptr_len(
+    tmp_path: Path,
+) -> None:
+    """#299: a genuinely true property over a `(ptr, len)` buffer with no domain
+    length bound used to report UNKNOWN whatever the ladder (an unbounded fill
+    loop no finite unwind fully explores). The default `max_len` cap settles it,
+    and the bound it was checked under is on the verdict."""
+    verdict = _count_odd_run(tmp_path, "result >= 0 && (unsigned)result <= n")
+
+    assert verdict.outcome is PropertyOutcome.HELD
+    assert verdict.length_bounds == (("n", 8),)
+    assert verdict.k == 16  # the 8-element fill loop needs k > 8: ladder 4, 8, 16
+
+
+def test_check_source_settles_a_false_property_over_an_unconstrained_ptr_len(
+    tmp_path: Path,
+) -> None:
+    verdict = _count_odd_run(tmp_path, "result < 0")
+    assert verdict.outcome is PropertyOutcome.VIOLATED
+    assert verdict.length_bounds == (("n", 8),)
+
+
+def test_check_source_lower_bound_only_domain_still_settles(tmp_path: Path) -> None:
+    verdict = _count_odd_run(tmp_path, "result >= 0", ("n >= 1",))
+    assert verdict.outcome is PropertyOutcome.HELD
+    assert verdict.length_bounds == (("n", 8),)
+
+
+def test_check_source_max_len_none_restores_the_unknown_ceiling(
+    tmp_path: Path,
+) -> None:
+    verdict = _count_odd_run(
+        tmp_path, "result >= 0 && (unsigned)result <= n", max_len=None
+    )
+    assert verdict.outcome is PropertyOutcome.UNKNOWN
+    assert verdict.length_bounds == ()
+
+
+def test_check_source_length_the_domain_forces_past_the_cap_is_never_vacuous_held(
+    tmp_path: Path,
+) -> None:
+    """`n >= 16` contradicts the default cap of 8. The domain wins, so the check
+    stays honestly UNKNOWN rather than assuming `false` and passing vacuously."""
+    verdict = _count_odd_run(tmp_path, "result >= 0", ("n >= 16",))
+    assert verdict.outcome is PropertyOutcome.UNKNOWN
+    assert verdict.length_bounds == ()
 
 
 def test_cli_check_exit_codes_and_json(
