@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Forseti Observability Canvas</title>
+<style>
+  :root {
+    --bg: #0b0f14;
+    --panel: #121820;
+    --panel-2: #0e141b;
+    --border: #253141;
+    --text: #d7e0e8;
+    --dim: #5c6b7a;
+    --green: #2ecc71;
+    --red: #e74c3c;
+    --yellow: #f1c40f;
+    --cyan: #22c3d6;
+    --blue: #4aa3ff;
+    --magenta: #c77dff;
+    --orange: #ff9f43;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: ui-monospace, "SF Mono", Consolas, "Liberation Mono", monospace;
+  }
+  #app { display: flex; flex-direction: column; height: 100vh; }
+
+  #status-bar {
+    display: flex; align-items: center; gap: 12px;
+    padding: 8px 14px; background: var(--panel-2);
+    border-bottom: 1px solid var(--border); font-size: 13px; flex: 0 0 auto;
+  }
+  #status-bar h1 { font-size: 14px; margin: 0; color: var(--text); font-weight: 600; }
+  #status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); flex: 0 0 auto; }
+  #status-dot.live { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  #status-dot.waiting { background: var(--yellow); }
+  #status-dot.down { background: var(--red); }
+  #status-text, #meta-text { color: var(--dim); }
+
+  #diagram-wrap { position: relative; flex: 0 0 auto; padding: 10px 14px 0; }
+  #diagram { width: 100%; height: auto; display: block; max-height: 42vh; }
+
+  .node-box {
+    fill: var(--panel); stroke-width: 2; rx: 10; ry: 10;
+    transition: filter 0.15s ease;
+  }
+  .node-label { fill: var(--text); font-size: 15px; font-weight: 600; text-anchor: middle; }
+  .node-sub { fill: var(--dim); font-size: 10px; text-anchor: middle; }
+  .edge-line { stroke: var(--border); stroke-width: 2; }
+
+  .node-agent .node-box { stroke: var(--blue); }
+  .node-forseti .node-box { stroke: var(--cyan); }
+  .node-esbmc .node-box { stroke: var(--magenta); }
+  .node-llm .node-box { stroke: var(--orange); }
+
+  .node-glow .node-box { filter: drop-shadow(0 0 10px currentColor); }
+  .node-agent.node-glow .node-box { stroke: var(--blue); filter: drop-shadow(0 0 12px var(--blue)); }
+  .node-forseti.node-glow .node-box { filter: drop-shadow(0 0 12px var(--cyan)); }
+  .node-esbmc.node-glow .node-box { filter: drop-shadow(0 0 12px var(--magenta)); }
+  .node-llm.node-glow .node-box { filter: drop-shadow(0 0 12px var(--orange)); }
+
+  .pulse-dot { filter: drop-shadow(0 0 4px currentColor); }
+
+  .badge {
+    position: absolute; transform: translate(-50%, -50%);
+    padding: 3px 9px; border-radius: 999px; font-size: 11px; white-space: nowrap;
+    background: var(--panel-2); border: 1px solid var(--border);
+    opacity: 0; pointer-events: none; max-width: 46%; overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .badge.show { animation: badge-fade 2.6s ease-out forwards; }
+  .badge.unresolved { border-style: dashed; }
+  @keyframes badge-fade {
+    0% { opacity: 0; transform: translate(-50%, -50%) scale(0.9); }
+    10% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+    75% { opacity: 1; }
+    100% { opacity: 0; }
+  }
+
+  #log-wrap { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; border-top: 1px solid var(--border); }
+  #log-header {
+    padding: 6px 14px; font-size: 11px; color: var(--dim);
+    background: var(--panel-2); border-bottom: 1px solid var(--border); flex: 0 0 auto;
+  }
+  #log {
+    flex: 1 1 auto; overflow-y: auto; padding: 8px 14px; font-size: 12.5px; line-height: 1.55;
+  }
+  .log-line { white-space: pre-wrap; word-break: break-word; }
+  .log-line .ts { color: var(--dim); }
+  .log-divider { color: var(--dim); text-align: center; margin: 6px 0; }
+
+  .tag { font-weight: 700; }
+  .tag-agent { color: var(--blue); }
+  .tag-forseti { color: var(--cyan); }
+  .tag-esbmc { color: var(--magenta); }
+  .tag-llm { color: var(--orange); }
+  .tag-neutral { color: var(--dim); }
+
+  .verdict { font-weight: 700; }
+  .v-green { color: var(--green); }
+  .v-red { color: var(--red); }
+  .v-yellow { color: var(--yellow); border-bottom: 1px dashed var(--yellow); }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="status-bar">
+    <span id="status-dot"></span>
+    <h1>Forseti Observability Canvas</h1>
+    <span id="status-text">connecting…</span>
+    <span id="meta-text"></span>
+  </div>
+
+  <div id="diagram-wrap">
+    <svg id="diagram" viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg">
+      <line class="edge-line" x1="180" y1="220" x2="380" y2="220"></line>
+      <line class="edge-line" x1="520" y1="220" x2="720" y2="220"></line>
+      <line class="edge-line" x1="450" y1="190" x2="450" y2="90"></line>
+
+      <g id="pulse-layer"></g>
+
+      <g class="node-agent" id="node-agent">
+        <rect class="node-box" x="40" y="190" width="140" height="60"></rect>
+        <text class="node-label" x="110" y="216">Agent</text>
+        <text class="node-sub" x="110" y="234">(Claude)</text>
+      </g>
+
+      <g class="node-forseti" id="node-forseti">
+        <rect class="node-box" x="380" y="190" width="140" height="60"></rect>
+        <text class="node-label" x="450" y="216">forseti</text>
+        <text class="node-sub" x="450" y="234">CLI / hooks</text>
+      </g>
+
+      <g class="node-esbmc" id="node-esbmc">
+        <rect class="node-box" x="720" y="190" width="140" height="60"></rect>
+        <text class="node-label" x="790" y="216">ESBMC</text>
+        <text class="node-sub" x="790" y="234">bounded model checker</text>
+      </g>
+
+      <g class="node-llm" id="node-llm">
+        <rect class="node-box" x="380" y="30" width="140" height="60"></rect>
+        <text class="node-label" x="450" y="56">LLM</text>
+        <text class="node-sub" x="450" y="74">property proposer</text>
+      </g>
+    </svg>
+    <div id="badge-layer"></div>
+  </div>
+
+  <div id="log-wrap">
+    <div id="log-header">event log (full session history — scroll up to rewind; auto-scrolls only while pinned to bottom)</div>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ------------------------------------------------------------------
+  // Vocabulary discipline (see this repo's CLAUDE.md, mirrored from
+  // demo/render.py): ESBMC never "proves" or "corrects" anything -- it
+  // returns a bounded verdict. This page never renders "proven"/"correct";
+  // it always renders VERIFIED/VIOLATED/UNKNOWN (or the synth-specific
+  // assessment vocabulary), and UNKNOWN/NEEDS_CONTRACT/ERROR always get a
+  // distinct, unresolved styling (yellow + dashed) -- never a pass color.
+  //
+  // Four separate color maps, deliberately not merged into one, because
+  // they are different claims from different sources even when the string
+  // is the same word (render.py's own "same color policy, different
+  // source" split): a `verify` event's `needs_contract` VERDICT (the
+  // safety gate couldn't check a pointer/array param without a harness)
+  // is not the same claim as a `cli` synth event's own `assessment`.
+  // ------------------------------------------------------------------
+  var VERDICT_COLOR = {
+    verified: "v-green", violated: "v-red", unknown: "v-yellow",
+    error: "v-yellow", needs_contract: "v-yellow"
+  };
+  var ASSESSMENT_COLOR = {
+    assumed_verified: "v-green", discharged_verified: "v-green",
+    violated: "v-red", vacuous: "v-yellow", unknown: "v-yellow",
+    needs_contract: "v-yellow", error: "v-yellow"
+  };
+  var OUTCOME_COLOR = {
+    held: "v-green", violated: "v-red", unknown: "v-yellow",
+    error: "v-yellow", skipped: "v-yellow"
+  };
+  var GATE_DECISION_COLOR = { pass: "v-green", block: "v-red" };
+  var STOP_DECISION_COLOR = {
+    allow: "v-green", allow_needs_contract: "v-yellow",
+    allow_semantic_check: "v-yellow", block: "v-red", residual: "v-red",
+    pruned_deleted: "v-yellow", oob_scan_skipped: "v-yellow"
+  };
+  var UNRESOLVED = { unknown: true, error: true, needs_contract: true };
+
+  var KNOWN_ASSESSMENTS = Object.keys(ASSESSMENT_COLOR).reduce(function (s, k) {
+    s[k] = true; return s;
+  }, {});
+  var ASSESSMENT_RE = /"assessment"\s*:\s*"([a-zA-Z_]+)"/;
+  function parseAssessment(outputTail) {
+    if (!outputTail) return null;
+    var m = ASSESSMENT_RE.exec(outputTail);
+    if (m && KNOWN_ASSESSMENTS[m[1]]) return m[1];
+    return null;
+  }
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+  function verdictSpan(word, cls) {
+    var css = cls || "v-yellow";
+    var extra = UNRESOLVED[word] ? " unresolved-text" : "";
+    return '<span class="verdict ' + css + extra + '">' + esc(String(word).toUpperCase()) + "</span>";
+  }
+  function fmtTs(ev) {
+    var ts = ev && ev.ts;
+    if (typeof ts !== "number") return "??:??:??";
+    try { return new Date(ts * 1000).toLocaleTimeString(); } catch (e) { return "??:??:??"; }
+  }
+  function fmtDur(v) { return typeof v === "number" ? v.toFixed(2) + "s" : "?"; }
+
+  // ------------------------------------------------------------------
+  // Diagram geometry / node & edge registry.
+  // ------------------------------------------------------------------
+  var NODES = {
+    agent: { x: 110, y: 220, el: null },
+    forseti: { x: 450, y: 220, el: null },
+    esbmc: { x: 790, y: 220, el: null },
+    llm: { x: 450, y: 60, el: null }
+  };
+  var EDGES = {
+    "agent-forseti": { a: "agent", b: "forseti", ax: 180, ay: 220, bx: 380, by: 220 },
+    "forseti-esbmc": { a: "forseti", b: "esbmc", ax: 520, ay: 220, bx: 720, by: 220 },
+    "forseti-llm": { a: "forseti", b: "llm", ax: 450, ay: 190, bx: 450, by: 90 }
+  };
+  Object.keys(NODES).forEach(function (id) {
+    NODES[id].el = document.getElementById("node-" + id);
+  });
+
+  var svg = document.getElementById("diagram");
+  var pulseLayer = document.getElementById("pulse-layer");
+  var badgeLayer = document.getElementById("badge-layer");
+  var NS = "http://www.w3.org/2000/svg";
+  var VB_W = 900, VB_H = 300;
+
+  function pulseNode(id) {
+    var n = NODES[id];
+    if (!n || !n.el) return;
+    n.el.classList.add("node-glow");
+    setTimeout(function () { n.el.classList.remove("node-glow"); }, 420);
+  }
+
+  function colorVar(colorClass) {
+    // Map a verdict CSS class to a concrete color for SVG fill / badge accents.
+    if (colorClass === "v-green") return "#2ecc71";
+    if (colorClass === "v-red") return "#e74c3c";
+    return "#f1c40f";
+  }
+
+  // Active pulses are driven by one shared requestAnimationFrame loop
+  // (not per-pulse SMIL/CSS animations) so many overlapping pulses stay
+  // cheap and never fight browser SMIL-restart quirks.
+  var activePulses = [];
+  function spawnPulse(edgeId, dir, color, unresolved) {
+    var edge = EDGES[edgeId];
+    if (!edge) return;
+    var fwd = dir !== "rev";
+    var x1 = fwd ? edge.ax : edge.bx, y1 = fwd ? edge.ay : edge.by;
+    var x2 = fwd ? edge.bx : edge.ax, y2 = fwd ? edge.by : edge.ay;
+    var shape = unresolved ? "diamond" : "circle";
+    var el;
+    if (shape === "diamond") {
+      el = document.createElementNS(NS, "rect");
+      el.setAttribute("width", 11); el.setAttribute("height", 11);
+    } else {
+      el = document.createElementNS(NS, "circle");
+      el.setAttribute("r", 6);
+    }
+    el.setAttribute("fill", color);
+    el.setAttribute("class", "pulse-dot");
+    pulseLayer.appendChild(el);
+    activePulses.push({ el: el, shape: shape, x1: x1, y1: y1, x2: x2, y2: y2, start: performance.now(), dur: 850 });
+    pulseNode(fwd ? edge.a : edge.b);
+    setTimeout(function () { pulseNode(fwd ? edge.b : edge.a); }, 800);
+  }
+  function tick(now) {
+    for (var i = activePulses.length - 1; i >= 0; i--) {
+      var p = activePulses[i];
+      var t = (now - p.start) / p.dur;
+      if (t >= 1) {
+        p.el.remove();
+        activePulses.splice(i, 1);
+        continue;
+      }
+      var x = p.x1 + (p.x2 - p.x1) * t;
+      var y = p.y1 + (p.y2 - p.y1) * t;
+      if (p.shape === "diamond") {
+        el_setDiamond(p.el, x, y);
+      } else {
+        p.el.setAttribute("cx", x);
+        p.el.setAttribute("cy", y);
+      }
+    }
+    requestAnimationFrame(tick);
+  }
+  function el_setDiamond(el, x, y) {
+    el.setAttribute("x", x - 5.5);
+    el.setAttribute("y", y - 5.5);
+    el.setAttribute("transform", "rotate(45 " + x + " " + y + ")");
+  }
+  requestAnimationFrame(tick);
+
+  function showBadge(edgeId, text, colorClass, unresolved) {
+    var edge = EDGES[edgeId];
+    if (!edge) return;
+    var mx = (edge.ax + edge.bx) / 2, my = (edge.ay + edge.by) / 2;
+    // Nudge vertical edges' badge off the line so it doesn't sit on top of it.
+    if (edge.ax === edge.bx) mx += 90;
+    var wrap = document.getElementById("diagram-wrap");
+    var rect = svg.getBoundingClientRect();
+    var scale = rect.width / VB_W;
+    var left = (mx / VB_W) * 100;
+    var top = ((my * scale + (rect.height - VB_H * scale) / 2) / rect.height) * 100;
+    // Fallback if the above (accounting for letterboxing) misbehaves: clamp.
+    if (!(top >= 0 && top <= 100)) top = (my / VB_H) * 100;
+
+    var badge = document.createElement("div");
+    badge.className = "badge" + (unresolved ? " unresolved" : "");
+    badge.style.left = left + "%";
+    badge.style.top = top + "%";
+    badge.style.color = colorVar(colorClass);
+    badge.style.borderColor = colorVar(colorClass);
+    badge.textContent = text;
+    badgeLayer.appendChild(badge);
+    // Force reflow so the animation restarts even if badges overlap in time.
+    void badge.offsetWidth;
+    badge.classList.add("show");
+    setTimeout(function () { badge.remove(); }, 2700);
+  }
+
+  // ------------------------------------------------------------------
+  // Log rendering -- mirrors demo/render.py's per-event-type renderers,
+  // including the gate / gate.decision same-edit collapse.
+  // ------------------------------------------------------------------
+  var TOOL_VERB = { Write: "wrote", Edit: "edited", MultiEdit: "edited (multi)" };
+  var logEl = document.getElementById("log");
+
+  function appendLog(html) {
+    var atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 24;
+    var div = document.createElement("div");
+    div.className = "log-line";
+    div.innerHTML = html;
+    logEl.appendChild(div);
+    if (atBottom) logEl.scrollTop = logEl.scrollHeight;
+  }
+  function tsPrefix(ev) { return '<span class="ts">[' + esc(fmtTs(ev)) + "]</span> "; }
+
+  var RENDERERS = {
+    session: function (ev) {
+      return tsPrefix(ev) + '<span class="tag tag-forseti">SESSION</span> ' +
+        esc(ev.decision || "baseline") + " (n_baselined=" + esc(ev.n_baselined) +
+        ", source=" + esc(ev.source) + ")";
+    },
+    edit: function (ev) {
+      var verb = TOOL_VERB[ev.tool] || ev.tool || "?";
+      var fns = ev.functions || [];
+      var fnPart = fns.length ? " (functions: " + esc(fns.join(", ")) + ")" : " (no functions)";
+      return tsPrefix(ev) + '<span class="tag tag-agent">AGENT</span> ' +
+        esc(verb) + " " + esc(ev.file) + fnPart;
+    },
+    verify: function (ev) {
+      var verdict = String(ev.verdict || "?").toLowerCase();
+      var note = verdict === "needs_contract" ?
+        " (gate: no harness for pointer/array param -- not evidence of safety)" : "";
+      return tsPrefix(ev) + '<span class="tag tag-esbmc">ESBMC</span> verify ' +
+        esc(ev.unit) + " -> " + verdictSpan(verdict, VERDICT_COLOR[verdict]) +
+        " (k=" + esc(ev.k == null ? "?" : ev.k) + ", " + fmtDur(ev.duration_s) + ")" + note;
+    },
+    gate: function (ev, state) {
+      var decision = String(ev.decision || "?");
+      var parts = [];
+      if (ev.n_failures) parts.push("failures=" + ev.n_failures);
+      if (ev.n_needs_contract) parts.push("needs_contract=" + ev.n_needs_contract);
+      var suffix = parts.length ? " (" + parts.join(", ") + ")" : "";
+      state.lastGate = { file: ev.file, decision: decision, ts: ev.ts };
+      return tsPrefix(ev) + '<span class="tag tag-forseti">GATE</span> ' +
+        verdictSpan(decision, GATE_DECISION_COLOR[decision]) + " " + esc(ev.file) + suffix;
+    },
+    "gate.decision": function (ev, state) {
+      var decision = String(ev.decision || "?");
+      var last = state.lastGate;
+      if (ev.file != null && last) {
+        var closeInTime = Math.abs((ev.ts || 0) - (last.ts || 0)) <= 5.0;
+        if (last.file === ev.file && last.decision === decision && closeInTime) return null;
+      }
+      var unitIds = ev.unit_ids || [];
+      var scope = ev.file ? ev.file : unitIds.length + " unit(s)";
+      return tsPrefix(ev) + '<span class="tag tag-forseti">GATE</span> [' + esc(ev.adapter) + "] " +
+        verdictSpan(decision, GATE_DECISION_COLOR[decision]) + " " + esc(scope);
+    },
+    stop: function (ev) {
+      var decision = String(ev.decision || "?");
+      var bits = [];
+      [["n_needs_contract", "needs_contract"], ["n_semantic_violations", "semantic_violated"],
+       ["n_unverified", "unverified"], ["n_oob", "oob"], ["attempt", "attempt"]].forEach(function (p) {
+        if (ev[p[0]]) bits.push(p[1] + "=" + ev[p[0]]);
+      });
+      var suffix = bits.length ? " (" + bits.join(", ") + ")" : "";
+      return tsPrefix(ev) + '<span class="tag tag-forseti">STOP</span> ' +
+        verdictSpan(decision, STOP_DECISION_COLOR[decision]) + suffix;
+    },
+    cli: function (ev) {
+      var argv = ev.argv || [];
+      var cmd = argv.length ? argv.join(" ") : String(ev.subcommand || "forseti");
+      var assessment = parseAssessment(String(ev.output_tail || ""));
+      var result;
+      if (assessment) {
+        result = "assessment: " + verdictSpan(assessment, ASSESSMENT_COLOR[assessment]);
+      } else {
+        result = ev.exit_code === 0 ?
+          '<span class="verdict v-green">ok</span>' : '<span class="verdict v-yellow">failed</span>';
+      }
+      return tsPrefix(ev) + '<span class="tag tag-forseti">CLI</span> ' + esc(cmd) + " -> " +
+        result + " (exit " + esc(ev.exit_code) + ", " + fmtDur(ev.duration_s) + ")";
+    },
+    "property.proposed": function (ev) {
+      var expr = String(ev.expression || "");
+      if (expr.length > 60) expr = expr.slice(0, 57) + "...";
+      return tsPrefix(ev) + '<span class="tag tag-llm">PROPOSE</span> ' +
+        esc(ev.unit_id) + "::" + esc(ev.property_id) + ' "' + esc(expr) + '" (' +
+        esc(ev.channel) + ", " + esc(ev.provider) + "/" + esc(ev.model) + ")";
+    },
+    "property.check.start": function (ev) {
+      return tsPrefix(ev) + '<span class="tag tag-esbmc">CHECK</span> start ' + esc(ev.unit_id);
+    },
+    "property.verdict": function (ev) {
+      var outcome = String(ev.outcome || "?").toLowerCase();
+      return tsPrefix(ev) + '<span class="tag tag-esbmc">CHECK</span> ' +
+        esc(ev.unit_id) + "::" + esc(ev.property_id) + " -> " +
+        verdictSpan(outcome, OUTCOME_COLOR[outcome]) + " (k=" + esc(ev.k == null ? "?" : ev.k) + ")";
+    }
+  };
+
+  // ------------------------------------------------------------------
+  // Diagram choreography per event type. Kept separate from log
+  // rendering so a collapsed gate.decision (see RENDERERS above) is also
+  // skipped here, and so a big batch (initial page load / fast replay)
+  // can be queued and throttled without touching the log at all.
+  // ------------------------------------------------------------------
+  var CHOREOGRAPHY = {
+    session: function () { pulseNode("agent"); },
+    edit: function (ev) {
+      pulseNode("agent");
+      var fns = ev.functions || [];
+      showBadge("agent-forseti", (TOOL_VERB[ev.tool] || ev.tool || "edit") + " " + (ev.file || "?") +
+        (fns.length ? " (" + fns.join(", ") + ")" : ""), null, false);
+    },
+    verify: function (ev) {
+      var verdict = String(ev.verdict || "?").toLowerCase();
+      var unresolved = !!UNRESOLVED[verdict];
+      spawnPulse("forseti-esbmc", "fwd", "#5c6b7a", false);
+      showBadge("forseti-esbmc", "verify " + (ev.unit || "?") + " (k=" + (ev.k == null ? "?" : ev.k) + ")", null, false);
+      setTimeout(function () {
+        spawnPulse("forseti-esbmc", "rev", colorVar(VERDICT_COLOR[verdict]), unresolved);
+        showBadge("forseti-esbmc", verdict.toUpperCase(), VERDICT_COLOR[verdict], unresolved);
+      }, 700);
+    },
+    gate: function (ev) {
+      var decision = String(ev.decision || "?");
+      spawnPulse("agent-forseti", "rev", colorVar(GATE_DECISION_COLOR[decision]), false);
+      showBadge("agent-forseti", "gate: " + decision, GATE_DECISION_COLOR[decision], false);
+    },
+    "gate.decision": function (ev, state) {
+      // Suppress the animation for the same collapsed decision the log
+      // already skips (see RENDERERS["gate.decision"]).
+      var decision = String(ev.decision || "?");
+      var last = state.lastGate;
+      if (ev.file != null && last) {
+        var closeInTime = Math.abs((ev.ts || 0) - (last.ts || 0)) <= 5.0;
+        if (last.file === ev.file && last.decision === decision && closeInTime) return;
+      }
+      spawnPulse("agent-forseti", "rev", colorVar(GATE_DECISION_COLOR[decision]), false);
+      showBadge("agent-forseti", "gate[" + (ev.adapter || "?") + "]: " + decision, GATE_DECISION_COLOR[decision], false);
+    },
+    stop: function (ev) {
+      var decision = String(ev.decision || "?");
+      var unresolved = decision !== "allow" && decision !== "block";
+      spawnPulse("agent-forseti", "rev", colorVar(STOP_DECISION_COLOR[decision]), unresolved);
+      showBadge("agent-forseti", "stop: " + decision, STOP_DECISION_COLOR[decision], unresolved);
+    },
+    cli: function (ev) {
+      var argv = ev.argv || [];
+      var cmd = argv.length ? argv.join(" ") : String(ev.subcommand || "forseti");
+      spawnPulse("agent-forseti", "fwd", "#4aa3ff", false);
+      showBadge("agent-forseti", cmd, null, false);
+      var assessment = parseAssessment(String(ev.output_tail || ""));
+      setTimeout(function () {
+        spawnPulse("forseti-esbmc", "fwd", "#5c6b7a", false);
+      }, 350);
+      setTimeout(function () {
+        var unresolved = assessment ? !!UNRESOLVED[assessment] : ev.exit_code !== 0;
+        var cls = assessment ? ASSESSMENT_COLOR[assessment] : (ev.exit_code === 0 ? "v-green" : "v-yellow");
+        spawnPulse("forseti-esbmc", "rev", colorVar(cls), unresolved);
+        showBadge("forseti-esbmc", assessment ? ("assessment: " + assessment) : (ev.exit_code === 0 ? "ok" : "failed"), cls, unresolved);
+      }, 750);
+      setTimeout(function () {
+        var cls2 = assessment ? ASSESSMENT_COLOR[assessment] : (ev.exit_code === 0 ? "v-green" : "v-yellow");
+        spawnPulse("agent-forseti", "rev", colorVar(cls2), assessment ? !!UNRESOLVED[assessment] : ev.exit_code !== 0);
+      }, 1150);
+    },
+    "property.proposed": function (ev) {
+      spawnPulse("forseti-llm", "rev", "#ff9f43", false);
+      var expr = String(ev.expression || "");
+      if (expr.length > 40) expr = expr.slice(0, 37) + "...";
+      showBadge("forseti-llm", "candidate " + (ev.property_id || "?") + ": " + expr, null, false);
+    },
+    "property.check.start": function (ev) {
+      spawnPulse("forseti-esbmc", "fwd", "#5c6b7a", false);
+      showBadge("forseti-esbmc", "check " + (ev.unit_id || "?"), null, false);
+    },
+    "property.verdict": function (ev) {
+      var outcome = String(ev.outcome || "?").toLowerCase();
+      var unresolved = !!UNRESOLVED[outcome] || outcome === "skipped";
+      spawnPulse("forseti-esbmc", "rev", colorVar(OUTCOME_COLOR[outcome]), unresolved);
+      showBadge("forseti-esbmc", outcome.toUpperCase(), OUTCOME_COLOR[outcome], unresolved);
+    }
+  };
+
+  // ------------------------------------------------------------------
+  // Event intake: render the log line immediately and in full (never
+  // capped/truncated -- this is the rewindable record), but queue the
+  // diagram choreography through a throttled drain so a large batch
+  // (initial load, or a fast --replay) doesn't spawn dozens of
+  // overlapping animations at once.
+  // ------------------------------------------------------------------
+  var uiState = {};
+  var animQueue = [];
+  var MAX_QUEUED = 16;
+
+  function handleEvent(ev) {
+    var type = String(ev.type || "");
+    var renderFn = RENDERERS[type];
+    if (renderFn) {
+      var html = renderFn(ev, uiState);
+      if (html != null) appendLog(html);
+    }
+    var chorFn = CHOREOGRAPHY[type];
+    if (chorFn) {
+      animQueue.push({ fn: chorFn, ev: ev });
+      if (animQueue.length > MAX_QUEUED) animQueue.splice(0, animQueue.length - MAX_QUEUED);
+    }
+  }
+  setInterval(function () {
+    var item = animQueue.shift();
+    if (item) item.fn(item.ev, uiState);
+  }, 180);
+
+  function resetAll() {
+    logEl.innerHTML = "";
+    uiState = {};
+    animQueue.length = 0;
+    var div = document.createElement("div");
+    div.className = "log-divider";
+    div.textContent = "── session reset (new trace) ──";
+    logEl.appendChild(div);
+  }
+
+  // ------------------------------------------------------------------
+  // Polling loop. Plain GET polling, not SSE: see server.py's docstring
+  // for why. The cursor is opaque -- this page never interprets it,
+  // just echoes back whatever the server returned last.
+  // ------------------------------------------------------------------
+  var cursor = 0;
+  var POLL_MS = 700;
+  var statusDot = document.getElementById("status-dot");
+  var statusText = document.getElementById("status-text");
+  var metaText = document.getElementById("meta-text");
+
+  function setStatus(cls, text) {
+    statusDot.className = cls;
+    statusText.textContent = text;
+  }
+
+  fetch("/meta", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (m) {
+    var bits = [m.mode];
+    if (m.target) bits.push(m.target);
+    if (m.pace) bits.push(m.pace);
+    metaText.textContent = bits.join(" · ");
+  }).catch(function () {});
+
+  function pollOnce() {
+    fetch("/events?since=" + cursor, { cache: "no-store" }).then(function (res) {
+      if (!res.ok) throw new Error("bad status " + res.status);
+      return res.json();
+    }).then(function (data) {
+      if (data.reset) resetAll();
+      cursor = data.cursor;
+      setStatus(data.waiting ? "waiting" : "live", data.waiting ? "waiting for session…" : "live");
+      (data.events || []).forEach(handleEvent);
+    }).catch(function () {
+      setStatus("down", "disconnected, retrying…");
+    });
+  }
+  setInterval(pollOnce, POLL_MS);
+  pollOnce();
+})();
+</script>
+</body>
+</html>

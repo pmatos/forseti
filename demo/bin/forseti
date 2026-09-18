@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Demo-only PATH shim that wraps the real `forseti` CLI with a `cli` trace event.
+
+This is NOT part of the Forseti package -- it is demo/e2e-test tooling that lets
+the live "observability" pane see `forseti synth`/`discharge` (and any other
+subcommand) invocations, which the real package does not instrument today. It
+appends one JSON line per call to the same `.forseti/events.jsonl` trace the
+Claude Code adapter (`forseti.adapters.claude_code.event_log`) and Forseti Core
+(`forseti.core.events`) already write to, using the same conventions: an epoch
+`ts`, a `type` field, `sort_keys=True`, and a swallow-all-OSError best-effort
+append.
+
+Usage: put this directory ahead of the real `forseti`'s directory on PATH,
+e.g. `PATH="$REPO/demo/bin:$PATH" claude`. See demo/bin/README.md.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import BinaryIO
+
+_EVENTS_FILE = Path(".forseti") / "events.jsonl"
+_TAIL_CHARS = 4000
+_CHUNK_SIZE = 4096
+# Keep a little headroom over _TAIL_CHARS while trimming, since multi-byte
+# UTF-8 sequences mean chars-to-bytes isn't 1:1.
+_BUF_CAP_BYTES = _TAIL_CHARS * 4
+
+
+def _find_real_forseti(self_path: Path) -> str:
+    """Search PATH for the real `forseti`, skipping this shim's own directory.
+
+    Mirrors `command -v` but walks PATH by hand so we can exclude the
+    directory this script lives in (otherwise it would just find itself and
+    recurse forever).
+    """
+    self_dir = self_path.parent
+    try:
+        self_dir_resolved = self_dir.resolve()
+    except OSError:
+        self_dir_resolved = self_dir
+
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        candidate_dir = Path(entry)
+        try:
+            if candidate_dir.resolve() == self_dir_resolved:
+                continue
+        except OSError:
+            pass
+        candidate = candidate_dir / "forseti"
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            continue
+        try:
+            if candidate.resolve() == self_path:
+                continue
+        except OSError:
+            pass
+        return str(candidate)
+
+    print(
+        f"forseti-shim: could not find the real 'forseti' binary on PATH "
+        f"(skipped {self_dir})",
+        file=sys.stderr,
+    )
+    sys.exit(127)
+
+
+def _log_event(project_dir: Path, **fields: object) -> None:
+    """Append one `cli` event; never raise into the caller (matches event_log.py)."""
+    event = {"ts": time.time(), "type": "cli", **fields}
+    try:
+        path = project_dir / _EVENTS_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def _pump(src: BinaryIO, dst: BinaryIO, buf: bytearray, lock: threading.Lock) -> None:
+    """Relay bytes from `src` to `dst` live, while also accumulating a bounded tail."""
+    while True:
+        chunk = src.read(_CHUNK_SIZE)
+        if not chunk:
+            break
+        dst.write(chunk)
+        dst.flush()
+        with lock:
+            buf.extend(chunk)
+            if len(buf) > _BUF_CAP_BYTES:
+                del buf[: len(buf) - _BUF_CAP_BYTES]
+
+
+def main(argv: list[str]) -> int:
+    self_path = Path(__file__).resolve()
+    real_forseti = _find_real_forseti(self_path)
+
+    subcommand = argv[1] if len(argv) > 1 else None
+    is_hook = subcommand == "claude-code-hook"
+
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+
+    start = time.time()
+    proc = subprocess.Popen(
+        [real_forseti, *argv[1:]],
+        stdin=None,  # inherit -- hooks read a JSON payload from stdin
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+
+    combined = bytearray()
+    lock = threading.Lock()
+    assert proc.stdout is not None and proc.stderr is not None
+    t_out = threading.Thread(
+        target=_pump, args=(proc.stdout, sys.stdout.buffer, combined, lock)
+    )
+    t_err = threading.Thread(
+        target=_pump, args=(proc.stderr, sys.stderr.buffer, combined, lock)
+    )
+    t_out.start()
+    t_err.start()
+    exit_code = proc.wait()
+    t_out.join()
+    t_err.join()
+    duration_s = time.time() - start
+
+    if not is_hook:
+        tail = combined.decode("utf-8", errors="replace")[-_TAIL_CHARS:]
+        _log_event(
+            Path.cwd(),
+            argv=["forseti", *argv[1:]],
+            exit_code=exit_code,
+            duration_s=duration_s,
+            subcommand=subcommand,
+            output_tail=tail,
+        )
+
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
