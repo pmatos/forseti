@@ -154,7 +154,7 @@ def sidecar_verify_port(
 
 
 class PreconditionUnavailable(Exception):
-    """A precondition could not be synthesised (no such unit / main / L2).
+    """A precondition could not be synthesised (no such unit / L2 / unreadable).
 
     Carries the `Assessment` and human `detail` so both `verify_precondition`
     (which turns it into a `PreconditionResult`) and `synthesize`/the CLI (which
@@ -175,20 +175,16 @@ def plan_for(
 ) -> UnitPlan:
     """Resolve `source::function` to a materialisable plan, or raise.
 
-    The shared front half of both entry points: list the units, refuse a source
-    that defines ``main`` (the sidecar ``#include``\\ s it), require the function
-    to exist, and require every pointer to have an L0 plan (else ``NEEDS_CONTRACT``).
+    The shared front half of both entry points: list the units, require the
+    function to exist, and require every pointer to have an L0 plan (else
+    ``NEEDS_CONTRACT``). A source that defines ``main`` is fine here: the sidecar
+    renames it away around its ``#include`` (`render_sidecar`), so ``main`` is
+    plannable like any other unit.
     """
     try:
         units = {u.name: u for u in lister(source)}
     except ListUnitsError as exc:
         raise PreconditionUnavailable(Assessment.ERROR, str(exc)) from exc
-    if "main" in units:
-        raise PreconditionUnavailable(
-            Assessment.ERROR,
-            f"{source} defines main(); the sidecar #includes the source, which "
-            "would duplicate main",
-        )
     unit = units.get(function)
     if unit is None:
         raise PreconditionUnavailable(
@@ -234,7 +230,10 @@ def verify_precondition(
 
     Returns a `PreconditionResult` with an honestly-labelled `assessment`. A unit
     with an unresolved pointer shape is ``NEEDS_CONTRACT`` (never rendered wrong);
-    a source that defines ``main`` is refused (the sidecar ``#include``\\ s it).
+    a source that defines ``main`` has it renamed away inside the sidecar, so a
+    complete program is checkable (one where that rename cannot take — an
+    ``#undef main`` in the source — is an ``ERROR`` from esbmc's own
+    redefinition diagnostic).
     `raw_verify` and `list_units_fn` inject the two esbmc calls for tests;
     production uses `list_units` + assertions-on/force-malloc-success `verify`.
     When `work_dir` is None a temporary directory holds the generated harnesses
@@ -271,9 +270,9 @@ def synthesize(
     """Return the sidecar C harness text for `source::function` (no ESBMC verify).
 
     The pure render path exposed for inspection (``forseti synth --emit-only``).
-    Raises `PreconditionUnavailable` when the unit is missing, the source defines
-    ``main``, or a pointer shape is unresolved (L2) — the caller maps that to an
-    exit code, never a silent empty emit.
+    Raises `PreconditionUnavailable` when the unit is missing or a pointer shape
+    is unresolved (L2) — the caller maps that to an exit code, never a silent
+    empty emit.
     """
     lister = list_units_fn or (lambda src: list_units(src, esbmc_bin=esbmc_bin))
     plan = plan_for(source, function, lister)

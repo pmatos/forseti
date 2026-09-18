@@ -11,7 +11,9 @@ This module reads the precondition off the *type signature* alone — no LLM, no
 functional-property machinery (RFC-0003 D1). For each pointer parameter it picks
 one of a few mechanical shapes and renders a **sidecar** C translation unit: it
 ``#include``\\ s the source verbatim (the user's file stays pristine), allocates a
-valid object per pointer, constrains any symbolic length, and calls the unit.
+valid object per pointer, constrains any symbolic length, and calls the unit. A
+source that defines its own ``main`` is renamed out of the sidecar's way by a
+``#define`` around that ``#include`` rather than refused (issue #290).
 
 The shapes (L0):
 
@@ -63,6 +65,12 @@ DEFAULT_MAX_LEN = 8
 # System headers the sidecar needs beyond what the included source already pulls
 # in. `malloc`/`size_t` come from stdlib; the source supplies its own stdint etc.
 DEFAULT_INCLUDES: tuple[str, ...] = ("stdlib.h",)
+
+# What a source's own `main` is called inside the sidecar. The sidecar has an
+# entry point of its own, so `render_sidecar` renames every `main` token of the
+# included source to this with a `#define` (undone right after the `#include`),
+# which leaves the user's file — and the injected copy of it — untouched.
+RENAMED_MAIN = "__forseti_source_main"
 
 # The property label the non-vacuity probe (`__ESBMC_assert(0, ...)`) carries, so
 # a reachable call site is a recognisable FAILED rather than an anonymous one.
@@ -389,7 +397,10 @@ def render_sidecar(
     """Render the sidecar C translation unit for `plan` (pure).
 
     Emits, in order: ``#include "<source_include>"`` (the source verbatim, so the
-    user's file stays pristine), the system `includes`, one `nondet_*` prototype
+    user's file stays pristine) bracketed by ``#define main`` / ``#undef main`` so
+    a ``main`` the source defines becomes `RENAMED_MAIN` instead of colliding with
+    the harness's own (a unit that *is* ``main`` is called under that name); the
+    system `includes`, one `nondet_*` prototype
     per distinct scalar/length type, then an ``int main`` that declares the
     scalars/lengths first (a length bounded to ``max_len``), allocates each
     pointer object with **exact** size, calls the unit, and returns. With
@@ -415,7 +426,11 @@ def render_sidecar(
         if p.param.type not in nondet_types:
             nondet_types.append(p.param.type)
 
-    lines: list[str] = [f'#include "{source_include}"']
+    lines: list[str] = [
+        f"#define main {RENAMED_MAIN}",
+        f'#include "{source_include}"',
+        "#undef main",
+    ]
     lines += [f"#include <{header}>" for header in includes]
     lines.append("")
     lines += [f"extern {t} {_nondet_slug(t)}(void);" for t in nondet_types]
@@ -431,7 +446,8 @@ def render_sidecar(
         lines.append(f"    {p.param.type} {p.var} = malloc({_pointer_alloc(p)});")
 
     args = ", ".join(p.var for p in plan.params)
-    lines.append(f"    {plan.unit.name}({args});")
+    callee = RENAMED_MAIN if plan.unit.name == "main" else plan.unit.name
+    lines.append(f"    {callee}({args});")
     if non_vacuity:
         lines.append(f'    __ESBMC_assert(0, "{NON_VACUITY_LABEL}");')
     lines.append("    return 0;")
