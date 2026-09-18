@@ -172,12 +172,13 @@ def render_semantic_harness(
         else:
             raise HarnessError(f"unknown Param subtype: {type(param).__name__}")
 
+    # The buffers `_render_buffer` will `malloc`/`free`, computed once and
+    # reused for both: whether the harness needs `<stdlib.h>` and which names
+    # need a matching `free()` at the end are the same question.
+    malloc_buffers = [buf for buf in buffers if not _is_scalar_backed(buf)]
+
     lines: list[str] = [f"#include <{inc}>" for inc in includes]
-    # `malloc` (`_render_buffer`) needs a declaration; only pulled in when a
-    # buffer actually needs it, so a scalar-only unit's harness stays as lean
-    # as before this fix.
-    needs_malloc = any(not _is_scalar_backed(buf) for buf in buffers)
-    if needs_malloc and "stdlib.h" not in includes:
+    if malloc_buffers and "stdlib.h" not in includes:
         lines.append("#include <stdlib.h>")
     lines.append("")
     lines.append(unit_source.strip("\n"))
@@ -203,9 +204,8 @@ def render_semantic_harness(
     else:
         lines.append(f"    {signature.return_ctype} {spec.result_var} = {call};")
     lines.append(f'    __ESBMC_assert(({postcondition}), "forseti:semantic");')
-    for buf in buffers:
-        if not _is_scalar_backed(buf):
-            lines.append(f"    free({buf.name});")
+    for buf in malloc_buffers:
+        lines.append(f"    free({buf.name});")
     lines.append("    return 0;")
     lines.append("}")
     return "\n".join(lines) + "\n"
@@ -379,34 +379,26 @@ def _render_buffer(buf: BufferParam) -> list[str]:
     excludes 0) made *every* property over such a buffer spuriously VIOLATE at
     `length == 0`, regardless of what the property actually asserted (#297).
     `malloc(0)` is well-defined C, so the length-can-be-zero case is now sound.
+    The caller (`render_semantic_harness`) `free`s every such buffer after the
+    call, for the same reason: an unfreed one reports VIOLATED ("forgotten
+    memory") under `--memory-leak-check`, independent of the checked property.
 
     A leading `__ESBMC_assume` guards the allocation's own size arithmetic:
-    `length * sizeof(elem_ctype)` is computed in `length`'s type, and when that
-    type is as wide as `size_t` (e.g. a `size_t`/`unsigned long` length param,
-    which nothing here restricts against) an unconstrained `length` can wrap the
-    multiplication to a small value -- confirmed with `esbmc`: a `size_t n` with
-    no domain bound reports VIOLATED ("array bounds violated") on a
-    tautologically-true postcondition, `malloc` having "succeeded" with a
-    too-small object the fill loop then writes past. That is the same "harness
-    artifact fails independent of the property" failure as the zero-length VLA,
-    just relocated into the size computation. `precond/synth.py` sidesteps this
-    by bounding every length to a small `max_len` before it ever reaches
-    `malloc` (`_length_bound`); this harness must support a genuinely
+    `length * sizeof(elem_ctype)`, computed in `length`'s type, can wrap when
+    that type is as wide as `size_t` (nothing here restricts against a
+    `size_t`/`unsigned long` length param) -- the same failure class relocated
+    into the size computation, confirmed with `esbmc`. `precond/synth.py`
+    sidesteps this by bounding every length to a small `max_len` before it ever
+    reaches `malloc` (`_length_bound`); this harness must support a genuinely
     unconstrained length (the point of #297), so it guards the multiplication
     itself instead, the same shape `precond/synth.py`'s `obligation_expr` uses
     to guard its own count-based allocation. Input buffers are nondet-filled
-    element by element; output buffers are left for the unit to write; every
-    non-scalar-backed buffer is `free`d after the call
-    (`render_semantic_harness`) -- confirmed with `esbmc`: an unfreed buffer of
-    this shape reports VIOLATED ("forgotten memory") under `--memory-leak-check`
-    on the same tautologically-true postcondition, independent of what it
-    actually asserts.
+    element by element; output buffers are left for the unit to write.
     """
     if _is_scalar_backed(buf):
         return [f"    {buf.elem_ctype} {buf.name};"]
     lines = [
-        f"    __ESBMC_assume(({buf.length}) <= (__SIZE_TYPE__)-1 / "
-        f"sizeof({buf.elem_ctype}));",
+        f"    __ESBMC_assume(({buf.length}) <= SIZE_MAX / sizeof({buf.elem_ctype}));",
         f"    {buf.elem_ctype} *{buf.name} = "
         f"malloc(({buf.length}) * sizeof({buf.elem_ctype}));",
         f"    __ESBMC_assume({buf.name} != NULL);",

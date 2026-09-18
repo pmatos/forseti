@@ -87,27 +87,34 @@ def test_buffer_content_precondition_renders_valid_c(tmp_path: Path) -> None:
     assert isinstance(verify(source, unwind=2), Verified)
 
 
-def test_unconstrained_length_buffer_verifies(tmp_path: Path) -> None:
-    # #297: a tautologically-true property over a (ptr, len) buffer with no
-    # domain entry bounding `len` (so `len == 0` is reachable) must VERIFY.
-    # The buffer used to be a raw stack VLA, and ESBMC treats a zero-size VLA
-    # as its own violation independent of the checked property -- every such
-    # property spuriously VIOLATED regardless of whether it actually held.
+def _render_unconstrained_length_buffer(length_ctype: str, tmp_path: Path) -> Path:
+    """A tautologically-true property over a `(ptr, length_ctype)` buffer with
+    no domain entry bounding the length -- the shared shape #297's regression
+    tests check against, varying only the length param's width."""
     source = tmp_path / "unconstrained.c"
     source.write_text(
         render_semantic_harness(
-            unit_source="int first(const int *a, unsigned n) { return 0; }",
+            unit_source=f"int first(const int *a, {length_ctype} n) {{ return 0; }}",
             signature=UnitSignature(
                 "first",
                 "int",
                 (
                     BufferParam("int", "a", "n", const=True),
-                    ScalarParam("unsigned", "n"),
+                    ScalarParam(length_ctype, "n"),
                 ),
             ),
             spec=SemanticSpec("result == result"),
         )
     )
+    return source
+
+
+def test_unconstrained_length_buffer_verifies(tmp_path: Path) -> None:
+    # #297: len == 0 is reachable with no domain bound. The buffer used to be
+    # a raw stack VLA, and ESBMC treats a zero-size VLA as its own violation
+    # independent of the checked property -- every such property spuriously
+    # VIOLATED regardless of whether it actually held.
+    source = _render_unconstrained_length_buffer("unsigned", tmp_path)
     assert isinstance(verify(source, unwind=2), Verified)
 
 
@@ -117,21 +124,7 @@ def test_unconstrained_length_buffer_is_freed(tmp_path: Path) -> None:
     # regardless of the postcondition -- the same "harness artifact fails
     # independent of the property" failure class as the zero-length VLA, just
     # relocated from the allocation itself to a forgotten one.
-    source = tmp_path / "freed.c"
-    source.write_text(
-        render_semantic_harness(
-            unit_source="int first(const int *a, unsigned n) { return 0; }",
-            signature=UnitSignature(
-                "first",
-                "int",
-                (
-                    BufferParam("int", "a", "n", const=True),
-                    ScalarParam("unsigned", "n"),
-                ),
-            ),
-            spec=SemanticSpec("result == result"),
-        )
-    )
+    source = _render_unconstrained_length_buffer("unsigned", tmp_path)
     result = verify(source, unwind=2, extra_flags=("--memory-leak-check",))
     assert isinstance(result, Verified)
 
@@ -148,21 +141,7 @@ def test_wide_unconstrained_length_does_not_overflow_the_allocation(
     # must keep this sound. (A 32-bit `unsigned` length, as in the test above,
     # cannot wrap a 64-bit `size_t` multiply, which is why that case alone
     # never surfaced this.)
-    source = tmp_path / "wide_length.c"
-    source.write_text(
-        render_semantic_harness(
-            unit_source="int first(const int *a, size_t n) { return 0; }",
-            signature=UnitSignature(
-                "first",
-                "int",
-                (
-                    BufferParam("int", "a", "n", const=True),
-                    ScalarParam("size_t", "n"),
-                ),
-            ),
-            spec=SemanticSpec("result == result"),
-        )
-    )
+    source = _render_unconstrained_length_buffer("size_t", tmp_path)
     assert isinstance(verify(source, unwind=2), Verified)
 
 
