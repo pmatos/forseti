@@ -835,7 +835,7 @@ def test_input_and_output_names_partition_param_names() -> None:
 # check vacuous.
 
 _FIRST_SRC = "int first(const int *a, unsigned n) { return 0; }"
-_CAP_N = "__ESBMC_assume((n) <= 8);"
+_CAP_N = "__ESBMC_assume((n >= 0 && n <= 8));"
 
 
 def _render_first(*domain: str, max_len: int | None) -> str:

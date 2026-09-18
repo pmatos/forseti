@@ -267,10 +267,12 @@ def _count_odd_run(
     tmp_path: Path,
     expression: str,
     domain: tuple[str, ...] = (),
+    *,
+    unit_text: str = _COUNT_ODD,
     **kwargs: Any,
 ) -> PropertyVerdict:
     unit = tmp_path / "count_odd.c"
-    unit.write_text(_COUNT_ODD)
+    unit.write_text(unit_text)
     root = tmp_path / ".forseti"
     store = PropertyStore.open(root)
     store.add(_semantic(f"{unit}::count_odd", expression, domain))
@@ -307,6 +309,36 @@ def test_check_source_lower_bound_only_domain_still_settles(tmp_path: Path) -> N
     verdict = _count_odd_run(tmp_path, "result >= 0", ("n >= 1",))
     assert verdict.outcome is PropertyOutcome.HELD
     assert verdict.length_bounds == (("n", 8),)
+
+
+def test_check_source_a_raised_max_len_still_settles_on_the_default_ladder(
+    tmp_path: Path,
+) -> None:
+    verdict = _count_odd_run(
+        tmp_path, "result >= 0 && (unsigned)result <= n", max_len=16
+    )
+    assert verdict.outcome is PropertyOutcome.HELD
+    assert verdict.length_bounds == (("n", 16),)
+    assert verdict.k == 17  # the derived rung past the fixed (4, 8, 16) ladder
+
+
+def test_check_source_signed_length_excludes_negatives_and_stays_non_vacuous(
+    tmp_path: Path,
+) -> None:
+    """A signed length is capped at `0 <= n <= max_len`. With a 1-byte element the
+    allocation's overflow guard (`n <= SIZE_MAX / 1`) prunes nothing, so without
+    the explicit `>= 0` a negative `n` reaches the fill loop as a huge trip count
+    and every property reports UNKNOWN."""
+    signed = _COUNT_ODD.replace("unsigned n", "int n").replace("unsigned i", "int i")
+    for i, expression in enumerate(("n >= 0", "result >= 0 && result <= n")):
+        (tmp_path / str(i)).mkdir()
+        verdict = _count_odd_run(tmp_path / str(i), expression, unit_text=signed)
+        assert verdict.outcome is PropertyOutcome.HELD, expression
+        assert verdict.length_bounds == (("n", 8),)
+    # ... and the cap does not make the harness vacuous: `n == 8` is reachable.
+    (tmp_path / "reach").mkdir()
+    reachable = _count_odd_run(tmp_path / "reach", "n != 8", unit_text=signed)
+    assert reachable.outcome is PropertyOutcome.VIOLATED
 
 
 def test_check_source_max_len_none_restores_the_unknown_ceiling(

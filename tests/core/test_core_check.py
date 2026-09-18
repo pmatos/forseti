@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from forseti.core import check_source
+from forseti.core.check import default_unwind_ladder_above
 from forseti.core.cli import main
 from forseti.esbmc import (
     EXIT_CODES,
@@ -303,7 +304,7 @@ def test_check_source_caps_an_unconstrained_length_by_default_and_reports_it(
     verdict = _buf_verdict(tmp_path)
     assert verdict.length_bounds == (("n", 8),)  # synth's DEFAULT_MAX_LEN
     assert verdict.harness_source is not None
-    assert "__ESBMC_assume((n) <= 8);" in verdict.harness_source
+    assert "__ESBMC_assume((n >= 0 && n <= 8));" in verdict.harness_source
     assert verdict.to_dict()["length_bounds"] == {"n": 8}
 
 
@@ -311,7 +312,7 @@ def test_check_source_max_len_overrides_the_default_cap(tmp_path: Path) -> None:
     verdict = _buf_verdict(tmp_path, max_len=3)
     assert verdict.length_bounds == (("n", 3),)
     assert verdict.harness_source is not None
-    assert "__ESBMC_assume((n) <= 3);" in verdict.harness_source
+    assert "__ESBMC_assume((n >= 0 && n <= 3));" in verdict.harness_source
 
 
 def test_check_source_max_len_none_leaves_the_length_unconstrained(
@@ -329,6 +330,72 @@ def test_check_source_reports_no_cap_when_the_domain_bounds_the_length(
 ) -> None:
     verdict = _buf_verdict(tmp_path, ("n >= 1 && n <= 4",))
     assert verdict.length_bounds == ()
+
+
+@pytest.mark.parametrize(
+    ("unwind", "max_len", "expected"),
+    [
+        (4, None, (8, 16)),
+        (4, 8, (8, 16)),  # the 16 rung already clears a cap of 8
+        (4, 15, (8, 16)),
+        (4, 16, (8, 16, 17)),  # k must exceed the fill loop's trip count
+        (4, 32, (8, 16, 33)),
+        (8, 8, (16,)),
+        (16, 16, (17,)),  # no default rung above -k 16: derive one
+        (20, 25, (26,)),
+        (20, 10, ()),  # -k already clears the cap
+    ],
+)
+def test_default_ladder_reaches_past_max_len(
+    unwind: int, max_len: int | None, expected: tuple[int, ...]
+) -> None:
+    ladder = default_unwind_ladder_above(unwind, max_len)
+    assert ladder == expected
+    assert all(a < b for a, b in zip((unwind, *ladder), ladder, strict=False))
+
+
+def test_check_source_extends_the_default_ladder_for_a_raised_max_len(
+    tmp_path: Path,
+) -> None:
+    """`--max-len 16` against the fixed (4, 8, 16) ladder could never settle: the
+    fill loop needs k > 16. The derived default gains a 17 rung instead."""
+    source = tmp_path / "buf_unit.c"
+    source.write_text(BUF_SLICE)
+    root = tmp_path / ".forseti"
+    _seed_store(root, _semantic(f"{source}::count", "result == 0"))
+    fake = FakeVerify(
+        [Unknown(_meta(k), UnknownReason.TIMEOUT) for k in (4, 8, 16)]
+        + [Verified(_meta(17))]
+    )
+
+    run = check_source(
+        source, function="count", store_root=root, max_len=16, verify_port=fake
+    )
+
+    assert fake.unwinds == [4, 8, 16, 17]
+    assert run.counts()["held"] == 1
+
+
+def test_check_source_explicit_ladder_is_not_extended_for_max_len(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "buf_unit.c"
+    source.write_text(BUF_SLICE)
+    root = tmp_path / ".forseti"
+    _seed_store(root, _semantic(f"{source}::count", "result == 0"))
+    fake = FakeVerify([Unknown(_meta(4), UnknownReason.TIMEOUT)])
+
+    run = check_source(
+        source,
+        function="count",
+        store_root=root,
+        max_len=16,
+        unwind_ladder=(),
+        verify_port=fake,
+    )
+
+    assert fake.unwinds == [4]
+    assert run.counts()["unknown"] == 1
 
 
 def test_check_source_scalar_only_unit_reports_no_cap(tmp_path: Path) -> None:

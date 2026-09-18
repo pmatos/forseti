@@ -79,16 +79,27 @@ DEFAULT_TIMEOUT_S = 110.0
 _WORK_SUBDIR = "check-work"
 
 
-def default_unwind_ladder_above(unwind: int) -> tuple[int, ...]:
-    """`DEFAULT_UNWIND_LADDER` rungs above `unwind`.
+def default_unwind_ladder_above(
+    unwind: int, max_len: int | None = None
+) -> tuple[int, ...]:
+    """`DEFAULT_UNWIND_LADDER` rungs above `unwind`, reaching past `max_len`.
 
     `check_source` derives its ladder this way when `unwind_ladder is None`, so a
     caller-chosen unwind (e.g. `-k 8`) doesn't collide with the fixed default
     rungs and raise `ValueError` (issue #95 review). Kept public because the CLI
     and MCP faces name it in their `--unwind-ladder` help / tool-schema docs as
     the documented default.
+
+    A `(ptr, len)` fill loop over up to `max_len` elements needs ``k > max_len``
+    (#299), so when no rung clears `max_len` -- a raised `--max-len` against the
+    fixed ``(4, 8, 16)`` ladder -- one final ``max_len + 1`` rung is appended,
+    else that flag value could never settle and would only ever report `unknown`.
+    The same coupling `precond.run.precondition_ladder` derives for `synth`.
     """
-    return tuple(k for k in DEFAULT_UNWIND_LADDER if k > unwind)
+    rungs = tuple(k for k in DEFAULT_UNWIND_LADDER if k > unwind)
+    if max_len is not None and max_len >= (rungs[-1] if rungs else unwind):
+        rungs += (max_len + 1,)
+    return rungs
 
 
 def validated_max_len(max_len: int | None) -> int | None:
@@ -160,10 +171,12 @@ def check_source(
     `length_bounds` it was checked under, so `held` reads as "held up to k,
     len<=N". A domain clause that mentions the length is authoritative and
     suppresses the cap for that length (`properties.plan_length_bounds`).
-    `None` restores the genuinely unconstrained length; the default ladder
-    tops out at 16, so a `max_len` of 16 or more needs a raised `unwind` (the
-    fill loop over `len` elements needs `k > len`) to settle rather than
-    reporting `unknown`. A negative `max_len` raises `ValueError` before any event.
+    `None` restores the genuinely unconstrained length. The fill loop over `len`
+    elements needs ``k > max_len``, so a derived default ladder gains a
+    ``max_len + 1`` rung when its own top rung does not clear `max_len`
+    (`default_unwind_ladder_above`); an *explicit* `unwind`/`unwind_ladder` is
+    taken as given, so one that never exceeds `max_len` reports `unknown`. A
+    negative `max_len` raises `ValueError` before any event.
 
     Harnesses are written under a fresh, per-call subdirectory of
     `store_root/"check-work"` (module docstring: never beside `source`, never
@@ -191,7 +204,7 @@ def check_source(
     ladder = (
         unwind_ladder
         if unwind_ladder is not None
-        else default_unwind_ladder_above(unwind)
+        else default_unwind_ladder_above(unwind, max_len)
     )
     verify_fn = verify_port or escalating_port(
         partial(

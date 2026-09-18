@@ -165,11 +165,14 @@ def render_semantic_harness(
     negative `max_len`).
 
     `max_len` caps every buffer-length parameter the property's domain leaves
-    unconstrained (`plan_length_bounds`) with ``__ESBMC_assume(len <= max_len)``
-    before the allocation. ``None`` (the default) leaves such a length genuinely
-    unconstrained -- sound, but the nondet-fill loop then iterates an unbounded
-    number of times, so no finite unwind settles it and the verdict is always
-    UNKNOWN (#299); the check path passes a small bound instead.
+    unconstrained (`plan_length_bounds`) with
+    ``__ESBMC_assume(len >= 0 && len <= max_len)`` before the allocation (the
+    ``>= 0`` is a tautology for an unsigned length; for a signed one it keeps a
+    negative length out of the fill loop, which the allocation's overflow guard
+    only prunes when ``sizeof(elem) > 1``). ``None`` (the default) leaves such a
+    length genuinely unconstrained -- sound, but the nondet-fill loop then
+    iterates an unbounded number of times, so no finite unwind settles it and the
+    verdict is always UNKNOWN (#299); the check path passes a small bound instead.
     """
     # The source-level guard needs `unit_source`, so it stays here; every
     # `(signature, spec)` guard -- empty postcondition, `result_var` clash, void
@@ -221,7 +224,7 @@ def render_semantic_harness(
     for pre in pre_buffer:
         lines.append(f"    __ESBMC_assume(({pre}));")
     for name, bound in plan_length_bounds(signature, spec, max_len):
-        lines.append(f"    __ESBMC_assume(({name}) <= {bound});")
+        lines.append(f"    __ESBMC_assume(({name} >= 0 && {name} <= {bound}));")
     for buf in buffers:
         lines += _render_buffer(buf)
     for pre in post_buffer:
