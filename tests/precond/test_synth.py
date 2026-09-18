@@ -13,6 +13,7 @@ import pytest
 from forseti.esbmc.units import Param, Unit
 from forseti.precond.synth import (
     NON_VACUITY_LABEL,
+    RENAMED_MAIN,
     ParamRole,
     SynthError,
     plan_unit,
@@ -220,11 +221,31 @@ def test_unnamed_pointer_param_gets_argN_var() -> None:
 def test_render_includes_source_and_declares_main() -> None:
     unit = _unit(Param("ctx", "sha1_ctx *"), name="sha1_init")
     text = render_sidecar(plan_unit(unit), "/abs/sha1.c")
-    assert text.startswith('#include "/abs/sha1.c"')
+    assert '#include "/abs/sha1.c"' in text
     assert "#include <stdlib.h>" in text
     assert "int main(void) {" in text
     assert "sha1_init(ctx);" in text
     assert "sha1_ctx * ctx = malloc(sizeof(*ctx));" in text
+
+
+def test_render_renames_the_sources_main_only_around_its_include() -> None:
+    # The source may define `main`; the sidecar's own must not collide with it. The
+    # rename is scoped to the `#include` so the harness's `int main` is its own.
+    text = render_sidecar(plan_unit(_unit(Param("ctx", "ctx *"))), "/abs/prog.c")
+    lines = text.splitlines()
+    assert lines[:3] == [
+        f"#define main {RENAMED_MAIN}",
+        '#include "/abs/prog.c"',
+        "#undef main",
+    ]
+    assert lines.count("int main(void) {") == 1
+
+
+def test_render_calls_a_unit_that_is_main_under_its_renamed_name() -> None:
+    unit = _unit(Param("argv", "char *"), name="main")
+    text = render_sidecar(plan_unit(unit), "/abs/prog.c")
+    assert f"{RENAMED_MAIN}(argv);" in text
+    assert "    main(argv);" not in text
 
 
 def test_render_symbolic_length_is_bounded_and_exact() -> None:

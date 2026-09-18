@@ -832,3 +832,75 @@ def test_an_overflowing_element_count_does_not_discharge(tmp_path: Path) -> None
     assert outcomes["frame_checksum"] is CallerOutcome.DISCHARGED
     assert outcomes["overflow_checksum"] is CallerOutcome.OBLIGATION_VIOLATED
     assert "overflow_checksum()" in result.detail
+
+
+_COMPLETE_PROGRAM = """\
+#include <stddef.h>
+#include <stdio.h>
+
+static int sum_bytes(const unsigned char *buf, size_t len) {
+    int acc = 0;
+    for (size_t i = 0; i < len; i++) acc += buf[i];
+    return acc;
+}
+
+int main(void) {
+    int main = 1;
+    unsigned char frame[4] = {1, 2, 3, 4};
+    printf("%d\\n", sum_bytes(frame, {span}) + main);
+    return 0;
+}
+"""
+
+
+def test_a_complete_program_is_checked_not_refused(tmp_path: Path) -> None:
+    # A source that defines `main` used to be an unconditional ERROR, which made
+    # the gate unusable on any self-contained program (#290). The sidecar now
+    # renames it away around the `#include` — including a local that happens to
+    # be spelled `main` — and the helper is checked like any other unit.
+    src = tmp_path / "program.c"
+    src.write_text(_COMPLETE_PROGRAM.replace("{span}", "4"))
+    result = verify_precondition(src, function="sum_bytes", max_len=MAX_LEN)
+    assert result.assessment is Assessment.ASSUMED_VERIFIED, result.label
+
+
+def test_main_is_a_discharging_caller(tmp_path: Path) -> None:
+    src = tmp_path / "program.c"
+    src.write_text(_COMPLETE_PROGRAM.replace("{span}", "4"))
+    result = discharge_precondition(src, function="sum_bytes", max_len=MAX_LEN)
+    assert result.assessment is Assessment.DISCHARGED_VERIFIED, result.label
+    assert [(c.caller, c.outcome) for c in result.callers] == [
+        ("main", CallerOutcome.DISCHARGED)
+    ]
+
+
+def test_main_passing_a_too_short_object_is_named_at_the_call_site(
+    tmp_path: Path,
+) -> None:
+    src = tmp_path / "program.c"
+    src.write_text(_COMPLETE_PROGRAM.replace("{span}", "5"))
+    result = discharge_precondition(src, function="sum_bytes", max_len=MAX_LEN)
+    assert result.assessment is Assessment.VIOLATED, result.label
+    assert [(c.caller, c.outcome) for c in result.callers] == [
+        ("main", CallerOutcome.OBLIGATION_VIOLATED)
+    ]
+
+
+def test_the_unit_under_test_may_be_main_itself(tmp_path: Path) -> None:
+    src = tmp_path / "program.c"
+    src.write_text(_COMPLETE_PROGRAM.replace("{span}", "4"))
+    result = verify_precondition(src, function="main", max_len=MAX_LEN)
+    assert result.assessment is Assessment.ASSUMED_VERIFIED, result.label
+
+
+def test_a_source_that_undoes_the_rename_stays_an_honest_error(
+    tmp_path: Path,
+) -> None:
+    # `#undef main` in the source defeats the sidecar's `#define`, leaving a real
+    # second `main` for esbmc to reject. The rename cannot take, so the verdict
+    # must be today's loud ERROR — never a pass on a program that did not parse.
+    src = tmp_path / "program.c"
+    src.write_text("#undef main\n" + _COMPLETE_PROGRAM.replace("{span}", "4"))
+    result = verify_precondition(src, function="sum_bytes", max_len=MAX_LEN)
+    assert result.assessment is Assessment.ERROR, result.label
+    assert result.esbmc_result is not None

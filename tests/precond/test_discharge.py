@@ -43,6 +43,7 @@ from forseti.precond.synth import (
     NON_VACUITY_LABEL,
     OBLIGATION_LABEL_PREFIX,
     OBLIGATION_SITE_LABEL_PREFIX,
+    RENAMED_MAIN,
 )
 from forseti.precond.verify import PreconditionUnavailable
 
@@ -161,6 +162,27 @@ def test_every_caller_clean_upgrades_to_discharged(tmp_path: Path) -> None:
     assert [c.outcome for c in result.callers] == [CallerOutcome.DISCHARGED]
     assert "discharged" in result.label
     assert ASSESSMENT_EXIT_CODES[result.assessment] == 0
+
+
+def test_main_is_a_caller_like_any_other_and_is_called_renamed(
+    tmp_path: Path,
+) -> None:
+    # `main` calling the leaf is the caller a complete program has. Its sidecar
+    # must run it under the renamed name — the harness's own `main` is the entry.
+    driver = Unit("main", (), ("sum_bytes",))
+    harnesses: dict[str, str] = {}
+    canned = _raw({})
+
+    def raw(source: Path, *, unwind: int) -> EsbmcResult:
+        harnesses[source.name] = source.read_text()
+        return canned(source, unwind=unwind)
+
+    result = _run(tmp_path, units=(CALLEE, driver), raw=raw)
+    assert result.assessment is Assessment.DISCHARGED_VERIFIED, result.label
+    assert [c.caller for c in result.callers] == ["main"]
+    harness = harnesses["main__discharge.c"]
+    assert f"#define main {RENAMED_MAIN}" in harness
+    assert f"    {RENAMED_MAIN}();" in harness
 
 
 def test_broken_obligation_is_violated_and_names_the_caller(tmp_path: Path) -> None:

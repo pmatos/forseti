@@ -23,10 +23,11 @@ from forseti.esbmc import (
     Violated,
 )
 from forseti.esbmc.units import Param
-from forseti.precond.synth import NON_VACUITY_LABEL
+from forseti.precond.synth import NON_VACUITY_LABEL, RENAMED_MAIN
 from forseti.precond.verify import (
     Assessment,
     PreconditionResult,
+    synthesize,
     verify_precondition,
 )
 
@@ -168,20 +169,44 @@ def test_needs_contract_for_unresolved_pointer(tmp_path: Path) -> None:
     assert not called  # never shelled out to esbmc
 
 
-def test_source_defining_main_is_refused(tmp_path: Path) -> None:
+def test_source_defining_main_is_checked_with_main_renamed_away(
+    tmp_path: Path,
+) -> None:
+    # A complete program is the natural shape of real C: its own `main` must not
+    # make every helper unreachable to the gate. The sidecar renames it away
+    # around the `#include` instead of the driver refusing the source (#290).
     unit = Unit("g", (Param("p", "int *", array_extent=4),))
     main = Unit("main", ())
-    src = tmp_path / "sha1.c"
+    src = tmp_path / "prog.c"
     src.write_text("int main(void){}\n")
+    harnesses: list[str] = []
+
+    def raw(source: Path, *, unwind: int) -> EsbmcResult:
+        harnesses.append(source.read_text())
+        return (
+            _violated(f"  {NON_VACUITY_LABEL}")
+            if _is_nonvacuity(source)
+            else _verified()
+        )
+
     result = verify_precondition(
         src,
         function="g",
         work_dir=tmp_path,
-        raw_verify=lambda s, *, unwind: _verified(),
+        raw_verify=raw,
         list_units_fn=_lister(unit, main),
     )
-    assert result.assessment is Assessment.ERROR
-    assert "main" in result.detail
+    assert result.assessment is Assessment.ASSUMED_VERIFIED, result.label
+    assert harnesses
+    assert all(f"#define main {RENAMED_MAIN}" in h for h in harnesses)
+
+
+def test_the_unit_under_test_may_be_main_itself(tmp_path: Path) -> None:
+    main = Unit("main", ())
+    src = tmp_path / "prog.c"
+    src.write_text("int main(void){}\n")
+    text = synthesize(src, function="main", list_units_fn=_lister(main))
+    assert f"    {RENAMED_MAIN}();" in text
 
 
 def test_unknown_function_is_error(tmp_path: Path) -> None:
