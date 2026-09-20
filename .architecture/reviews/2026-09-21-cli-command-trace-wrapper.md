@@ -435,4 +435,130 @@ Three further reasons it is the right one for an unattended firing:
 
 ## Design
 
-Written at step 4; see below.
+Four interfaces were produced in parallel by sub-agents, each briefed to a different constraint,
+before any adjudication. All four satisfy the same hard constraints, which are worth restating
+because they are what makes this refactor behaviour-preserving:
+
+1. The emitted JSON stays byte-identical per command (`record_event` serialises with
+   `sort_keys=True`, so only the key *set* and the values are load-bearing).
+2. `_run_synth`/`_run_discharge` stay in `_precond_cli` and `_run_semantic_loop` in `cli`, under
+   exactly those names, as the objects argparse binds — `tests/core/test_precond_cli.py:57` and
+   `tests/core/test_core_cli_dispatch.py:62-65` assert *identity*, not just callability.
+3. Exactly one event per invocation, on every exit path. Today this is a **structural**
+   guarantee: the handler returns `tuple[int, X | None]` instead of calling `sys.exit`. All four
+   designs keep it structural and none adds a `try/finally` — an escaping exception records
+   nothing today, and inventing a payload for a crash would be a wire-format change.
+4. The new home must be importable by both `core/cli.py` and `core/_precond_cli.py` without a
+   cycle.
+5. The handler's second return element is differently typed per command (`Assessment | None` vs
+   `SemanticLoopResult | None`) and must stay checkable under `ty check src tests`.
+
+**One fact all four flagged independently:** `src/forseti/` contains no generics today — no
+`TypeVar`, no `Generic[`, no PEP 695 type parameters, and (for Design A) no `@overload`. Whichever
+design is taken is the first to find out how `ty>=0.0.81` behaves on the construct it needs, and
+each carries a stated fallback.
+
+### Design A — minimal interface: `@traced("synth")`, one entry point, closed command set
+
+New `core/_cli_trace.py`. A decorator factory `traced(command: CliCommand)` returning a frozen
+`TracedHandler(command, run)` whose `__call__` is the whole policy. `CliCommand` is a
+`Literal["synth", "discharge", "semantic-loop"]`; a private `_payload_fields` holds one `match`
+arm per command, closed with `assert_never`. Two `@overload` stubs pair the command literal with
+its payload type, so `@traced("synth")` accepts only an `Assessment`-returning handler.
+
+*Call site*: `@traced("synth")` above the handler — one line. The `_run_X`/`_X` forwarder split
+disappears; `_run_synth` becomes the body.
+
+*Dependencies*: both hard-wired. Argues the clock is a hypothetical seam (one adapter ever;
+`monkeypatch.setattr(_cli_trace.time, "monotonic", ...)` is a free seam that costs the interface
+nothing) and that injecting the sink would make the tests **weaker**, because asserting a Python
+dict against a fake stops testing `sort_keys`, the one-line append and JSON-serialisability —
+which are what make the trace a contract.
+
+*Stated weakest point*: **the seam is closed.** A fourth traced subcommand costs one line at the
+call site but requires editing `_cli_trace.py` twice (a `match` arm and an `@overload`), and the
+trace module must import `Assessment` and `SemanticLoopResult` — so `_precond_cli` transitively
+gains an import of `core.loop` (and thus `orchestrator`/`properties`) that it does not have today.
+Compensating property: `assert_never` makes that edit a type error rather than a silent drift.
+Second cost: a mismatched payload degrades to `null` rather than failing loudly.
+
+### Design B — maximum flexibility: injectable `Tracer` with an ambient `ContextVar`
+
+New `core/_cli_trace.py` publishing **14 names**: `Handler`, `FieldsFor`, `Clock`, `FRAME_FIELDS`,
+`TraceSink` (Protocol), `discard`, `Tracer` (frozen dataclass bundling sink + clock),
+`current_tracer`, `use_tracer` (context manager over a `ContextVar`), `TracedCommand[R]` (generic
+frozen dataclass with `.run(handler, args)`), `unit_fields`, `RecordedEvent`, `CollectingSink`,
+`StepClock`. Per-command projections merge *under* the three frame fields, so a projection cannot
+clobber `command`/`exit_code`/`duration_s`.
+
+*Call site*: a projection function, a module-level `_SYNTH = TracedCommand("synth", _precond_fields)`,
+and `return _SYNTH.run(_synth, args)`.
+
+*Dependencies*: both injected. Argues the sink is a real seam with three adapters doing three
+different jobs (`record_event`, `CollectingSink`, `discard`) and that this is the repo's own house
+style — `orchestrator/telemetry.py:41-90` already ships `EventSink` + `NullSink` + `ListSink` +
+`JsonlSink`. Concedes the clock is the weaker of the two and would be the first thing cut.
+
+*Stated weakest point, in its own words*: "the payoff is entirely in futures… break-even is
+roughly the fourth traced command, or the first non-`events.jsonl` destination. **If neither
+arrives, this design is a net loss and Design A wins.**" Second: the ambient `ContextVar` is
+action at a distance — reading `_run_synth` no longer tells you where the event goes, and no
+production path can use the explicit `tracer=` override, because argparse owns the call.
+
+### Design C — trivial common case: a `CliTrace[T]` family used as a decorator
+
+New `core/_cli_trace.py` with a frozen generic `CliTrace[T](extras)` whose `__call__(command)`
+returns a decorator. Two commands sharing a published contract row share one family object:
+`_traced = CliTrace[Assessment](_precond_extras)` covers both `synth` and `discharge`.
+`functools.wraps` carries `__name__`/`__qualname__` so tracebacks and the dispatch test's failure
+message still say `_run_synth`.
+
+*Call site*: `@_traced("synth")` — one line, and the handler body is byte-for-byte today's
+`_synth`. Six functions become four in `_precond_cli`; the `_run_X`/`_X` split is gone.
+
+*Dependencies*: both inside. Same reasoning as A, plus a second-order argument: `record_event`
+never raises, so "a seam whose dependency has no error mode and no second implementation carries
+nothing". Notes `CliTrace` is a frozen dataclass, so a future `sink=record_event` field would
+arrive with zero call-site churn — the seam is *shaped* for it without being *paid for*.
+
+*Stated weakest point*: **the source signature lies about the bound signature.** `cli.py` will
+read `def _run_semantic_loop(args) -> tuple[int, SemanticLoopResult | None]` while what the module
+exports under that name is `(Namespace) -> int`. Also flags that if `ty` degrades on the generic
+decorator application, `_run_synth` becomes `Unknown` and **nothing errors** — the check silently
+stops checking — which is why its test surface includes a type-level pin.
+
+### Design D — ports and adapters: `traced(...)` with `TracePort` and `ClockPort`
+
+New `core/cli_trace.py` (unprefixed — the seam is not private glue). One function
+`traced[ResultT](command, run, args, *, fields, clock=time.monotonic, trace=record_event)`, two
+`Protocol`s with positional-only parameters in `orchestrator/ports.py`'s idiom, a shipped
+`ListTrace` test adapter, a `COMMON_FIELDS` frozenset, and `if TYPE_CHECKING` structural guards
+that fail `ty check` if `record_event` or `time.monotonic` drifts from its port.
+
+*Call site*: a `fields` builder plus `return traced("synth", _synth, args, fields=_precond_fields)`.
+The `_run_X`/`_X` split is **kept**, so no signature lies.
+
+*Dependencies*: per-port pricing, done rigorously. `TracePort` is judged **weakly real** — the
+grounded second adapter is a dry-run `NullTrace`, which the design doc already commits to ("a dry
+run (`persist=False`) records nothing") and `--no-store` already exists on `propose`/`submit-property`.
+It explicitly refuses to count `adapters/claude_code/event_log.log_event` as a second adapter even
+though it is structurally assignable, calling that "gaming the rule". `ClockPort` is declared
+**hypothetical** outright: "Nobody will supply a second production clock. I am not going to pretend
+otherwise."
+
+*Stated weakest point*: because injection is by default argument and `main` is untouched, **the
+fake adapters never run on the argparse dispatch path.** A test driving `traced` with a `ListTrace`
+proves the wrapper emits correctly; it does not prove `args.func` is bound to a handler that calls
+the wrapper. So the port does not increase confidence in the property that actually matters — it
+increases locality and makes the duration assertion exact.
+
+*Bonus finding*: D was asked whether a port here is the right precedent for eventually fixing
+`core/check.py` vs `orchestrator/check.py` (the backlog's `check-source-event-emission-bypass`).
+Its answer is **no**, with evidence: those are two different events wearing the same name in two
+different envelopes (`unit_id`/`outcome` flat vs `index`/`k`/`verdict`/`detail` in a frozen `Event`),
+so swapping the sink reconciles nothing — "you would have a port whose two adapters emit
+incompatible schemas and call it unified". That reasoning is recorded on the backlog entry.
+
+### Adjudication
+
+*Written below after the advisor pass.*
