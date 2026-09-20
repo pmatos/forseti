@@ -148,6 +148,7 @@ same ideas. Reconciled against `gh` at the start of every run.
 - **Summary**: `UnitSignature`/`BufferParam`/`ScalarParam`/`Param`/`HarnessError`/`extract_signature` are defined in `signature.py` but imported "from `.harness`", so finding where they live is a two-hop bounce. Redirect the six names to `from .signature import ...`.
 - **First seen**: 2026-09-11
 - **Reason**: Leverage 1 — `__init__.py` is a facade for ~10 external importers (deleting it scatters), and redirecting six names is interface hygiene, not a shallow→deep change; nothing concentrates.
+- **Re-check 2026-09-21**: filter still applies (leverage 1). `properties/__init__.py:14-28` still imports all six names `from .harness`, so the two-hop bounce is intact — but the drop reason is unchanged: `__init__.py` is a facade for ~10 external importers, so deleting it scatters, and redirecting six names is interface hygiene, not a shallow→deep change. Note this run filed a sibling on the same filter, `event-log-write-text-atomic-reexport`.
 
 ## proposal-request-prologue
 
@@ -273,6 +274,7 @@ same ideas. Reconciled against `gh` at the start of every run.
 - **Summary**: The `*_tool` wrappers re-declare each `*_source` signature — but the typed, docstring'd param list *is* the MCP tool schema the SDK introspects.
 - **First seen**: 2026-09-02
 - **Reason**: Leverage 1 — deletion test scatters; shallow but load-bearing.
+- **Re-check 2026-09-21**: filter still applies (leverage 1). Re-validated by the core/orchestrator exploration pass: the typed parameter lists at `mcp_server.py:65-306` really are the tool schema, so collapsing them would move the schema into a dict rather than concentrate anything.
 
 ## verify-and-record-decomposition
 
@@ -283,6 +285,7 @@ same ideas. Reconciled against `gh` at the start of every run.
 - **Summary**: The densest function in the tree, but it is the fail-closed/ownership heart of the gate — deep, not shallow.
 - **First seen**: 2026-09-02
 - **Reason**: Not a deepening candidate — high blast radius and high regression risk; every line encodes a fail-closed invariant.
+- **Re-check 2026-09-21**: filter still applies (not a deepening). `orchestrator/check.py:261` `check_properties` is still the single driver; there is no verify-and-record pair to decompose, and splitting one would add an interface rather than hide one.
 
 ## cli-run-handler-shape
 
@@ -293,6 +296,7 @@ same ideas. Reconciled against `gh` at the start of every run.
 - **Summary**: The `try op() except: print; return 1` + json/human + exit-code shape repeats across ~6 handlers, but the exit-code logic genuinely differs per command.
 - **First seen**: 2026-09-02
 - **Reason**: Leverage 1 — consolidating would scatter the per-command exit-code variation into flags.
+- **Re-check 2026-09-21**: filter still applies (leverage 1), and the generic shape it named has since been extracted anyway — `_run_harness_action` at `core/cli.py:1046`, used at `:1088`, `:1107`, `:1117` and `:1174`. What remains around it is per-harness *facts*, which is `harness-registry-dispatch-table`'s scope, not this one's.
 
 ## esbmc-init-all-parser-surface
 
@@ -303,6 +307,7 @@ same ideas. Reconciled against `gh` at the start of every run.
 - **Summary**: The package re-exports several `parse_*` scanners with no `src/` callers outside `units.py`; removing them from `__all__` narrows a namespace.
 - **First seen**: 2026-09-02
 - **Reason**: Leverage 1 — interface hygiene, not a deepening; nothing concentrates.
+- **Re-check 2026-09-21**: filter still applies (leverage 1). `esbmc/__init__.py` is unchanged in shape — 95 lines, one `__all__` at `:53` — and the adapters/esbmc exploration pass independently reached the same conclusion about the neighbouring result modules (see the dropped `esbmc-result-render-runner-cluster`): they are exhaustive `match`es and a real banner-grammar abstraction, not a shallow cluster.
 
 ## harness-writer-port-inline
 
@@ -313,6 +318,7 @@ same ideas. Reconciled against `gh` at the start of every run.
 - **Summary**: A one-adapter seam whose `render` is a one-line delegation — a candidate to *inline*, not to deepen.
 - **First seen**: 2026-09-02
 - **Reason**: Not a deepening; the indirection defensibly keeps the driver from importing `properties` directly.
+- **Re-check 2026-09-21**: filter still applies (simplification, not a deepening). `HarnessWriterPort` is still a live protocol at `orchestrator/ports.py:141`, documented at `:12` as the #64 renderer seam, with a stated rename hazard at `:99`. Inlining it would remove a seam, not deepen one.
 
 ## cli-json-or-render-epilogue
 
@@ -323,6 +329,7 @@ same ideas. Reconciled against `gh` at the start of every run.
 - **Summary**: Every Core CLI handler ends with `if args.json: print(json.dumps(result.to_dict())) else: print(_render_X(result))`.
 - **First seen**: 2026-09-04
 - **Reason**: Leverage 1 — the render fn and the exit-code policy differ per command; a shared helper would take both as injected params, relocating the variation to the call site rather than concentrating it.
+- **Re-check 2026-09-21**: filter still applies (leverage 1). Six `if args.json` epilogues remain in `core/cli.py`, but each renders a different payload, so a shared helper would take a renderer callback and concentrate only the two-line branch.
 
 ## codex-claude-verify-drift
 
@@ -333,6 +340,7 @@ same ideas. Reconciled against `gh` at the start of every run.
 - **Summary**: The Codex whole-file `forseti verify` subprocess + JSON `decision` path and the Claude in-process per-function `verify_and_record` + stderr/exit path are parallel "verify edits → block on counterexample → report" pipelines that drifted (lowercase verdict strings vs `UnitVerdict`; file vs function granularity; no shared state persistence on the Codex side).
 - **First seen**: 2026-09-04
 - **Reason**: Fails the deletion test — the mechanisms genuinely differ, so a shared seam would be a param-heavy switch; complexity moves/parameterises, it does not concentrate.
+- **Re-check 2026-09-21**: filter still applies (fails the deletion test). The adapters exploration pass re-confirmed the two pipelines are still structurally different (`codex/verify_hook.py:106` `main` is per-function; `claude_code/post_tool_use.py:58` `main` is per-file), so reconciling them scatters. What *is* shared underneath — argv, timeout, failure bucketing, JSON decode — is filed separately as `forseti-cli-json-subprocess-seam`, and that entry is not a re-run of this one.
 
 ## precond-sidecar-run-seam
 

@@ -7,7 +7,7 @@ puts `core/cli.py` (13 commits), `esbmc/units.py` (11), `precond/discharge.py` (
 scan ran as three parallel passes — `properties/`+`precond/`, `core/`+`orchestrator/`,
 `adapters/`+`esbmc/` — each briefed with the existing backlog slugs so nothing was re-derived.
 
-**Picked**: `cli-command-trace-wrapper` — 22/25. See `.architecture/backlog.md`.
+**Picked**: `cli-command-trace-wrapper` — 22/25. See [PR #307](https://github.com/pmatos/forseti/pull/307) and `.architecture/backlog.md`.
 
 **Degradations**: none. `gh` is authenticated, sub-agents were available for both the exploration
 pass and the design-it-twice pass, and the advisor adjudicated step 4.
@@ -621,6 +621,16 @@ def traced[ResultT](
 ```
 
 plus `COMMON_FIELDS` and one field builder per published contract row.
+
+**One deviation from Design D as written: the module ships as `core/_cli_trace.py`, not
+`core/cli_trace.py`.** D argued for the unprefixed name on the grounds that "the seam is not
+private glue". The underscore was taken instead for two reasons. First, the autonomy contract
+forbids an unattended run from changing a published interface beyond what the picked candidate
+strictly requires, and an unprefixed `forseti.core.cli_trace` makes a claim on the package surface
+that a behaviour-preserving relocation does not need. Second, three of the four designs
+independently chose `_cli_trace.py`, and the module's nearest sibling — `_precond_cli.py`, the
+other piece of CLI glue in this package — is already underscore-private. Nothing else about D
+changed.
 
 **The `ty` question was settled empirically before implementation, not assumed.** All four designs
 flagged that `src/forseti/` contains no generics today, so the checker's behaviour on PEP 695 type
