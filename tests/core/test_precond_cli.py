@@ -224,6 +224,22 @@ def test_discharge_json_emits_the_result_payload(
 
 # --- cli.command trace (#301) ----------------------------------------------
 
+# The published `cli.command` row for `synth`/`discharge`
+# (docs/design/0001-harness-portability.md). Pinned as a *set*, not field by
+# field: the row is a wire format, so an added or renamed key is a break, and
+# the per-field assertions below cannot see one.
+PRECOND_EVENT_KEYS = {
+    "ts",
+    "type",
+    "command",
+    "source",
+    "function",
+    "emit_only",
+    "assessment",
+    "exit_code",
+    "duration_s",
+}
+
 
 def _cli_events(store_root: Path) -> list[dict[str, Any]]:
     lines = events_path(store_root).read_text().splitlines()
@@ -279,6 +295,7 @@ def test_synth_and_discharge_record_one_cli_command_event_per_path(
 
     assert code == exit_code
     (event,) = _cli_events(root)
+    assert set(event) == PRECOND_EVENT_KEYS
     assert event["command"] == command
     assert event["source"] == "x.c"
     assert event["function"] == "foo"
