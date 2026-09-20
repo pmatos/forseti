@@ -1,3 +1,18 @@
+# [1.10.0](https://github.com/pmatos/forseti/compare/v1.9.0...v1.10.0) (2026-09-20)
+
+
+### Bug Fixes
+
+* **precond:** rename a source's main away in the sidecar instead of refusing it ([#305](https://github.com/pmatos/forseti/issues/305)) ([a913b99](https://github.com/pmatos/forseti/commit/a913b9902508aaea0e5cc9ce2a0ba23d320653ee))
+* **properties:** materialise semantic-harness buffers via malloc, not a stack VLA ([#298](https://github.com/pmatos/forseti/issues/298)) ([6504090](https://github.com/pmatos/forseti/commit/650409021189bfc5075a67b59d2304e5886b0921))
+* **symphonika:** gate shipit stage on an open PR, not just a commit ([#280](https://github.com/pmatos/forseti/issues/280)) ([3bf47d1](https://github.com/pmatos/forseti/commit/3bf47d1debf3eb4f0927435413f6602e3337063f))
+
+
+### Features
+
+* **core:** synth/discharge/semantic-loop emit their own cli.command trace event ([#301](https://github.com/pmatos/forseti/issues/301)) ([#303](https://github.com/pmatos/forseti/issues/303)) ([7bcc812](https://github.com/pmatos/forseti/commit/7bcc812e3c77987d08248122d0e94d837b6fc60a))
+* **demo:** live write->verify->fix loop demo, terminal + browser canvas ([#300](https://github.com/pmatos/forseti/issues/300)) ([569f2a7](https://github.com/pmatos/forseti/commit/569f2a714f18ac2e1b80b68fcb9047db7348cefd))
+
 # [1.9.0](https://github.com/pmatos/forseti/compare/v1.8.1...v1.9.0) (2026-09-06)
 
 
