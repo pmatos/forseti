@@ -561,4 +561,88 @@ incompatible schemas and call it unified". That reasoning is recorded on the bac
 
 ### Adjudication
 
-*Written below after the advisor pass.*
+**Winner: Design D, with both ports deleted.** The criteria were applied in the skill's fixed
+order — depth, locality, seam placement, test surface, blast radius — and the advisor adjudicated
+against the four written designs above.
+
+**Design B is out on depth and seam placement.** Fourteen published names for three call sites is
+the inverse of depth. Of its three sink adapters, two are test-only and one (`discard`) is
+speculative — a hypothetical seam by the two-adapter rule, not a real one. Its own author states
+the case against it: "if neither arrives, this design is a net loss and Design A wins."
+
+**Design A is out on locality, despite winning depth.** `@traced("synth")` is genuinely the
+smallest thing a caller must learn, and `assert_never` forcing each new command to state its
+contract row is a real locality asset. But `_cli_trace` must import both `Assessment` and
+`SemanticLoopResult`, so `_precond_cli` transitively gains `core.loop` → `orchestrator` →
+`properties` — an import it does not have today. `forseti synth` is a short-lived process, and
+this repo already documents that it cares about exactly that cost: `cli.py:925-929` keeps the four
+hook `main()` imports lazy, one per invocation, for that reason. A trace module that must know
+every payload type grows a dependency per command, where a `fields` callback keeps payload
+knowledge with the payload's owner. Design A's silent-`null` degradation on a mismatched payload
+is also the worse failure mode if typing ever degrades.
+
+**Design C is out on test surface and blast radius.** The declared-versus-exported signature lie
+is survivable on its own; what is not is the risk underneath it, which C itself names: if `ty`
+degrades on the generic decorator application, `_run_synth` becomes `Unknown` and **nothing
+errors** — a type check that silently stops checking is precisely the failure mode this repo
+rejects. C also carries the largest diff: it relocates three full handler bodies, where D leaves
+`_synth`/`_discharge`/`_semantic_loop` untouched.
+
+**Design D wins locality, test surface and blast radius, and loses depth only narrowly.** The
+trace module depends on `.events` and the stdlib only; the `_run_X`/`_X` split survives, so
+constraint 3 stays *visibly* structural at every call site; and a `fields` builder that returns a
+common key is a loud `TypeError` rather than a silent overwrite.
+
+**The runner-up design is Design A**, on the strength of its depth: one decorator line is a
+smaller interface than a builder plus a `traced(...)` call, and `assert_never` is a stronger
+anti-drift guard than a `COMMON_FIELDS` test. It lost on the transitive-import cost it forces on
+`_precond_cli`, which is a locality regression in a repo that has already paid attention to CLI
+import cost.
+
+**Both of D's ports are deleted, which fixes its own criterion-3 weakness.** D declares
+`ClockPort` hypothetical outright ("Nobody will supply a second production clock. I am not going
+to pretend otherwise") and rates `TracePort` only "weakly real", resting on a `NullTrace` that
+does not exist yet. Designs A and C each argue, independently, that injecting the sink makes the
+tests *weaker*: asserting a Python dict against a fake stops exercising `sort_keys`, the one-line
+append, and JSON-serialisability — which are the properties that make the trace a contract. D
+itself prices the removal: "a variant that inlines `time.monotonic` and keeps only `TracePort` is
+defensibly leaner." Going one further and dropping both also removes the shipped test-adapter
+lines that would otherwise need their own coverage under the 96% gate. The implemented shape is
+therefore:
+
+```python
+def traced[ResultT](
+    command: str,
+    run: Callable[[argparse.Namespace], tuple[int, ResultT]],
+    args: argparse.Namespace,
+    *,
+    fields: Callable[[argparse.Namespace, ResultT], dict[str, Any]],
+) -> int
+```
+
+plus `COMMON_FIELDS` and one field builder per published contract row.
+
+**The `ty` question was settled empirically before implementation, not assumed.** All four designs
+flagged that `src/forseti/` contains no generics today, so the checker's behaviour on PEP 695 type
+parameters was unknown. A throwaway probe reproduced the exact shape above and deliberately
+cross-wired it (`_loop` handler with `_precond_fields` builder). `ty` 0.0.81 reports:
+
+```
+error[invalid-argument-type]: Argument to function `traced` is incorrect
+  Expected `(Namespace, LoopResult | None | Assessment, /) -> dict[str, Any]`,
+  found `def _precond_fields(args: Namespace, assessment: Assessment | None) -> dict[str, Any]`
+info: the second parameter has an incompatible type
+```
+
+So `ty` does join `ResultT` across both positions rather than binding it from `run` alone — the
+degradation D anticipated — but the cross-wire is *still* a hard error, because the joined type is
+not assignable to the builder's parameter. Constraint 5 is met with no `TYPE_CHECKING` pairing
+guards, and D's fallback is not needed.
+
+**Test-first sequencing.** The existing `cli.command` tests
+(`tests/core/test_precond_cli.py:266-290`, `tests/core/test_semantic_loop_cli.py:568-665`) assert
+field *values*, not the field *set* — an added or renamed key passes green today, and constraint 1
+is byte-identity of a published format. The key-set assertions therefore land **first**, on the
+unchanged tree, as the pin for the thing that actually matters; the `ImportError` on a new
+`tests/core/test_cli_trace.py` is the cheaper red and satisfies the letter of test-first, but it
+does not guard the contract.
