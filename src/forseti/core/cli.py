@@ -104,6 +104,7 @@ from forseti.esbmc import (
     verify_kwargs,
 )
 from forseti.orchestrator import PropertyCheckRun, property_check_transcript
+from forseti.precond import DEFAULT_MAX_LEN
 from forseti.properties import (
     BlankProvenanceError,
     CandidateSpec,
@@ -508,6 +509,27 @@ def _parse_ladder(value: str) -> tuple[int, ...]:
         ) from exc
 
 
+def _add_max_len_argument(p: argparse.ArgumentParser) -> None:
+    """`--max-len` for the semantic-property check path (#299).
+
+    Mirrors `synth --max-len` (same name, same default) but caps only a
+    `(ptr, len)` length the property's own domain leaves unconstrained.
+    """
+    p.add_argument(
+        "--max-len",
+        type=int,
+        default=DEFAULT_MAX_LEN,
+        metavar="N",
+        help=(
+            "cap on a `(ptr, len)` buffer length the property's domain does not "
+            f"constrain (default: {DEFAULT_MAX_LEN}); a held/violated is then "
+            "scoped to len<=N. The default ladder is extended past N; an "
+            "explicit -k/--unwind-ladder must reach N+1 to settle (a domain "
+            "clause naming the length overrides the cap)"
+        ),
+    )
+
+
 def _add_check_parser(
     sub: argparse._SubParsersAction[argparse.ArgumentParser],
 ) -> None:
@@ -548,6 +570,7 @@ def _add_check_parser(
         metavar="SECONDS",
         help=f"per-attempt esbmc timeout in seconds (default: {CHECK_TIMEOUT_S:g})",
     )
+    _add_max_len_argument(p)
     p.add_argument(
         "--json",
         action="store_true",
@@ -625,6 +648,7 @@ def _run_check(args: argparse.Namespace) -> int:
             timeout_s=args.timeout,
             extra_flags=tuple(args.esbmc_args),
             esbmc_bin=args.esbmc_bin,
+            max_len=args.max_len,
         )
     except (PropertyStoreError, OSError, ValueError) as exc:
         print(f"forseti check: {exc}", file=sys.stderr)
@@ -754,6 +778,7 @@ def _add_semantic_loop_parser(
         metavar="SECONDS",
         help=f"per-attempt esbmc timeout in seconds (default: {CHECK_TIMEOUT_S:g})",
     )
+    _add_max_len_argument(p)
     p.add_argument(
         "--json",
         action="store_true",
@@ -876,6 +901,7 @@ def _semantic_loop(
             check_timeout_s=args.timeout,
             extra_flags=tuple(args.esbmc_args),
             esbmc_bin=args.esbmc_bin,
+            max_len=args.max_len,
         )
     except (
         ValueError,

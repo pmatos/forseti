@@ -19,8 +19,10 @@ from forseti.properties import (
     ScalarParam,
     SemanticSpec,
     UnitSignature,
+    build_property_harness,
     extract_signature,
     make_property_id,
+    plan_length_bounds,
     render_property_harness,
     render_semantic_harness,
     renderability_reason,
@@ -821,3 +823,201 @@ def test_input_and_output_names_partition_param_names() -> None:
         == _MIXED_SIG.param_names
     )
     assert not (_MIXED_SIG.input_param_names & _MIXED_SIG.output_param_names)
+
+
+# --- default length cap (#299) ------------------------------------------------
+#
+# A malloc-backed buffer's length is otherwise a symbolic, effectively unbounded
+# fill-loop trip count, so no finite unwind settles a property over it. The cap
+# is opt-in at the renderer (`max_len=None` keeps #297/#298's genuinely
+# unconstrained length) and skipped where the property's own domain already
+# constrains the length, since capping on top could contradict it and turn the
+# check vacuous.
+
+_FIRST_SRC = "int first(const int *a, unsigned n) { return 0; }"
+_CAP_N = "__ESBMC_assume((n >= 0 && n <= 8));"
+
+
+def _render_first(*domain: str, max_len: int | None) -> str:
+    return render_semantic_harness(
+        unit_source=_FIRST_SRC,
+        signature=_BUF_SIG,
+        spec=SemanticSpec("result == result", domain),
+        max_len=max_len,
+    )
+
+
+def test_max_len_none_emits_no_cap() -> None:
+    assert "<= 8" not in _render_first(max_len=None)
+    assert plan_length_bounds(_BUF_SIG, SemanticSpec("result == result"), None) == ()
+
+
+def test_max_len_caps_an_unconstrained_length_before_the_allocation() -> None:
+    out = _render_first(max_len=8)
+    assert _CAP_N in out
+    assert out.index("unsigned n = nondet_unsigned();") < out.index(_CAP_N)
+    assert out.index(_CAP_N) < out.index(_ALLOC_A_N)
+
+
+@pytest.mark.parametrize(
+    "domain",
+    [
+        "n <= 4",
+        "n >= 1 && n <= 4",
+        "n == 3",
+        "n < 100",
+        "n >= 16",
+        "n >= 0x10",
+        "n > 8",
+        "(n >= 1) && (n >= 2)",
+        "n >= 1 || n == 20",
+    ],
+)
+def test_domain_clause_naming_the_length_suppresses_the_cap(domain: str) -> None:
+    # The domain is authoritative: `n >= 16` under a cap of 8 would assume
+    # `false` and settle every property vacuously HELD, and `n <= 100` capped to
+    # 8 would silently narrow an explicit bound.
+    out = _render_first(domain, max_len=8)
+    assert _CAP_N not in out
+    assert plan_length_bounds(_BUF_SIG, SemanticSpec("result == 0", (domain,)), 8) == ()
+
+
+@pytest.mark.parametrize(
+    "domain",
+    ["n >= 1", "n > 0", "n != 0", "1 <= n", "0 < n", "(n >= 1)", "n >= 8", "n >= 0"],
+)
+def test_lower_bound_the_cap_can_satisfy_still_gets_the_cap(domain: str) -> None:
+    # The most common proposer domain (`len >= 1`) must not disable the cap, or
+    # the property stays UNKNOWN by default; the floor still fits under 8, so the
+    # two assumes are jointly satisfiable.
+    assert plan_length_bounds(_BUF_SIG, SemanticSpec("result == 0", (domain,)), 8) == (
+        ("n", 8),
+    )
+    out = _render_first(domain, max_len=8)
+    assert out.index(_CAP_N) < out.index(_ALLOC_A_N)
+
+
+def test_lower_bound_above_the_cap_disables_it() -> None:
+    spec = SemanticSpec("result == 0", ("n >= 5",))
+    assert plan_length_bounds(_BUF_SIG, spec, 8) == (("n", 8),)
+    assert plan_length_bounds(_BUF_SIG, spec, 4) == ()
+    assert (
+        plan_length_bounds(_BUF_SIG, SemanticSpec("result == 0", ("n > 4",)), 4) == ()
+    )
+
+
+def test_length_used_only_as_an_index_does_not_suppress_the_cap() -> None:
+    # `a[n - 1]` is a buffer-content predicate emitted after the fill, not a
+    # size constraint, so the length is still unconstrained.
+    spec = SemanticSpec("result == 0", ("a[n - 1] >= 0",))
+    assert plan_length_bounds(_BUF_SIG, spec, 8) == (("n", 8),)
+
+
+def test_cap_is_scoped_to_the_length_the_domain_leaves_open() -> None:
+    sig = UnitSignature(
+        "f",
+        "int",
+        (
+            BufferParam("int", "a", "n", const=True),
+            ScalarParam("unsigned", "n"),
+            BufferParam("int", "b", "m", const=True),
+            ScalarParam("unsigned", "m"),
+        ),
+    )
+    spec = SemanticSpec("result == 0", ("m <= 2",))
+    assert plan_length_bounds(sig, spec, 8) == (("n", 8),)
+
+
+def test_shared_length_is_capped_once() -> None:
+    sig = UnitSignature(
+        "dot",
+        "int",
+        (
+            BufferParam("int", "a", "n", const=True),
+            BufferParam("int", "b", "n", const=True),
+            ScalarParam("unsigned", "n"),
+        ),
+    )
+    out = render_semantic_harness(
+        unit_source="int dot(const int *a, const int *b, unsigned n) { return 0; }",
+        signature=sig,
+        spec=SemanticSpec("result == 0"),
+        max_len=8,
+    )
+    assert out.count(_CAP_N) == 1
+
+
+def test_compound_length_caps_each_scalar_param_it_names() -> None:
+    sig = UnitSignature(
+        "f",
+        "int",
+        (
+            BufferParam("int", "a", "w * h", const=True),
+            ScalarParam("unsigned", "w"),
+            ScalarParam("unsigned", "h"),
+        ),
+    )
+    assert plan_length_bounds(sig, SemanticSpec("result == 0"), 4) == (
+        ("w", 4),
+        ("h", 4),
+    )
+
+
+@pytest.mark.parametrize("length", ["16", "N", "1"])
+def test_non_param_length_is_not_capped(length: str) -> None:
+    # A literal/macro length is not nondet: assuming `N <= 8` on a macro whose
+    # value is 16 would make the harness vacuous.
+    sig = UnitSignature(
+        "f",
+        "int",
+        (BufferParam("int", "a", length, const=True), ScalarParam("int", "x")),
+    )
+    assert plan_length_bounds(sig, SemanticSpec("result == 0"), 8) == ()
+
+
+def test_scalar_backed_output_is_not_capped() -> None:
+    sig = UnitSignature(
+        "f",
+        "int",
+        (
+            BufferParam("unsigned char", "b", "len", const=True),
+            ScalarParam("unsigned", "len"),
+            BufferParam("uint32_t", "cp", "1", out=True),
+        ),
+    )
+    assert plan_length_bounds(sig, SemanticSpec("result == 0"), 8) == (("len", 8),)
+
+
+def test_negative_max_len_is_an_error() -> None:
+    # `n <= -1` on an unsigned length assumes `false`: every property vacuously HELD.
+    with pytest.raises(HarnessError, match="max_len"):
+        plan_length_bounds(_BUF_SIG, SemanticSpec("result == 0"), -1)
+    with pytest.raises(HarnessError, match="max_len"):
+        _render_first(max_len=-1)
+
+
+def test_zero_max_len_is_allowed() -> None:
+    assert plan_length_bounds(_BUF_SIG, SemanticSpec("result == 0"), 0) == (("n", 0),)
+
+
+def test_build_property_harness_reports_the_bounds_it_applied() -> None:
+    prop = _semantic_property("result >= 0", ("n >= 1",))
+    built = build_property_harness(
+        unit_source=_FIRST_SRC, symbol="first", prop=prop, max_len=8
+    )
+    assert built.length_bounds == (("n", 8),)
+    assert _CAP_N in built.source_text
+    assert built.source_text == render_property_harness(
+        unit_source=_FIRST_SRC, symbol="first", prop=prop, max_len=8
+    )
+
+
+def test_build_property_harness_reports_no_bounds_when_domain_bounds_the_length() -> (
+    None
+):
+    prop = _semantic_property("result >= 0", ("n <= 4",))
+    built = build_property_harness(
+        unit_source=_FIRST_SRC, symbol="first", prop=prop, max_len=8
+    )
+    assert built.length_bounds == ()
+    assert "<= 8" not in built.source_text

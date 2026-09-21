@@ -240,6 +240,37 @@ def test_build_server_registers_semantic_loop_tool() -> None:
     assert {"source", "function", "mode"} <= props.keys()
 
 
+def test_check_tools_expose_and_forward_max_len(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`max_len` (#299) is a schema property of both check-path tools, defaults
+    to `forseti synth`'s 8, and is forwarded to Core unchanged."""
+    tools = {t.name: t for t in asyncio.run(build_server().list_tools())}
+    for name in ("check", "semantic_loop"):
+        props = tools[name].input_schema["properties"]
+        assert props["max_len"]["default"] == 8
+
+    seen: list[int | None] = []
+
+    class _Stop(Exception): ...
+
+    def _spy(*_a: object, max_len: int | None, **_kw: object) -> object:
+        seen.append(max_len)
+        raise _Stop
+
+    monkeypatch.setattr("forseti.core.mcp_server.check_source", _spy)
+    monkeypatch.setattr("forseti.core.mcp_server.run_semantic_loop", _spy)
+    with pytest.raises(_Stop):
+        check_tool("u.c", "f")
+    with pytest.raises(_Stop):
+        check_tool("u.c", "f", max_len=3)
+    with pytest.raises(_Stop):
+        semantic_loop_tool("u.c", "f", "check_only")
+    with pytest.raises(_Stop):
+        semantic_loop_tool("u.c", "f", "check_only", max_len=5)
+    assert seen == [8, 3, 8, 5]
+
+
 def test_semantic_loop_tool_rejects_an_unknown_mode(tmp_path: Path) -> None:
     source = tmp_path / "abs_unit.c"
     source.write_text(_ABS_SLICE)

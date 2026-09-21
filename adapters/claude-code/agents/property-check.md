@@ -36,6 +36,9 @@ following, in order:
    (`--unwind`/`--unwind-ladder` if the defaults are not enough for a
    property over a loop — a property that iterates needs a higher k than a
    straight-line one; raise both if you see `UNKNOWN` at the default bounds).
+   A `(ptr, len)` buffer's length is capped at `--max-len` (default 8) unless
+   the property's own `domain` names the length; each verdict's
+   `length_bounds` reports the cap, so `held` means "up to k, len<=8".
    This is still the expensive, latent step (a nested `claude -p` call) — it
    is why this agent exists as a deliberate, explicit action rather than
    something the hooks run on every edit. If the project sets
