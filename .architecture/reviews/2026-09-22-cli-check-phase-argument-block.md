@@ -9,7 +9,7 @@ The scan ran as three parallel passes:
 - one on `precond/` + `orchestrator/` + `properties/` for friction the backlog does not already list;
 - one re-checking every `proposed` backlog entry at HEAD `e552555`.
 
-**Picked**: `cli-check-phase-argument-block`, 22/25. See the PR and `.architecture/backlog.md`.
+**Picked**: `cli-check-phase-argument-block`, 22/25. See [PR #312](https://github.com/pmatos/forseti/pull/312) and `.architecture/backlog.md`.
 
 **Degradations**: none. `gh` is authenticated, sub-agents were available, and the advisor was consulted
 at the pick.
@@ -396,7 +396,7 @@ backlog. It is the entry the 2026-09-21 firing named as the natural next firing.
 Why it is safe to take unattended:
 - It touches one source file.
 - The argparse surface and the Core keyword calls are behaviour-preserving, which the design pass
-  proves by diffing `format_help()` against the pre-change tree.
+  shows by diffing `format_help()` against the pre-change tree.
 - Both subcommands are already driven through `cli.main` by esbmc-free tests
   (`tests/core/test_core_check.py:433-722`, `tests/core/test_semantic_loop_cli.py:502`, `:688`).
 
@@ -563,7 +563,7 @@ Why the other three lost:
 **Implementation notes carried from the adjudication:**
 - **Pin the missing seam first.** The red test imports and exercises `_add_check_phase_arguments` /
   `_check_phase_kwargs`, which do not exist yet. A test asserting only that "the two blocks agree"
-  would pass today and prove nothing.
+  would pass today and pin nothing new.
 - **Baselines were captured before any edit.** `format_help()` for both subcommands and the exact
   keyword arguments reaching `check_source` / `run_semantic_loop` were recorded over six argv shapes,
   with `COLUMNS=100`, from a scratch working directory. After the change both must diff empty.

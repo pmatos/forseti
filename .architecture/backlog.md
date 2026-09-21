@@ -388,7 +388,8 @@ same ideas. Reconciled against `gh` at the start of every run.
 
 ## cli-check-phase-argument-block
 
-- **Status**: proposed
+- **Status**: in-flight
+- **PR**: #312
 - **Score**: 22/25 (leverage 4, locality 4, blast radius 1, heat 5)
 - **Files**: ~2 estimated (`core/cli.py` + one new test file)
 - **Modules**: `src/forseti/core/cli.py:524-561` (the `check` subparser) and `:730-767` (the `semantic-loop` subparser); existing precedent at `:274-289` (`_add_unit_store_arguments`) and `core/_precond_cli.py:36-73` (`_add_precondition_arguments`)
@@ -405,6 +406,34 @@ same ideas. Reconciled against `gh` at the start of every run.
   - Heat re-measured: W=9 → 5. Score 20/25 → **22/25**.
   - **Picked 2026-09-22**: top score, 2 points clear of the runner-up candidate `precond-unit-lister-default-four-copies` (20/25).
   - Scope constraint: the argparse surface stays byte-identical, proved by a `format_help()` diff. The stale ladder help is reported for a human, not fixed, because the same sentence lives in `core/mcp_server.py`'s two tool docstrings and `demo/scaffold/CLAUDE.md:83-85`.
+
+### Run 2026-09-22 — complete
+
+- **Outcome**: complete
+- **Stopped at**: step 6 — PR #312 opened; work landed on branch
+- **Branch**: `pm-deepen/cli-check-phase-argument-block`. It was *created* as `pm-deepen/run-2026-09-22-0101` from `origin/main` and renamed at step 2. Adoption was **refused** at step 0 on condition 3: the firing branch (`sym/forseti/routine/refactor-audit/01M33370QR`) had an upstream (`@{u}` resolved to `origin/main`), so it was not a made-for-this-run, no-upstream branch.
+- **Committed**:
+  - the review report, including the four-design pass and the adjudication;
+  - the `refactor(core)` implementation: `_add_check_phase_arguments` / `_check_phase_kwargs` in `core/cli.py`, replacing both flag blocks, both handler forwards and `_add_max_len_argument`, plus the new `tests/core/test_core_cli_check_phase.py`;
+  - this backlog update.
+- **Evidence**:
+  - **Quality gate green**, each step run as a separate command: ruff check, ruff format --check, ty check, and pytest (**1797 passed, 1 skipped**, ESBMC-gated tests included, esbmc 8.3.0 on PATH). Project coverage **98.03%** (gate 96).
+  - **Test-first**: 7 of the 10 new tests failed on the missing seam. The other 3 pinned existing behaviour and passed both before and after.
+  - **Behaviour-preserving, checked against the pre-change tree, not assumed.** `format_help()` for both subcommands and the exact Core kwargs over six argv shapes were captured before any edit (`COLUMNS=100`, scratch working directory). The `diff` after the change is empty.
+  - **Mutation check**: flipping `semantic-loop`'s `timeout_kw` fails the new recorder test and 12 existing tests with `TypeError`.
+  - **Diff size**: 2 files, against the ~2 estimate.
+- **Design**:
+  - **Winner: Design A**, two private entry points with no defaults.
+  - **Runner-up design D** (a per-subcommand `_CheckPhaseFace` record) lost on depth. It adds a behaviour-free record, and its safety claim is already covered by a loud `TypeError`.
+  - **Design C** (`check`'s prose as the default) lost on locality and seam placement.
+  - **Design B** (a `CheckPhaseSettings` value type) lost on depth.
+- **Next**:
+  - Human review of PR #312. Do not merge as part of the routine.
+  - Natural next firing: the runner-up candidate `precond-unit-lister-default-four-copies` (20/25), which carries a CLI behaviour change to call out.
+  - Findings for a human, recorded in the report:
+    1. The Claude Stop gate's explicit `--unwind 4 --unwind-ladder ""` can never settle a capped `(ptr, len)` property (`property_gate.py:303-306`).
+    2. The `--unwind-ladder` default is described wrongly in 4 places since #306. It is now a one-site fix in the CLI, but the MCP docstrings and `demo/scaffold/CLAUDE.md` also carry it.
+    3. Ladder validation runs after `property.check.start` and after the LLM call.
 
 ## verify-port-test-doubles
 
