@@ -432,4 +432,100 @@ Constraints the implementation must keep:
 
 ## Design
 
-*(written in step 4, below)*
+### Problem-space framing
+
+Constraints any interface must satisfy:
+- **Help must not change.** `format_help()` for `check` and `semantic-loop` stays byte-identical.
+  Help order is registration order, so the shared registration must sit exactly where each block sits
+  today: right after `_add_unit_store_arguments` in `check`, and right after `--max-candidates` in
+  `semantic-loop`.
+- **Core calls must not change.** The keyword arguments reaching `check_source` / `run_semantic_loop`
+  stay identical, and both exported signatures stay as they are. The one real difference is the
+  timeout keyword (`timeout_s` vs `check_timeout_s`).
+- **The stale `--unwind-ladder` help is carried verbatim**, not fixed.
+- **Handler identity is pinned.** `tests/core/test_core_cli_dispatch.py` pins `cli._run_check` and
+  `cli._run_semantic_loop`, and forbids shared builders binding `func`.
+- **Everything stays in `core/cli.py`.** It is the only consumer.
+- **Dependency category:** in-process and pure (argparse plus a dict). No port, no I/O.
+
+Illustrative shape, not a proposal:
+`check_source(args.source, function=…, store_root=…, **<check-phase kwargs>(args))`.
+
+Four designs were produced in parallel by sub-agents, each under a different constraint.
+
+### Design A — minimal interface: two entry points plus a `timeout_kw` selector
+
+- `_add_check_phase_arguments(p, *, json_help: str, passthrough_example: str) -> None`. Both
+  arguments are required and keyword-only, so neither subcommand's wording is the silent default.
+- `_check_phase_kwargs(args, *, timeout_kw: Literal["timeout_s", "check_timeout_s"]) -> dict[str, Any]`.
+  It returns six keys: `unwind`, `unwind_ladder`, `<timeout_kw>`, `extra_flags`, `esbmc_bin`,
+  `max_len`.
+- `_add_max_len_argument` is folded into the registrar, since its only callers are these two sites.
+  `_parse_ladder` stays module-level because tests import it.
+- The 4-line "`None` means Core derives the ladder" comment moves into the reader's docstring.
+- **Hides:** 11 lines of flag spelling, defaults, metavars, the `:g` timeout format, the passthrough
+  prose, registration order, the `None`-vs-`()` ladder rule, and the list→tuple conversion for
+  `extra_flags`.
+- **Trade-offs:**
+  - The registrar carries the leverage: about 38 lines per site become one call.
+  - The reader is thin: about 6 lines per site. Its value is that the six forwarded values are
+    spelled once.
+  - The `**dict` splat is not keyword-checked by `ty`, the same cost as `verify_kwargs`. A recorder
+    test and an `inspect.signature` test make up for it.
+
+### Design B — maximum flexibility: a `CheckPhaseSettings` value with `from_args` / `as_kwargs`
+
+- `_add_check_phase_arguments(p, *, json_help, passthrough_help)` registers the flags.
+- A frozen dataclass `CheckPhaseSettings` has fields `unwind`, `unwind_ladder`, `timeout_s`,
+  `max_len`, `extra_flags` and `esbmc_bin`, with Core's defaults. `from_args(args)` builds it from
+  the parsed args, and `as_kwargs(*, timeout_keyword="timeout_s")` returns the Core keywords.
+- A programmatic caller gets typed fields. A seventh setting is one field plus one `add_argument`
+  plus one `from_args` line.
+- The design names an explicit trigger for moving the class next to `check_source`: the MCP tools
+  adopting it. Until then a shared module is a hypothetical seam.
+- **Trade-offs:**
+  - `from_args` is still a hand mapping, because two names differ.
+  - It adds a class whose only consumer converts it straight back into a dict.
+  - `timeout_keyword` is a plain `str`, not a `Literal`, so a third entry point stays possible.
+  - Unlike A, it has three names to learn (the helper, the class, and `as_kwargs`).
+
+### Design C — optimise for the common caller: `check`'s spelling is the default
+
+- The same two functions as A, but with defaults:
+  - `_add_check_phase_arguments(p, *, json_help="emit the check run as a JSON object", passthrough_example="... file.c --function f -- -DNDEBUG")`
+  - `_check_phase_kwargs(args, *, timeout_key: Literal[...] = "timeout_s")`
+- `check` calls both with no arguments. `semantic-loop` passes its three overrides.
+- `_add_max_len_argument` is kept as its own function, for its #299 docstring.
+- **Trade-offs:**
+  - The `check` call sites read as one plain call each, which is the most readable result for the
+    common case.
+  - One subcommand's prose becomes the helper's default. A future third subcommand that forgets to
+    override the defaults silently inherits `check`'s `--json` help and passthrough example.
+  - The designer rejected a `for_loop: bool` flag, because it would hide the exception inside the
+    helper.
+
+### Design D — declarative spec: a frozen `_CheckPhaseFace` per subcommand
+
+- `@dataclass(frozen=True) class _CheckPhaseFace` has three fields: `json_help`,
+  `passthrough_example` and `timeout_kw: Literal[...]`.
+- Two module constants, `_CHECK_FACE` and `_SEMANTIC_LOOP_FACE`, hold the only differences between
+  the subcommands, side by side.
+- `_add_check_phase_arguments(p, face)` and `_check_phase_kwargs(args, face)` take the face.
+- The designer is explicit that the seam is real (two adapters) but does **not** earn a
+  `Protocol`/ABC/registry: the adapters differ only in three values, not in behaviour.
+- A table-of-`add_argument`-records version was rejected: three of seven entries are irregular
+  (a delegated esbmc helper, a trailing `nargs="*"` positional, a custom type with f-string help).
+- **Trade-offs:**
+  - The difference between the two subcommands reads like a six-line diff.
+  - Each call site states the face once, at both the parser and the handler, so the two ends cannot
+    disagree about which subcommand they serve.
+  - It costs one private dataclass and two constants.
+
+### Adjudication criteria (in order)
+
+1. **Depth**: how much behaviour sits behind how much interface a caller must learn.
+2. **Locality**: where change, bugs and verification concentrate afterwards.
+3. **Seam placement**: is the seam where something actually varies? One adapter is a hypothetical
+   seam; two is a real one.
+4. **Test surface**: can the behaviour be exercised through the interface, without reaching past it?
+5. **Blast radius**: between two otherwise-equal designs, the smaller diff wins.
