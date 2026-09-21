@@ -529,3 +529,49 @@ Four designs were produced in parallel by sub-agents, each under a different con
    seam; two is a real one.
 4. **Test surface**: can the behaviour be exercised through the interface, without reaching past it?
 5. **Blast radius**: between two otherwise-equal designs, the smaller diff wins.
+
+### Adjudication
+
+The advisor adjudicated against the criteria above, applied in order.
+
+**Winner: Design A.** Two private entry points in `core/cli.py`, with no defaults:
+- `_add_check_phase_arguments(p, *, json_help, passthrough_example)`
+- `_check_phase_kwargs(args, *, timeout_kw: Literal["timeout_s", "check_timeout_s"])`
+
+Why the other three lost:
+- **Design C is out on locality and seam placement.** Making `check`'s prose the helper's default
+  re-opens the failure mode this refactor exists to close. #306 added a flag at one site, and the
+  other site's prose went silently stale. Under C, a third check-phase subcommand that forgets to
+  override would silently inherit `check`'s `--json` help and passthrough example. That also cuts
+  against the repo's "never silently pass" rule, which `cli.py:874-878` cites from CLAUDE.md.
+- **Design B is out on depth and seam placement.** `CheckPhaseSettings` is a value type whose only
+  consumer immediately calls `as_kwargs()` to turn it back into a dict.
+  - Deletion test: delete the class and the complexity does not reappear; it becomes A's two explicit
+    arguments.
+  - Its justification is a *future* MCP adoption, which is a hypothetical seam by the repo's own
+    rule.
+  - It asks callers to learn three names without hiding any behaviour.
+- **Runner-up design: D.** It loses to A on depth, and its locality edge is not real.
+  - `_CheckPhaseFace` is a three-field record with no behaviour, two instances, both module-local. It
+    adds interface without hiding behaviour, which is what shallow means.
+  - D's claimed win is that a parser site and its handler site cannot disagree about which
+    subcommand they serve. Under A that disagreement is not silent: a wrong `timeout_kw` raises
+    `TypeError` from `check_source` / `run_semantic_loop` on the first test that drives the handler.
+    D buys a name to prevent something already caught loudly.
+  - Blast radius then favours A's smaller diff.
+
+**Implementation notes carried from the adjudication:**
+- **Pin the missing seam first.** The red test imports and exercises `_add_check_phase_arguments` /
+  `_check_phase_kwargs`, which do not exist yet. A test asserting only that "the two blocks agree"
+  would pass today and prove nothing.
+- **Baselines were captured before any edit.** `format_help()` for both subcommands and the exact
+  keyword arguments reaching `check_source` / `run_semantic_loop` were recorded over six argv shapes,
+  with `COLUMNS=100`, from a scratch working directory. After the change both must diff empty.
+- **Non-vacuity check after green:** flip `timeout_kw` at one handler and confirm the recorder test
+  fails.
+- **Keep:**
+  - `_parse_ladder` stays module-level, because tests import it.
+  - `_add_max_len_argument` folds into the registrar, because its only callers are these two sites.
+  - The stale ladder help is carried verbatim.
+- **Out of scope by construction:** the `adapters/codex/AGENTS.md` ↔ `adapters/prompt-tools-fallback.md`
+  verbatim-sync rule. This change touches no prompt text and no `--help` output.
