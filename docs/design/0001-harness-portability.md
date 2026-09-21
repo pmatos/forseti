@@ -128,7 +128,7 @@ names, distinct at a glance from an adapter's own short local names (`edit`, `ga
 | `gate.decision` | Claude Code's `post_tool_use` | `harness`, `adapter`, `unit_ids` (`path::symbol`, per verified function), `decision` |
 | `gate.decision` | Codex's `verify_hook` | `harness`, `adapter`, `files` (raw edited paths — the hook verifies a whole file at a time, no per-function enumeration), `decision` |
 | `gate.decision` | Oh My Pi's `verify_hook` (#249) | `harness`, `adapter`, `unit_ids` (`path::symbol`, per checked function — the hook calls `forseti list-units` before checking, same granularity as Claude Code's), `decision` |
-| `cli.command` | `forseti synth` / `discharge` (`core._precond_cli`), `forseti semantic-loop` (`core.cli`) (#301) | `command`, `source`, `function`, `exit_code`, `duration_s`; `synth`/`discharge` add `emit_only` and `assessment` (the `Assessment` value, `null` for a successful `--emit-only`); `semantic-loop` adds `mode`, `unit_id`, `outcome` (both `null` when no run completed) |
+| `cli.command` | `forseti synth` / `discharge` (`core._precond_cli`), `forseti semantic-loop` (`core.cli`), all three through `core._cli_trace.traced` (#301) | `command`, `source`, `function`, `exit_code`, `duration_s`; `synth`/`discharge` add `emit_only` and `assessment` (the `Assessment` value, `null` for a successful `--emit-only`); `semantic-loop` adds `mode`, `unit_id`, `outcome` (both `null` when no run completed) |
 
 All six append to `<store_root>/events.jsonl` — the project's `.forseti/events.jsonl` when
 `store_root` is the default, the same file the Claude Code adapter's own

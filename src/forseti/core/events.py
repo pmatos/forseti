@@ -38,7 +38,8 @@ GATE_DECISION = "gate.decision"
 # One per invocation of `synth`/`discharge`/`semantic-loop`, on every exit path.
 # Emitted by the CLI handler, not the engine: `precond` takes no store_root and
 # `run_semantic_loop` adds no event of its own (its per-property events are
-# unchanged), so library/MCP callers stay silent.
+# unchanged), so library/MCP callers stay silent. This states the policy;
+# `core._cli_trace.traced` is the one place that carries it out.
 CLI_COMMAND = "cli.command"
 
 

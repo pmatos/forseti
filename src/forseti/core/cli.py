@@ -78,11 +78,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import time
 from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from forseti.adapters.claude_code import install as claude_code_install
 from forseti.adapters.claude_code.install import (
@@ -117,6 +116,7 @@ from forseti.properties import (
 from forseti.update_notice import installed_version, update_notice
 
 from . import EXIT_CODES
+from ._cli_trace import traced
 
 # The synth/discharge glue lives in its own module (RFC-0003 S2/S3), but the
 # dispatch contract resolves each subcommand's handler as `cli._run_<name>`
@@ -140,7 +140,6 @@ from .check import (
     DEFAULT_UNWIND_LADDER as CHECK_DEFAULT_UNWIND_LADDER,
 )
 from .check import check_source
-from .events import CLI_COMMAND, record_event
 from .loop import LoopMode, SemanticLoopResult, run_semantic_loop
 from .propose import (
     DEFAULT_MAX_CANDIDATES,
@@ -798,30 +797,31 @@ def _render_semantic_loop(result: SemanticLoopResult) -> str:
     return "\n".join(lines)
 
 
+def _semantic_loop_fields(
+    args: argparse.Namespace, result: SemanticLoopResult | None
+) -> dict[str, Any]:
+    """The three fields `semantic-loop` adds to the common `cli.command` row.
+
+    `unit_id`/`outcome` are `None` when no run completed -- an early argument
+    error or a caught engine error. `mode` is argparse's own spelling
+    ("check-only"), not `LoopMode`'s underscore respelling.
+    """
+    return {
+        "mode": args.mode,
+        "unit_id": result.unit_id if result is not None else None,
+        "outcome": result.outcome if result is not None else None,
+    }
+
+
 def _run_semantic_loop(args: argparse.Namespace) -> int:
     """Run the loop and record one `cli.command` event for it (#301).
 
-    Emitted here, not in `run_semantic_loop`, which documents that it adds no
+    Traced here, not in `run_semantic_loop`, which documents that it adds no
     event of its own (its per-candidate/per-property Core events are unchanged).
     Wrapping the whole body means the early argument errors and the caught
-    engine errors are traced too; `unit_id`/`outcome` are `None` when no run
-    completed.
+    engine errors are traced too.
     """
-    started = time.monotonic()
-    exit_code, result = _semantic_loop(args)
-    record_event(
-        args.store_root,
-        CLI_COMMAND,
-        command="semantic-loop",
-        source=str(args.source),
-        function=args.function,
-        mode=args.mode,
-        unit_id=result.unit_id if result is not None else None,
-        outcome=result.outcome if result is not None else None,
-        exit_code=exit_code,
-        duration_s=time.monotonic() - started,
-    )
-    return exit_code
+    return traced("semantic-loop", _semantic_loop, args, fields=_semantic_loop_fields)
 
 
 def _semantic_loop(

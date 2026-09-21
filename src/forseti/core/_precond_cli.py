@@ -15,9 +15,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import time
-from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from forseti.esbmc import Violated
 from forseti.precond import (
@@ -34,7 +33,7 @@ from forseti.precond import (
     DEFAULT_TIMEOUT_S as SYNTH_TIMEOUT_S,
 )
 
-from .events import CLI_COMMAND, record_event
+from ._cli_trace import traced
 from .propose import DEFAULT_STORE_ROOT
 
 
@@ -110,36 +109,28 @@ def _add_synth_parser(
     p.set_defaults(func=_run_synth)
 
 
-def _traced(
-    command: str,
-    run: Callable[[argparse.Namespace], tuple[int, Assessment | None]],
-    args: argparse.Namespace,
-) -> int:
-    """Run `run(args)` and record one `cli.command` event for it (#301).
+def _precond_fields(
+    args: argparse.Namespace, assessment: Assessment | None
+) -> dict[str, Any]:
+    """The two fields `synth`/`discharge` add to the common `cli.command` row.
 
-    Every return path of `run` -- `--emit-only`, `PreconditionUnavailable`, a
-    verdict -- lands here, so no path can skip the trace. The assessment rides
-    along as a field rather than living only in stdout for a consumer to scrape;
-    it is `None` only for a successful `--emit-only` (nothing was assessed).
+    The assessment rides along as a field rather than living only in stdout for
+    a consumer to scrape; it is `None` only for a successful `--emit-only`
+    (nothing was assessed).
     """
-    started = time.monotonic()
-    exit_code, assessment = run(args)
-    record_event(
-        args.store_root,
-        CLI_COMMAND,
-        command=command,
-        source=str(args.source),
-        function=args.function,
-        emit_only=args.emit_only,
-        assessment=assessment.value if assessment is not None else None,
-        exit_code=exit_code,
-        duration_s=time.monotonic() - started,
-    )
-    return exit_code
+    return {
+        "emit_only": args.emit_only,
+        "assessment": assessment.value if assessment is not None else None,
+    }
 
 
 def _run_synth(args: argparse.Namespace) -> int:
-    return _traced("synth", _synth, args)
+    """Run `_synth` and record one `cli.command` event for it (#301).
+
+    Every return path of `_synth` -- `--emit-only`, `PreconditionUnavailable`, a
+    verdict -- reaches the seam, so no path can skip the trace.
+    """
+    return traced("synth", _synth, args, fields=_precond_fields)
 
 
 def _synth(args: argparse.Namespace) -> tuple[int, Assessment | None]:
@@ -203,7 +194,8 @@ def _add_discharge_parser(
 
 
 def _run_discharge(args: argparse.Namespace) -> int:
-    return _traced("discharge", _discharge, args)
+    """Run `_discharge` and record one `cli.command` event for it (#301)."""
+    return traced("discharge", _discharge, args, fields=_precond_fields)
 
 
 def _discharge(args: argparse.Namespace) -> tuple[int, Assessment | None]:

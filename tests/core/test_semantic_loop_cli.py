@@ -565,6 +565,24 @@ def test_cli_store_error_exits_one(
     assert "forseti semantic-loop:" in capsys.readouterr().err
 
 
+# The published `cli.command` row for `semantic-loop`
+# (docs/design/0001-harness-portability.md). Pinned as a *set*, not field by
+# field: the row is a wire format, so an added or renamed key is a break, and
+# the per-field assertions below cannot see one.
+SEMANTIC_LOOP_EVENT_KEYS = {
+    "ts",
+    "type",
+    "command",
+    "source",
+    "function",
+    "mode",
+    "unit_id",
+    "outcome",
+    "exit_code",
+    "duration_s",
+}
+
+
 def test_cli_records_one_cli_command_event_keyed_by_store_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -595,6 +613,7 @@ def test_cli_records_one_cli_command_event_keyed_by_store_root(
 
     assert code == 0
     (event,) = _cli_events(root)
+    assert set(event) == SEMANTIC_LOOP_EVENT_KEYS
     assert event["command"] == "semantic-loop"
     assert event["source"] == str(source)
     assert event["function"] == "my_abs"
@@ -625,6 +644,7 @@ def test_cli_records_the_event_for_an_argument_error(tmp_path: Path) -> None:
 
     assert code == 1
     (event,) = _cli_events(root)
+    assert set(event) == SEMANTIC_LOOP_EVENT_KEYS
     assert event["exit_code"] == 1
     assert event["mode"] == "submit"
     assert event["unit_id"] is None
