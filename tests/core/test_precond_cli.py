@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -184,6 +185,36 @@ def test_discharge_emit_only_unavailable_exits_the_assessment_code(
     code = main(["discharge", "x.c", "--function", "foo", "--emit-only"])
     assert code == ASSESSMENT_EXIT_CODES[Assessment.ERROR]
     assert "forseti discharge: no such unit" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", ["synth", "discharge"])
+def test_emit_only_honors_the_requested_parse_timeout(
+    command: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def timing_out(
+        argv: tuple[str, ...], **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", timing_out)
+    code = main(
+        [
+            command,
+            "x.c",
+            "--function",
+            "foo",
+            "--emit-only",
+            "--timeout",
+            "0.125",
+            "--esbmc-bin",
+            "fake-esbmc",
+        ]
+    )
+
+    assert code == ASSESSMENT_EXIT_CODES[Assessment.ERROR]
+    assert "timed out after 0.125 seconds" in capsys.readouterr().err
 
 
 def test_discharge_prints_the_label_and_each_caller_line(
