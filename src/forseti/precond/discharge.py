@@ -170,7 +170,6 @@ from forseti.esbmc import (
     Verified,
     Violated,
     list_caller_openings,
-    list_units,
 )
 from forseti.orchestrator.ports import VerifyPort
 
@@ -194,6 +193,7 @@ from .verify import (
     PreconditionUnavailable,
     plan_for,
     sidecar_verify_port,
+    unit_lister,
     verify_precondition,
 )
 
@@ -331,6 +331,7 @@ def emit_obligations(
     source: Path,
     *,
     function: str,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
     esbmc_bin: str = "esbmc",
     list_units_fn: Callable[[Path], list[Unit]] | None = None,
 ) -> str:
@@ -341,7 +342,9 @@ def emit_obligations(
     sees is the user's translation unit plus one assert per pointer parameter,
     and nothing is written back to the user's file.
     """
-    lister = list_units_fn or (lambda src: list_units(src, esbmc_bin=esbmc_bin))
+    lister = unit_lister(
+        esbmc_bin=esbmc_bin, timeout_s=timeout_s, adapter=list_units_fn
+    )
     plan = plan_for(source, function, lister)
     try:
         return inject_obligations(
@@ -383,8 +386,7 @@ def discharge_precondition(
     the caller set can be open).
     """
     lister = _memoized(
-        list_units_fn
-        or (lambda src: list_units(src, esbmc_bin=esbmc_bin, timeout_s=timeout_s))
+        unit_lister(esbmc_bin=esbmc_bin, timeout_s=timeout_s, adapter=list_units_fn)
     )
     unit_result = verify_precondition(
         source,

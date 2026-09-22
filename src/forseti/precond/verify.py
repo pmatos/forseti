@@ -62,6 +62,22 @@ DEFAULT_LADDER_CAP = 256
 _FORCE_MALLOC = ("--force-malloc-success",)
 
 
+def unit_lister(
+    *,
+    esbmc_bin: str,
+    timeout_s: float,
+    adapter: Callable[[Path], list[Unit]] | None = None,
+) -> Callable[[Path], list[Unit]]:
+    """Bind unit listing to one precondition operation's process budget."""
+    if adapter is not None:
+        return adapter
+
+    def configured(source: Path) -> list[Unit]:
+        return list_units(source, esbmc_bin=esbmc_bin, timeout_s=timeout_s)
+
+    return configured
+
+
 class Assessment(Enum):
     """The honestly-labelled outcome of a memory-precondition verification."""
 
@@ -240,8 +256,8 @@ def verify_precondition(
     (the sidecar ``#include``\\ s the source by absolute path, so it can live
     anywhere).
     """
-    lister = list_units_fn or (
-        lambda src: list_units(src, esbmc_bin=esbmc_bin, timeout_s=timeout_s)
+    lister = unit_lister(
+        esbmc_bin=esbmc_bin, timeout_s=timeout_s, adapter=list_units_fn
     )
     try:
         plan = plan_for(source, function, lister)
@@ -264,6 +280,7 @@ def synthesize(
     *,
     function: str,
     max_len: int = DEFAULT_MAX_LEN,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
     esbmc_bin: str = "esbmc",
     list_units_fn: Callable[[Path], list[Unit]] | None = None,
 ) -> str:
@@ -274,7 +291,9 @@ def synthesize(
     is unresolved (L2) — the caller maps that to an exit code, never a silent
     empty emit.
     """
-    lister = list_units_fn or (lambda src: list_units(src, esbmc_bin=esbmc_bin))
+    lister = unit_lister(
+        esbmc_bin=esbmc_bin, timeout_s=timeout_s, adapter=list_units_fn
+    )
     plan = plan_for(source, function, lister)
     return render_sidecar(plan, str(source.resolve()), max_len=max_len)
 
