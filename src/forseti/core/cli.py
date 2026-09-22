@@ -81,7 +81,7 @@ import sys
 from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from forseti.adapters.claude_code import install as claude_code_install
 from forseti.adapters.claude_code.install import (
@@ -509,41 +509,22 @@ def _parse_ladder(value: str) -> tuple[int, ...]:
         ) from exc
 
 
-def _add_max_len_argument(p: argparse.ArgumentParser) -> None:
-    """`--max-len` for the semantic-property check path (#299).
-
-    Mirrors `synth --max-len` (same name, same default) but caps only a
-    `(ptr, len)` length the property's own domain leaves unconstrained.
-    """
-    p.add_argument(
-        "--max-len",
-        type=int,
-        default=DEFAULT_MAX_LEN,
-        metavar="N",
-        help=(
-            "cap on a `(ptr, len)` buffer length the property's domain does not "
-            f"constrain (default: {DEFAULT_MAX_LEN}); a held/violated is then "
-            "scoped to len<=N. The default ladder is extended past N; an "
-            "explicit -k/--unwind-ladder must reach N+1 to settle (a domain "
-            "clause naming the length overrides the cap)"
-        ),
-    )
-
-
-def _add_check_parser(
-    sub: argparse._SubParsersAction[argparse.ArgumentParser],
+def _add_check_phase_arguments(
+    p: argparse.ArgumentParser, *, json_help: str, passthrough_example: str
 ) -> None:
-    p = sub.add_parser(
-        "check",
-        help="check a unit's stored properties with ESBMC, one verdict each",
-        description=(
-            "Read <source>::<function>'s stored, checkable properties (proposed by "
-            "`forseti propose`), render each semantic one to a self-contained ESBMC "
-            "harness, and verify it: held | violated | unknown | error, plus "
-            "skipped for a deferred reachability property (ADR-0009 D2)."
-        ),
-    )
-    _add_unit_store_arguments(p)
+    """The check-phase flags shared by `check` and `semantic-loop`.
+
+    `-k/--unwind`, `--unwind-ladder`, `-t/--timeout`, `--max-len`, `--json`, then
+    `--esbmc-bin` and the trailing `--` passthrough -- registered once so the two
+    subcommands cannot drift. `json_help` and `passthrough_example` are the only
+    parts that differ per subcommand; neither has a default, so each caller
+    states its own wording. Registers the `esbmc_args` positional, so call it
+    after the caller's own positionals, at the point its flags belong in --help.
+
+    `--max-len` (#299) mirrors `synth --max-len` (same name, same default) but
+    caps only a `(ptr, len)` length the property's own domain leaves
+    unconstrained.
+    """
     p.add_argument(
         "-k",
         "--unwind",
@@ -570,18 +551,69 @@ def _add_check_parser(
         metavar="SECONDS",
         help=f"per-attempt esbmc timeout in seconds (default: {CHECK_TIMEOUT_S:g})",
     )
-    _add_max_len_argument(p)
     p.add_argument(
-        "--json",
-        action="store_true",
-        help="emit the check run as a JSON object",
+        "--max-len",
+        type=int,
+        default=DEFAULT_MAX_LEN,
+        metavar="N",
+        help=(
+            "cap on a `(ptr, len)` buffer length the property's domain does not "
+            f"constrain (default: {DEFAULT_MAX_LEN}); a held/violated is then "
+            "scoped to len<=N. The default ladder is extended past N; an "
+            "explicit -k/--unwind-ladder must reach N+1 to settle (a domain "
+            "clause naming the length overrides the cap)"
+        ),
     )
+    p.add_argument("--json", action="store_true", help=json_help)
     add_esbmc_invocation_arguments(
         p,
         passthrough_help=(
             "flags forwarded verbatim to esbmc; place them after a `--` separator, "
-            "e.g. `... file.c --function f -- -DNDEBUG`"
+            f"e.g. `{passthrough_example}`"
         ),
+    )
+
+
+def _check_phase_kwargs(
+    args: argparse.Namespace, *, timeout_kw: Literal["timeout_s", "check_timeout_s"]
+) -> dict[str, Any]:
+    """Map `_add_check_phase_arguments`' flags to the Core check keyword call.
+
+    `timeout_kw` is the one keyword the two Core entry points spell differently:
+    `check_source` takes `timeout_s`, `run_semantic_loop` `check_timeout_s`
+    (it also takes a `propose_timeout_s`). `unwind_ladder` is `None` when
+    --unwind-ladder is unset: Core then derives the rungs above --unwind itself
+    (so `-k 8` alone can't build a non-increasing ladder). An explicit ladder,
+    including "" -> (), passes straight through.
+    """
+    return {
+        "unwind": args.unwind,
+        "unwind_ladder": args.unwind_ladder,
+        timeout_kw: args.timeout,
+        "extra_flags": tuple(args.esbmc_args),
+        "esbmc_bin": args.esbmc_bin,
+        "max_len": args.max_len,
+    }
+
+
+def _add_check_parser(
+    sub: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    p = sub.add_parser(
+        "check",
+        help="check a unit's stored properties with ESBMC, one verdict each",
+        description=(
+            "Read <source>::<function>'s stored, checkable properties (proposed by "
+            "`forseti propose`), render each semantic one to a self-contained ESBMC "
+            "harness, and verify it: held | violated | unknown | error, plus "
+            "skipped for a deferred reachability property (ADR-0009 D2)."
+        ),
+    )
+    _add_unit_store_arguments(p)
+    _add_check_phase_arguments(
+        p,
+        json_help="emit the check run as a JSON object",
+        passthrough_example="... file.c --function f -- -DNDEBUG",
     )
     p.set_defaults(func=_run_check)
 
@@ -639,16 +671,7 @@ def _run_check(args: argparse.Namespace) -> int:
             args.source,
             function=args.function,
             store_root=args.store_root,
-            unwind=args.unwind,
-            # `None` when --unwind-ladder is unset: check_source then derives the
-            # rungs above --unwind itself (so `-k 8` alone can't build a
-            # non-increasing ladder). An explicit ladder, including "" -> (),
-            # passes straight through.
-            unwind_ladder=args.unwind_ladder,
-            timeout_s=args.timeout,
-            extra_flags=tuple(args.esbmc_args),
-            esbmc_bin=args.esbmc_bin,
-            max_len=args.max_len,
+            **_check_phase_kwargs(args, timeout_kw="timeout_s"),
         )
     except (PropertyStoreError, OSError, ValueError) as exc:
         print(f"forseti check: {exc}", file=sys.stderr)
@@ -752,44 +775,10 @@ def _add_semantic_loop_parser(
         metavar="N",
         help=f"cap on accepted candidates (default: {DEFAULT_MAX_CANDIDATES})",
     )
-    p.add_argument(
-        "-k",
-        "--unwind",
-        type=int,
-        default=CHECK_DEFAULT_UNWIND,
-        help=f"loop unwind bound k (default: {CHECK_DEFAULT_UNWIND})",
-    )
-    p.add_argument(
-        "--unwind-ladder",
-        type=_parse_ladder,
-        default=None,
-        metavar="K1,K2,...",
-        help=(
-            "comma-separated bounds tried after --unwind on an UNKNOWN verdict "
-            f"(default: whichever of {','.join(map(str, CHECK_DEFAULT_UNWIND_LADDER))} "
-            "exceed --unwind, so raising -k/--unwind alone still works)"
-        ),
-    )
-    p.add_argument(
-        "-t",
-        "--timeout",
-        type=float,
-        default=CHECK_TIMEOUT_S,
-        metavar="SECONDS",
-        help=f"per-attempt esbmc timeout in seconds (default: {CHECK_TIMEOUT_S:g})",
-    )
-    _add_max_len_argument(p)
-    p.add_argument(
-        "--json",
-        action="store_true",
-        help="emit the run as a JSON object (the MCP tool's payload)",
-    )
-    add_esbmc_invocation_arguments(
+    _add_check_phase_arguments(
         p,
-        passthrough_help=(
-            "flags forwarded verbatim to esbmc; place them after a `--` separator, "
-            "e.g. `... file.c --function f --mode check-only -- -DNDEBUG`"
-        ),
+        json_help="emit the run as a JSON object (the MCP tool's payload)",
+        passthrough_example="... file.c --function f --mode check-only -- -DNDEBUG",
     )
     p.set_defaults(func=_run_semantic_loop)
 
@@ -896,12 +885,7 @@ def _semantic_loop(
             propose_model=args.propose_model,
             claude_bin=args.claude_bin,
             propose_timeout_s=args.propose_timeout,
-            unwind=args.unwind,
-            unwind_ladder=args.unwind_ladder,
-            check_timeout_s=args.timeout,
-            extra_flags=tuple(args.esbmc_args),
-            esbmc_bin=args.esbmc_bin,
-            max_len=args.max_len,
+            **_check_phase_kwargs(args, timeout_kw="check_timeout_s"),
         )
     except (
         ValueError,
