@@ -1,7 +1,7 @@
 """Behavioural tests for the pure verdict classifier.
 
-Each test feeds `classify` a `RunMeta` built from real ESBMC 8.3.0 output and
-asserts the verdict. No subprocess, no esbmc binary required.
+Each test feeds `classify` a `RunMeta` built from real ESBMC output (8.3.0
+unless noted) and asserts the verdict. No subprocess, no esbmc binary required.
 """
 
 from forseti.esbmc.result import (
@@ -199,3 +199,56 @@ def test_counterexample_not_truncated_by_echoed_failed_in_message() -> None:
     assert "x > 0" in result.raw_counterexample  # not truncated at the echo
     # the terminal banner is excluded from the slice
     assert not result.raw_counterexample.rstrip().endswith("VERIFICATION FAILED")
+
+
+# esbmc 8.5.0 added a `** Results:` summary before the terminal banner, listing
+# every evaluated property's PASSED/FAILED/NOT CHECKED status -- not just the
+# one actually violated. Captured live from a real 8.5.0 run over a buggy
+# loop: the reported violation is a real array-bounds bug, but the summary
+# also lists an unrelated "unwinding assertion" row and a NOT CHECKED site
+# label that never fired.
+RESULTS_BLOCK_OUT = """\
+[Counterexample]
+
+State 1 file f.c line 1 column 5 function main thread 0
+----------------------------------------------------
+  x = 0
+
+State 2 file f.c line 3 column 9 function fill thread 0
+----------------------------------------------------
+Violated property:
+  file f.c line 3 column 9 function fill
+  dereference failure: array bounds violated: heap object
+  CWE: CWE-122, CWE-125, CWE-129, CWE-131, CWE-193, CWE-787
+
+
+** Results:
+f.c, function fill
+  FAILED       [fill.assertion.1]        line 2  unwinding assertion loop 1
+  NOT CHECKED  [fill.assertion.2]        line 4  forseti:obligation-site:unreached
+  FAILED       [fill.heap-array-bounds-violated.1]  line 3  array bounds violated
+
+** 2 of 3 properties failed, 1 not checked
+   (this mode stops at the first violation; use --multi-property for every
+   property)
+
+VERIFICATION FAILED
+ESBMC version 8.5.0 64-bit x86_64 linux
+"""
+
+
+def test_results_block_summary_is_excluded_from_the_raw_counterexample() -> None:
+    result = classify(meta(stdout=RESULTS_BLOCK_OUT, exit_code=1))
+    assert isinstance(result, Violated)
+    # the real violated property survives
+    assert "array bounds violated" in result.raw_counterexample
+    # but the summary listing every evaluated property does not -- so a
+    # substring search over raw_counterexample can't mistake an unrelated
+    # "unwinding assertion" row, or a NOT CHECKED site label that never
+    # fired, for the actual reported violation.
+    assert "** Results:" not in result.raw_counterexample
+    assert "unwinding assertion" not in result.raw_counterexample
+    assert "forseti:obligation-site:unreached" not in result.raw_counterexample
+    assert result.counterexample is not None
+    description = result.counterexample.violated_property.description
+    assert description == "dereference failure: array bounds violated: heap object"

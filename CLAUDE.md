@@ -54,8 +54,9 @@ ESBMC's. Don't over-claim soundness: bounded = "proven up to k," not for all inp
 
 ## ESBMC
 
-- `esbmc` 8.3.0 is installed at `~/.local/bin/esbmc`. The project pins to our **own fork** and
-  upstreams fixes in curated batches (ADR-0004).
+- `esbmc` 8.5.0 (the upstream release) is installed at `~/.local/bin/esbmc`; the prior 8.3.0
+  build is kept at `~/.local/bin/esbmc-8.3.0` for comparison. The project pins to our **own
+  fork** for dev-branch work and upstreams fixes in curated batches (ADR-0004).
 - Prefer `--unwind N --no-unwinding-assertions` over `--incremental-bmc` (the latter is known to
   yield spurious `UNKNOWN` on small unwinds). Treat `UNKNOWN` as a distinct loop state — raise k,
   simplify the harness, or report; **never silently pass it.**
