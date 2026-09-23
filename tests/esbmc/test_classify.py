@@ -201,6 +201,16 @@ def test_counterexample_not_truncated_by_echoed_failed_in_message() -> None:
     assert not result.raw_counterexample.rstrip().endswith("VERIFICATION FAILED")
 
 
+def test_counterexample_not_truncated_by_echoed_results_header() -> None:
+    out = VIOLATED_OUT.replace("  x must be five", "  ** Results:")
+    result = classify(meta(stdout=out, exit_code=1))
+    assert isinstance(result, Violated)
+    assert "  ** Results:" in result.raw_counterexample
+    assert "  x == 5" in result.raw_counterexample
+    assert result.counterexample is not None
+    assert result.counterexample.violated_property.description == "** Results:"
+
+
 # esbmc 8.5.0 added a `** Results:` summary before the terminal banner, listing
 # every evaluated property's PASSED/FAILED/NOT CHECKED status -- not just the
 # one actually violated. Captured live from a real 8.5.0 run over a buggy

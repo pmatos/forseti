@@ -58,7 +58,7 @@ def _counterexample(text: str) -> str:
             cut = i
             break
     for i in range(cut - 1, -1, -1):
-        if lines[i].strip() == _RESULTS:
+        if lines[i] == _RESULTS:
             cut = i
             break
     body = "\n".join(lines[:cut])

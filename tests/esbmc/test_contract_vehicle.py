@@ -68,16 +68,7 @@ int main(void) {{ uint8_t *b = malloc({size}); fill(b, 4); return 0; }}
 
 
 def _replace_run(tmp_path: Path, requires: str, size: int) -> Violated | Verified:
-    callee = tmp_path / f"callee_{size}_{abs(hash(requires))}.c"
-    callee.write_text(_CALLEE.format(requires=requires))
-    caller = tmp_path / f"caller_{size}_{abs(hash(requires))}.c"
-    caller.write_text(_CALLER.format(callee=callee.name, size=size))
-    result = verify(
-        caller,
-        unwind=_K,
-        timeout_s=_TIMEOUT,
-        extra_flags=("--replace-call-with-contract", "fill", "--force-malloc-success"),
-    )
+    result = _replace_run_any(tmp_path, requires, size)
     assert isinstance(result, Verified | Violated), result
     return result
 

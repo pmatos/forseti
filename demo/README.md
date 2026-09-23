@@ -20,7 +20,7 @@ On a machine that has never run Forseti:
 | `git` | `scaffold/init.sh` makes each workspace its own repo | your package manager |
 | `tmux`, a browser | optional: without tmux `run_demo.sh` runs `claude` directly; without `xdg-open`/`open` it prints the canvas URL | your package manager |
 
-**ESBMC.** CI pins the upstream v8.5 release (ESBMC 8.5.0):
+**ESBMC.** CI pins the upstream v8.5 release (ESBMC 8.5.0). On Linux x86-64:
 
 ```sh
 curl -fLO https://github.com/esbmc/esbmc/releases/download/v8.5/esbmc-linux.zip
