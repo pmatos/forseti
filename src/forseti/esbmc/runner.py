@@ -23,6 +23,7 @@ from .result import (
 _FAILED = "VERIFICATION FAILED"
 _SUCCESSFUL = "VERIFICATION SUCCESSFUL"
 _CEX_START = "[Counterexample]"
+_RESULTS = "** Results:"
 
 
 def _has_banner(text: str, banner: str) -> bool:
@@ -41,13 +42,23 @@ def _counterexample(text: str) -> str:
 
     Slices at the *last* standalone FAILED line, not the first substring match —
     so a `VERIFICATION FAILED` echoed inside the `Violated property:` block (e.g.
-    an `__ESBMC_assert` message) doesn't truncate the trace early. Callers only
-    invoke this once a standalone FAILED banner is known to exist.
+    an `__ESBMC_assert` message) doesn't truncate the trace early. Also excludes
+    the `** Results:` summary esbmc appends before that banner (new in 8.5): it
+    lists every evaluated property's PASSED/FAILED/NOT CHECKED status, not just
+    the one actually violated, so its text can contain "unwinding assertion" or
+    a forseti obligation-site label for a check that never fired — callers that
+    substring-search `raw_counterexample` (`precond.run._is_under_unwound`,
+    `precond.reachability`, `precond.discharge`) would otherwise misread it.
+    Callers only invoke this once a standalone FAILED banner is known to exist.
     """
     lines = text.splitlines()
     cut = len(lines)
     for i in range(len(lines) - 1, -1, -1):
         if lines[i].strip() == _FAILED:
+            cut = i
+            break
+    for i in range(cut - 1, -1, -1):
+        if lines[i] == _RESULTS:
             cut = i
             break
     body = "\n".join(lines[:cut])

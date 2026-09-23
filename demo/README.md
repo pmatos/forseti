@@ -15,25 +15,24 @@ On a machine that has never run Forseti:
 | Python >= 3.12 | Forseti itself (the demo scripts are stdlib-only) | your package manager, or `uv` |
 | A clone of this repo | the demo runs from a checkout, not a release build | `git clone https://github.com/pmatos/forseti && cd forseti` |
 | An editable install | `demo/env.sh` puts this checkout's `.venv/bin` ahead of any released `forseti` on `PATH` | `python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"` (or `uv venv && uv pip install -e ".[dev]"`) |
-| ESBMC 8.3.0 on `PATH` | every verdict comes from it | see below |
+| ESBMC 8.5.0 on `PATH` | every verdict comes from it | see below |
 | The `claude` CLI, logged in | the left-hand session, and `forseti propose` shells out to `claude -p` for candidate properties | install and log in per Anthropic's Claude Code documentation |
 | `git` | `scaffold/init.sh` makes each workspace its own repo | your package manager |
 | `tmux`, a browser | optional: without tmux `run_demo.sh` runs `claude` directly; without `xdg-open`/`open` it prints the canvas URL | your package manager |
 
-**ESBMC.** CI pins the upstream v8.3 release (ESBMC 8.3.0). On Linux x86-64
-(Ubuntu 24.04 build):
+**ESBMC.** CI pins the upstream v8.5 release (ESBMC 8.5.0). On Linux x86-64:
 
 ```sh
-curl -fLO https://github.com/esbmc/esbmc/releases/download/v8.3/release-ubuntu-24.04--b.RelWithDebInfo.-e.OFF.zip
-echo "982097d9987c40cd66bfcf1c7cb12a27cab89903571fe815a566e403345f04ab  release-ubuntu-24.04--b.RelWithDebInfo.-e.OFF.zip" | sha256sum --check --strict -
-unzip -q release-ubuntu-24.04--b.RelWithDebInfo.-e.OFF.zip -d ~/esbmc
-export PATH="$HOME/esbmc/bin:$PATH"     # add to your shell profile
-esbmc --version                          # ESBMC version 8.3.0
+curl -fLO https://github.com/esbmc/esbmc/releases/download/v8.5/esbmc-linux.zip
+echo "d8da304dd0dfce6c9f488379f03a72e768bce8598c22478c980e1704247352f1  esbmc-linux.zip" | sha256sum --check --strict -
+unzip -q esbmc-linux.zip -d ~/esbmc
+export PATH="$HOME/esbmc/release/bin:$PATH"     # add to your shell profile
+esbmc --version                                  # ESBMC version 8.5.0
 ```
 
 The digest is copied from `.github/workflows/ci.yml` (`ESBMC_SHA256`); if that
 file has moved on, trust it over this page. Other platforms: build or download
-a matching 8.3 release from <https://github.com/esbmc/esbmc/releases>.
+a matching 8.5 release from <https://github.com/esbmc/esbmc/releases>.
 
 Sanity check before a live run (no Claude or ESBMC needed for the first line):
 
