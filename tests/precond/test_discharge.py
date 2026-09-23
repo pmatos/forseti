@@ -696,7 +696,7 @@ def test_discharge_forwards_the_requested_timeout_to_every_parse_run(
             foreign=(), escaped=(), aliased=(), implicit=(), asm_sites=()
         )
 
-    monkeypatch.setattr("forseti.precond.discharge.list_units", _list_units)
+    monkeypatch.setattr("forseti.precond.verify.list_units", _list_units)
     monkeypatch.setattr("forseti.precond.discharge.list_caller_openings", _openings)
 
     src = tmp_path / "frame.c"

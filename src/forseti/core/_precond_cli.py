@@ -140,6 +140,7 @@ def _synth(args: argparse.Namespace) -> tuple[int, Assessment | None]:
                 args.source,
                 function=args.function,
                 max_len=args.max_len,
+                timeout_s=args.timeout,
                 esbmc_bin=args.esbmc_bin,
             )
         except PreconditionUnavailable as exc:
@@ -204,6 +205,7 @@ def _discharge(args: argparse.Namespace) -> tuple[int, Assessment | None]:
             text = emit_obligations(
                 args.source,
                 function=args.function,
+                timeout_s=args.timeout,
                 esbmc_bin=args.esbmc_bin,
             )
         except PreconditionUnavailable as exc:
