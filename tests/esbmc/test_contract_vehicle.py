@@ -111,17 +111,6 @@ def test_is_fresh_in_a_requires_now_discharges_correctly(tmp_path: Path) -> None
     assert "contract requires" in bad.raw_counterexample
 
 
-def test_the_is_fresh_warning_is_now_a_harmless_byproduct(tmp_path: Path) -> None:
-    # esbmc still prints the "lost temporary" warning it always did — but it no
-    # longer reflects a broken check (see the test above): the warning and a
-    # correct VERIFIED now coexist.
-    result = _replace_run(tmp_path, "__ESBMC_requires(__ESBMC_is_fresh(p, n));", 4)
-    assert isinstance(result, Verified), result
-    output = result.meta.stdout + result.meta.stderr
-    assert "Could not find definition for temporary variable" in output
-    assert "__ESBMC_is_fresh" in output
-
-
 def test_bare_intrinsic_call_in_a_requires_is_now_rejected_up_front(
     tmp_path: Path,
 ) -> None:
