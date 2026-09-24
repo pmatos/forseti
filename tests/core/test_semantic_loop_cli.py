@@ -124,8 +124,12 @@ def test_cli_submit_mode_ok(
     assert payload["ingestion"][0]["accepted"][0]["expression"] == "result >= 0"
 
 
+@pytest.mark.parametrize("mode", ["check-only", "check_only"])
 def test_cli_check_only_mode_skips_ingestion(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mode: str,
 ) -> None:
     source = _write_unit(tmp_path)
     root = tmp_path / ".forseti"
@@ -162,7 +166,7 @@ def test_cli_check_only_mode_skips_ingestion(
             "--function",
             "my_abs",
             "--mode",
-            "check-only",
+            mode,
             "--store-root",
             str(root),
             "--json",
