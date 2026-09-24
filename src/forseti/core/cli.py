@@ -81,7 +81,7 @@ import sys
 from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 from forseti.adapters.claude_code import install as claude_code_install
 from forseti.adapters.claude_code.install import (
@@ -141,7 +141,12 @@ from .check import (
     DEFAULT_UNWIND_LADDER as CHECK_DEFAULT_UNWIND_LADDER,
 )
 from .check import check_source
-from .loop import LoopMode, SemanticLoopResult, run_semantic_loop
+from .loop import (
+    LOOP_MODE_CHOICES,
+    SemanticLoopResult,
+    parse_loop_mode,
+    run_semantic_loop,
+)
 from .propose import (
     DEFAULT_MAX_CANDIDATES,
     DEFAULT_MODEL,
@@ -704,7 +709,7 @@ def _add_semantic_loop_parser(
     p.add_argument(
         "--mode",
         required=True,
-        choices=("propose", "submit", "check-only"),
+        choices=LOOP_MODE_CHOICES,
         help="how to ingest candidates before checking",
     )
     p.add_argument(
@@ -866,9 +871,7 @@ def _semantic_loop(
         )
         return 1, None
 
-    # argparse's --mode choices use a hyphen ("check-only"); LoopMode spells
-    # it with an underscore -- "propose"/"submit" need no respelling.
-    loop_mode = cast(LoopMode, args.mode.replace("-", "_"))
+    loop_mode = parse_loop_mode(args.mode)
 
     try:
         result = run_semantic_loop(

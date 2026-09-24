@@ -79,6 +79,23 @@ from forseti.properties import CandidateSpec, LLMClient, ProposalResult
 
 LoopMode = Literal["propose", "submit", "check_only"]
 
+LOOP_MODE_CHOICES = ("propose", "submit", "check-only", "check_only")
+
+
+def parse_loop_mode(value: str, /) -> LoopMode:
+    """Parse either published spelling into Core's canonical loop mode."""
+    match value:
+        case "propose":
+            return "propose"
+        case "submit":
+            return "submit"
+        case "check-only" | "check_only":
+            return "check_only"
+        case _:
+            raise ValueError(
+                f"mode must be one of propose|submit|check_only, got {value!r}"
+            )
+
 
 @dataclass(frozen=True)
 class SemanticLoopResult:
