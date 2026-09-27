@@ -1,3 +1,10 @@
+## [1.10.1](https://github.com/pmatos/forseti/compare/v1.10.0...v1.10.1) (2026-09-27)
+
+
+### Bug Fixes
+
+* **properties:** cap unconstrained (ptr, len) lengths in the semantic check path ([#299](https://github.com/pmatos/forseti/issues/299)) ([#306](https://github.com/pmatos/forseti/issues/306)) ([e552555](https://github.com/pmatos/forseti/commit/e552555ab52bb5f99af6174ed3d762c29ca97070))
+
 # [1.10.0](https://github.com/pmatos/forseti/compare/v1.9.0...v1.10.0) (2026-09-20)
 
 
