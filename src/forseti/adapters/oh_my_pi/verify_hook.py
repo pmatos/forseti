@@ -64,6 +64,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from forseti.adapters.gate_reply import render_gate_reply
 from forseti.core.events import GATE_DECISION
 from forseti.core.events import record_event as record_core_event
 from forseti.unit_id import make_unit_id
@@ -244,28 +245,22 @@ def main() -> int:
             elif outcome in ("unknown", "error"):
                 unresolved.append((unit_id, outcome))
 
-    if violated:
-        lines = [
+    reply = render_gate_reply(
+        violated,
+        unresolved,
+        violation_header=(
             "Forseti found a counterexample in a stored semantic property "
             "for a unit you just edited — fix it before continuing:"
-        ]
-        for unit_id, evidence in violated:
-            lines.append(f"\n### VIOLATED: {unit_id}\n{evidence}")
-        if unresolved:
-            residual = ", ".join(f"{u} [{o}]" for u, o in unresolved)
-            lines.append(f"\nAlso inconclusive (do not ignore): {residual}")
+        ),
+        verb="check",
+    )
+    if reply.decision == "block":
         _record_gate_decision(cwd, checked_units, "block")
-        print(json.dumps({"decision": "block", "reason": "\n".join(lines)}))
+        print(json.dumps({"decision": "block", "reason": reply.message}))
         return 0
 
-    if unresolved:
-        residual = ", ".join(f"{u} [{o}]" for u, o in unresolved)
-        _report_unresolved(
-            cwd,
-            checked_units,
-            f"Forseti could not conclusively check: {residual}. "
-            "Not a pass — raise k, add an entry/harness, or report.",
-        )
+    if reply.decision == "unresolved":
+        _report_unresolved(cwd, checked_units, reply.message)
         return 0
 
     if not any_path_existed:
