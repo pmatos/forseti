@@ -31,7 +31,7 @@ from .check import (
     DEFAULT_UNWIND as CHECK_DEFAULT_UNWIND,
 )
 from .check import check_source
-from .loop import LoopMode, run_semantic_loop
+from .loop import parse_loop_mode, run_semantic_loop
 from .propose import (
     DEFAULT_MAX_CANDIDATES,
     DEFAULT_MODEL,
@@ -259,8 +259,8 @@ def semantic_loop_tool(
         source: Path to the source file defining the unit.
         function: The function under test (the `symbol` of `path::symbol`).
         mode: One of `"propose"` (ask the LLM proposer), `"submit"` (ingest
-            `candidates`, no LLM call), or `"check_only"` (skip ingestion and
-            check whatever the store already holds).
+            `candidates`, no LLM call), or `"check_only"` / `"check-only"`
+            (skip ingestion and check whatever the store already holds).
         store_root: The `.forseti` store directory.
         max_candidates: Cap on accepted candidates.
         candidates: `mode="submit"` only -- a list of candidate objects, each
@@ -292,9 +292,7 @@ def semantic_loop_tool(
         worst-outcome-wins `outcome`: held | violated | unknown | error |
         empty -- the one field to key a gate/report decision on.
     """
-    if mode not in ("propose", "submit", "check_only"):
-        raise ValueError(f"mode must be one of propose|submit|check_only, got {mode!r}")
-    loop_mode: LoopMode = mode
+    loop_mode = parse_loop_mode(mode)
     specs = parse_candidate_list(candidates or ())
     result = run_semantic_loop(
         Path(source),

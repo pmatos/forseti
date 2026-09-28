@@ -185,6 +185,10 @@ face formats a unit id, persists a candidate, or renders a harness itself — th
 where `propose_source`/`submit_source`/`check_source` already put them; the composed op only
 sequences the existing calls and adds the `outcome` policy on top.
 
+The CLI keeps `check-only` as its documented spelling and the MCP tool keeps `check_only`, but
+both accept either spelling through Core's shared mode parser. Result payloads always use the
+canonical underscore spelling; `cli.command` events retain the exact CLI spelling supplied.
+
 The Claude Code subagent (`adapters/claude-code/agents/property-check.md`) now makes one
 `--mode propose` call instead of a separate `propose` then `check`, and reads `outcome` instead
 of recomputing worst-outcome-wins from `verdicts[]` itself. Codex's `AGENTS.md` gained a

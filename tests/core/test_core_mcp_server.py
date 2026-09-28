@@ -278,6 +278,24 @@ def test_semantic_loop_tool_rejects_an_unknown_mode(tmp_path: Path) -> None:
         semantic_loop_tool(str(source), "my_abs", "bogus-mode")
 
 
+@pytest.mark.parametrize("mode", ["check_only", "check-only"])
+def test_semantic_loop_tool_accepts_both_check_only_spellings(
+    tmp_path: Path, mode: str
+) -> None:
+    source = tmp_path / "abs_unit.c"
+    source.write_text(_ABS_SLICE)
+
+    payload = semantic_loop_tool(
+        str(source),
+        "my_abs",
+        mode,
+        store_root=str(tmp_path / mode),
+    )
+
+    assert payload["mode"] == "check_only"
+    assert payload["ingestion"] == []
+
+
 def test_semantic_loop_tool_submit_mode_rejects_non_list_domain(tmp_path: Path) -> None:
     source = tmp_path / "abs_unit.c"
     source.write_text(_ABS_SLICE)
