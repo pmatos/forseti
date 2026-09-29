@@ -55,6 +55,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from forseti.adapters.gate_reply import render_gate_reply
 from forseti.core.events import GATE_DECISION
 from forseti.core.events import record_event as record_core_event
 
@@ -132,30 +133,20 @@ def main() -> int:
             # Surface it, never let it fall through as an implicit pass.
             inconclusive.append((path, verdict))
 
-    if violated:
-        lines = ["Forseti found a counterexample — fix it before continuing:"]
-        for path, evidence in violated:
-            lines.append(f"\n### VIOLATED: {path}\n{evidence}")
-        if inconclusive:
-            residual = ", ".join(f"{p} [{v}]" for p, v in inconclusive)
-            lines.append(f"\nAlso inconclusive (do not ignore): {residual}")
+    reply = render_gate_reply(
+        violated,
+        inconclusive,
+        violation_header="Forseti found a counterexample — fix it before continuing:",
+        verb="verify",
+    )
+    if reply.decision == "block":
         _record_gate_decision(checked, "block")
-        print(json.dumps({"decision": "block", "reason": "\n".join(lines)}))
+        print(json.dumps({"decision": "block", "reason": reply.message}))
         return 0
 
-    if inconclusive:
-        residual = ", ".join(f"{p} [{v}]" for p, v in inconclusive)
+    if reply.decision == "unresolved":
         _record_gate_decision(checked, "unresolved")
-        print(
-            json.dumps(
-                {
-                    "systemMessage": (
-                        f"Forseti could not conclusively verify: {residual}. "
-                        "Not a pass — raise k, add an entry/harness, or report."
-                    )
-                }
-            )
-        )
+        print(json.dumps({"systemMessage": reply.message}))
         return 0
 
     if not checked:
