@@ -24,6 +24,7 @@ from forseti.esbmc.units import (
     ListUnitsError,
     Param,
     Unit,
+    analyze_translation_unit,
     annotate_array_extents,
     find_definition_brace,
     list_caller_openings,
@@ -1840,6 +1841,28 @@ def test_list_units_raises_on_failed_parse(tmp_path: Path) -> None:
         list_units(bad)
 
 
+def test_translation_unit_analysis_reuses_one_ast_for_both_views(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[Path, str, float, tuple[str, ...]]] = []
+
+    def _fake_parse_tree(source, esbmc_bin, timeout_s, extra_flags):  # noqa: ANN001, ANN202
+        calls.append((source, esbmc_bin, timeout_s, tuple(extra_flags)))
+        return _AST
+
+    monkeypatch.setattr("forseti.esbmc.units._parse_tree", _fake_parse_tree)
+    source = Path(_TARGET)
+    analysis = analyze_translation_unit(
+        source, esbmc_bin="my-esbmc", timeout_s=2.5, extra_flags=("-I.",)
+    )
+
+    assert [unit.name for unit in analysis.units()] == ["scal", "hash", "reg"]
+    assert analysis.caller_openings("scal") == CallerOpenings(
+        foreign=(), escaped=(), aliased=(), implicit=(), asm_sites=()
+    )
+    assert calls == [(source, "my-esbmc", 2.5, ("-I.",))]
+
+
 # --- list_caller_openings: one shared dump, five caller-completeness answers ---
 #
 # The five ways `list_units` can under-report a callee's callers each have their
@@ -1877,7 +1900,8 @@ def test_list_caller_openings_routes_each_pass_to_its_own_field(
     # each field to its own pass with a distinct sentinel.
     monkeypatch.setattr("forseti.esbmc.units._parse_tree", lambda *a: "AST")
     monkeypatch.setattr(
-        "forseti.esbmc.units.parse_external_callers", lambda *a: ("foreign",)
+        "forseti.esbmc.units._external_callers_from_definitions",
+        lambda *a: ("foreign",),
     )
     monkeypatch.setattr(
         "forseti.esbmc.units.parse_address_escapes", lambda *a: ("escaped",)
@@ -1902,20 +1926,20 @@ def test_list_caller_openings_routes_each_pass_to_its_own_field(
 def test_list_caller_openings_threads_source_and_symbol_into_the_external_scan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # `parse_external_callers` alone needs `source`: it excludes in-file definitions
-    # by full-path match, so the same source the run parsed must reach it, or a
-    # header-defined caller is silently mis-classified.
-    seen: dict[str, tuple[str, Path, str]] = {}
+    # External-caller filtering alone needs `source`: it excludes in-file
+    # definitions by full-path match, so the same source the run parsed must
+    # reach the shared-definitions view.
+    seen: dict[str, tuple[tuple[tuple[str, Unit], ...], Path, str]] = {}
 
-    def _ext(ast_text, source, symbol):  # noqa: ANN001, ANN202
-        seen["args"] = (ast_text, source, symbol)
+    def _ext(definitions, source, symbol):  # noqa: ANN001, ANN202
+        seen["args"] = (tuple(definitions), source, symbol)
         return ()
 
     monkeypatch.setattr("forseti.esbmc.units._parse_tree", lambda *a: "AST-TEXT")
-    monkeypatch.setattr("forseti.esbmc.units.parse_external_callers", _ext)
+    monkeypatch.setattr("forseti.esbmc.units._external_callers_from_definitions", _ext)
     src = Path("/proj/frame.c")
     list_caller_openings(src, "sum_bytes")
-    assert seen["args"] == ("AST-TEXT", src, "sum_bytes")
+    assert seen["args"] == ((), src, "sum_bytes")
 
 
 def test_list_caller_openings_propagates_a_failed_parse(
