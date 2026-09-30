@@ -165,12 +165,14 @@ from pathlib import Path
 from typing import assert_never
 
 from forseti.esbmc import (
+    CallerOpenings,
     ListUnitsError,
     Unit,
     Verified,
     Violated,
     list_caller_openings,
 )
+from forseti.esbmc.units import TranslationUnitAnalysis, analyze_translation_unit
 from forseti.orchestrator.ports import VerifyPort
 
 from .model import CallerCheck, CallerOutcome, DischargeResult
@@ -280,6 +282,21 @@ def open_caller_checks(
     )
 
 
+def _caller_checks_from_openings(
+    function: str, source: Path, openings: CallerOpenings
+) -> tuple[CallerCheck, ...]:
+    """Project ESBMC caller-opening facts into discharge outcomes."""
+    return open_caller_checks(
+        function,
+        source,
+        foreign=openings.foreign,
+        escaped=openings.escaped,
+        aliased=openings.aliased,
+        implicit=openings.implicit,
+        asm_sites=openings.asm_sites,
+    )
+
+
 def find_open_callers(
     source: Path,
     function: str,
@@ -300,15 +317,7 @@ def find_open_callers(
     openings = list_caller_openings(
         source, function, esbmc_bin=esbmc_bin, timeout_s=timeout_s
     )
-    return open_caller_checks(
-        function,
-        source,
-        foreign=openings.foreign,
-        escaped=openings.escaped,
-        aliased=openings.aliased,
-        implicit=openings.implicit,
-        asm_sites=openings.asm_sites,
-    )
+    return _caller_checks_from_openings(function, source, openings)
 
 
 def _memoized(lister: Callable[[Path], list[Unit]]) -> Callable[[Path], list[Unit]]:
@@ -378,16 +387,45 @@ def discharge_precondition(
     Runs S2 first and *only ever upgrades* its verdict: anything other than
     ``ASSUMED_VERIFIED`` (a real violation, ``NEEDS_CONTRACT``, an error) passes
     through untouched, because there is no assumption to discharge. `raw_verify`,
-    `list_units_fn` and `open_callers_fn` inject the esbmc calls for tests;
-    production adds a ``-I`` for the source's own directory so the generated
-    copy's relative ``#include``\\ s still resolve. `open_callers_fn` is the one
-    seam over the whole caller-completeness question — the five ESBMC listings
-    that `find_open_callers` fans out to (see `open_caller_checks` for the ways
-    the caller set can be open).
+    `list_units_fn` and `open_callers_fn` inject the ESBMC calls for tests. With
+    neither listing adapter injected, production binds both S2 unit planning and
+    S3 caller-completeness analysis to one operation-scoped translation-unit AST.
+    The generated-copy verifier adds a ``-I`` for the source's own directory so
+    relative ``#include``\\ s still resolve.
     """
-    lister = _memoized(
-        unit_lister(esbmc_bin=esbmc_bin, timeout_s=timeout_s, adapter=list_units_fn)
-    )
+    if list_units_fn is None and open_callers_fn is None:
+        analyses: dict[Path, TranslationUnitAnalysis] = {}
+
+        def analysis_for(path: Path) -> TranslationUnitAnalysis:
+            if path not in analyses:
+                analyses[path] = analyze_translation_unit(
+                    path, esbmc_bin=esbmc_bin, timeout_s=timeout_s
+                )
+            return analyses[path]
+
+        def list_from_analysis(path: Path) -> list[Unit]:
+            return analysis_for(path).units()
+
+        def openings_from_analysis(path: Path, symbol: str) -> tuple[CallerCheck, ...]:
+            return _caller_checks_from_openings(
+                symbol, path, analysis_for(path).caller_openings(symbol)
+            )
+
+        lister = _memoized(list_from_analysis)
+        open_callers = openings_from_analysis
+    else:
+        lister = _memoized(
+            unit_lister(
+                esbmc_bin=esbmc_bin,
+                timeout_s=timeout_s,
+                adapter=list_units_fn,
+            )
+        )
+        open_callers = open_callers_fn or (
+            lambda src, sym: find_open_callers(
+                src, sym, esbmc_bin=esbmc_bin, timeout_s=timeout_s
+            )
+        )
     unit_result = verify_precondition(
         source,
         function=function,
@@ -411,11 +449,6 @@ def discharge_precondition(
         timeout_s=timeout_s,
         esbmc_bin=esbmc_bin,
         extra_flags=(f"-I{source.resolve().parent}",),
-    )
-    open_callers = open_callers_fn or (
-        lambda src, sym: find_open_callers(
-            src, sym, esbmc_bin=esbmc_bin, timeout_s=timeout_s
-        )
     )
     with sidecar_runner(
         work_dir=work_dir,

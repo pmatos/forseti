@@ -484,6 +484,21 @@ def _is_target(file: str, source_norm: str) -> bool:
     return bool(file) and os.path.normpath(file) == source_norm
 
 
+def _units_from_definitions(
+    definitions: Sequence[tuple[str, Unit]], source: str | Path
+) -> list[Unit]:
+    """`parse_units` over definitions already recovered from one AST."""
+    source_norm = os.path.normpath(str(source))
+    units: list[Unit] = []
+    seen: set[str] = set()
+    for file, unit in definitions:
+        if not _is_target(file, source_norm) or unit.name in seen:
+            continue
+        seen.add(unit.name)
+        units.append(unit)
+    return units
+
+
 def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
     """Function definitions in `source` from an ``esbmc --parse-tree-only`` dump.
 
@@ -491,15 +506,21 @@ def parse_units(ast_text: str, source: str | Path) -> list[Unit]:
     declarations yields nothing, matching what the gate can verify. Deduped by
     name, first definition wins.
     """
+    return _units_from_definitions(parse_definitions(ast_text), source)
+
+
+def _external_callers_from_definitions(
+    definitions: Sequence[tuple[str, Unit]], source: str | Path, symbol: str
+) -> tuple[str, ...]:
+    """`parse_external_callers` over definitions already recovered from one AST."""
     source_norm = os.path.normpath(str(source))
-    units: list[Unit] = []
-    seen: set[str] = set()
-    for file, unit in parse_definitions(ast_text):
-        if not _is_target(file, source_norm) or unit.name in seen:
+    names: dict[str, None] = {}
+    for file, unit in definitions:
+        if _is_target(file, source_norm) or unit.name == symbol:
             continue
-        seen.add(unit.name)
-        units.append(unit)
-    return units
+        if symbol in unit.calls:
+            names[unit.name] = None
+    return tuple(names)
 
 
 def parse_external_callers(
@@ -514,14 +535,9 @@ def parse_external_callers(
     checked while some were never even listed — so it counts them and withholds
     the upgrade rather than quietly ignoring them.
     """
-    source_norm = os.path.normpath(str(source))
-    names: dict[str, None] = {}
-    for file, unit in parse_definitions(ast_text):
-        if _is_target(file, source_norm) or unit.name == symbol:
-            continue
-        if symbol in unit.calls:
-            names[unit.name] = None
-    return tuple(names)
+    return _external_callers_from_definitions(
+        parse_definitions(ast_text), source, symbol
+    )
 
 
 def _is_call_callee(stack: list[_AstNode]) -> bool:
@@ -1448,19 +1464,17 @@ def list_caller_openings(
 
     Parses `source` once with ``esbmc --parse-tree-only`` and runs all five
     `parse_*` passes over that single dump — the seam `find_open_callers`
-    crosses. Each pass keeps its own semantics (e.g. `parse_external_callers`
-    still takes `source`, to exclude in-file definitions). Raises `ListUnitsError`
-    on the same conditions as `list_units`, so an unparseable TU never reads as
-    "no hidden callers".
+    crosses. Each pass keeps its own semantics (e.g. external callers still need
+    `source` to exclude in-file definitions). Raises `ListUnitsError` on the same
+    conditions as `list_units`, so an unparseable TU never reads as "no hidden
+    callers".
     """
-    ast_text = _parse_tree(source, esbmc_bin, timeout_s, extra_flags)
-    return CallerOpenings(
-        foreign=parse_external_callers(ast_text, source, symbol),
-        escaped=parse_address_escapes(ast_text, symbol),
-        aliased=parse_symbol_aliases(ast_text, symbol),
-        implicit=parse_implicit_invocations(ast_text, symbol),
-        asm_sites=parse_asm_statements(ast_text, symbol),
-    )
+    return analyze_translation_unit(
+        source,
+        esbmc_bin=esbmc_bin,
+        timeout_s=timeout_s,
+        extra_flags=extra_flags,
+    ).caller_openings(symbol)
 
 
 def _with_predefined_guards(
@@ -1505,6 +1519,84 @@ def _with_predefined_guards(
     return [replace(unit, predefined_guards=guards) for unit in units]
 
 
+@dataclass(frozen=True)
+class TranslationUnitAnalysis:
+    """Two domain views over one ESBMC translation-unit AST acquisition.
+
+    The raw textual AST and invocation settings stay inside this module. One
+    operation may ask for both the verifiable units and the ways a caller set is
+    open without launching ``esbmc --parse-tree-only`` twice.
+    """
+
+    _source: Path = field(repr=False)
+    _ast_text: str = field(repr=False)
+    _definitions: tuple[tuple[str, Unit], ...] = field(repr=False)
+    _esbmc_bin: str = field(repr=False)
+    _timeout_s: float = field(repr=False)
+    _extra_flags: tuple[str, ...] = field(repr=False)
+
+    def units(self) -> list[Unit]:
+        """The same enriched units returned by `list_units`."""
+        units = _units_from_definitions(self._definitions, self._source)
+        # Enrich with fixed-array extents read from the source declarators (the
+        # clang type has adjusted `T p[N]` to `T *`). Best-effort: a successful
+        # parse means esbmc read the file, so an unexpected read failure degrades
+        # to the unannotated units, preserving `list_units`' contract.
+        try:
+            source_text = self._source.read_text()
+        except OSError:
+            return units
+        masked = _stripped_for_scan(source_text)
+        candidates = _candidates_by_name(units, masked)
+        return _annotate_array_extents(
+            _with_predefined_guards(
+                units,
+                masked,
+                candidates,
+                esbmc_bin=self._esbmc_bin,
+                timeout_s=self._timeout_s,
+                extra_flags=self._extra_flags,
+                # The extension selects the language and therefore the
+                # predefined set read by `probe_predefined_guards`.
+                suffix=self._source.suffix,
+            ),
+            masked,
+            candidates,
+        )
+
+    def caller_openings(self, symbol: str) -> CallerOpenings:
+        """The same five caller-completeness views as `list_caller_openings`."""
+        return CallerOpenings(
+            foreign=_external_callers_from_definitions(
+                self._definitions, self._source, symbol
+            ),
+            escaped=parse_address_escapes(self._ast_text, symbol),
+            aliased=parse_symbol_aliases(self._ast_text, symbol),
+            implicit=parse_implicit_invocations(self._ast_text, symbol),
+            asm_sites=parse_asm_statements(self._ast_text, symbol),
+        )
+
+
+def analyze_translation_unit(
+    source: Path,
+    *,
+    esbmc_bin: str = "esbmc",
+    timeout_s: float = 30.0,
+    extra_flags: Sequence[str] = (),
+) -> TranslationUnitAnalysis:
+    """Acquire one translation-unit AST for unit and caller-opening analysis."""
+    flags = tuple(extra_flags)
+    ast_text = _parse_tree(source, esbmc_bin, timeout_s, flags)
+    return TranslationUnitAnalysis(
+        source,
+        ast_text,
+        tuple(parse_definitions(ast_text)),
+        esbmc_bin,
+        timeout_s,
+        flags,
+    )
+
+
 def list_units(
     source: Path,
     *,
@@ -1521,30 +1613,9 @@ def list_units(
     failed parse as an empty file, which would be indistinguishable from a valid
     one and could let the gate silently skip a unit.
     """
-    units = parse_units(_parse_tree(source, esbmc_bin, timeout_s, extra_flags), source)
-    # Enrich with fixed-array extents read from the source declarators (the clang
-    # type has adjusted `T p[N]` to `T *`). Best-effort: a successful parse means
-    # esbmc read the file, so a read failure here is unexpected — degrade to the
-    # un-annotated units rather than fail a listing that already succeeded.
-    try:
-        source_text = Path(source).read_text()
-    except OSError:
-        return units
-    masked = _stripped_for_scan(source_text)
-    candidates = _candidates_by_name(units, masked)
-    return _annotate_array_extents(
-        _with_predefined_guards(
-            units,
-            masked,
-            candidates,
-            esbmc_bin=esbmc_bin,
-            timeout_s=timeout_s,
-            extra_flags=extra_flags,
-            # The extension is a parse input like the binary and the flags: it
-            # picks the language, and so the predefined set the probe reads
-            # (`probe_predefined_guards`).
-            suffix=Path(source).suffix,
-        ),
-        masked,
-        candidates,
-    )
+    return analyze_translation_unit(
+        source,
+        esbmc_bin=esbmc_bin,
+        timeout_s=timeout_s,
+        extra_flags=extra_flags,
+    ).units()

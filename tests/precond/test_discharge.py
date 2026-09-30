@@ -676,28 +676,34 @@ def test_every_assessment_has_an_exit_code() -> None:
     assert set(ASSESSMENT_EXIT_CODES) == set(Assessment)
 
 
-def test_discharge_forwards_the_requested_timeout_to_every_parse_run(
+def test_discharge_reuses_one_analysis_with_the_requested_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # `-t/--timeout` maps to `timeout_s`; every ESBMC parse-tree run this driver
-    # makes on its own — not just the actual verification runs — must honour it.
-    # The five caller-completeness listings now share one dump, so the driver
-    # makes two such runs (the unit list and the openings dump) where it once made
-    # up to six; a short user-requested timeout must still reach both.
-    seen: dict[str, float | None] = {}
+    # S2 unit planning and S3 caller-completeness analysis are two views over the
+    # same translation unit. One operation must acquire that AST once, with the
+    # caller's timeout, rather than parse the source independently for each view.
+    seen: list[tuple[Path, str, float, tuple[str, ...]]] = []
 
-    def _list_units(_src, *, esbmc_bin, timeout_s):  # noqa: ANN001, ANN202
-        seen["list_units"] = timeout_s
-        return [CALLEE, CALLER]
+    class _Analysis:
+        def units(self) -> list[Unit]:
+            return [CALLEE, CALLER]
 
-    def _openings(_src, _sym, *, esbmc_bin, timeout_s):  # noqa: ANN001, ANN202
-        seen["caller_openings"] = timeout_s
-        return CallerOpenings(
-            foreign=(), escaped=(), aliased=(), implicit=(), asm_sites=()
-        )
+        def caller_openings(self, _symbol: str) -> CallerOpenings:
+            return CallerOpenings(
+                foreign=(), escaped=(), aliased=(), implicit=(), asm_sites=()
+            )
 
-    monkeypatch.setattr("forseti.precond.verify.list_units", _list_units)
-    monkeypatch.setattr("forseti.precond.discharge.list_caller_openings", _openings)
+    def _analyze(
+        source: Path,
+        *,
+        esbmc_bin: str,
+        timeout_s: float,
+        extra_flags: tuple[str, ...] = (),
+    ) -> _Analysis:
+        seen.append((source, esbmc_bin, timeout_s, extra_flags))
+        return _Analysis()
+
+    monkeypatch.setattr("forseti.precond.discharge.analyze_translation_unit", _analyze)
 
     src = tmp_path / "frame.c"
     src.write_text(SOURCE)
@@ -710,4 +716,4 @@ def test_discharge_forwards_the_requested_timeout_to_every_parse_run(
         work_dir=tmp_path,
         raw_verify=_raw({}),
     )
-    assert seen == {"list_units": 1.0, "caller_openings": 1.0}
+    assert seen == [(src, "esbmc", 1.0, ())]
