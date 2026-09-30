@@ -1,27 +1,23 @@
 workflow:
   name: forseti_issue_to_pr
-  initial: shipit
-  use:
-    shipit:
-      template: builtin:single-agent-pr
-      with:
+  initial: shipit.agent
+  states:
+    # Former builtin:single-agent-pr instance "shipit". Its own transitions
+    # only prove provider_success + branch_ahead_of_base, not that the PR was
+    # opened, so success routes through wait_for_pr_open rather than straight
+    # to code_review_fix (vow-lang/vow#1277, symphonika #730).
+    shipit.agent:
+      action:
+        kind: agent
         provider: claude
         prompt: prompts/impl.md
-      exits:
-        # builtin:single-agent-pr's own transitions only check
-        # provider_success + branch_ahead_of_base, which only prove the agent
-        # committed something -- not that it ever pushed and opened the PR
-        # prompts/impl.md tells it to (vow-lang/vow#1277: an implement run
-        # backgrounded the quality gate, ended its turn waiting on it, and
-        # never reached the "open the PR" step -- yet still satisfied that
-        # predicate). Route the template's success exit through
-        # wait_for_pr_open rather than straight to code_review_fix so a PR
-        # is actually observed before proceeding, mirroring the state
-        # symphonika's own workflow.yml added for the same failure class
-        # (symphonika issue #730, #1255).
-        success: wait_for_pr_open
-        blocked: failed
-  states:
+      transitions:
+        - to: wait_for_pr_open
+          when:
+            provider_success: true
+            branch_ahead_of_base: true
+        - to: failed
+
     # pr_signal predicates (pr_open/pr_merged/...) are only projected for
     # kind: wait states, so this check cannot live on shipit's own template
     # transitions. This dedicated wait state is the supported way to gate on
