@@ -51,10 +51,10 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 import sys
 from pathlib import Path
 
+from forseti.adapters._cli_json import run_json
 from forseti.adapters.gate_reply import render_gate_reply
 from forseti.core.events import GATE_DECISION
 from forseti.core.events import record_event as record_core_event
@@ -81,19 +81,21 @@ def _edited_sources(command: str) -> list[str]:
 
 def _verify(path: str) -> tuple[str, str]:
     """Run `forseti verify --json`; return (verdict, evidence)."""
-    try:
-        proc = subprocess.run(
-            ["forseti", "verify", path, "--json"],
-            capture_output=True,
-            text=True,
-            timeout=_VERIFY_TIMEOUT_S,
+    result = run_json(
+        ["forseti", "verify", path, "--json"],
+        timeout=_VERIFY_TIMEOUT_S,
+    )
+    if result.failure == "launch":
+        return (
+            "skipped",
+            f"could not run forseti verify: {result.diagnostic}",
         )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return ("skipped", f"could not run forseti verify: {exc}")
-    try:
-        payload = json.loads(proc.stdout)
-    except ValueError:
-        return ("skipped", (proc.stderr or proc.stdout).strip()[:400])
+    if result.failure == "decode":
+        return ("skipped", result.diagnostic)
+
+    payload = result.payload
+    if not isinstance(payload, dict):
+        return ("skipped", result.diagnostic)
     verdict = str(payload.get("verdict", "error"))
     evidence = str(
         payload.get("counterexample")

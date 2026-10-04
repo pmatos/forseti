@@ -1,8 +1,8 @@
 """Tests for the Codex `PostToolUse` verify hook (`adapters/codex/verify_hook.py`).
 
-Hermetic: `_verify`'s own `subprocess.run` call and `main`'s call into `_verify`
-are both monkeypatched -- no esbmc, no real `forseti verify`, no real Codex
-session.
+Hermetic: the shared JSON runner used by `_verify` and `main`'s call into
+`_verify` are both monkeypatched -- no esbmc, no real `forseti verify`, no
+real Codex session.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from forseti.adapters import _cli_json
 from forseti.adapters.codex import verify_hook
 
 
@@ -46,7 +47,7 @@ def test_verify_parses_json_payload(monkeypatch: pytest.MonkeyPatch) -> None:
             stderr="",
         )
 
-    monkeypatch.setattr(verify_hook.subprocess, "run", fake_run)
+    monkeypatch.setattr(_cli_json.subprocess, "run", fake_run)
     verdict, evidence = verify_hook._verify("f.c")
     assert verdict == "violated"
     assert evidence == "x == 0"
@@ -58,7 +59,7 @@ def test_verify_reports_skipped_on_launch_failure(
     def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         raise OSError("forseti not found")
 
-    monkeypatch.setattr(verify_hook.subprocess, "run", fake_run)
+    monkeypatch.setattr(_cli_json.subprocess, "run", fake_run)
     verdict, evidence = verify_hook._verify("f.c")
     assert verdict == "skipped"
     assert "forseti not found" in evidence
@@ -72,7 +73,7 @@ def test_verify_reports_skipped_on_unparseable_output(
             args=[], returncode=1, stdout="not json", stderr="boom"
         )
 
-    monkeypatch.setattr(verify_hook.subprocess, "run", fake_run)
+    monkeypatch.setattr(_cli_json.subprocess, "run", fake_run)
     verdict, evidence = verify_hook._verify("f.c")
     assert verdict == "skipped"
     assert evidence == "boom"

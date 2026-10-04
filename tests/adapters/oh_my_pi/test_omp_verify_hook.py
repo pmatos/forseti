@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from forseti.adapters import _cli_json
 from forseti.adapters.oh_my_pi import verify_hook
 
 needs_esbmc = pytest.mark.skipif(
@@ -104,7 +105,7 @@ def test_list_functions_parses_json_payload(monkeypatch: pytest.MonkeyPatch) -> 
             stderr="",
         )
 
-    monkeypatch.setattr(verify_hook.subprocess, "run", fake_run)
+    monkeypatch.setattr(_cli_json.subprocess, "run", fake_run)
     assert verify_hook._list_functions("f.c", "/cwd") == ["f", "g"]
 
 
@@ -114,7 +115,7 @@ def test_list_functions_returns_none_on_launch_failure(
     def fake_run(*_a: object, **_kw: object) -> subprocess.CompletedProcess[str]:
         raise OSError("forseti not found")
 
-    monkeypatch.setattr(verify_hook.subprocess, "run", fake_run)
+    monkeypatch.setattr(_cli_json.subprocess, "run", fake_run)
     assert verify_hook._list_functions("f.c", "/cwd") is None
 
 
@@ -126,7 +127,7 @@ def test_list_functions_returns_none_on_unparseable_output(
             args=[], returncode=1, stdout="oops", stderr=""
         )
 
-    monkeypatch.setattr(verify_hook.subprocess, "run", fake_run)
+    monkeypatch.setattr(_cli_json.subprocess, "run", fake_run)
     assert verify_hook._list_functions("f.c", "/cwd") is None
 
 
@@ -138,7 +139,7 @@ def test_list_functions_returns_none_when_units_not_a_list(
             args=[], returncode=0, stdout=json.dumps({"units": "not-a-list"}), stderr=""
         )
 
-    monkeypatch.setattr(verify_hook.subprocess, "run", fake_run)
+    monkeypatch.setattr(_cli_json.subprocess, "run", fake_run)
     assert verify_hook._list_functions("f.c", "/cwd") is None
 
 
@@ -150,7 +151,7 @@ def test_semantic_check_returns_error_when_outcome_missing(
             args=[], returncode=1, stdout=json.dumps({}), stderr="unexpected failure"
         )
 
-    monkeypatch.setattr(verify_hook.subprocess, "run", fake_run)
+    monkeypatch.setattr(_cli_json.subprocess, "run", fake_run)
     outcome, evidence = verify_hook._semantic_check("f.c", "my_fn", "/cwd")
     assert outcome == "error"
     assert "unexpected failure" in evidence
@@ -173,7 +174,7 @@ def test_semantic_check_extracts_outcome_and_counterexample(
             args=[], returncode=1, stdout=json.dumps(payload), stderr=""
         )
 
-    monkeypatch.setattr(verify_hook.subprocess, "run", fake_run)
+    monkeypatch.setattr(_cli_json.subprocess, "run", fake_run)
     outcome, evidence = verify_hook._semantic_check("f.c", "my_fn", "/cwd")
     assert outcome == "violated"
     assert evidence == "x == 0"
@@ -187,7 +188,7 @@ def test_semantic_check_held_has_no_evidence(monkeypatch: pytest.MonkeyPatch) ->
             args=[], returncode=0, stdout=json.dumps(payload), stderr=""
         )
 
-    monkeypatch.setattr(verify_hook.subprocess, "run", fake_run)
+    monkeypatch.setattr(_cli_json.subprocess, "run", fake_run)
     outcome, evidence = verify_hook._semantic_check("f.c", "my_fn", "/cwd")
     assert outcome == "held"
     assert evidence == ""
@@ -210,7 +211,7 @@ def test_semantic_check_falls_back_to_skip_reason(
             args=[], returncode=1, stdout=json.dumps(payload), stderr=""
         )
 
-    monkeypatch.setattr(verify_hook.subprocess, "run", fake_run)
+    monkeypatch.setattr(_cli_json.subprocess, "run", fake_run)
     outcome, evidence = verify_hook._semantic_check("f.c", "my_fn", "/cwd")
     assert outcome == "unknown"
     assert evidence == "reachability, deferred"
@@ -224,7 +225,7 @@ def test_semantic_check_returns_error_on_unparseable_output(
             args=[], returncode=1, stdout="not json", stderr="boom"
         )
 
-    monkeypatch.setattr(verify_hook.subprocess, "run", fake_run)
+    monkeypatch.setattr(_cli_json.subprocess, "run", fake_run)
     outcome, evidence = verify_hook._semantic_check("f.c", "my_fn", "/cwd")
     assert outcome == "error"
     assert evidence == "boom"
@@ -236,7 +237,7 @@ def test_semantic_check_returns_error_on_launch_failure(
     def fake_run(*_a: object, **_kw: object) -> subprocess.CompletedProcess[str]:
         raise OSError("boom")
 
-    monkeypatch.setattr(verify_hook.subprocess, "run", fake_run)
+    monkeypatch.setattr(_cli_json.subprocess, "run", fake_run)
     outcome, evidence = verify_hook._semantic_check("f.c", "my_fn", "/cwd")
     assert outcome == "error"
     assert "boom" in evidence
