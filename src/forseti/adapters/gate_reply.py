@@ -1,8 +1,8 @@
 """Shared violated/inconclusive reply grammar for harness gate adapters.
 
-Codex and Oh My Pi classify their own verification results and own their JSON
-transport, canonical events, and output. This module concentrates only the
-ordered reply grammar those adapters otherwise repeat.
+Codex and Oh My Pi classify their own verification results and own their
+command-specific payload interpretation, canonical events, and output. This
+module concentrates only the ordered reply grammar those adapters repeat.
 """
 
 from __future__ import annotations

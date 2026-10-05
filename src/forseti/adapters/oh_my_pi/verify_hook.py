@@ -60,10 +60,10 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 import sys
 from pathlib import Path
 
+from forseti.adapters._cli_json import run_json
 from forseti.adapters.gate_reply import render_gate_reply
 from forseti.core.events import GATE_DECISION
 from forseti.core.events import record_event as record_core_event
@@ -114,20 +114,14 @@ def _edited_sources(tool_name: str, tool_input: dict[str, object]) -> list[str]:
 
 def _list_functions(path: str, cwd: str) -> list[str] | None:
     """`forseti list-units --json`'s function names, or `None` on any failure."""
-    try:
-        proc = subprocess.run(
-            ["forseti", "list-units", path, "--json"],
-            capture_output=True,
-            text=True,
-            timeout=_LIST_UNITS_TIMEOUT_S,
-            cwd=cwd,
-        )
-    except (OSError, subprocess.SubprocessError):
+    result = run_json(
+        ["forseti", "list-units", path, "--json"],
+        timeout=_LIST_UNITS_TIMEOUT_S,
+        cwd=cwd,
+    )
+    if result.failure is not None:
         return None
-    try:
-        payload = json.loads(proc.stdout)
-    except ValueError:
-        return None
+    payload = result.payload
     units = payload.get("units") if isinstance(payload, dict) else None
     if not isinstance(units, list):
         return None
@@ -143,33 +137,34 @@ def _semantic_check(path: str, function: str, cwd: str) -> tuple[str, str]:
     `verdicts[]` here. `evidence` is the first non-held verdict's raw
     counterexample/skip reason, best-effort.
     """
-    try:
-        proc = subprocess.run(
-            [
-                "forseti",
-                "semantic-loop",
-                path,
-                "--function",
-                function,
-                "--mode",
-                "check-only",
-                "--json",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=_SEMANTIC_LOOP_TIMEOUT_S,
-            cwd=cwd,
+    result = run_json(
+        [
+            "forseti",
+            "semantic-loop",
+            path,
+            "--function",
+            function,
+            "--mode",
+            "check-only",
+            "--json",
+        ],
+        timeout=_SEMANTIC_LOOP_TIMEOUT_S,
+        cwd=cwd,
+    )
+    if result.failure == "launch":
+        return (
+            "error",
+            f"could not run forseti semantic-loop: {result.diagnostic}",
         )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return ("error", f"could not run forseti semantic-loop: {exc}")
-    fallback_evidence = (proc.stderr or proc.stdout).strip()[:400]
-    try:
-        payload = json.loads(proc.stdout)
-    except ValueError:
-        return ("error", fallback_evidence)
-    outcome = payload.get("outcome") if isinstance(payload, dict) else None
+    if result.failure == "decode":
+        return ("error", result.diagnostic)
+
+    payload = result.payload
+    if not isinstance(payload, dict):
+        return ("error", result.diagnostic)
+    outcome = payload.get("outcome")
     if not isinstance(outcome, str):
-        return ("error", fallback_evidence)
+        return ("error", result.diagnostic)
     evidence = ""
     check = payload.get("check")
     verdicts = check.get("verdicts") if isinstance(check, dict) else None
@@ -177,9 +172,11 @@ def _semantic_check(path: str, function: str, cwd: str) -> tuple[str, str]:
         for verdict in verdicts:
             if not isinstance(verdict, dict) or verdict.get("outcome") == "held":
                 continue
-            result = verdict.get("result")
-            if isinstance(result, dict) and result.get("raw_counterexample"):
-                evidence = str(result["raw_counterexample"])
+            verdict_result = verdict.get("result")
+            if isinstance(verdict_result, dict) and verdict_result.get(
+                "raw_counterexample"
+            ):
+                evidence = str(verdict_result["raw_counterexample"])
                 break
             if verdict.get("skip_reason"):
                 evidence = str(verdict["skip_reason"])
