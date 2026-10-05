@@ -79,6 +79,20 @@ def test_verify_reports_skipped_on_unparseable_output(
     assert evidence == "boom"
 
 
+def test_verify_reports_skipped_on_non_object_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="[1, 2]", stderr="odd"
+        )
+
+    monkeypatch.setattr(_cli_json.subprocess, "run", fake_run)
+    verdict, evidence = verify_hook._verify("f.c")
+    assert verdict == "skipped"
+    assert evidence == "odd"
+
+
 def test_main_ignores_non_apply_patch_tool(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

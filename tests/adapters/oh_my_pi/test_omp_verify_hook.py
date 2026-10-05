@@ -157,6 +157,60 @@ def test_semantic_check_returns_error_when_outcome_missing(
     assert "unexpected failure" in evidence
 
 
+def test_semantic_check_returns_error_on_non_object_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(*_a: object, **_kw: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="[1, 2]", stderr="odd"
+        )
+
+    monkeypatch.setattr(_cli_json.subprocess, "run", fake_run)
+    outcome, evidence = verify_hook._semantic_check("f.c", "my_fn", "/cwd")
+    assert outcome == "error"
+    assert evidence == "odd"
+
+
+def test_semantic_check_skips_verdicts_without_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        "outcome": "violated",
+        "check": {
+            "verdicts": [
+                {"outcome": "violated", "result": {"raw_counterexample": ""}},
+                {"outcome": "violated", "result": {"raw_counterexample": "y == 1"}},
+            ]
+        },
+    }
+
+    def fake_run(*_a: object, **_kw: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=json.dumps(payload), stderr=""
+        )
+
+    monkeypatch.setattr(_cli_json.subprocess, "run", fake_run)
+    outcome, evidence = verify_hook._semantic_check("f.c", "my_fn", "/cwd")
+    assert outcome == "violated"
+    assert evidence == "y == 1"
+
+
+def test_semantic_check_without_any_evidence_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {"outcome": "unknown", "check": {"verdicts": [{"outcome": "unknown"}]}}
+
+    def fake_run(*_a: object, **_kw: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=json.dumps(payload), stderr=""
+        )
+
+    monkeypatch.setattr(_cli_json.subprocess, "run", fake_run)
+    outcome, evidence = verify_hook._semantic_check("f.c", "my_fn", "/cwd")
+    assert outcome == "unknown"
+    assert evidence == ""
+
+
 def test_semantic_check_extracts_outcome_and_counterexample(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
