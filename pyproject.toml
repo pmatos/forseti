@@ -22,7 +22,7 @@ dev = [
     "setuptools>=84.0.0",
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
-    "hypothesis>=6.168.3",
+    "hypothesis>=6.168.4",
     "ty>=0.0.84",
     "ruff>=0.16.10",
     "forseti[mcp]",
