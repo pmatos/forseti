@@ -29,13 +29,13 @@ if you need the PR number — do not assume one. Stay on branch
   when a run ends up blocked.
 - Do not modify the `symphony/` submodule.
 - If `/code-review --fix` genuinely cannot proceed (e.g. no open PR found
-  for this branch), post a `gh pr comment` explaining what blocked you and
-  **exit non-zero (e.g. `exit 1`)**. A non-zero exit routes the FSM through
-  `provider_success: false` to the `to: failed` catch-all and terminates
-  the run as blocked.
+  for this branch), post a `gh pr comment` explaining what blocked you, then
+  end with a `blocked` claim carrying the same explanation. A Bash tool
+  call's `exit 1` only ends that subshell, not the provider session, so the
+  final claim is what routes the run to its blocked exit.
 
 ## Exit
 
-Exit 0 once `/code-review --fix` has run and any fixes it made are pushed
-(or it found nothing to fix). The orchestrator will advance to the next
-state on success.
+Once `/code-review --fix` has run and any fixes it made are pushed (or it
+found nothing to fix), end with a `success` claim. The orchestrator will
+advance to the next state on success.
