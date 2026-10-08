@@ -29,13 +29,13 @@ if you need the PR number — do not assume one. Stay on branch
   when a run ends up blocked.
 - Do not modify the `symphony/` submodule.
 - If `/simplify` genuinely cannot proceed (e.g. no open PR found for this
-  branch), post a `gh pr comment` explaining what blocked you and **exit
-  non-zero (e.g. `exit 1`)**. A non-zero exit routes the FSM through
-  `provider_success: false` to the `to: failed` catch-all and terminates
-  the run as blocked.
+  branch), post a `gh pr comment` explaining what blocked you, then end with
+  a `blocked` claim carrying the same explanation. A Bash tool call's
+  `exit 1` only ends that subshell, not the provider session, so the final
+  claim is what routes the run to its blocked exit.
 
 ## Exit
 
-Exit 0 once `/simplify` has run and any fixes it made are pushed (or it
-found nothing to simplify). The orchestrator will re-enter the wait state
+Once `/simplify` has run and any fixes it made are pushed (or it found
+nothing to simplify), end with a `success` claim. The orchestrator will re-enter the wait state
 and start polling CI/merge signals for this PR.

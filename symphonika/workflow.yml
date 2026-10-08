@@ -1,31 +1,65 @@
 workflow:
   name: forseti_issue_to_pr
-  initial: shipit.agent
+  initial: plan
   states:
-    # Former builtin:single-agent-pr instance "shipit". Its own transitions
-    # only prove provider_success + branch_ahead_of_base, not that the PR was
-    # opened, so success routes through wait_for_pr_open rather than straight
-    # to code_review_fix (vow-lang/vow#1277, symphonika #730).
-    shipit.agent:
+    # Planning pass. Invokes the pm-plan skill against the issue and commits
+    # the result as PLAN.md, which the implement stage executes. Gated on the
+    # agent's own claim like every other agent state: a blocked claim routes
+    # to failed, and a missing or malformed claim falls through to failed.
+    # artifact_exists probes the Run Workspace for PLAN.md itself, and
+    # branch_advanced_since_attempt_start is false unless this run added a
+    # commit, so a resumed attempt cannot coast on a PLAN.md an earlier
+    # attempt left behind.
+    plan:
+      action:
+        kind: agent
+        provider: claude
+        prompt: prompts/plan.md
+      transitions:
+        - to: failed
+          when:
+            claim_status: blocked
+        - to: implement
+          when:
+            claim_status: success
+            provider_success: true
+            artifact_exists: PLAN.md
+            branch_advanced_since_attempt_start: true
+        - to: failed
+
+    # Former builtin:single-agent-pr instance "shipit" (initial state
+    # shipit.agent, renamed to implement). Its own transitions only prove a
+    # success claim + branch_ahead_of_base, not that the PR was opened, so
+    # success routes through wait_for_pr_open rather than straight to
+    # code_review_fix (vow-lang/vow#1277, symphonika #730).
+    implement:
       action:
         kind: agent
         provider: claude
         prompt: prompts/impl.md
       transitions:
+        - to: failed
+          when:
+            claim_status: blocked
+        # branch_ahead_of_base alone would be satisfied by the plan commit
+        # already on the branch, so require this run to advance HEAD too.
         - to: wait_for_pr_open
           when:
+            claim_status: success
             provider_success: true
             branch_ahead_of_base: true
+            branch_advanced_since_attempt_start: true
         - to: failed
 
-    # pr_signal predicates (pr_open/pr_merged/...) are only projected for
-    # kind: wait states, so this check cannot live on shipit's own template
-    # transitions. This dedicated wait state is the supported way to gate on
-    # PR existence: it reuses the same tracked-PR polling and
-    # no-PR-ever-tracked escalation to sym:blocked/sym:human-needed that
-    # wait_for_pr already relies on, but fails fast right after shipit
-    # instead of silently burning a code_review_fix and a simplify run
-    # against a branch with no PR first.
+    # implement's own transition only proves local git state -- a commit
+    # ahead of base -- not that impl.md's other job (push + `gh pr create`)
+    # actually happened. Parking here before code_review_fix reuses the
+    # exact tracked-PR-by-issue + PR-discovery machinery wait_for_pr already
+    # relies on below, plus the bounded untracked-wait
+    # escalation, so a turn that ended before opening a PR (issue #730,
+    # vow-lang/vow#1255) parks and eventually terminalizes blocked instead
+    # of silently walking into code_review_fix/simplify against a PR that
+    # was never opened.
     wait_for_pr_open:
       action:
         kind: wait
@@ -33,21 +67,36 @@ workflow:
         - to: merged
           when:
             pr_merged: true
-        - to: code_review_fix
-          when:
-            pr_open: true
         - to: failed
           when:
             pr_open: false
+        - to: code_review_fix
+          when:
+            pr_open: true
 
+    # Automated review pass on the freshly opened PR. Runs once per PR open
+    # (repairs below loop back to wait_for_pr only, not through here), so a
+    # CI-failure -> autofix -> recheck cycle doesn't re-run code review every
+    # tick.
     code_review_fix:
       action:
         kind: agent
         provider: claude
         prompt: prompts/code-review-fix.md
       transitions:
+        # The pass ends with a structured claim as its final message
+        # (schema-enforced on Claude/Codex). A blocked pass (no open PR to
+        # review, etc.) claims "blocked" instead of relying on a non-zero
+        # exit code -- exiting non-zero from a Bash tool call only ends that
+        # subshell, not the provider session, so provider_success reads true
+        # regardless (issue #730). Advance needs a positive success claim, so
+        # a missing or malformed claim falls through to failed.
+        - to: failed
+          when:
+            claim_status: blocked
         - to: simplify
           when:
+            claim_status: success
             provider_success: true
         - to: failed
 
@@ -57,18 +106,48 @@ workflow:
         provider: claude
         prompt: prompts/simplify.md
       transitions:
+        - to: failed
+          when:
+            claim_status: blocked
         - to: wait_for_pr
           when:
+            claim_status: success
             provider_success: true
         - to: failed
 
+    # Poll-driven park state. Re-evaluated each daemon tick against
+    # projectPullRequestSignals (pr-signal-projection.ts). Transitions are
+    # checked top-down; first match wins. Predicate matching is strict
+    # equality (state-machine-dispatch.ts).
+    #
+    # The FSM owns every outcome here, unresolved reviews included: failing
+    # checks -> autofix, merge conflicts -> resolve, reviewer feedback ->
+    # autofix, clean -> merge. The orchestrator-wide review_followup loop
+    # defers to a parked raw-FSM run, or one whose Run is still actively
+    # executing an earlier state's turn, rather than dispatching alongside it
+    # (issue #616), so a case this state does not name is
+    # a case nothing handles -- the run
+    # parks and raises manual attention.
     wait_for_pr:
       action:
         kind: wait
       transitions:
+        # External-merge catch-all. Covers manual merges and any other path
+        # that lands the PR outside the FSM. The orchestrator-wide follow-up
+        # loop is no longer one of them -- isIssueOwnedByWorkflow defers it
+        # for any parked raw-FSM run, not just a merge_pr one (issue #616) --
+        # but a human with the merge button still is. pr_merged is only ever
+        # true post-merge, so this never short-circuits the normal
+        # wait -> merge -> merged path.
         - to: merged
           when:
             pr_merged: true
+        # Closed-unmerged escape. projectPullRequestSignals leaves mergeable
+        # absent for closed PRs and emits pr_merged only when merged, so a
+        # PR closed without being merged would otherwise either park forever
+        # (if last checks were green) or mis-route into autofix on a dead
+        # branch (if last checks were failing). Must come AFTER pr_merged:
+        # true so merged PRs still take the merged path.
         - to: failed
           when:
             pr_open: false
@@ -88,35 +167,57 @@ workflow:
         # the state parks forever on the common shape -- green checks, one
         # unresolved thread -- because `merge` needs
         # unresolved_review_threads: 0 and `autofix` needs failing checks.
-        # The orchestrator-wide review_followup loop no longer dispatches
-        # alongside a parked raw-FSM run (issue #616), so a case this state
-        # does not name is a case nothing handles.
+        # The progress guard stops the autofix -> wait_for_pr -> autofix cycle
+        # this opens once the observation stops changing.
         - to: autofix
           when:
             has_unresolved_reviews: true
 
+    # Claude session that invokes the pm-autofix-pr skill. Skill triggering
+    # is description-based, so the prompt phrasing is what activates it.
+    #
     autofix:
       action:
         kind: agent
         provider: claude
         prompt: prompts/autofix-pr.md
       transitions:
+        - to: failed
+          when:
+            claim_status: blocked
         - to: wait_for_pr
           when:
+            claim_status: success
             provider_success: true
         - to: failed
 
+    # Claude session for merge conflict resolution. Reuses pm-autofix-pr,
+    # whose trigger set includes "fix the build" / "iterate on pr".
     resolve_conflicts:
       action:
         kind: agent
         provider: claude
         prompt: prompts/resolve-conflicts.md
       transitions:
+        - to: failed
+          when:
+            claim_status: blocked
         - to: wait_for_pr
           when:
+            claim_status: success
             provider_success: true
         - to: failed
 
+    # FSM-controlled merge. Respects symphonika.yml pull_requests.merge
+    # policy per ADR 0048. reEvaluateWaitingRun calls tryMergePullRequest
+    # on each tick this state is entered.
+    #
+    # Escape transitions cover the window between the wait_for_pr gate
+    # check and the next merge tick: a late check flip or a late conflict
+    # routes back to the right repair state instead of parking forever.
+    # No generic catch-all back to wait_for_pr — that would loop on
+    # transient merge failures (API hiccup, branch protection deadlock)
+    # because wait_for_pr's clean predicates would immediately re-advance.
     merge:
       action:
         kind: merge_pr
@@ -124,6 +225,8 @@ workflow:
         - to: merged
           when:
             pr_merged: true
+        # Closed-unmerged escape (mirrors wait_for_pr). Must come AFTER
+        # pr_merged: true so merged PRs still terminate as merged.
         - to: failed
           when:
             pr_open: false
