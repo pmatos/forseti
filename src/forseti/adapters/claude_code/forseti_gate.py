@@ -28,7 +28,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterable, Iterator
+from collections.abc import Generator, Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -554,7 +554,7 @@ def _index_ignore_snapshot(start_dir: str, prefix: str) -> bool:
 @contextlib.contextmanager
 def _enumerable_source(
     file_path: str | os.PathLike[str], content: bytes | None, *, project_dir: str
-) -> Iterator[str]:
+) -> Generator[str]:
     """Yield the path to enumerate for `file_path` — itself, or an immutable sibling.
 
     With `content` ``None`` the file is enumerated where it lies. Given `content`,
@@ -1490,7 +1490,7 @@ def _verifiable_source(
     *,
     project_dir: str,
     mtime_ns: int,
-) -> Iterator[str]:
+) -> Generator[str]:
     """Yield the path to verify `file_path`'s content against: an immutable sibling.
 
     One boundary over from `_enumerable_source` (issue #150): the *verify* step
@@ -1763,7 +1763,7 @@ def _gate_path(project_dir: str) -> Path:
 
 
 @contextlib.contextmanager
-def gate_lock(project_dir: str) -> Iterator[None]:
+def gate_lock(project_dir: str) -> Generator[None]:
     """Serialize gate-state read-modify-write across concurrent hook processes.
 
     Parallel PostToolUse hooks (one per edited file in a batch) each do

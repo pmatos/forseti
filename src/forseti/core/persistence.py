@@ -24,7 +24,7 @@ Two seams, layered:
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Literal
 
@@ -43,7 +43,7 @@ ProposalChannel = Literal["llm", "submitted"]
 
 
 @contextmanager
-def open_store(store_root: Path) -> Iterator[PropertyStore]:
+def open_store(store_root: Path) -> Generator[PropertyStore]:
     """Open `store_root`'s `PropertyStore`, translating store failure to a domain error.
 
     Unlike `PropertyStore.open`, which lets a raw `sqlite3.Error` escape, this seam
