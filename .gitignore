@@ -40,3 +40,7 @@ htmlcov/
 
 .claude/settings.local.json
 .clawpatch/
+
+# Local story/notes scratch and uv lockfile (CI installs via pip; not tracked)
+.stories/
+uv.lock
