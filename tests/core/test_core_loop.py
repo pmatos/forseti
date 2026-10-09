@@ -5,7 +5,7 @@ stands in for the proposer and a scripted `FakeVerify` (mirrors
 `test_core_check.py`'s) stands in for ESBMC, while a real `PropertyStore`
 (under `tmp_path`) and the real `SemanticHarnessWriter` exercise the actual
 persistence/render wiring `run_semantic_loop` composes from `propose_source`/
-`submit_source`/`check_source`.
+the batch submit interface/`check_source`.
 """
 
 from __future__ import annotations
@@ -187,8 +187,8 @@ def test_submit_mode_enforces_max_candidates_across_the_whole_batch(
         verify_port=FakeVerify([Verified(_meta()), Verified(_meta())]),
     )
 
-    # Each `submit_source` call only ever sees a 1-item batch, so the cap must
-    # be tracked across calls -- a per-call `max_candidates` would never trip.
+    # Each candidate keeps its own result, while the submission module tracks
+    # the accepted-count cap across the complete ordered sequence.
     assert len(result.ingestion) == 3
     assert sum(len(r.accepted) for r in result.ingestion) == 2
     assert result.ingestion[2].rejected

@@ -17,15 +17,16 @@ traceability -- never invoked, never guessed.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
-from forseti.core.persistence import persist_proposal
+from forseti.core.persistence import persist_proposals
 from forseti.core.propose import DEFAULT_STORE_ROOT
 from forseti.properties import (
     CandidateSpec,
     HarnessError,
     PromptTemplate,
+    PropertyStore,
     ProposalRequest,
     ProposalResult,
     UnitSignature,
@@ -74,6 +75,46 @@ def submit_source(
     or writing the store is translated to `PropertyStoreError`, mirroring
     `propose_source`/`check_source`.
     """
+    spec = CandidateSpec(
+        expression=expression,
+        domain=tuple(domain),
+        referenced_params=tuple(referenced_params),
+        rationale=rationale,
+    )
+    return _submit_sources(
+        source,
+        function=function,
+        candidates=(spec,),
+        provider=provider,
+        model=model,
+        prompt_id=prompt_id,
+        prompt_version=prompt_version,
+        persist=persist,
+        store_root=store_root,
+        max_candidates=max_candidates,
+    )[0]
+
+
+def _submit_sources(
+    source: Path,
+    *,
+    function: str,
+    candidates: Sequence[CandidateSpec],
+    provider: str,
+    model: str,
+    prompt_id: str = DEFAULT_PROMPT_ID,
+    prompt_version: str = DEFAULT_PROMPT_VERSION,
+    persist: bool = True,
+    store_root: Path = DEFAULT_STORE_ROOT,
+    max_candidates: int = DEFAULT_MAX_CANDIDATES,
+) -> tuple[ProposalResult, ...]:
+    """Submit ordered candidates with one prepared unit and one store lifetime.
+
+    Keep one result per candidate. Each call to ``submit_candidates`` retains the
+    singleton validation and dedup semantics, while the accepted-count budget is
+    shared across the sequence. ``kind`` is intentionally omitted: the existing
+    semantic-loop submit face forwarded only the four candidate content fields.
+    """
     source_text = source.read_text()
     unit_id = make_unit_id(source, function)
     signature: UnitSignature | None
@@ -88,22 +129,29 @@ def submit_source(
         prompt=PromptTemplate(prompt_id=prompt_id, version=prompt_version, template=""),
         signature=signature,
     )
-    spec = CandidateSpec(
-        expression=expression,
-        domain=tuple(domain),
-        referenced_params=tuple(referenced_params),
-        rationale=rationale,
-    )
 
-    return persist_proposal(
-        lambda store: submit_candidates(
-            request,
-            (spec,),
-            provider=provider,
-            model=model,
-            store=store,
-            max_candidates=max_candidates,
-        ),
+    def ingest(store: PropertyStore | None) -> Iterator[ProposalResult]:
+        accepted_count = 0
+        for candidate in candidates:
+            spec = CandidateSpec(
+                expression=candidate.expression,
+                domain=candidate.domain,
+                referenced_params=candidate.referenced_params,
+                rationale=candidate.rationale,
+            )
+            result = submit_candidates(
+                request,
+                (spec,),
+                provider=provider,
+                model=model,
+                store=store,
+                max_candidates=max(max_candidates - accepted_count, 0),
+            )
+            accepted_count += len(result.accepted)
+            yield result
+
+    return persist_proposals(
+        ingest,
         persist=persist,
         store_root=store_root,
         channel="submitted",

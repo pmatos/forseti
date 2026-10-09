@@ -17,7 +17,13 @@ import pytest
 from forseti.core import submit_source
 from forseti.core.cli import main
 from forseti.core.events import events_path
-from forseti.properties import BlankProvenanceError, PropertyStore, PropertyStoreError
+from forseti.core.submit import _submit_sources
+from forseti.properties import (
+    BlankProvenanceError,
+    CandidateSpec,
+    PropertyStore,
+    PropertyStoreError,
+)
 
 ABS_SLICE = "int64_t my_abs(int64_t x) {\n    return (x < 0) ? -x : x;\n}\n"
 
@@ -101,6 +107,58 @@ def test_submit_source_persists_the_candidate(tmp_path: Path) -> None:
         store.close()
     assert {p.property_id for p in stored} == {p.property_id for p in result.accepted}
     assert stored[0].provenance.provider == "codex"
+
+
+def test_batch_submission_prepares_once_and_keeps_independent_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _write_unit(tmp_path)
+    root = tmp_path / ".forseti"
+    reads = 0
+    opens = 0
+    original_read_text = Path.read_text
+    original_open = PropertyStore.open
+
+    def read_text(
+        path: Path, encoding: str | None = None, errors: str | None = None
+    ) -> str:
+        nonlocal reads
+        if path == source:
+            reads += 1
+        return original_read_text(path, encoding=encoding, errors=errors)
+
+    def open_store(cls: type[PropertyStore], path: Path) -> PropertyStore:
+        nonlocal opens
+        opens += 1
+        return original_open(path)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(PropertyStore, "open", classmethod(open_store))
+
+    results = _submit_sources(
+        source,
+        function="my_abs",
+        candidates=(
+            CandidateSpec(expression="result >= 0", domain=("x > INT64_MIN",)),
+            CandidateSpec(expression="result >= 0", domain=("x > INT64_MIN",)),
+            CandidateSpec(expression="result >= x", domain=("x > INT64_MIN",)),
+        ),
+        provider="codex",
+        model="gpt-5.1",
+        store_root=root,
+        max_candidates=2,
+    )
+
+    assert reads == opens == 1
+    assert [len(result.accepted) for result in results] == [1, 1, 0]
+    assert results[2].rejected[0].reason == "over max_candidates"
+    events = [json.loads(line) for line in events_path(root).read_text().splitlines()]
+    assert [event["type"] for event in events] == [
+        "property.proposed",
+        "property.proposed",
+    ]
+    with PropertyStore.open(root) as store:
+        assert len(store.list_for_unit(f"{source}::my_abs")) == 1
 
 
 def test_submit_source_dry_run_does_not_persist(tmp_path: Path) -> None:

@@ -17,15 +17,14 @@ three modes:
   Claude Code subagent's own use case (a nested `claude -p` call it already
   pays for deliberately, issue #95).
 - `"submit"` — ingest `candidates`, host-generated properties with no LLM
-  call (`submit_source`, looped once per candidate so a rejected one is
-  visible in `SemanticLoopResult.ingestion`, never swallowed into a single
-  batch result); the Codex host-model's use case (submitted via MCP or CLI,
-  #213's original provider-neutral motivation).
+  call (the submission module returns one result per candidate so a rejected
+  one remains visible in `SemanticLoopResult.ingestion`); the Codex host-model's
+  use case (submitted via MCP or CLI, #213's original provider-neutral motivation).
 - `"check_only"` — skip ingestion and check whatever the store already
   holds; a re-check after a fix turn, or a Stop-gate surface that only ever
   reads already-persisted candidates.
 
-This module composes `propose_source`/`submit_source`/`check_source`
+This module composes `propose_source`/`_submit_sources`/`check_source`
 verbatim — it never re-implements unit-id formatting, persistence, or harness
 rendering, and it never re-derives verdict policy: `SemanticLoopResult.outcome`
 is `PropertyCheckRun.outcome` (`forseti.orchestrator.check`), Core's own
@@ -71,7 +70,7 @@ from forseti.core.propose import (
 from forseti.core.submit import (
     DEFAULT_PROMPT_ID,
     DEFAULT_PROMPT_VERSION,
-    submit_source,
+    _submit_sources,
 )
 from forseti.orchestrator import PropertyCheckRun, RunOutcome, VerifyPort
 from forseti.precond import DEFAULT_MAX_LEN
@@ -172,7 +171,7 @@ def run_semantic_loop(
     Every persisted candidate and every checked property still emits Core's
     own canonical events (`property.proposed`, `property.check.start`,
     `property.verdict` — `core/events.py`) through `propose_source`/
-    `submit_source`/`check_source` unchanged; this function adds no event of
+    `_submit_sources`/`check_source` unchanged; this function adds no event of
     its own; a `gate.decision` from `SemanticLoopResult.outcome` stays the
     adapter's job (capability-specific gating action, not Core policy).
     """
@@ -204,31 +203,17 @@ def run_semantic_loop(
         case "submit":
             assert provider is not None
             assert model is not None
-            # `submit_source` validates one candidate per call, so `max_candidates`
-            # must be tracked across calls here -- passing the same bound to every
-            # call would let each call's own 1-item batch pass `_accept_reject`'s
-            # `len(accepted) >= max_candidates` check and defeat the cap entirely.
-            submitted = []
-            accepted_count = 0
-            for candidate in candidates:
-                result = submit_source(
-                    source,
-                    function=function,
-                    expression=candidate.expression,
-                    provider=provider,
-                    model=model,
-                    domain=candidate.domain,
-                    referenced_params=candidate.referenced_params,
-                    rationale=candidate.rationale,
-                    prompt_id=prompt_id,
-                    prompt_version=prompt_version,
-                    persist=True,
-                    store_root=store_root,
-                    max_candidates=max(max_candidates - accepted_count, 0),
-                )
-                accepted_count += len(result.accepted)
-                submitted.append(result)
-            ingestion = tuple(submitted)
+            ingestion = _submit_sources(
+                source,
+                function=function,
+                candidates=candidates,
+                provider=provider,
+                model=model,
+                prompt_id=prompt_id,
+                prompt_version=prompt_version,
+                store_root=store_root,
+                max_candidates=max_candidates,
+            )
         case "check_only":
             ingestion = ()
         case _:
