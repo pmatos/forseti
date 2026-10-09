@@ -24,7 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1303,7 +1303,7 @@ def test_stamp_is_not_reclaimed_after_losing_the_lock_race(
     landed: list[bool] = []
 
     @contextlib.contextmanager
-    def lock_a_concurrent_run_got_first(project_dir: str) -> Iterator[None]:
+    def lock_a_concurrent_run_got_first(project_dir: str) -> Generator[None]:
         with real_lock(project_dir):
             if not landed:
                 landed.append(True)
@@ -1353,7 +1353,7 @@ def test_enumerate_drift_block_defers_to_a_stamp_taken_after_the_check(
     real_lock, locks = gate.gate_lock, []
 
     @contextlib.contextmanager
-    def lock_a_concurrent_run_stamped_in(project_dir: str) -> Iterator[None]:
+    def lock_a_concurrent_run_stamped_in(project_dir: str) -> Generator[None]:
         with real_lock(project_dir):
             locks.append(1)
             if len(locks) == 2:  # the one `_blocking_error` takes
@@ -1591,7 +1591,7 @@ def test_drift_block_defers_to_a_stamp_taken_after_the_withdrawal(
     landed: list[bool] = []
 
     @contextlib.contextmanager
-    def lock_a_concurrent_run_finished_in(project_dir: str) -> Iterator[None]:
+    def lock_a_concurrent_run_finished_in(project_dir: str) -> Generator[None]:
         with real_lock(project_dir):
             state = gate.load_state(project_dir)
             gave_up_the_stamp = "x.c" not in state["scanned"]
@@ -1647,7 +1647,7 @@ def test_drift_block_still_lands_when_no_stamp_vouches_for_the_file(
     @contextlib.contextmanager
     def lock_a_concurrent_run_stamped_other_content_in(
         project_dir: str,
-    ) -> Iterator[None]:
+    ) -> Generator[None]:
         with real_lock(project_dir):
             state = gate.load_state(project_dir)
             gave_up_the_stamp = "x.c" not in state["scanned"]
@@ -2122,7 +2122,7 @@ def test_verify_and_record_stages_the_mtime_seen_at_verify_time_not_before_enume
         *,
         project_dir: str,
         mtime_ns: int,
-    ) -> Iterator[str]:
+    ) -> Generator[str]:
         captured["mtime_ns"] = mtime_ns
         with real_verifiable_source(
             file_path, content, project_dir=project_dir, mtime_ns=mtime_ns

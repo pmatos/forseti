@@ -36,7 +36,7 @@ shape) — which lived in `verify.py` until the recipe was extracted here.
 from __future__ import annotations
 
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -234,7 +234,7 @@ def sidecar_runner(
     ladder_cap: int,
     raw: VerifyPort,
     prefix: str,
-) -> Iterator[SidecarRunner]:
+) -> Generator[SidecarRunner]:
     """Bind one driver run's sidecar context, owning a temp dir when needed.
 
     A caller-supplied `work_dir` is used as-is and **never removed** — it is the
