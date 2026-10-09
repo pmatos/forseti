@@ -103,7 +103,7 @@ if command -v tmux >/dev/null 2>&1 && [[ -z "${TMUX:-}" ]]; then
         "bash -c \"source ${ENV_SH_Q} && exec claude\""
     RENDER_CMD="source ${ENV_SH_Q} && exec python3 $(printf '%q' "${SCRIPT_DIR}/render.py") $(printf '%q' "${TARGET_DIR}")"
     tmux split-window -h -t "${SESSION}" -c "${SCRIPT_DIR}/.." "bash -c \"${RENDER_CMD}\""
-    tmux select-pane -t "${SESSION}.0"
+    tmux select-pane -t "${SESSION}:.{left}"
     echo "tmux session: ${SESSION} (left: claude, right: render.py)"
     # `tmux attach` fails outright with no controlling TTY (e.g. this script
     # itself launched non-interactively) -- degrade to a clear message rather
