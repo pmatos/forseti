@@ -1,3 +1,16 @@
+# [1.11.0](https://github.com/pmatos/forseti/compare/v1.10.1...v1.11.0) (2026-10-11)
+
+
+### Bug Fixes
+
+* **demo:** select left tmux pane by position, not index ([#342](https://github.com/pmatos/forseti/issues/342)) ([682e50b](https://github.com/pmatos/forseti/commit/682e50ba895f30bfb2fcf3a634c4b75cda06f9c2))
+* **types:** annotate [@contextmanager](https://github.com/contextmanager) functions as Generator ([#343](https://github.com/pmatos/forseti/issues/343)) ([cc5975c](https://github.com/pmatos/forseti/commit/cc5975c347bc30141596ec7571ec41aeb75d73f4))
+
+
+### Features
+
+* add a pm-plan planning stage and claim-based workflow gates ([#339](https://github.com/pmatos/forseti/issues/339)) ([f3ebdaf](https://github.com/pmatos/forseti/commit/f3ebdaf2d74dce77a852afd8490e912790e81490))
+
 ## [1.10.1](https://github.com/pmatos/forseti/compare/v1.10.0...v1.10.1) (2026-09-27)
 
 
