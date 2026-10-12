@@ -8,16 +8,16 @@ independently tested — so both drivers route through it (`run_loop` per fix
 round, `check_properties` (#66) per property) instead of each keeping its own
 copy of the escalation rule.
 
-Pure with respect to emission: `verify_ladder` *yields* every attempt in order,
-one at a time as it is computed, so the caller owns telemetry (each driver emits
-its own event vocabulary) and can surface each completed rung — and its
-escalation decision — before the next (possibly slow) verify runs.
+`verify_ladder` *yields* every attempt in order, one at a time as it is computed.
+`climb_to_terminal` consumes it, observing each completed rung synchronously
+before the next (possibly slow) verify runs. Callers own their telemetry and
+history; the ladder owns observation timing and terminal selection.
 """
 
 from __future__ import annotations
 
 import itertools
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -84,16 +84,27 @@ def verify_ladder(
 
 
 def climb_to_terminal(
-    source: Path, *, verify: VerifyPort, ladder: tuple[int, ...]
+    source: Path,
+    *,
+    verify: VerifyPort,
+    ladder: tuple[int, ...],
+    on_attempt: Callable[[LadderAttempt], None] | None = None,
 ) -> LadderAttempt:
-    """Climb `ladder`, discarding intermediate attempts, and return the terminal one.
+    """Climb a validated `ladder`, observe each attempt, and return the terminal one.
 
-    For a caller with no need for per-rung telemetry (unlike `check_properties`/
-    `run_loop`, which emit an event on each escalation as they consume
-    `verify_ladder` themselves) — just the settled attempt the ladder ends at.
+    `on_attempt`, when supplied, runs synchronously for every completed rung,
+    including the terminal one, before any next verification starts (issue #100).
+    The caller owns history and telemetry; only the latest attempt is retained
+    here. With no observer, intermediate attempts are discarded.
+
+    Verification and observation exceptions propagate immediately, without
+    running a later rung. An exhausted ladder returns its terminal `Unknown`,
+    never a pass. Like `verify_ladder`, expects a nonempty validated ladder.
     """
     settled = None
     for attempt in verify_ladder(source, verify=verify, ladder=ladder):
         settled = attempt
+        if on_attempt is not None:
+            on_attempt(attempt)
     assert settled is not None  # verify_ladder yields at least one attempt
     return settled

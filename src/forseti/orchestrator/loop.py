@@ -22,7 +22,7 @@ from typing import assert_never
 
 from forseti.esbmc import Error, EsbmcResult, Unknown, Verified, Violated
 
-from .ladder import LadderAttempt, validated_ladder, verify_ladder
+from .ladder import LadderAttempt, climb_to_terminal, validated_ladder
 from .ports import FixPort, VerifyPort
 from .state import GiveUpReason, LoopState, next_state
 from .telemetry import EventEmitter, EventSink
@@ -79,7 +79,7 @@ def run_loop(
     remains to verify a fix's output, so it goes straight to `GIVE_UP` instead
     of performing an unverified (and possibly side-effecting) edit. Each round
     delegates the k-escalation to the shared
-    `verify_ladder`: on `Unknown` it re-verifies the *same* source at the
+    `climb_to_terminal`: on `Unknown` it re-verifies the *same* source at the
     next-higher unwind along `(unwind, *unwind_ladder)`, settling on the terminal
     `UNKNOWN` only once the ladder is exhausted (never a silent pass; roadmap
     Risk 1) — the exact rule `check_properties` runs, so the two drivers can't
@@ -96,43 +96,36 @@ def run_loop(
     current = source
     index = 0
     rounds = 0
+
+    def record_attempt(attempt: LadderAttempt) -> None:
+        nonlocal index
+        state = next_state(attempt.result)
+        iterations.append(Iteration(index, current, attempt.result, state, attempt.k))
+        emit(
+            "verify.verdict",
+            index=index,
+            k=attempt.k,
+            verdict=attempt.result.verdict.value,
+        )
+        if attempt.escalate_to is not None:
+            emit(
+                "unknown.policy.decision",
+                index=index,
+                detail={
+                    "decision": "escalate",
+                    "from_k": attempt.k,
+                    "to_k": attempt.escalate_to,
+                },
+            )
+        index += 1
+
     emit("trigger.fired", detail={"source": str(source), "base_k": unwind})
     while rounds < max_iterations:
         rounds += 1
-        # The shared k-ladder owns the escalation walk (never a silent pass on
-        # UNKNOWN; roadmap Risk 1) — the same rule `check_properties` runs. It
-        # *yields* each rung's attempt as it is computed, already carrying its
-        # `escalate_to` decision; the driver turns each into an `Iteration` and,
-        # before the next (possibly slow) rung runs, flushes this rung's verdict
-        # and — when it will escalate — that escalation, in its own event
-        # vocabulary (issue #100).
-        attempts: list[LadderAttempt] = []
-        for attempt in verify_ladder(current, verify=verify, ladder=ladder):
-            attempts.append(attempt)
-            state = next_state(attempt.result)
-            iterations.append(
-                Iteration(index, current, attempt.result, state, attempt.k)
-            )
-            emit(
-                "verify.verdict",
-                index=index,
-                k=attempt.k,
-                verdict=attempt.result.verdict.value,
-            )
-            if attempt.escalate_to is not None:
-                # a non-terminal Unknown the ladder will escalate past — surface
-                # that decision now, before the next verify (mirrors check.py).
-                emit(
-                    "unknown.policy.decision",
-                    index=index,
-                    detail={
-                        "decision": "escalate",
-                        "from_k": attempt.k,
-                        "to_k": attempt.escalate_to,
-                    },
-                )
-            index += 1
-        final = attempts[-1]
+        # Observation records each rung before the ladder starts the next verify.
+        final = climb_to_terminal(
+            current, verify=verify, ladder=ladder, on_attempt=record_attempt
+        )
         state = next_state(final.result)
         match final.result:
             case Verified():

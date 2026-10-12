@@ -28,6 +28,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal, assert_never
 
@@ -48,7 +49,7 @@ from forseti.properties import (
     build_property_harness,
 )
 
-from .ladder import LadderAttempt, validated_ladder, verify_ladder
+from .ladder import LadderAttempt, climb_to_terminal, validated_ladder
 from .ports import (
     HarnessWriterPort,
     PropertyStorePort,
@@ -314,6 +315,21 @@ def check_properties(
     props = store.list_for_unit(unit.unit_id, CHECKABLE_STATUSES)
     emit("properties.loaded", detail={"unit": unit.unit_id, "count": len(props)})
 
+    def record_escalation(
+        attempt: LadderAttempt, *, index: int, property_id: str
+    ) -> None:
+        if attempt.escalate_to is not None:
+            emit(
+                "unknown.policy.decision",
+                index=index,
+                detail={
+                    "decision": "escalate",
+                    "property_id": property_id,
+                    "from_k": attempt.k,
+                    "to_k": attempt.escalate_to,
+                },
+            )
+
     verdicts: list[PropertyVerdict] = []
     for index, prop in enumerate(props):
         kind = prop.kind.value
@@ -360,26 +376,15 @@ def check_properties(
         harness_path = work_dir / _harness_filename(unit.unit_id, prop.property_id)
         harness_path.write_text(rendered.source_text)
 
-        # verify_ladder *yields* each rung as it is computed, already carrying its
-        # `escalate_to` decision; consume it lazily so a non-terminal Unknown's
-        # escalation is flushed before the next (possibly slow) rung runs (issue
-        # #100) — never pull the next rung ahead of emitting (that was the eager
-        # bug).
-        attempts: list[LadderAttempt] = []
-        for attempt in verify_ladder(harness_path, verify=verify, ladder=ladder):
-            attempts.append(attempt)
-            if attempt.escalate_to is not None:
-                emit(
-                    "unknown.policy.decision",
-                    index=index,
-                    detail={
-                        "decision": "escalate",
-                        "property_id": prop.property_id,
-                        "from_k": attempt.k,
-                        "to_k": attempt.escalate_to,
-                    },
-                )
-        final = attempts[-1]
+        # Observation flushes each escalation before the next verification starts.
+        final = climb_to_terminal(
+            harness_path,
+            verify=verify,
+            ladder=ladder,
+            on_attempt=partial(
+                record_escalation, index=index, property_id=prop.property_id
+            ),
+        )
         outcome = _outcome_for(final.result)
         verdicts.append(
             PropertyVerdict.settled(
