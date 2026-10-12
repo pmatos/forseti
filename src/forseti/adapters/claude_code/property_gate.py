@@ -65,6 +65,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from forseti.adapters._cli_json import capture_json_command
 from forseti.esbmc import VERIFY_GRACE_S
 from forseti.properties import (
     CHECKABLE_STATUSES,
@@ -326,10 +327,8 @@ def _check_unit(
     )
     timeout = min(natural_timeout, budget_s)
     try:
-        proc = subprocess.run(
+        command = capture_json_command(
             argv,
-            capture_output=True,
-            text=True,
             timeout=timeout,
             cwd=project_dir,
         )
@@ -341,7 +340,7 @@ def _check_unit(
         # could give it -- ran out of *turn* budget, not a broken subprocess.
         return _CLAMPED if timeout < natural_timeout else None
     try:
-        payload = json.loads(proc.stdout)
+        payload = command.decode()
     except json.JSONDecodeError:
         return None
     if not isinstance(payload, dict) or not isinstance(payload.get("verdicts"), list):

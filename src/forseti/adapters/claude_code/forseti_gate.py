@@ -31,8 +31,9 @@ import tempfile
 from collections.abc import Generator, Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
 
+from forseti.adapters._cli_json import capture_json_command
 from forseti.unit_id import make_unit_id, unit_id_prefix
 
 from . import event_log
@@ -827,10 +828,8 @@ def _list_units(source: str, *, project_dir: str) -> list[FuncDef]:
     if build_flags:
         argv += ["--", *build_flags]
     try:
-        proc = subprocess.run(
+        command = capture_json_command(
             argv,
-            capture_output=True,
-            text=True,
             timeout=LIST_UNITS_TIMEOUT_S + _SUBPROCESS_MARGIN_S,
             cwd=project_dir,
         )
@@ -844,14 +843,14 @@ def _list_units(source: str, *, project_dir: str) -> list[FuncDef]:
             f"list-units exceeded {LIST_UNITS_TIMEOUT_S:g}s (raise "
             "FORSETI_LIST_UNITS_TIMEOUT_S)"
         ) from exc
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout).strip()[:800] or f"exit {proc.returncode}"
+    if command.returncode != 0:
+        detail = command.diagnostic(limit=800) or f"exit {command.returncode}"
         raise UnitsUnavailable(detail)
     try:
-        payload = json.loads(proc.stdout)
+        payload = command.decode()
     except json.JSONDecodeError as exc:
         raise UnitsUnavailable(
-            (proc.stderr or proc.stdout).strip()[:800] or "no JSON output"
+            command.diagnostic(limit=800) or "no JSON output"
         ) from exc
     # Require an explicit list-valued `units`. Defaulting a missing key to `[]`
     # would let an older/incompatible `forseti` build — one that exits 0 with a
@@ -861,7 +860,7 @@ def _list_units(source: str, *, project_dir: str) -> list[FuncDef]:
     if not isinstance(payload, dict) or not isinstance(payload.get("units"), list):
         raise UnitsUnavailable(
             "list-units payload has no list-valued `units` key (incompatible "
-            f"`forseti` build?): {proc.stdout.strip()[:800] or '<empty>'}"
+            f"`forseti` build?): {command.stdout.strip()[:800] or '<empty>'}"
         )
     return [_func_def(u) for u in payload["units"]]
 
@@ -1688,10 +1687,8 @@ def verify_function(
         *build_flags,
     ]
     try:
-        proc = subprocess.run(
+        command = capture_json_command(
             argv,
-            capture_output=True,
-            text=True,
             timeout=VERIFY_TIMEOUT_S + _SUBPROCESS_MARGIN_S,
             cwd=project_dir,
         )
@@ -1717,7 +1714,7 @@ def verify_function(
         )
 
     try:
-        payload = json.loads(proc.stdout)
+        payload = cast(dict[str, Any], command.decode())
     except json.JSONDecodeError:
         return UnitVerdict(
             uid,
@@ -1725,7 +1722,7 @@ def verify_function(
             function,
             "error",
             k,
-            detail=(proc.stderr or proc.stdout).strip()[:800] or "no output",
+            detail=command.diagnostic(limit=800) or "no output",
         )
 
     verdict = str(payload.get("verdict", "error"))
