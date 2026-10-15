@@ -12,13 +12,16 @@ from pathlib import Path
 import pytest
 
 from forseti.esbmc import (
+    Error,
     EsbmcResult,
     RunMeta,
     Unknown,
     UnknownReason,
     Verified,
+    Violated,
 )
 from forseti.orchestrator import LadderAttempt, validated_ladder, verify_ladder
+from forseti.orchestrator.ladder import climb_to_terminal
 
 SRC = Path("harness.c")
 
@@ -132,3 +135,94 @@ def test_verify_ladder_is_lazy_one_rung_at_a_time() -> None:
 
     assert [a.k for a in gen] == [32]
     assert verify.unwinds == [8, 16, 32]
+
+
+def test_climb_to_terminal_without_observation() -> None:
+    terminal = Verified(meta())
+    verify = FakeVerify([unknown(), terminal])
+
+    settled = climb_to_terminal(SRC, verify=verify, ladder=(8, 16, 32))
+
+    assert settled.k == 16
+    assert settled.result is terminal
+    assert settled.escalate_to is None
+    assert verify.unwinds == [8, 16]
+
+
+@pytest.mark.parametrize(
+    "terminal",
+    [Verified(meta()), Violated(meta(), "trace"), Error(meta(), "failed"), unknown()],
+)
+def test_climb_observes_each_attempt_before_next_verify(
+    terminal: EsbmcResult,
+) -> None:
+    history: list[tuple[str, int]] = []
+    results = [unknown(), terminal]
+    observed: list[LadderAttempt] = []
+
+    def verify(source: Path, *, unwind: int) -> EsbmcResult:
+        assert source == SRC
+        history.append(("verify", unwind))
+        return results.pop(0)
+
+    def observe(attempt: LadderAttempt) -> None:
+        history.append(("observe", attempt.k))
+        observed.append(attempt)
+
+    settled = climb_to_terminal(SRC, verify=verify, ladder=(8, 16), on_attempt=observe)
+
+    assert history == [("verify", 8), ("observe", 8), ("verify", 16), ("observe", 16)]
+    assert [a.escalate_to for a in observed] == [16, None]
+    assert settled is observed[-1]
+    assert settled.result is terminal
+    assert results == []
+
+
+def test_climb_observes_immediate_settlement_without_running_later_rungs() -> None:
+    terminal = Verified(meta())
+    verify = FakeVerify([terminal])
+    observed: list[LadderAttempt] = []
+
+    settled = climb_to_terminal(
+        SRC, verify=verify, ladder=(8, 16, 32), on_attempt=observed.append
+    )
+
+    assert observed == [settled]
+    assert settled.result is terminal
+    assert settled.escalate_to is None
+    assert verify.unwinds == [8]
+
+
+def test_climb_preserves_completed_observation_when_next_verify_raises() -> None:
+    failure = RuntimeError("interrupted verification")
+    history: list[tuple[str, int]] = []
+
+    def verify(source: Path, *, unwind: int) -> EsbmcResult:
+        history.append(("verify", unwind))
+        if unwind == 16:
+            raise failure
+        return unknown()
+
+    def observe(attempt: LadderAttempt) -> None:
+        history.append(("observe", attempt.k))
+
+    with pytest.raises(RuntimeError) as raised:
+        climb_to_terminal(SRC, verify=verify, ladder=(8, 16, 32), on_attempt=observe)
+
+    assert raised.value is failure
+    assert history == [("verify", 8), ("observe", 8), ("verify", 16)]
+
+
+def test_climb_stops_before_next_verify_when_observation_raises() -> None:
+    failure = RuntimeError("observer failed")
+    verify = FakeVerify([unknown(), Verified(meta())])
+
+    def observe(attempt: LadderAttempt) -> None:
+        assert attempt.k == 8
+        raise failure
+
+    with pytest.raises(RuntimeError) as raised:
+        climb_to_terminal(SRC, verify=verify, ladder=(8, 16), on_attempt=observe)
+
+    assert raised.value is failure
+    assert verify.unwinds == [8]
