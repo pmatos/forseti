@@ -21,19 +21,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from forseti.core._proposal_request import prepare_proposal_request
 from forseti.core.persistence import persist_proposal
 from forseti.properties import (
     MAX_CANDIDATES_DEFAULT,
     ClaudeCliClient,
-    HarnessError,
     LLMClient,
-    ProposalRequest,
     ProposalResult,
-    UnitSignature,
-    extract_signature,
     propose_properties,
 )
-from forseti.unit_id import make_unit_id
 
 DEFAULT_MODEL = "sonnet"
 DEFAULT_TIMEOUT_S = 240.0
@@ -67,17 +63,7 @@ def propose_source(
     is translated to `PropertyStoreError`, so both Core faces get a stable
     domain-level failure instead of an uncaught SQLite traceback.
     """
-    source_text = source.read_text()
-    unit_id = make_unit_id(source, function)
-    signature: UnitSignature | None
-    try:
-        signature = extract_signature(source_text, function)
-    except HarnessError:
-        signature = None
-
-    request = ProposalRequest(
-        unit_id=unit_id, source_text=source_text, signature=signature
-    )
+    request = prepare_proposal_request(source, function=function)
     llm = client or ClaudeCliClient(
         model=model, claude_bin=claude_bin, timeout_s=timeout_s
     )

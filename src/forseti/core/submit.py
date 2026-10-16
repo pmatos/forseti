@@ -20,21 +20,17 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
+from forseti.core._proposal_request import prepare_proposal_request
 from forseti.core.persistence import persist_proposals
 from forseti.core.propose import DEFAULT_STORE_ROOT
 from forseti.properties import (
     CandidateSpec,
-    HarnessError,
     PromptTemplate,
     PropertyStore,
-    ProposalRequest,
     ProposalResult,
-    UnitSignature,
-    extract_signature,
     submit_candidates,
 )
 from forseti.properties.prompts import MAX_CANDIDATES_DEFAULT
-from forseti.unit_id import make_unit_id
 
 DEFAULT_MAX_CANDIDATES = MAX_CANDIDATES_DEFAULT
 DEFAULT_PROMPT_ID = "host-submitted"
@@ -115,19 +111,10 @@ def _submit_sources(
     shared across the sequence. ``kind`` is intentionally omitted: the existing
     semantic-loop submit face forwarded only the four candidate content fields.
     """
-    source_text = source.read_text()
-    unit_id = make_unit_id(source, function)
-    signature: UnitSignature | None
-    try:
-        signature = extract_signature(source_text, function)
-    except HarnessError:
-        signature = None
-
-    request = ProposalRequest(
-        unit_id=unit_id,
-        source_text=source_text,
+    request = prepare_proposal_request(
+        source,
+        function=function,
         prompt=PromptTemplate(prompt_id=prompt_id, version=prompt_version, template=""),
-        signature=signature,
     )
 
     def ingest(store: PropertyStore | None) -> Iterator[ProposalResult]:
