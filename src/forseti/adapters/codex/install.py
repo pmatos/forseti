@@ -36,10 +36,11 @@ from __future__ import annotations
 
 import re
 import tomllib
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
 
-from forseti.adapters._atomic import write_text_atomic
+from forseti.adapters._config_file import FileChange, edit_file
 
 _MARKER_PREFIX = "forseti codex-hook "
 _HOOK_NAME = "verify"
@@ -199,6 +200,19 @@ def _config_path(project_dir: Path) -> Path:
     return project_dir / ".codex" / "config.toml"
 
 
+def _edit_config(
+    path: Path, transform: Callable[[str | None], str | None]
+) -> FileChange:
+    return edit_file(
+        path,
+        decode=str,
+        transform=transform,
+        encode=str,
+        error_type=ProjectConfigError,
+        description="config",
+    )
+
+
 def install(project_dir: Path) -> tuple[Path, InstallOutcome]:
     """Install/update the Codex verify-gate hook for `project_dir`.
 
@@ -208,35 +222,19 @@ def install(project_dir: Path) -> tuple[Path, InstallOutcome]:
     replacing the link with a plain file.
     """
     config_path = _config_path(project_dir)
-    if config_path.is_symlink():
-        raise ProjectConfigError(
-            f"{config_path} is a symlink -- refusing to replace it (an atomic "
-            "rewrite would swap in a plain file, silently breaking the link)"
-        )
-    existed = config_path.exists()
-    if existed:
-        try:
-            existing_text = config_path.read_text(encoding="utf-8")
-        except (OSError, ValueError) as exc:
-            raise ProjectConfigError(
-                f"{config_path}: cannot read existing config ({exc})"
-            ) from exc
-        try:
-            tomllib.loads(existing_text)
-        except tomllib.TOMLDecodeError as exc:
-            raise ProjectConfigError(
-                f"{config_path}: cannot parse existing config as TOML ({exc})"
-            ) from exc
-    else:
-        existing_text = ""
 
-    merged = merge_config(existing_text, config_path)
-    if merged == existing_text:
-        return config_path, InstallOutcome.UNCHANGED
+    def merge(existing_text: str | None) -> str:
+        if existing_text is not None:
+            try:
+                tomllib.loads(existing_text)
+            except tomllib.TOMLDecodeError as exc:
+                raise ProjectConfigError(
+                    f"{config_path}: cannot parse existing config as TOML ({exc})"
+                ) from exc
+        return merge_config(existing_text or "", config_path)
 
-    write_text_atomic(config_path, merged)
-    outcome = InstallOutcome.CREATED if not existed else InstallOutcome.UPDATED
-    return config_path, outcome
+    change = _edit_config(config_path, merge)
+    return config_path, InstallOutcome[change.name]
 
 
 def remove(project_dir: Path) -> tuple[Path, RemoveOutcome]:
@@ -253,24 +251,25 @@ def remove(project_dir: Path) -> tuple[Path, RemoveOutcome]:
     unpaired/duplicated sentinel marker.
     """
     config_path = _config_path(project_dir)
-    if config_path.is_symlink():
-        raise ProjectConfigError(
-            f"{config_path} is a symlink -- refusing to replace it (an atomic "
-            "rewrite would swap in a plain file, silently breaking the link)"
-        )
-    if not config_path.exists():
-        return config_path, RemoveOutcome.UNCHANGED
-    try:
-        existing_text = config_path.read_text(encoding="utf-8")
-    except (OSError, ValueError) as exc:
-        raise ProjectConfigError(
-            f"{config_path}: cannot read existing config ({exc})"
-        ) from exc
+    change = _edit_config(
+        config_path, lambda existing: _without_managed_block(existing, config_path)
+    )
+    outcome = (
+        RemoveOutcome.UNCHANGED
+        if change is FileChange.UNCHANGED
+        else RemoveOutcome.REMOVED
+    )
+    return config_path, outcome
+
+
+def _without_managed_block(existing_text: str | None, config_path: Path) -> str | None:
+    if existing_text is None:
+        return None
     _refuse_sentinel_collision(existing_text, config_path)
     _refuse_unpaired_sentinels(existing_text, config_path)
     stripped = _strip_managed_block(existing_text)
     if stripped == existing_text:
-        return config_path, RemoveOutcome.UNCHANGED
+        return existing_text
     trailing_newlines = len(stripped) - len(stripped.rstrip("\n"))
     if trailing_newlines <= 2:
         # `merge_config` pads at most up to a two-newline (blank-line) separator
@@ -282,5 +281,4 @@ def remove(project_dir: Path) -> tuple[Path, RemoveOutcome]:
         stripped = stripped.rstrip("\n")
         if stripped:
             stripped += "\n"
-    write_text_atomic(config_path, stripped)
-    return config_path, RemoveOutcome.REMOVED
+    return stripped

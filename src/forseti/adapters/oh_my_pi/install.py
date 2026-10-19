@@ -27,11 +27,12 @@ risk clobbering it.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from forseti.adapters._atomic import write_text_atomic
+from forseti.adapters._config_file import FileChange, edit_file
 
 HOOK_NAMES: frozenset[str] = frozenset({"tool-result"})
 
@@ -161,60 +162,47 @@ def _is_forseti_extension(text: str) -> bool:
     return text.startswith(_MARKER_START)
 
 
-def _reject_symlink(path: Path) -> None:
-    if path.is_symlink():
-        raise ProjectConfigError(
-            f"{path} is a symlink -- refusing to replace it (an atomic "
-            "rewrite would swap in a plain file, silently breaking the link)"
-        )
-
-
-def _read_owned_extension(path: Path, action: str) -> str | None:
-    """`path`'s text if it exists and carries forseti's own sentinel header.
-
-    `None` if `path` doesn't exist. Raises `ProjectConfigError` if it exists
-    but can't be read, or doesn't look like forseti's own managed extension --
-    hand-written content this `action` must not touch.
-    """
-    if not path.exists():
-        return None
-    try:
-        existing_text = path.read_text(encoding="utf-8")
-    except (OSError, ValueError) as exc:
-        raise ProjectConfigError(
-            f"{path}: cannot read existing extension ({exc})"
-        ) from exc
-    if not _is_forseti_extension(existing_text):
+def _require_owned_extension(text: str | None, path: Path, action: str) -> None:
+    if text is not None and not _is_forseti_extension(text):
         raise ProjectConfigError(
             f"{path}: does not look like forseti's own managed extension "
             f"(missing its sentinel header) -- refusing to {action} "
             "hand-written content"
         )
-    return existing_text
+
+
+def _edit_extension(
+    path: Path, transform: Callable[[str | None], str | None]
+) -> FileChange:
+    return edit_file(
+        path,
+        decode=str,
+        transform=transform,
+        encode=str,
+        error_type=ProjectConfigError,
+        description="extension",
+    )
 
 
 def _install_extension(project_dir: Path) -> tuple[Path, InstallOutcome]:
     path = _extension_path(project_dir)
-    _reject_symlink(path)
-    existing_text = _read_owned_extension(path, "overwrite")
-    if existing_text == _EXTENSION_SOURCE:
-        return path, InstallOutcome.UNCHANGED
 
-    write_text_atomic(path, _EXTENSION_SOURCE)
-    return (
-        path,
-        InstallOutcome.CREATED if existing_text is None else InstallOutcome.UPDATED,
-    )
+    def replace(existing: str | None) -> str:
+        _require_owned_extension(existing, path, "overwrite")
+        return _EXTENSION_SOURCE
+
+    change = _edit_extension(path, replace)
+    return path, InstallOutcome[change.name]
 
 
 def _remove_extension(project_dir: Path) -> tuple[Path, RemoveOutcome]:
     path = _extension_path(project_dir)
-    _reject_symlink(path)
-    existing_text = _read_owned_extension(path, "delete")
-    if existing_text is None:
-        return path, RemoveOutcome.UNCHANGED
-    path.unlink()
-    return path, RemoveOutcome.REMOVED
+
+    def delete(existing: str | None) -> None:
+        _require_owned_extension(existing, path, "delete")
+
+    change = _edit_extension(path, delete)
+    return path, RemoveOutcome[change.name]
 
 
 def _mcp_config_path(project_dir: Path) -> Path:
@@ -225,18 +213,25 @@ def _is_forseti_server(value: object) -> bool:
     return isinstance(value, dict) and value.get("command") == "forseti"
 
 
-def _read_existing_mcp_config(config_path: Path) -> dict[str, Any]:
-    if not config_path.exists():
-        return {}
-    try:
-        existing = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise ProjectConfigError(
-            f"{config_path}: cannot read existing MCP config ({exc})"
-        ) from exc
+def _mcp_config_from_text(text: str, config_path: Path) -> dict[str, Any]:
+    existing = json.loads(text)
     if not isinstance(existing, dict):
         raise ProjectConfigError(f"{config_path}: top-level JSON must be an object")
     return existing
+
+
+def _edit_mcp_config(
+    path: Path,
+    transform: Callable[[dict[str, Any] | None], dict[str, Any] | None],
+) -> FileChange:
+    return edit_file(
+        path,
+        decode=lambda text: _mcp_config_from_text(text, path),
+        transform=transform,
+        encode=lambda value: json.dumps(value, indent=2) + "\n",
+        error_type=ProjectConfigError,
+        description="MCP config",
+    )
 
 
 def merge_mcp_config(existing: dict[str, Any], config_path: Path) -> dict[str, Any]:
@@ -295,30 +290,26 @@ def _strip_mcp_server(existing: dict[str, Any], config_path: Path) -> dict[str, 
 
 def _install_mcp_config(project_dir: Path) -> tuple[Path, InstallOutcome]:
     config_path = _mcp_config_path(project_dir)
-    _reject_symlink(config_path)
-    existed = config_path.exists()
-    existing = _read_existing_mcp_config(config_path)
-    merged = merge_mcp_config(existing, config_path)
-    if merged == existing:
-        return config_path, InstallOutcome.UNCHANGED
-    write_text_atomic(config_path, json.dumps(merged, indent=2) + "\n")
-    return (
-        config_path,
-        InstallOutcome.CREATED if not existed else InstallOutcome.UPDATED,
+    change = _edit_mcp_config(
+        config_path, lambda existing: merge_mcp_config(existing or {}, config_path)
     )
+    return config_path, InstallOutcome[change.name]
 
 
 def _remove_mcp_config(project_dir: Path) -> tuple[Path, RemoveOutcome]:
     config_path = _mcp_config_path(project_dir)
-    _reject_symlink(config_path)
-    if not config_path.exists():
-        return config_path, RemoveOutcome.UNCHANGED
-    existing = _read_existing_mcp_config(config_path)
-    stripped = _strip_mcp_server(existing, config_path)
-    if stripped == existing:
-        return config_path, RemoveOutcome.UNCHANGED
-    write_text_atomic(config_path, json.dumps(stripped, indent=2) + "\n")
-    return config_path, RemoveOutcome.REMOVED
+    change = _edit_mcp_config(
+        config_path,
+        lambda existing: (
+            _strip_mcp_server(existing, config_path) if existing is not None else None
+        ),
+    )
+    outcome = (
+        RemoveOutcome.UNCHANGED
+        if change is FileChange.UNCHANGED
+        else RemoveOutcome.REMOVED
+    )
+    return config_path, outcome
 
 
 def install(project_dir: Path) -> tuple[Path, InstallOutcome]:

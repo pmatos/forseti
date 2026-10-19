@@ -20,11 +20,12 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from . import event_log
+from forseti.adapters._config_file import FileChange, edit_file
 
 _MARKER_PREFIX = "forseti claude-code-hook "
 
@@ -179,27 +180,25 @@ def _settings_path(project_dir: Path, *, shared: bool) -> Path:
     return project_dir / ".claude" / name
 
 
-def _read_existing_settings(settings_path: Path) -> dict[str, Any]:
-    """Read and validate `settings_path`'s JSON; `{}` if it doesn't exist.
-
-    Raises `ProjectSettingsError` on unreadable/malformed JSON or a
-    non-object top level, shared by `install` and `remove`.
-    """
-    if not settings_path.exists():
-        return {}
-    try:
-        existing = json.loads(settings_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        # ValueError, not just json.JSONDecodeError: a byte sequence the
-        # locale codec would otherwise misdecode into mojibake instead
-        # raises UnicodeDecodeError here (also a ValueError subclass),
-        # so it hits this same honest-error path rather than escaping it.
-        raise ProjectSettingsError(
-            f"{settings_path}: cannot read existing settings ({exc})"
-        ) from exc
+def _settings_from_text(text: str, settings_path: Path) -> dict[str, Any]:
+    existing = json.loads(text)
     if not isinstance(existing, dict):
         raise ProjectSettingsError(f"{settings_path}: top-level JSON must be an object")
     return existing
+
+
+def _edit_settings(
+    path: Path,
+    transform: Callable[[dict[str, Any] | None], dict[str, Any] | None],
+) -> FileChange:
+    return edit_file(
+        path,
+        decode=lambda text: _settings_from_text(text, path),
+        transform=transform,
+        encode=lambda value: json.dumps(value, indent=2) + "\n",
+        error_type=ProjectSettingsError,
+        description="settings",
+    )
 
 
 def install(project_dir: Path, *, shared: bool = False) -> tuple[Path, InstallOutcome]:
@@ -214,21 +213,8 @@ def install(project_dir: Path, *, shared: bool = False) -> tuple[Path, InstallOu
     raises `ProjectSettingsError` instead of doing that.
     """
     settings_path = _settings_path(project_dir, shared=shared)
-    if settings_path.is_symlink():
-        raise ProjectSettingsError(
-            f"{settings_path} is a symlink -- refusing to replace it (an atomic "
-            "rewrite would swap in a plain file, silently breaking the link)"
-        )
-    existed = settings_path.exists()
-    existing = _read_existing_settings(settings_path)
-
-    updated = merge_hooks(existing)
-    if updated == existing:
-        return settings_path, InstallOutcome.UNCHANGED
-
-    event_log.write_text_atomic(settings_path, json.dumps(updated, indent=2) + "\n")
-    outcome = InstallOutcome.CREATED if not existed else InstallOutcome.UPDATED
-    return settings_path, outcome
+    change = _edit_settings(settings_path, lambda existing: merge_hooks(existing or {}))
+    return settings_path, InstallOutcome[change.name]
 
 
 def remove(project_dir: Path, *, shared: bool = False) -> tuple[Path, RemoveOutcome]:
@@ -244,24 +230,26 @@ def remove(project_dir: Path, *, shared: bool = False) -> tuple[Path, RemoveOutc
     restores its pre-install content.
     """
     settings_path = _settings_path(project_dir, shared=shared)
-    if settings_path.is_symlink():
-        raise ProjectSettingsError(
-            f"{settings_path} is a symlink -- refusing to replace it (an atomic "
-            "rewrite would swap in a plain file, silently breaking the link)"
-        )
-    if not settings_path.exists():
-        return settings_path, RemoveOutcome.UNCHANGED
+    change = _edit_settings(settings_path, _without_forseti_hooks)
+    outcome = (
+        RemoveOutcome.UNCHANGED
+        if change is FileChange.UNCHANGED
+        else RemoveOutcome.REMOVED
+    )
+    return settings_path, outcome
 
-    existing = _read_existing_settings(settings_path)
+
+def _without_forseti_hooks(existing: dict[str, Any] | None) -> dict[str, Any] | None:
+    if existing is None:
+        return None
     merged = dict(existing)
     hooks = _validate_hooks_shape(merged.get("hooks", {}))
     stripped = _strip_forseti_hooks(hooks)
     if stripped == hooks:
-        return settings_path, RemoveOutcome.UNCHANGED
+        return existing
     if stripped:
         merged["hooks"] = stripped
     else:
         merged.pop("hooks", None)
 
-    event_log.write_text_atomic(settings_path, json.dumps(merged, indent=2) + "\n")
-    return settings_path, RemoveOutcome.REMOVED
+    return merged
