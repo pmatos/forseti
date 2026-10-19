@@ -14,19 +14,20 @@ when `store_root` is the project's default `.forseti` -- so a project's whole
 loop history (adapter-local trigger events interleaved with Core's own) lives in
 one append-only file. Best-effort and never raises: a trace failure must not
 turn a verdict into an error (mirrors `adapters.claude_code.event_log.log_event`).
+The concrete writer and destination helper are re-exported from the shared
+`forseti._events` module; this module owns the canonical event vocabulary.
 """
 
 from __future__ import annotations
 
-import json
-import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
+
+from forseti._events import events_path as events_path
+from forseti._events import record_event as record_event
 
 if TYPE_CHECKING:
     from forseti.properties import ProposalResult
-
-_EVENTS_FILE = "events.jsonl"
 
 # Canonical event-type vocabulary (the `type` field). Dotted names distinguish
 # these from an adapter's own short local names (`edit`, `gate`, `stop`, ...) at
@@ -41,31 +42,6 @@ GATE_DECISION = "gate.decision"
 # unchanged), so library/MCP callers stay silent. This states the policy;
 # `core._cli_trace.traced` is the one place that carries it out.
 CLI_COMMAND = "cli.command"
-
-
-def events_path(store_root: Path) -> Path:
-    """The trace file for a store root: ``<store_root>/events.jsonl``."""
-    return store_root / _EVENTS_FILE
-
-
-def record_event(store_root: Path, event_type: str, **fields: Any) -> None:
-    """Append one canonical lifecycle event; never raise into the caller.
-
-    Stamps a wall-clock ``ts`` (epoch seconds) and ``type``, then writes the
-    JSON object as a single line (one ``O_APPEND`` syscall of a below-``PIPE_BUF``
-    line, so concurrent writers interleave whole lines rather than corrupting
-    each other -- mirrors the Claude Code adapter's own event log). All I/O and
-    serialization errors are swallowed: observability must never turn a
-    successful propose/check/gate outcome into a crash.
-    """
-    event = {"ts": time.time(), "type": event_type, **fields}
-    try:
-        path = events_path(store_root)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, sort_keys=True) + "\n")
-    except (OSError, TypeError, ValueError):
-        pass
 
 
 def record_property_proposed(

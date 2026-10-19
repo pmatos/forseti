@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
 
+from forseti.adapters.claude_code import event_log
 from forseti.core.events import (
     GATE_DECISION,
     PROPERTY_CHECK_START,
@@ -58,3 +60,49 @@ def test_record_event_swallows_non_serializable_fields(tmp_path: Path) -> None:
     record_event(root, PROPERTY_PROPOSED, unit_id="a.c::f", bad=object())  # no raise
     # Nothing usable was written -- the whole line is best-effort, not partial.
     assert not events_path(root).exists() or events_path(root).read_text() == ""
+
+
+def test_core_and_adapter_append_to_one_trace(tmp_path: Path) -> None:
+    root = tmp_path / ".forseti"
+    record_event(root, PROPERTY_CHECK_START, unit_id="a.c::f", ts=1)
+    event_log.log_event(tmp_path, event_log.VERIFY, verdict="verified", ts=2)
+    record_event(root, PROPERTY_VERDICT, outcome="held", ts=3)
+
+    assert events_path(root) == event_log.events_path(tmp_path)
+    assert event_log.read_events(tmp_path) == [
+        {"ts": 1, "type": PROPERTY_CHECK_START, "unit_id": "a.c::f"},
+        {"ts": 2, "type": event_log.VERIFY, "verdict": "verified"},
+        {"ts": 3, "type": PROPERTY_VERDICT, "outcome": "held"},
+    ]
+
+
+def test_core_event_preserves_field_overrides_and_json_format(tmp_path: Path) -> None:
+    record_event(tmp_path, "original", ts=7, type="custom", note="café\nnext")
+
+    assert events_path(tmp_path).read_text(encoding="utf-8") == (
+        '{"note": "caf\\u00e9\\nnext", "ts": 7, "type": "custom"}\n'
+    )
+
+
+def test_core_event_swallows_circular_fields_after_opening(tmp_path: Path) -> None:
+    circular: list[object] = []
+    circular.append(circular)
+
+    record_event(tmp_path, PROPERTY_PROPOSED, bad=circular)
+
+    assert events_path(tmp_path).read_text(encoding="utf-8") == ""
+
+
+def test_core_event_does_not_suppress_clock_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    failure = OSError("clock unavailable")
+
+    def broken_clock() -> float:
+        raise failure
+
+    monkeypatch.setattr(time, "time", broken_clock)
+    with pytest.raises(OSError) as caught:
+        record_event(tmp_path, PROPERTY_CHECK_START)
+    assert caught.value is failure
+    assert not events_path(tmp_path).exists()
