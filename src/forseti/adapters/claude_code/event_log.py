@@ -14,6 +14,8 @@ standalone (stdlib only, no ``forseti_gate`` import) so a hook can log without
 pulling the gate machinery in. The canonical, redacted W10 event schema
 ([#15](https://github.com/pmatos/forseti/issues/15)) supersedes it later; the
 event *vocabulary* here is chosen to map onto that cleanly.
+The writer and project destination helper are re-exported from
+`forseti._events`; this module owns the local vocabulary and trace reader.
 
 What it does NOT capture: Claude's natural-language messages. A hook sees the tool
 call (the code written/edited) and the verifier's response, not the assistant's
@@ -25,14 +27,12 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from pathlib import Path
 from typing import Any
 
+from forseti._events import log_event as log_event
+from forseti._events import project_events_path as events_path
 from forseti.adapters._atomic import write_text_atomic as write_text_atomic
-
-_STATE_DIR = ".forseti"
-_EVENTS_FILE = "events.jsonl"
 
 # Event type vocabulary (the `type` field). Kept small and stable so the renderer
 # and any later #15 migration have a fixed contract to map from.
@@ -41,34 +41,6 @@ VERIFY = "verify"  # one `forseti verify` (ESBMC) call and its verdict
 GATE = "gate"  # the PostToolUse decision for a file (pass | block)
 STOP = "stop"  # the Stop-gate decision (block | residual | allow)
 SESSION = "session"  # a SessionStart baseline of the pre-session dirty C tree
-
-
-def events_path(project_dir: str | os.PathLike[str]) -> Path:
-    """The trace file for a project: ``<project_dir>/.forseti/events.jsonl``."""
-    return Path(project_dir) / _STATE_DIR / _EVENTS_FILE
-
-
-def log_event(project_dir: str | os.PathLike[str], type: str, **fields: Any) -> None:
-    """Append one event to the project's trace; never raise into the caller.
-
-    Stamps a wall-clock ``ts`` (epoch seconds) and a ``type``, then writes the
-    JSON object as a single line. The write is one ``O_APPEND`` syscall of a
-    below-``PIPE_BUF`` line, so concurrent PostToolUse hooks appending in parallel
-    interleave whole lines rather than corrupting each other — the same
-    concurrency the gate lock guards for ``gate_state.json``, achieved here
-    lock-free because append is atomic and the trace is write-only.
-
-    Logging is best-effort observability: a trace failure must never turn a
-    verdict into an error or crash a hook, so all I/O errors are swallowed.
-    """
-    event = {"ts": time.time(), "type": type, **fields}
-    try:
-        path = events_path(project_dir)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, sort_keys=True) + "\n")
-    except OSError:
-        pass
 
 
 def read_events(project_dir: str | os.PathLike[str]) -> list[dict[str, Any]]:

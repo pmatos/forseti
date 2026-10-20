@@ -8,8 +8,12 @@ adapter (RFC-0004), not moved here.
 from __future__ import annotations
 
 import json
+import os
 import stat
+import time
 from pathlib import Path
+
+import pytest
 
 from forseti.adapters.claude_code import event_log
 
@@ -81,3 +85,62 @@ def test_log_event_never_raises_on_bad_target(tmp_path: Path) -> None:
     clash = tmp_path / "file"
     clash.write_text("x")
     event_log.log_event(clash / "nested", event_log.STOP, decision="allow")
+
+
+@pytest.mark.parametrize("circular", [False, True])
+def test_log_event_propagates_serialization_errors(
+    tmp_path: Path, circular: bool
+) -> None:
+    cycle: list[object] = []
+    cycle.append(cycle)
+
+    with pytest.raises(ValueError if circular else TypeError):
+        event_log.log_event(
+            tmp_path, event_log.EDIT, bad=cycle if circular else object()
+        )
+
+    assert event_log.events_path(tmp_path).read_text(encoding="utf-8") == ""
+
+
+def test_log_event_preserves_timestamp_override_and_json_format(tmp_path: Path) -> None:
+    event_log.log_event(str(tmp_path), event_log.EDIT, ts=4, note="café\nnext")
+
+    assert event_log.events_path(tmp_path).read_text(encoding="utf-8") == (
+        '{"note": "caf\\u00e9\\nnext", "ts": 4, "type": "edit"}\n'
+    )
+
+
+def test_log_event_stamps_before_resolving_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    def clock() -> float:
+        calls.append("clock")
+        return 1.0
+
+    class BrokenPath(os.PathLike[str]):
+        def __fspath__(self) -> str:
+            calls.append("path")
+            raise ValueError("bad project path")
+
+    monkeypatch.setattr(time, "time", clock)
+    with pytest.raises(ValueError, match="bad project path"):
+        event_log.log_event(BrokenPath(), event_log.EDIT)
+    assert calls == ["clock", "path"]
+    assert not event_log.events_path(tmp_path).exists()
+
+
+def test_log_event_does_not_suppress_clock_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    failure = OSError("clock unavailable")
+
+    def broken_clock() -> float:
+        raise failure
+
+    monkeypatch.setattr(time, "time", broken_clock)
+    with pytest.raises(OSError) as caught:
+        event_log.log_event(tmp_path, event_log.EDIT)
+    assert caught.value is failure
+    assert not event_log.events_path(tmp_path).exists()
