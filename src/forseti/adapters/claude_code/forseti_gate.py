@@ -37,6 +37,10 @@ from forseti.adapters._cli_json import capture_json_command
 from forseti.unit_id import make_unit_id, unit_id_prefix
 
 from . import event_log
+from ._source_observation import (
+    MTIME_STABLE_ATTEMPTS as _MTIME_STABLE_ATTEMPTS,  # noqa: F401 — compatibility
+)
+from ._source_observation import observe_stable_source
 from .git import (
     _git,
     _git_probe_env,
@@ -233,16 +237,6 @@ MAX_STOP_ATTEMPTS = 3
 # file's still-pending `unknown` units keep blocking and reach the loud residual
 # via MAX_STOP_ATTEMPTS.
 MAX_PENDING_VERIFY_ATTEMPTS = 3
-
-# How many times `verify_and_record` re-reads a file whose mtime moved between
-# the two `fstat`s bracketing its read — see the comment at that read for why a
-# lone re-read-through-the-same-fd does not by itself guarantee `raw` and
-# `mtime_ns` describe the same instant. Bounded, not looped forever: a file
-# some other process keeps rewriting on every attempt fails closed as a
-# blocking `error` (or, if a concurrent run has already stamped fresher
-# content, defers quietly to it) instead of spinning here (review feedback on
-# PR #159, issue #150).
-_MTIME_STABLE_ATTEMPTS = 5
 
 C_SUFFIXES = {".c", ".h"}
 
@@ -2076,31 +2070,8 @@ def verify_and_record(
         return [] if superseded else [verdict]
 
     try:
-        # Read and stat through the same fd, not `Path.read_bytes()` followed by a
-        # separate `os.stat`: `mtime_ns` below has to describe the exact bytes in
-        # `raw`. Same fd is not enough by itself, though — `read()` and `fstat()`
-        # are still two separate syscalls, so an in-place rewrite by another
-        # process can land between them, or straddle the read itself, without
-        # `raw` reflecting the write that moved the mtime. A transient A -> B -> A
-        # can then leave `raw` holding A while `mtime_ns` reports B's timestamp —
-        # a mismatched pair the content-only checks further down (which compare
-        # bytes, never mtime) would never catch, so a `__TIMESTAMP__` branch could
-        # be verified against a moment `raw` was never at. Bracketing the read
-        # with an `fstat()` on each side and retrying unless they agree rules
-        # that out — and, unlike the `stat`-based verify guard the issue
-        # rejects for being coarse-filesystem-dependent, this bracket isn't:
-        # an mtime delta too small for the filesystem to represent is also too
-        # small for `__TIMESTAMP__` to show, since that macro reads the same
-        # clock. Content itself stays hash-guarded further down regardless
-        # (review feedback on PR #159, issue #150).
-        for _ in range(_MTIME_STABLE_ATTEMPTS):
-            with open(file_path, "rb") as handle:
-                before_ns = os.fstat(handle.fileno()).st_mtime_ns
-                raw = handle.read()
-                mtime_ns = os.fstat(handle.fileno()).st_mtime_ns
-            if mtime_ns == before_ns:
-                break
-        else:
+        observed = observe_stable_source(file_path, bytes)
+        if observed is None:
             # Unlike the `OSError` below, this file is perfectly readable — it
             # will hash the same as any other content-fresh file — so a stamp
             # already vouching for what is on disk now means some other run
@@ -2118,6 +2089,7 @@ def verify_and_record(
             )
     except OSError as exc:
         return _blocking_error(str(exc))
+    raw, mtime_ns = observed
 
     # Hash the bytes we read before anything else can fail: every path below needs
     # to name the content it operated on, both to stamp `scanned` and to tell its
@@ -2183,25 +2155,19 @@ def verify_and_record(
         # correct (review feedback on PR #159, issue #150).
         on_disk: str | None = None
         fresh_mtime_ns = mtime_ns
-        for _ in range(_MTIME_STABLE_ATTEMPTS):
-            try:
-                with open(file_path, "rb") as handle:
-                    before_ns = os.fstat(handle.fileno()).st_mtime_ns
-                    on_disk = hashlib.sha256(handle.read()).hexdigest()
-                    fresh_mtime_ns = os.fstat(handle.fileno()).st_mtime_ns
-            except OSError:
-                on_disk = None
-                break
-            if fresh_mtime_ns == before_ns:
-                break
+        try:
+            current = observe_stable_source(
+                file_path, lambda raw: hashlib.sha256(raw).hexdigest()
+            )
+        except OSError:
+            pass  # unreadable: leave on_disk=None for the content-change policy
         else:
-            # Readable on every attempt, just never stable — distinct from
-            # "unreadable" and from "content changed" (both handled below via
-            # `on_disk`), so this gets the top bracket's own message and
-            # treatment instead of being folded into "someone else's content is
-            # on disk". Deferred until the lock releases: `_blocking_error`
-            # takes the same lock itself.
-            mtime_unstable = True
+            if current is None:
+                # Readable but never stable: defer the blocking error until
+                # this lock releases, since `_blocking_error` takes it too.
+                mtime_unstable = True
+            else:
+                on_disk, fresh_mtime_ns = current
 
         if not mtime_unstable and on_disk == digest:
             # `on_disk == digest` means this re-read's bytes are the same bytes
