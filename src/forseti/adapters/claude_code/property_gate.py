@@ -61,6 +61,7 @@ import json
 import sqlite3
 import subprocess
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -112,8 +113,8 @@ MAX_UNITS_PER_TURN = gate.env_int("FORSETI_PROPERTY_MAX_UNITS", "3", minimum=0)
 # failing the turn open instead. Enforced two ways: a unit not yet started is
 # `deferred` once the remaining budget can't cover one honest attempt
 # (`_MIN_ATTEMPT_BUDGET_S`), and a unit already starting has its own
-# subprocess timeout clamped to whatever budget remains (`_check_unit`'s
-# `budget_s`) -- a between-units check alone cannot bound total loop time,
+# subprocess timeout clamped to whatever budget remains (`_check_selected_units`)
+# -- a between-units check alone cannot bound total loop time,
 # since a single unit with enough stored properties can need more wall clock
 # than one attempt's share of the ceiling by itself (issue #95 review,
 # thread a7NSB on the between-units-only version of this fix).
@@ -151,7 +152,7 @@ def _check_min_attempt_budget_fits(
 
 # The smallest remaining budget worth starting a fresh unit with: one esbmc
 # attempt's worst case (`CHECK_TIMEOUT_S + VERIFY_GRACE_S`) plus the
-# subprocess margin. Below this, `_check_unit` would be clamped to a timeout
+# subprocess margin. Below this, a check would be clamped to a timeout
 # too small to complete even a single property honestly -- indistinguishable
 # from a real tooling failure (`failed`) even though it never got a fair
 # attempt; `deferred` (issue #95 review) is the honest bucket for "ran out of
@@ -218,7 +219,7 @@ def _units_with_candidates(
     with properties for only one of ten edited units pays the expensive
     `forseti check` subprocess exactly once. `checkable_count` -- every stored
     non-terminal property, not just CANDIDATE -- is a byproduct of the same
-    read, reused to size `_check_unit`'s subprocess timeout: `forseti check`
+    read, reused by the selected-unit batch to size subprocess timeouts: `forseti check`
     itself checks every non-terminal property for the unit in one process
     (`CHECKABLE_STATUSES`, e.g. a unit with 1 CANDIDATE + 2 already-GRADED
     properties runs 3 esbmc attempts, not 1), so counting CANDIDATE alone would
@@ -240,51 +241,16 @@ def _units_with_candidates(
         return out
 
 
-class _Clamped:
-    """Sentinel `_check_unit` returns when its subprocess timed out *and* that
-    timeout was clamped below what `n_props` actually needed (issue #95
-    review). Distinct from `None` (a genuine tooling failure) so the caller
-    can bucket it as `deferred` ("ran out of turn budget") rather than
-    `failed` ("this check itself broke") -- the same distinction
-    `_MIN_ATTEMPT_BUDGET_S` already draws for a unit clamped so hard it never
-    starts at all; this is the same failure mode for a unit that *did* start
-    but still ran out of its share of the budget partway through.
-    """
-
-
-_CLAMPED = _Clamped()
-
-
 def _check_unit(
-    project_dir: str, unit: dict[str, Any], n_props: int, budget_s: float
-) -> list[Any] | _Clamped | None:
+    project_dir: str, unit: dict[str, Any], timeout_s: float
+) -> list[Any] | None:
     """Run `forseti check --json` for one unit; `None` on any tooling failure.
 
-    Never raised: a broken check must surface as "nothing found" here, not
-    crash the Stop-gate over a best-effort feature (module docstring). `n_props`
-    (the unit's stored-checkable-property count, `_units_with_candidates`)
-    scales the subprocess's wall-clock budget -- `--timeout` below is esbmc's
-    *per-attempt* budget, but `forseti check` runs it once per stored
-    checkable property for the unit, so a unit with 2+ properties needs more
-    than one attempt's worth of wall clock. The subprocess timeout below adds
-    `VERIFY_GRACE_S` per attempt on top of `CHECK_TIMEOUT_S` -- `verify`
-    (`esbmc/runner.py`) itself permits `CHECK_TIMEOUT_S + VERIFY_GRACE_S`
-    before it hard-kills esbmc, so budgeting only `CHECK_TIMEOUT_S` per
-    attempt here would let this subprocess time out before a legitimately-
-    running child could, discarding every verdict already computed (issue #95
-    review).
-
-    `budget_s` -- the caller's *remaining* slice of `MAX_TOTAL_CHECK_S` -- caps
-    the per-unit formula from above: a unit with enough stored properties can
-    legitimately need more wall clock than one attempt's share of the
-    aggregate ceiling (a unit with 6 candidates needs `6 * 25 + 10 = 160s`,
-    already past `MAX_TOTAL_CHECK_S`'s 60s default and the Stop hook's own
-    120s timeout on its own) -- the between-units deadline check in
-    `semantic_check_summary` only bounds *when* a unit starts, not how long
-    its own subprocess may then run (issue #95 review, a7NSB: the earlier
-    aggregate-deadline fix left exactly this gap). The caller is responsible
-    for not calling this at all once `budget_s` can no longer cover one
-    honest attempt -- see `_MIN_ATTEMPT_BUDGET_S`.
+    The selected-unit batch owns admission and supplies the complete subprocess
+    timeout. `TimeoutExpired` propagates to that batch, which knows whether the
+    timeout was clamped by the turn budget. Other expected tooling failures stay
+    best-effort here; command construction and payload validation have no budget
+    policy to re-derive.
     """
     rel, function = unit["file"], unit["function"]
     # `rel`, unchanged: the subprocess already runs with `cwd=project_dir`, so
@@ -322,23 +288,14 @@ def _check_unit(
         return None
     if build_flags:
         argv += ["--", *build_flags]
-    natural_timeout = (
-        max(1, n_props) * (CHECK_TIMEOUT_S + VERIFY_GRACE_S) + _SUBPROCESS_MARGIN_S
-    )
-    timeout = min(natural_timeout, budget_s)
     try:
         command = capture_json_command(
             argv,
-            timeout=timeout,
+            timeout=timeout_s,
             cwd=project_dir,
         )
     except OSError:
         return None
-    except subprocess.TimeoutExpired:
-        # `timeout < natural_timeout` means `n_props` genuinely needed more
-        # wall clock than this unit's share of the remaining aggregate budget
-        # could give it -- ran out of *turn* budget, not a broken subprocess.
-        return _CLAMPED if timeout < natural_timeout else None
     try:
         payload = command.decode()
     except json.JSONDecodeError:
@@ -346,6 +303,65 @@ def _check_unit(
     if not isinstance(payload, dict) or not isinstance(payload.get("verdicts"), list):
         return None
     return payload["verdicts"]
+
+
+@dataclass(frozen=True)
+class _CheckBatch:
+    """Completed verdict rows and honest unit accounting for one selected batch."""
+
+    verdicts: tuple[Any, ...]
+    checked: int
+    deferred: int
+    failed: int
+
+
+def _check_selected_units(
+    project_dir: str, selected: Sequence[tuple[dict[str, Any], int]]
+) -> _CheckBatch:
+    """Check selected units within one turn budget, retaining completed verdicts.
+
+    Called after candidate discovery, sorting and prefix selection: store reads
+    do not spend this budget. Before each unit, require one honest attempt's
+    allowance (`_MIN_ATTEMPT_BUDGET_S`); equality admits, a smaller remainder
+    defers the entire unstarted suffix without preparing another command.
+
+    Each unit checks every non-terminal property, so its natural subprocess
+    allowance is `max(1, n_props)` attempts plus one margin. Every attempt needs
+    `CHECK_TIMEOUT_S + VERIFY_GRACE_S`: the ESBMC runner can legitimately use
+    that grace before killing its child. The remaining turn budget caps this
+    allowance even when a single unit would need more than the whole ceiling
+    (six properties need `6 * 25 + 10 = 160s` by default; issue #95, a7NSB).
+
+    Only an actual timeout under a strictly smaller allowance is `deferred`
+    (ran out of turn budget). An unclamped timeout, bad flags, missing executable
+    or malformed payload is `failed`. Successful clamped commands are `checked`.
+    """
+    start = time.monotonic()
+    rows: list[Any] = []
+    checked = deferred = failed = 0
+    for index, (unit, n_props) in enumerate(selected):
+        remaining = MAX_TOTAL_CHECK_S - (time.monotonic() - start)
+        if remaining < _MIN_ATTEMPT_BUDGET_S:
+            deferred += len(selected) - index
+            break
+        natural_timeout = (
+            max(1, n_props) * (CHECK_TIMEOUT_S + VERIFY_GRACE_S) + _SUBPROCESS_MARGIN_S
+        )
+        timeout = min(natural_timeout, remaining)
+        try:
+            verdicts = _check_unit(project_dir, unit, timeout)
+        except subprocess.TimeoutExpired:
+            if timeout < natural_timeout:
+                deferred += 1
+            else:
+                failed += 1
+            continue
+        if verdicts is None:
+            failed += 1
+            continue
+        checked += 1
+        rows.extend(verdicts)
+    return _CheckBatch(tuple(rows), checked, deferred, failed)
 
 
 def semantic_check_summary(
@@ -391,53 +407,26 @@ def semantic_check_summary(
         key=lambda pair: (pair[0].get("file", ""), pair[0].get("function", ""))
     )
     to_check = candidates[:MAX_UNITS_PER_TURN]
-    deferred = max(0, len(candidates) - MAX_UNITS_PER_TURN)
+    batch = _check_selected_units(project_dir, to_check)
+    deferred = max(0, len(candidates) - MAX_UNITS_PER_TURN) + batch.deferred
     violations: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
-    checked = 0
-    failed = 0
-    # Aggregate wall-clock cap across this whole loop, not just each unit's own
-    # subprocess timeout (MAX_TOTAL_CHECK_S's own comment) -- checked between
-    # units so a unit already in flight is never killed mid-subprocess. A unit
-    # cut off this way is `deferred`, not `failed`: it was never attempted,
-    # the same "never silently dropped" accounting the per-turn unit budget
-    # already gets. `_check_unit` is itself capped to the *remaining* slice
-    # of the budget (`min(..., budget_s)`), never just this loop's own
-    # between-units check alone -- a unit with enough stored properties can
-    # need more wall clock than one attempt's share of the ceiling on its
-    # own (issue #95 review, a7NSB), so the between-units check alone cannot
-    # bound total loop time. Below `_MIN_ATTEMPT_BUDGET_S` (one honest
-    # attempt's worth) a unit is deferred rather than started -- clamping it
-    # to a too-small timeout would misreport a real "ran out of budget" as a
-    # `failed` tooling error.
-    start = time.monotonic()
-    for i, (unit, n_props) in enumerate(to_check):
-        remaining = MAX_TOTAL_CHECK_S - (time.monotonic() - start)
-        if remaining < _MIN_ATTEMPT_BUDGET_S:
-            deferred += len(to_check) - i
-            break
-        verdicts = _check_unit(project_dir, unit, n_props, remaining)
-        if isinstance(verdicts, _Clamped):
-            # Started, but this unit's own share of the remaining aggregate
-            # budget ran out before `n_props` properties could finish -- ran
-            # out of turn budget, not a broken subprocess (issue #95 review).
-            deferred += 1
+    for verdict in batch.verdicts:
+        if not isinstance(verdict, dict):
             continue
-        if verdicts is None:
-            failed += 1
-            continue
-        checked += 1
-        for verdict in verdicts:
-            if not isinstance(verdict, dict):
-                continue
-            outcome = verdict.get("outcome")
-            if outcome == "violated":
-                violations.append(verdict)
-            elif outcome in ("unknown", "error"):
-                unresolved.append(verdict)
-            elif outcome == "skipped":
-                skipped.append(verdict)
+        outcome = verdict.get("outcome")
+        if outcome == "violated":
+            violations.append(verdict)
+        elif outcome in ("unknown", "error"):
+            unresolved.append(verdict)
+        elif outcome == "skipped":
+            skipped.append(verdict)
     return SemanticCheckSummary(
-        tuple(violations), checked, deferred, tuple(unresolved), failed, tuple(skipped)
+        tuple(violations),
+        batch.checked,
+        deferred,
+        tuple(unresolved),
+        batch.failed,
+        tuple(skipped),
     )

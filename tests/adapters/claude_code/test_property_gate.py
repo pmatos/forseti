@@ -666,6 +666,89 @@ def test_unclamped_timeout_is_still_failed_not_deferred(
     assert summary.failed == 1
 
 
+@pytest.mark.parametrize(
+    ("remaining", "n_props", "times_out", "expected"),
+    [
+        (34.5, 1, False, (0, 1, 0)),
+        (35.0, 1, True, (0, 0, 1)),
+        (35.0, 2, True, (0, 1, 0)),
+        (35.0, 2, False, (1, 0, 0)),
+    ],
+)
+def test_budget_admission_and_timeout_classification_share_the_same_allowance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    remaining: float,
+    n_props: int,
+    times_out: bool,
+    expected: tuple[int, int, int],
+) -> None:
+    """An exact minimum admits; only an actually timed-out clamp is deferred."""
+    monkeypatch.setattr(property_gate, "CHECK_TIMEOUT_S", 20.0)
+    monkeypatch.setattr(property_gate, "VERIFY_GRACE_S", 5.0)
+    monkeypatch.setattr(property_gate, "_SUBPROCESS_MARGIN_S", 10.0)
+    monkeypatch.setattr(property_gate, "_MIN_ATTEMPT_BUDGET_S", 35.0)
+    monkeypatch.setattr(property_gate, "MAX_TOTAL_CHECK_S", 100.0)
+    ticks = iter((10.0, 110.0 - remaining))
+    monkeypatch.setattr(property_gate.time, "monotonic", lambda: next(ticks))
+    for i in range(n_props):
+        _add_candidate(tmp_path, "f.c::f", expression=f"result >= {i}")
+    timeouts: list[float] = []
+
+    def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        timeouts.append(kwargs["timeout"])
+        if times_out:
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(_payload("f.c::f", "violated"))
+        )
+
+    monkeypatch.setattr(subprocess, "run", run)
+    summary = property_gate.semantic_check_summary(
+        str(tmp_path), _state(_unit("f.c", "f"))
+    )
+
+    assert (summary.checked, summary.deferred, summary.failed) == expected
+    assert timeouts == ([] if remaining < 35.0 else [35.0])
+    assert len(summary.violations) == expected[0]
+
+
+def test_budget_exhaustion_keeps_earlier_verdicts_and_defers_the_unstarted_suffix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(property_gate, "MAX_TOTAL_CHECK_S", 100.0)
+    monkeypatch.setattr(property_gate, "MAX_UNITS_PER_TURN", 3)
+    for name in ("a", "b", "c"):
+        _add_candidate(tmp_path, f"{name}.c::{name}")
+    for i in (1, 2):
+        _add_candidate(tmp_path, "b.c::b", expression=f"result >= {i}")
+    now = 10.0
+    monkeypatch.setattr(property_gate.time, "monotonic", lambda: now)
+    timeouts: list[float] = []
+
+    def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal now
+        timeouts.append(kwargs["timeout"])
+        if argv[2] == "b.c":
+            now += 50.0
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        now += 30.0
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(_payload("a.c::a", "violated"))
+        )
+
+    # The command prefix can vary; match the source independently of it.
+    monkeypatch.setattr(property_gate.gate, "resolve_forseti_cmd", lambda: ["forseti"])
+    monkeypatch.setattr(subprocess, "run", run)
+    summary = property_gate.semantic_check_summary(
+        str(tmp_path), _state(*(_unit(f"{n}.c", n) for n in ("c", "b", "a")))
+    )
+
+    assert timeouts == [35.0, 70.0]
+    assert (summary.checked, summary.deferred, summary.failed) == (1, 2, 0)
+    assert [v["unit_id"] for v in summary.violations] == ["a.c::a"]
+
+
 def test_negative_max_units_per_turn_is_rejected_not_slice_wrapped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
