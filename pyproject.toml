@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=84.2.0"]
+requires = ["setuptools>=84.2.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -19,7 +19,7 @@ mcp = ["mcp>=2.3.0,<3"]
 # dev pulls in the mcp extra so CI type-checks and tests the server too.
 dev = [
     "build>=1.6.1",
-    "setuptools>=84.2.0",
+    "setuptools>=84.2.1",
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
     "hypothesis>=6.170.5",
