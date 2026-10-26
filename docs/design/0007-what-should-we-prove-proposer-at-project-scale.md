@@ -236,6 +236,8 @@ All of it lives under `src/forseti/`, so the CI lint, type and test gates cover 
 - **E2 — Tier 1 replay.** The yield funnel, then the recipe × kind grid; M3 joins once #4 lands.
 - **E3 — kernel pilot**, after RFC-0008.
 - **E4 — the winning recipes become GEPA's proposer portfolio**, evaluated on the held-out split.
+  This is a second GEPA pass: per ADR-0006, GEPA v1 (P3, #5) runs first on Tier 0 plus mutants,
+  and E2–E4 are P4's real-code work.
 
 The Igalia talk fits after E1 or E2: the inputs × outputs grid on both metrics, blind vs. sighted,
 good and bad example properties, and the caveats. No date is assumed here.

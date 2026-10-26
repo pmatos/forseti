@@ -55,6 +55,10 @@ are **P4–P5** once the loop is proven. Design open questions are in [RFC-0001]
 
 ## The 6 phases
 
+> **Re-dated 2026-10-26.** P2 and P3 overran: W3 and W4 had no sub-issues yet. Per
+> [ADR-0006](adr/0006-sequencing-gepa-before-real-code.md), P4 absorbs the slip; the P5 bar date
+> is unchanged. Milestone due dates: P2 2026-11-20, P3 2026-12-18, P4 2027-01-15, P5 2027-01-31.
+
 ### P0 · Jul — Foundation
 Stand up the repo and the smallest end-to-end slice.
 - **Exit:** ESBMC is callable programmatically; its output parses into a typed
@@ -66,7 +70,7 @@ Automate the spine.
 - **Exit:** the orchestrator closes write→verify→cex→fix **without human intervention** on a
   set of C kernels, with a max-iteration give-up policy and clean handling of `UNKNOWN`.
 
-### P2 · Sep — Properties v1 + grading harness
+### P2 · Sep–Nov — Properties v1 + grading harness
 Stop hand-writing properties; start scoring them.
 - LLM proposes candidate properties (semantic **and** reachability) into a property store.
 - Build the **differential mutation-kill** grading harness: mutate the code, run ESBMC,
@@ -77,13 +81,18 @@ Stop hand-writing properties; start scoring them.
   (see Risk 6; candidate mitigation = stateful ESBMC).
 - **Touchpoint:** ~30-min Lean feasibility chat with Jesse (W8 scoping).
 
-### P3 · Oct — GEPA
+### P3 · Nov–Dec — GEPA
 Make the proposer good, automatically.
 - Wire GEPA to rewrite the property-proposing prompt against the kill-rate score; keep the
   Pareto-best variants.
-- **Exit:** a measured v1→v2 improvement in mutation-kill rate on a held-out kernel set.
+- **Exit:** a measured v1→v2 improvement in mutation-kill rate on a held-out kernel set, with
+  bootstrap 95% CIs under both the blind and sighted proposer recipes
+  ([RFC-0007](design/0007-what-should-we-prove-proposer-at-project-scale.md)), UNKNOWN, vacuous and
+  skipped-mutant counts beside each rate, and bug-pair discrimination on every usable pair. The
+  claim is "GEPA improves kill-rate", not "the proposer is good": kill-rate alone rewards a
+  proposer that restates the body.
 
-### P4 · Nov — Real code + ESBMC push
+### P4 · Dec–Jan — Real code + ESBMC push
 Leave the sandbox.
 - Run the loop on real C (then C++); land ESBMC fixes on the fork to unblock targets;
   upstream a curated PR batch.
