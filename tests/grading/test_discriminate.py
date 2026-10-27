@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -26,6 +27,7 @@ from forseti.esbmc import (
     Violated,
     ViolatedProperty,
 )
+from forseti.grading import discriminate
 from forseti.grading.discriminate import (
     PAIR_EVENT,
     PROPERTY_EVENT,
@@ -33,6 +35,7 @@ from forseti.grading.discriminate import (
     Discrimination,
     ExclusionReason,
     PairOutcome,
+    PropertyScore,
     PropertySetError,
     SafetyOutcome,
     SafetyReading,
@@ -49,7 +52,12 @@ from forseti.grading.discriminate import (
     trace_rows,
 )
 from forseti.orchestrator import PropertyOutcome, PropertyVerdict, RenderedHarness, Unit
-from forseti.precond import Assessment, DischargeResult, PreconditionResult
+from forseti.precond import (
+    DEFAULT_MAX_LEN,
+    Assessment,
+    DischargeResult,
+    PreconditionResult,
+)
 from forseti.properties import (
     Property,
     PropertyKind,
@@ -67,10 +75,14 @@ def meta() -> RunMeta:
     return RunMeta("8.5.0", ("esbmc",), 0, 0.0, "", "")
 
 
-def violated() -> Violated:
+def violated(description: str = "assertion") -> Violated:
     loc = SourceLoc("h.c", 1, 1, "main")
-    cex = Counterexample((), ViolatedProperty(loc, "assertion", None, ()))
+    cex = Counterexample((), ViolatedProperty(loc, description, None, ()))
     return Violated(meta(), "[Counterexample]", cex)
+
+
+def outside_domain() -> Violated:
+    return violated("forseti:domain")
 
 
 def reached_probe() -> Violated:
@@ -448,11 +460,11 @@ def test_absorption_reads_the_domain_on_the_triggering_input(
         ],
         held,
         {
-            "x <= 3": violated(),
+            "x <= 3": outside_domain(),
             "x >= 0": Verified(meta()),
             "mystery > 1": Error(meta(), "undeclared identifier"),
         },
-        {"x": 10},
+        {"x": 10, "lo": 0},
     )
     assert got == [
         Absorption.ABSORBED,
@@ -461,6 +473,20 @@ def test_absorption_reads_the_domain_on_the_triggering_input(
         Absorption.UNDETERMINED,
         Absorption.NOT_APPLICABLE,
     ]
+
+
+def test_undefined_behaviour_in_a_domain_clause_is_not_absorption(
+    pair: tuple[Path, Path, Path],
+) -> None:
+    held = {("fixed", "ub"): Verified(meta()), ("buggy", "ub"): Verified(meta())}
+    got = absorption_run(
+        pair,
+        [prop("ub", domain=("x / lo >= 0",))],
+        held,
+        {"x / lo >= 0": violated("division by zero")},
+        {"x": 10, "lo": 0},
+    )
+    assert got == [Absorption.UNDETERMINED]
 
 
 def test_absorption_is_not_applicable_without_a_trigger(
@@ -475,7 +501,7 @@ def test_absorption_detail_and_domain_program(pair: tuple[Path, Path, Path]) -> 
     buggy, fixed, work = pair
     fake = FakeVerify(
         {("fixed", "a"): Verified(meta()), ("buggy", "a"): Verified(meta())},
-        {"x <= 3": violated()},
+        {"x <= 3": outside_domain()},
     )
     got = score_pair(
         buggy=buggy,
@@ -502,9 +528,10 @@ def test_absorption_detail_and_domain_program(pair: tuple[Path, Path, Path]) -> 
 @pytest.mark.parametrize(
     ("trigger", "message"),
     [
-        ({"nope": 1}, "not a scalar parameter"),
-        ({"x": 2**64}, "out of range"),
-        ({"x": -(2**63) - 1}, "out of range"),
+        ({"nope": 1, "x": 1, "lo": 1}, "not a scalar parameter"),
+        ({"x": 2**64, "lo": 1}, "out of range"),
+        ({"x": -(2**63) - 1, "lo": 1}, "out of range"),
+        ({"x": 10}, r"missing \['lo'\]"),
     ],
 )
 def test_bad_trigger_fails_before_any_check(
@@ -525,6 +552,75 @@ def test_bad_trigger_fails_before_any_check(
             trigger=trigger,
         )
     assert safety.calls == []
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"max_len": -1}, "max_len"),
+        ({"unwind": 8, "unwind_ladder": (8, 16)}, "increasing"),
+        ({"unwind_ladder": (2,)}, "increasing"),
+    ],
+)
+def test_bad_bounds_fail_before_s0_runs_esbmc(
+    pair: tuple[Path, Path, Path], kwargs: dict[str, Any], message: str
+) -> None:
+    buggy, fixed, work = pair
+    safety = FakeSafety(PASSED, PASSED)
+    with pytest.raises(ValueError, match=message):
+        score_pair(
+            buggy=buggy,
+            fixed=fixed,
+            symbol="f",
+            properties=[],
+            safety=safety,
+            verify_for=FakeVerify({}).for_source,
+            render=FakeWriter(),
+            work_dir=work,
+            **kwargs,
+        )
+    assert safety.calls == []
+
+
+def test_a_raised_unwind_derives_its_own_ladder(
+    pair: tuple[Path, Path, Path],
+) -> None:
+    buggy, fixed, work = pair
+    got = score_pair(
+        buggy=buggy,
+        fixed=fixed,
+        symbol="f",
+        properties=[],
+        safety=FakeSafety(PASSED, PASSED),
+        verify_for=FakeVerify({}).for_source,
+        render=FakeWriter(),
+        work_dir=work,
+        unwind=8,
+    )
+    assert got.outcome is PairOutcome.EMPTY
+
+
+def test_default_safety_port_uses_the_property_max_len(
+    pair: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    buggy, fixed, work = pair
+    seen: list[int] = []
+
+    def fake_port(*, max_len: int, **_: object) -> FakeSafety:
+        seen.append(max_len)
+        return FakeSafety(FAILED, FAILED)
+
+    monkeypatch.setattr(discriminate, "esbmc_safety_port", fake_port)
+    for max_len in (5, None):
+        score_pair(
+            buggy=buggy,
+            fixed=fixed,
+            symbol="f",
+            properties=[],
+            work_dir=work,
+            max_len=max_len,
+        )
+    assert seen == [5, DEFAULT_MAX_LEN]
 
 
 def test_trigger_needs_a_readable_signature(pair: tuple[Path, Path, Path]) -> None:
@@ -623,6 +719,34 @@ def test_property_ids_and_units_are_kept_when_given() -> None:
         "own",
         PropertyKind.REACHABILITY,
     )
+
+
+def test_proposer_provenance_is_read_back_and_reported() -> None:
+    entry = {
+        "expression": "e",
+        "provenance": {
+            "prompt_id": "blind",
+            "prompt_version": "3",
+            "provider": "claude -p",
+            "model": "sonnet",
+            "extra": 1,
+        },
+    }
+    (got, bare, odd) = properties_from_data(
+        [entry, {"expression": "f"}, {"expression": "g", "provenance": {"model": 7}}],
+        unit_id="u",
+    )
+    assert got.provenance == Provenance("blind", "3", "claude -p", "sonnet")
+    assert bare.provenance == Provenance("", "")
+    assert odd.provenance == Provenance("", "")
+    score = PropertyScore(
+        got,
+        verdict(PropertyOutcome.HELD),
+        verdict(PropertyOutcome.VIOLATED),
+        Discrimination.DISCRIMINATES,
+        "r",
+    )
+    assert score.to_dict()["provenance"]["model"] == "sonnet"
 
 
 @pytest.mark.parametrize(

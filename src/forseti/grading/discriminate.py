@@ -37,6 +37,12 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from forseti._events import record_event
+from forseti.core.check import (
+    DEFAULT_TIMEOUT_S,
+    DEFAULT_UNWIND,
+    default_unwind_ladder_above,
+    validated_max_len,
+)
 from forseti.esbmc import Verified, Violated, verify
 from forseti.orchestrator import (
     HarnessWriterPort,
@@ -48,6 +54,7 @@ from forseti.orchestrator import (
     Unit,
     VerifyPort,
     check_properties,
+    validated_ladder,
 )
 from forseti.precond import DEFAULT_MAX_LEN, Assessment, DischargeResult
 from forseti.precond import discharge_precondition as _discharge_precondition
@@ -67,9 +74,6 @@ from forseti.properties import (
 )
 
 SAFETY_FLAGS: tuple[str, ...] = ("--overflow-check",)
-DEFAULT_UNWIND = 4
-DEFAULT_UNWIND_LADDER: tuple[int, ...] = (8, 16)
-DEFAULT_TIMEOUT_S = 110.0
 SAFETY_TIMEOUT_S = 60.0
 
 PAIR_EVENT = "discrimination.pair"
@@ -172,6 +176,7 @@ class PropertyScore:
             "kind": self.prop.kind.value,
             "expression": self.prop.expression,
             "domain": list(self.prop.domain),
+            "provenance": self.prop.provenance.to_dict(),
             "fixed": _side_dict(self.fixed),
             "buggy": _side_dict(self.buggy),
             "discrimination": self.discrimination.value,
@@ -397,7 +402,7 @@ def score_pair(
     render: HarnessWriterPort | None = None,
     work_dir: Path,
     unwind: int = DEFAULT_UNWIND,
-    unwind_ladder: tuple[int, ...] = DEFAULT_UNWIND_LADDER,
+    unwind_ladder: tuple[int, ...] | None = None,
     max_len: int | None = DEFAULT_MAX_LEN,
     trigger: Mapping[str, int] | None = None,
     esbmc_bin: str = "esbmc",
@@ -411,14 +416,26 @@ def score_pair(
     `SemanticHarnessWriter`) and checked with `check_properties` unchanged, so the
     ladder, vacuity probe and HELD/VACUOUS rules are the check phase's own.
     `trigger` (scalar `name -> int`) enables the M4 absorption reading and is
-    validated before any ESBMC call. `safety` and `verify_for` default to the real
-    ESBMC bindings (`esbmc_safety_port`, `esbmc_verify_for`).
+    validated before any ESBMC call, as are `max_len` and the unwind ladder (derived
+    as `check_source` does when `unwind_ladder` is None). `safety` and `verify_for`
+    default to the real ESBMC bindings (`esbmc_safety_port`, `esbmc_verify_for`);
+    the default S0 uses the same `max_len` as the property checks.
     """
     fixed_unit = Unit.from_path(fixed, symbol)
     buggy_unit = Unit.from_path(buggy, symbol)
-    pair_trigger = _validated_trigger(trigger, buggy_unit)
+    max_len = validated_max_len(max_len)
+    ladder = (
+        unwind_ladder
+        if unwind_ladder is not None
+        else default_unwind_ladder_above(unwind, max_len)
+    )
+    validated_ladder(unwind, ladder)
+    pair_trigger, signature = _validated_trigger(trigger, buggy_unit)
 
-    safety = safety or esbmc_safety_port(esbmc_bin=esbmc_bin)
+    safety = safety or esbmc_safety_port(
+        max_len=DEFAULT_MAX_LEN if max_len is None else max_len,
+        esbmc_bin=esbmc_bin,
+    )
     s0_fixed = safety(fixed, symbol)
     s0_buggy = (
         safety(buggy, symbol) if s0_fixed.outcome is SafetyOutcome.PASSED else None
@@ -458,18 +475,13 @@ def score_pair(
             verify=verify_for(source),
             work_dir=work_dir / subdir,
             unwind=unwind,
-            unwind_ladder=unwind_ladder,
+            unwind_ladder=ladder,
         )
 
     fixed_run = run_on(fixed_unit, fixed, "fixed")
     buggy_run = run_on(buggy_unit, buggy, "buggy")
 
-    signature = (
-        extract_signature(buggy_unit.source_text, symbol)
-        if pair_trigger is not None
-        else None
-    )
-    domain_verify = verify_for(buggy)
+    domain_verify = verify_for(buggy) if pair_trigger is not None else None
     scores = []
     for index, (prop, fixed_verdict, buggy_verdict) in enumerate(
         zip(properties, fixed_run.verdicts, buggy_run.verdicts, strict=True)
@@ -497,9 +509,11 @@ def score_pair(
     return pair(None, tuple(scores))
 
 
-def _validated_trigger(trigger: Mapping[str, int] | None, unit: Unit) -> Trigger | None:
+def _validated_trigger(
+    trigger: Mapping[str, int] | None, unit: Unit
+) -> tuple[Trigger | None, UnitSignature | None]:
     if trigger is None:
-        return None
+        return None, None
     try:
         signature = extract_signature(unit.source_text, unit.symbol)
     except HarnessError as exc:
@@ -507,6 +521,12 @@ def _validated_trigger(trigger: Mapping[str, int] | None, unit: Unit) -> Trigger
             f"cannot read the signature to place the trigger: {exc}"
         ) from exc
     scalars = {p.name for p in signature.params if isinstance(p, ScalarParam)}
+    missing = scalars - trigger.keys()
+    if missing:
+        raise ValueError(
+            f"trigger must give a value for every scalar parameter of "
+            f"{unit.symbol}; missing {sorted(missing)}"
+        )
     for name, value in trigger.items():
         if name not in scalars:
             raise ValueError(
@@ -515,7 +535,7 @@ def _validated_trigger(trigger: Mapping[str, int] | None, unit: Unit) -> Trigger
             )
         if not _INT_MIN <= value <= _INT_MAX:
             raise ValueError(f"trigger value for {name!r} is out of range: {value}")
-    return tuple(sorted(trigger.items()))
+    return tuple(sorted(trigger.items())), signature
 
 
 def _c_int(value: int) -> str:
@@ -538,18 +558,26 @@ def _domain_program(signature: UnitSignature, trigger: Trigger, clause: str) -> 
     return "\n".join(lines) + "\n"
 
 
+def _is_domain_violation(result: Violated) -> bool:
+    """Only the clause's own assertion counts: undefined behaviour while
+    evaluating it (division by zero, overflow) is a different violated property."""
+    cex = result.counterexample
+    return cex is not None and cex.violated_property.description == _DOMAIN_LABEL
+
+
 def _absorption(
     prop: Property,
     buggy: PropertyVerdict,
     trigger: Trigger | None,
     *,
-    verify: VerifyPort,
+    verify: VerifyPort | None,
     signature: UnitSignature | None,
     path: Path,
 ) -> tuple[Absorption, str | None]:
     if (
         trigger is None
         or signature is None
+        or verify is None
         or buggy.outcome is not PropertyOutcome.HELD
     ):
         return Absorption.NOT_APPLICABLE, None
@@ -560,7 +588,7 @@ def _absorption(
         program = path / f"clause{index}.c"
         program.write_text(_domain_program(signature, trigger, clause))
         match verify(program, unwind=1):
-            case Violated():
+            case Violated() as violated if _is_domain_violation(violated):
                 return (
                     Absorption.ABSORBED,
                     f"the triggering input ({inputs}) lies outside the domain "
@@ -715,6 +743,21 @@ def _property_from_obj(obj: object, unit_id: str, index: int) -> Property:
         kind=kind,
         expression=expression,
         status=PropertyStatus.CANDIDATE,
-        provenance=Provenance("", ""),
+        provenance=_provenance_from(obj.get("provenance")),
         domain=tuple(domain),
+    )
+
+
+def _provenance_from(raw: object) -> Provenance:
+    """The proposer attribution a `propose --json` run file carries, if any; kept
+    so a downstream report can aggregate per recipe and model."""
+    if not isinstance(raw, Mapping):
+        return Provenance("", "")
+
+    def text(key: str) -> str:
+        value = raw.get(key)
+        return value if isinstance(value, str) else ""
+
+    return Provenance(
+        text("prompt_id"), text("prompt_version"), text("provider"), text("model")
     )
