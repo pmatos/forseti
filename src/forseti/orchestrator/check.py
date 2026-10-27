@@ -415,9 +415,7 @@ def check_properties(
             ),
         )
         outcome = _outcome_for(final.result)
-        result = final.result
-        probe: ProbeReachability | None = None
-        reason: str | None = None
+        probed = _Probed(outcome, final.result, None, None)
         if outcome is PropertyOutcome.HELD:
             probed = _probe_post_call(
                 rendered,
@@ -426,40 +424,37 @@ def check_properties(
                 k=final.k,
                 verified=final.result,
             )
-            outcome, result, probe, reason = (
-                probed.outcome,
-                probed.result,
-                probed.probe,
-                probed.reason,
-            )
         verdicts.append(
             PropertyVerdict.settled(
                 prop.property_id,
                 unit.unit_id,
                 kind,
-                outcome,
+                probed.outcome,
                 k=final.k,
-                result=result,
+                result=probed.result,
                 harness_source=rendered.source_text,
                 length_bounds=rendered.length_bounds,
-                probe=probe,
-                reason=reason,
+                probe=probed.probe,
+                reason=probed.reason,
             )
         )
         detail: dict[str, Any] = {"property_id": prop.property_id, "kind": kind}
-        if probe is not None:
-            detail["probe"] = probe.value
+        if probed.probe is not None:
+            detail["probe"] = probed.probe.value
         emit(
             "property.verdict",
             index=index,
             k=final.k,
-            verdict=outcome.value,
+            verdict=probed.outcome.value,
             detail=detail,
         )
 
     run = PropertyCheckRun(unit.unit_id, tuple(verdicts))
     emit("properties.checked", detail={"unit": unit.unit_id, **run.counts()})
     return run
+
+
+PROBE_SUFFIX = ".probe.c"
 
 
 @dataclass(frozen=True)
@@ -554,9 +549,6 @@ def _result_payload(result: EsbmcResult, k: int | None) -> dict[str, Any]:
     over the intrinsic verdict fields the projection owns.
     """
     return {"k": k, **result_to_dict(result)}
-
-
-PROBE_SUFFIX = ".probe.c"
 
 
 def _harness_filename(unit_id: str, property_id: str) -> str:
