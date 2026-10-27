@@ -53,6 +53,57 @@ def test_scalar_harness_shape() -> None:
     assert out.rstrip().endswith("}")
 
 
+def test_probe_twin_differs_only_in_the_final_assertion() -> None:
+    spec = SemanticSpec("result >= 0", ("x > INT64_MIN",))
+    real = render_semantic_harness(
+        unit_source=ABS_SLICE, signature=ABS_SIG, spec=spec
+    ).splitlines()
+    probe = render_semantic_harness(
+        unit_source=ABS_SLICE, signature=ABS_SIG, spec=spec, probe=True
+    ).splitlines()
+
+    assert len(real) == len(probe)
+    diff = [(a, b) for a, b in zip(real, probe, strict=True) if a != b]
+    assert diff == [
+        (
+            '    __ESBMC_assert((result >= 0), "forseti:semantic");',
+            '    __ESBMC_assert(0, "forseti:non-vacuity");',
+        )
+    ]
+
+
+def test_probe_twin_keeps_buffer_cleanup_after_the_probe() -> None:
+    sig = extract_signature("int sum(const int *a, size_t n) { return n; }", "sum")
+    probe = render_semantic_harness(
+        unit_source="int sum(const int *a, size_t n) { return n; }",
+        signature=sig,
+        spec=SemanticSpec("result >= 0", ("n <= 4",)),
+        probe=True,
+    )
+
+    assert probe.index("forseti:non-vacuity") < probe.index("free(a)")
+    assert "forseti:semantic" not in probe
+
+
+def test_build_property_harness_carries_the_probe_twin() -> None:
+    prop = Property(
+        property_id=make_property_id(
+            "u.c::my_abs", PropertyKind.SEMANTIC, "result >= 0"
+        ),
+        unit_id="u.c::my_abs",
+        kind=PropertyKind.SEMANTIC,
+        expression="result >= 0",
+        status=PropertyStatus.CANDIDATE,
+        provenance=Provenance("test", "v1"),
+    )
+
+    built = build_property_harness(unit_source=ABS_SLICE, symbol="my_abs", prop=prop)
+
+    assert built.probe_source_text is not None
+    assert "forseti:non-vacuity" in built.probe_source_text
+    assert "forseti:non-vacuity" not in built.source_text
+
+
 def test_nondet_prototype_deduped() -> None:
     out = render_semantic_harness(
         unit_source="int add(int a, int b) { return a + b; }",

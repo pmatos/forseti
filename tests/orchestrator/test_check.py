@@ -29,6 +29,7 @@ from forseti.esbmc import (
     ViolatedProperty,
 )
 from forseti.orchestrator import (
+    HarnessWriterPort,
     ListSink,
     PropertyCheckRun,
     PropertyOutcome,
@@ -40,6 +41,7 @@ from forseti.orchestrator import (
     persist_property_check,
     property_check_transcript,
 )
+from forseti.precond.reachability import ProbeReachability
 from forseti.properties import (
     HarnessError,
     Property,
@@ -72,6 +74,10 @@ def cex() -> Counterexample:
 
 def violated() -> Violated:
     return Violated(meta(), "[Counterexample]\n", cex())
+
+
+def reached_probe() -> Violated:
+    return Violated(meta(), "Violated property:\n  forseti:non-vacuity", None)
 
 
 def unknown() -> Unknown:
@@ -138,21 +144,35 @@ class FakeHarnessWriter:
 
     def render(self, unit: Unit, prop: Property) -> RenderedHarness:
         self.calls += 1
-        return RenderedHarness(source_text=f"/* harness {prop.property_id} */")
+        return RenderedHarness(
+            source_text=f"/* harness {prop.property_id} */",
+            probe_source_text=f"/* probe {prop.property_id} */",
+        )
 
 
 class FakeVerify:
     """A VerifyPort that replays a scripted list of verdicts, recording bounds."""
 
-    def __init__(self, results: list[EsbmcResult]) -> None:
+    def __init__(
+        self,
+        results: list[EsbmcResult],
+        probe_results: list[EsbmcResult] | None = None,
+    ) -> None:
         self._results = list(results)
+        self._probe_results = list(probe_results) if probe_results else None
         self.unwinds: list[int] = []
+        self.probe_unwinds: list[int] = []
 
     @property
     def calls(self) -> int:
         return len(self.unwinds)
 
     def __call__(self, source: Path, *, unwind: int) -> EsbmcResult:
+        if source.name.endswith(".probe.c"):
+            self.probe_unwinds.append(unwind)
+            if self._probe_results is not None:
+                return self._probe_results.pop(0)
+            return reached_probe()
         assert self._results, "FakeVerify over-popped: script exhausted"
         self.unwinds.append(unwind)
         return self._results.pop(0)
@@ -182,12 +202,16 @@ def test_all_held(tmp_path: Path) -> None:
         "held": 2,
         "violated": 0,
         "unknown": 0,
+        "vacuous": 0,
         "error": 0,
         "skipped": 0,
     }
     assert render.calls == 2
     # a harness file was materialized per property (the file esbmc reads).
-    assert len(list((tmp_path / "work").glob("*.c"))) == 2
+    harnesses = [
+        p for p in (tmp_path / "work").glob("*.c") if not p.name.endswith(".probe.c")
+    ]
+    assert len(harnesses) == 2
 
     loaded = [e for e in sink.events if e.type == "properties.loaded"]
     assert loaded[0].detail == {"unit": "u.c::f", "count": 2}
@@ -229,6 +253,7 @@ def test_terminal_status_props_are_not_checked(tmp_path: Path) -> None:
         "held": 1,
         "violated": 0,
         "unknown": 0,
+        "vacuous": 0,
         "error": 0,
         "skipped": 0,
     }
@@ -295,6 +320,8 @@ def test_each_escalation_is_flushed_before_the_next_verify(tmp_path: Path) -> No
             self._results = list(results)
 
         def __call__(self, source: Path, *, unwind: int) -> EsbmcResult:
+            if source.name.endswith(".probe.c"):
+                return reached_probe()
             seen_before[unwind] = [e.type for e in sink.events]
             return self._results.pop(0)
 
@@ -457,6 +484,7 @@ def test_empty_store_is_an_honest_no_op(tmp_path: Path) -> None:
         "held": 0,
         "violated": 0,
         "unknown": 0,
+        "vacuous": 0,
         "error": 0,
         "skipped": 0,
     }
@@ -628,7 +656,9 @@ def test_transcript_shows_every_outcome(tmp_path: Path) -> None:
     assert "HELD" in text
     assert "VIOLATED" in text
     assert "SKIPPED" in text
-    assert "Counts: held=1, violated=1, unknown=0, error=0, skipped=1" in text
+    assert (
+        "Counts: held=1, violated=1, unknown=0, vacuous=0, error=0, skipped=1" in text
+    )
 
 
 def test_transcript_shows_the_length_bounds_a_verdict_was_checked_under() -> None:
@@ -795,3 +825,201 @@ if TYPE_CHECKING:
 
     def _run_is_check_run(r: PropertyCheckRun) -> PropertyCheckRun:
         return r
+
+
+# --- W3.4: the post-call vacuity probe ----------------------------------------
+
+
+def _check_one(
+    tmp_path: Path,
+    verify: FakeVerify,
+    *,
+    render: HarnessWriterPort | None = None,
+    unwind: int = 8,
+    unwind_ladder: tuple[int, ...] = (),
+) -> PropertyCheckRun:
+    return check_properties(
+        UNIT,
+        store=InMemoryPropertyStore([semantic_prop("p1")]),
+        render=render if render is not None else FakeHarnessWriter(),
+        verify=verify,
+        work_dir=tmp_path / "work",
+        unwind=unwind,
+        unwind_ladder=unwind_ladder,
+    )
+
+
+def test_held_is_confirmed_by_a_reached_probe_at_the_same_k(tmp_path: Path) -> None:
+    verify = FakeVerify([Verified(meta())])
+
+    run = _check_one(tmp_path, verify)
+
+    (verdict,) = run.verdicts
+    assert verdict.outcome is PropertyOutcome.HELD
+    assert verdict.probe is ProbeReachability.REACHED
+    assert verdict.skip_reason is None
+    assert verify.probe_unwinds == [8]
+    assert run.outcome == "held"
+
+
+def test_probe_runs_at_the_settled_k_not_the_first_rung(tmp_path: Path) -> None:
+    verify = FakeVerify([unknown(), Verified(meta())])
+
+    run = _check_one(tmp_path, verify, unwind=8, unwind_ladder=(16,))
+
+    assert run.verdicts[0].k == 16
+    assert verify.unwinds == [8, 16]
+    assert verify.probe_unwinds == [16]  # same k as the verdict; never escalated
+
+
+def test_unreachable_probe_makes_a_verified_property_vacuous(tmp_path: Path) -> None:
+    verify = FakeVerify([Verified(meta())], probe_results=[Verified(meta())])
+
+    run = _check_one(tmp_path, verify)
+
+    (verdict,) = run.verdicts
+    assert verdict.outcome is PropertyOutcome.VACUOUS
+    assert verdict.probe is ProbeReachability.UNREACHABLE
+    assert verdict.k == 8
+    assert isinstance(verdict.result, Verified)
+    assert verdict.skip_reason is not None
+    assert "vacuous at k=8" in verdict.skip_reason
+    assert "does not show that k covers every path" in verdict.skip_reason
+    assert run.held() == ()
+    assert run.counts()["vacuous"] == 1
+    assert run.counts()["held"] == 0
+
+
+def test_vacuous_never_yields_a_held_run_outcome(tmp_path: Path) -> None:
+    verify = FakeVerify([Verified(meta())], probe_results=[Verified(meta())])
+
+    run = _check_one(tmp_path, verify)
+
+    assert run.outcome == "unknown"
+    assert run.to_dict()["outcome"] == "unknown"
+
+
+def test_vacuous_alongside_held_keeps_the_run_from_being_held(tmp_path: Path) -> None:
+    store = InMemoryPropertyStore([semantic_prop("p1"), semantic_prop("p2")])
+    verify = FakeVerify(
+        [Verified(meta()), Verified(meta())],
+        probe_results=[reached_probe(), Verified(meta())],
+    )
+
+    run = check_properties(
+        UNIT,
+        store=store,
+        render=FakeHarnessWriter(),
+        verify=verify,
+        work_dir=tmp_path / "work",
+        unwind=8,
+    )
+
+    assert [v.outcome for v in run.verdicts] == [
+        PropertyOutcome.HELD,
+        PropertyOutcome.VACUOUS,
+    ]
+    assert run.outcome == "unknown"
+    assert [v.property_id for v in run.held()] == ["p1"]
+
+
+def test_violated_run_outranks_vacuous(tmp_path: Path) -> None:
+    store = InMemoryPropertyStore([semantic_prop("p1"), semantic_prop("p2")])
+    verify = FakeVerify(
+        [Verified(meta()), violated()], probe_results=[Verified(meta())]
+    )
+
+    run = check_properties(
+        UNIT,
+        store=store,
+        render=FakeHarnessWriter(),
+        verify=verify,
+        work_dir=tmp_path / "work",
+        unwind=8,
+    )
+
+    assert run.outcome == "violated"
+
+
+@pytest.mark.parametrize(
+    "probe_result",
+    [
+        unknown(),
+        Error(meta(), "boom"),
+        Violated(meta(), "Violated property:\n  some other property", None),
+    ],
+    ids=["unknown", "error", "unlabelled-violation"],
+)
+def test_inconclusive_probe_makes_the_property_unknown(
+    tmp_path: Path, probe_result: EsbmcResult
+) -> None:
+    verify = FakeVerify([Verified(meta())], probe_results=[probe_result])
+
+    run = _check_one(tmp_path, verify)
+
+    (verdict,) = run.verdicts
+    assert verdict.outcome is PropertyOutcome.UNKNOWN
+    assert verdict.probe is ProbeReachability.INCONCLUSIVE
+    if isinstance(probe_result, Violated):
+        assert isinstance(verdict.result, Verified)
+    else:
+        assert verdict.result is probe_result
+    assert run.outcome == "unknown"
+    assert run.held() == ()
+
+
+@pytest.mark.parametrize(
+    "result", [violated(), unknown(), Error(meta(), "boom")], ids=["v", "u", "e"]
+)
+def test_probe_never_runs_for_a_non_verified_verdict(
+    tmp_path: Path, result: EsbmcResult
+) -> None:
+    verify = FakeVerify([result])
+
+    run = _check_one(tmp_path, verify)
+
+    assert verify.probe_unwinds == []
+    assert run.verdicts[0].probe is None
+    assert not list((tmp_path / "work").glob("*.probe.c"))
+
+
+def test_writer_without_a_probe_never_reports_held(tmp_path: Path) -> None:
+    class NoProbeWriter:
+        def render(self, unit: Unit, prop: Property) -> RenderedHarness:
+            return RenderedHarness(source_text="/* harness */")
+
+    verify = FakeVerify([Verified(meta())])
+
+    run = _check_one(tmp_path, verify, render=NoProbeWriter())
+
+    (verdict,) = run.verdicts
+    assert verdict.outcome is PropertyOutcome.UNKNOWN
+    assert verdict.probe is None
+    assert verdict.skip_reason is not None
+    assert verify.probe_unwinds == []
+
+
+def test_probe_harness_is_materialized_beside_the_real_one(tmp_path: Path) -> None:
+    verify = FakeVerify([Verified(meta())])
+
+    _check_one(tmp_path, verify)
+
+    probes = list((tmp_path / "work").glob("*.probe.c"))
+    assert len(probes) == 1
+    assert probes[0].read_text() == "/* probe p1 */"
+
+
+def test_vacuous_serializes_and_is_stated_in_the_transcript(tmp_path: Path) -> None:
+    verify = FakeVerify([Verified(meta())], probe_results=[Verified(meta())])
+
+    run = _check_one(tmp_path, verify)
+
+    payload = json.loads(json.dumps(run.to_dict()))
+    verdict = payload["verdicts"][0]
+    assert verdict["outcome"] == "vacuous"
+    assert verdict["probe"] == "unreachable"
+    assert payload["counts"]["vacuous"] == 1
+    text = property_check_transcript(run)
+    assert "VACUOUS" in text
+    assert "vacuous=1" in text
+    assert "does not show that k covers every path" in text

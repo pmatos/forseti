@@ -14,13 +14,9 @@ the property id and kind), and a per-outcome counts footer.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
+from .check import VACUITY_LIMITATION, PropertyCheckRun
 from .loop import LoopRun
 from .report import report_for
-
-if TYPE_CHECKING:  # only for typing — avoids a runtime cycle with check.py
-    from .check import PropertyCheckRun
 
 
 def transcript_for(run: LoopRun, *, unit_id: str) -> str:
@@ -67,7 +63,9 @@ def property_check_transcript(run: PropertyCheckRun) -> str:
     counts = run.counts()
     summary = ", ".join(
         f"{name}={counts[name]}"
-        for name in ("held", "violated", "unknown", "error", "skipped")
+        for name in ("held", "violated", "unknown", "vacuous", "error", "skipped")
     )
     lines.append(f"Counts: {summary}")
+    if counts["held"] or counts["vacuous"]:
+        lines.append(f"Note: {VACUITY_LIMITATION}")
     return "\n".join(lines)

@@ -152,7 +152,7 @@ def _semantic_message(summary: property_gate.SemanticCheckSummary) -> str:
     this text stays neutral so it reads correctly whether the turn is
     actually blocking on it now or reporting it as part of a residual after
     `MAX_STOP_ATTEMPTS`). Every other outcome here (unresolved/failed/
-    skipped/deferred) never contributes to `outstanding` and is reported
+    skipped/deferred/vacuous) never contributes to `outstanding` and is reported
     purely so it is never silently dropped.
     """
     lines: list[str] = []
@@ -179,6 +179,20 @@ def _semantic_message(summary: property_gate.SemanticCheckSummary) -> str:
             summary.unresolved,
             "?",
             lambda v: f"({v.get('outcome')}, k={v.get('k')})",
+        )
+    if summary.vacuous:
+        n = len(summary.vacuous)
+        lines += _property_lines(
+            f"⚠ Forseti: {n} generated semantic propert{_plural(n)} held "
+            "VACUOUSLY (`forseti check` verified the harness but its post-call "
+            "point is unreachable at that k, W3.4) — the postcondition was never "
+            "evaluated, so this is NOT a held property and never counts toward "
+            "acceptance; fix an unsatisfiable domain or raise the unwind bound "
+            "(the probe shows a path reaches the post-call point, not that k "
+            "covers every path):",
+            summary.vacuous,
+            "∅",
+            lambda v: f"(k={v.get('k')})",
         )
     if summary.failed:
         n = summary.failed
@@ -379,6 +393,7 @@ def main() -> int:
                 n_semantic_unresolved=len(semantic.unresolved),
                 n_semantic_failed=semantic.failed,
                 n_semantic_skipped=len(semantic.skipped),
+                n_semantic_vacuous=len(semantic.vacuous),
                 attempt=0,
             )
             return _emit({"systemMessage": "\n\n".join(notes)})
@@ -419,6 +434,7 @@ def main() -> int:
             n_semantic_unresolved=len(semantic.unresolved),
             n_semantic_failed=semantic.failed,
             n_semantic_skipped=len(semantic.skipped),
+            n_semantic_vacuous=len(semantic.vacuous),
         )
         if semantic_blocking:
             _record_semantic_gate_decision(project_dir, semantic, "residual")
@@ -445,6 +461,7 @@ def main() -> int:
         n_semantic_unresolved=len(semantic.unresolved),
         n_semantic_failed=semantic.failed,
         n_semantic_skipped=len(semantic.skipped),
+        n_semantic_vacuous=len(semantic.vacuous),
     )
     if semantic_blocking:
         _record_semantic_gate_decision(project_dir, semantic, "block")

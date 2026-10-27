@@ -611,7 +611,12 @@ def _add_check_parser(
             "Read <source>::<function>'s stored, checkable properties (proposed by "
             "`forseti propose`), render each semantic one to a self-contained ESBMC "
             "harness, and verify it: held | violated | unknown | error, plus "
-            "skipped for a deferred reachability property (ADR-0009 D2)."
+            "skipped for a deferred reachability property (ADR-0009 D2). A "
+            "Verified harness is probed at the same k and is `held` only if the "
+            "post-call point is reachable; otherwise it is `vacuous` (reported "
+            "like `unknown` in the run outcome and exit code, never `held`). "
+            "The probe shows some path reaches the post-call point; it does not "
+            "show that k covers every path."
         ),
     )
     _add_unit_store_arguments(p)

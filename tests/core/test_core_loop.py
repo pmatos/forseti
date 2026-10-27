@@ -60,6 +60,14 @@ def _meta(unwind: int = 4) -> RunMeta:
     )
 
 
+def _reached_probe() -> Violated:
+    return Violated(
+        RunMeta("8.3.0", ("esbmc",), 0, 0.0, "", ""),
+        "Violated property:\n  forseti:non-vacuity",
+        None,
+    )
+
+
 class FakeVerify:
     """A VerifyPort that replays a scripted list of verdicts."""
 
@@ -67,6 +75,8 @@ class FakeVerify:
         self._results = list(results)
 
     def __call__(self, source: Path, *, unwind: int) -> EsbmcResult:
+        if source.name.endswith(".probe.c"):
+            return _reached_probe()
         assert self._results, "FakeVerify over-popped: script exhausted"
         return self._results.pop(0)
 

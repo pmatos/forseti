@@ -57,7 +57,9 @@ _INSTRUCTIONS = (
     "Call `propose` to generate candidate properties for a unit before checking, "
     "or `submit` to ingest a candidate the host model already generated (no LLM "
     "call). Call `check` to verify a unit's stored properties: held | violated | "
-    "unknown | error, plus skipped for a deferred reachability property. Or call "
+    "unknown | vacuous | error, plus skipped for a deferred reachability "
+    "property (`vacuous`: verified, but the post-call point is unreachable at "
+    "k, so the property was never evaluated; never a pass). Or call "
     "`semantic_loop` to do ingestion and checking in one call and get back "
     "Core's own worst-outcome-wins outcome, instead of deriving it yourself."
 )
@@ -216,7 +218,12 @@ def check_tool(
 
     Returns:
         A JSON object with the unit id, per-outcome counts, and one verdict
-        per checked property: held | violated | unknown | error | skipped.
+        per checked property: held | violated | unknown | vacuous | error |
+        skipped. `vacuous` means ESBMC verified the harness but a probe at the
+        same k could not reach the post-call point, so the postcondition was
+        never evaluated (the run `outcome` reports it as `unknown`). A `held`
+        shows some path reaches the post-call point, not that k covers every
+        path.
     """
     run = check_source(
         Path(source),
@@ -347,7 +354,9 @@ def build_server(name: str = "forseti") -> MCPServer:
         name="check",
         description=(
             "Check a unit's stored properties with ESBMC; returns held | "
-            "violated | unknown | error (plus skipped) per property."
+            "violated | unknown | vacuous | error (plus skipped) per property; "
+            "vacuous = verified but the post-call point is unreachable at k "
+            "(not a pass)."
         ),
     )
     server.add_tool(

@@ -21,7 +21,7 @@ import pytest
 from forseti.core.cli import main
 from forseti.core.events import CLI_COMMAND, events_path
 from forseti.core.loop import run_semantic_loop
-from forseti.esbmc import EsbmcResult, RunMeta, Verified
+from forseti.esbmc import EsbmcResult, RunMeta, Verified, Violated
 
 ABS_SLICE = "int64_t my_abs(int64_t x) {\n    return (x < 0) ? -x : x;\n}\n"
 
@@ -53,11 +53,21 @@ def _meta() -> RunMeta:
     )
 
 
+def _reached_probe() -> Violated:
+    return Violated(
+        RunMeta("8.3.0", ("esbmc",), 0, 0.0, "", ""),
+        "Violated property:\n  forseti:non-vacuity",
+        None,
+    )
+
+
 class FakeVerify:
     def __init__(self, results: list[EsbmcResult]) -> None:
         self._results = list(results)
 
     def __call__(self, source: Path, *, unwind: int) -> EsbmcResult:
+        if source.name.endswith(".probe.c"):
+            return _reached_probe()
         assert self._results, "FakeVerify over-popped: script exhausted"
         return self._results.pop(0)
 

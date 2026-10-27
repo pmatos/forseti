@@ -84,7 +84,8 @@ _STORE_ROOT_NAME = ".forseti"
 # (core/check.py: unwind=4, ladder=(8,16) -- up to 3 esbmc runs *per*
 # property): this runs inside the Stop-gate's existing 120s hook timeout
 # (hooks.json), shared with the OOB/blob git scans that already run there. No
-# ladder (`--unwind-ladder ""`) keeps one property to exactly one esbmc run; a
+# ladder (`--unwind-ladder ""`) keeps one property to one verdict run plus, when
+# that verdict is Verified, one vacuity-probe run (`_ESBMC_RUNS_PER_PROPERTY`); a
 # genuine loop property that needs more reports UNKNOWN here (loud, via
 # `forseti check`'s own contract) rather than eat the hook's budget escalating
 # on its own -- raise FORSETI_PROPERTY_UNWIND for a project that needs it.
@@ -94,6 +95,7 @@ _STORE_ROOT_NAME = ".forseti"
 DEFAULT_UNWIND = gate.env_int("FORSETI_PROPERTY_UNWIND", "4", minimum=1)
 CHECK_TIMEOUT_S = gate.env_float("FORSETI_PROPERTY_CHECK_TIMEOUT_S", "20", minimum=1.0)
 _SUBPROCESS_MARGIN_S = 10.0
+_ESBMC_RUNS_PER_PROPERTY = 2
 
 # How many units-with-candidates one Stop-gate call will actually shell out to
 # `forseti check` for. Each call is its own esbmc-driven subprocess, so an
@@ -182,7 +184,10 @@ class SemanticCheckSummary:
     (subprocess timeout, bad build flags, an unparseable payload) -- distinct
     from `unresolved`, which is a property `forseti check` *did* run but
     couldn't settle; a unit that never ran isn't silently indistinguishable
-    from one with nothing to report either (issue #95 review).
+    from one with nothing to report either (issue #95 review). `vacuous` are the
+    same shape for VACUOUS outcomes (W3.4): ESBMC verified the harness but the
+    post-call point is unreachable at that k, so the postcondition was never
+    evaluated. They never count as held and never make the summary `empty`.
     """
 
     violations: tuple[dict[str, Any], ...]
@@ -191,6 +196,7 @@ class SemanticCheckSummary:
     unresolved: tuple[dict[str, Any], ...] = ()
     failed: int = 0
     skipped: tuple[dict[str, Any], ...] = ()
+    vacuous: tuple[dict[str, Any], ...] = ()
 
     @property
     def empty(self) -> bool:
@@ -200,6 +206,7 @@ class SemanticCheckSummary:
             and not self.unresolved
             and not self.failed
             and not self.skipped
+            and not self.vacuous
         )
 
 
@@ -326,11 +333,12 @@ def _check_selected_units(
     defers the entire unstarted suffix without preparing another command.
 
     Each unit checks every non-terminal property, so its natural subprocess
-    allowance is `max(1, n_props)` attempts plus one margin. Every attempt needs
-    `CHECK_TIMEOUT_S + VERIFY_GRACE_S`: the ESBMC runner can legitimately use
-    that grace before killing its child. The remaining turn budget caps this
+    allowance is `max(1, n_props)` properties, each a verdict run plus a
+    vacuity-probe run (`_ESBMC_RUNS_PER_PROPERTY`), plus one margin. Every run
+    needs `CHECK_TIMEOUT_S + VERIFY_GRACE_S`: the ESBMC runner can legitimately
+    use that grace before killing its child. The remaining turn budget caps this
     allowance even when a single unit would need more than the whole ceiling
-    (six properties need `6 * 25 + 10 = 160s` by default; issue #95, a7NSB).
+    (six properties need `6 * 2 * 25 + 10 = 310s` by default; issue #95, a7NSB).
 
     Only an actual timeout under a strictly smaller allowance is `deferred`
     (ran out of turn budget). An unclamped timeout, bad flags, missing executable
@@ -345,7 +353,10 @@ def _check_selected_units(
             deferred += len(selected) - index
             break
         natural_timeout = (
-            max(1, n_props) * (CHECK_TIMEOUT_S + VERIFY_GRACE_S) + _SUBPROCESS_MARGIN_S
+            max(1, n_props)
+            * _ESBMC_RUNS_PER_PROPERTY
+            * (CHECK_TIMEOUT_S + VERIFY_GRACE_S)
+            + _SUBPROCESS_MARGIN_S
         )
         timeout = min(natural_timeout, remaining)
         try:
@@ -412,6 +423,7 @@ def semantic_check_summary(
     violations: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    vacuous: list[dict[str, Any]] = []
     for verdict in batch.verdicts:
         if not isinstance(verdict, dict):
             continue
@@ -422,6 +434,8 @@ def semantic_check_summary(
             unresolved.append(verdict)
         elif outcome == "skipped":
             skipped.append(verdict)
+        elif outcome == "vacuous":
+            vacuous.append(verdict)
     return SemanticCheckSummary(
         tuple(violations),
         batch.checked,
@@ -429,4 +443,5 @@ def semantic_check_summary(
         tuple(unresolved),
         batch.failed,
         tuple(skipped),
+        tuple(vacuous),
     )
