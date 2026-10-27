@@ -5,7 +5,7 @@ input up to a bound. ``render_equivalence_harness`` puts the reference (every
 function it defines renamed with a ``__ref`` suffix) and the candidate in one
 translation unit; ``main`` draws nondet inputs once, gives each version its own
 copy of every buffer, calls both, and asserts the *relation* over the return
-value and every non-const buffer.
+value and every buffer (a ``const`` one too: a cast can still write through it).
 
 The relation is bitwise equality. Floats compare as "both NaN, or bit-identical",
 so NaN payloads do not matter but -0.0 and +0.0 differ.
@@ -25,7 +25,9 @@ reported alongside the filter's result.
 Scope of the shared translation unit (v1, fail closed): sources that define a
 file-scope object, a file-scope aggregate, ``main``, or function-local ``static``
 state are refused, as are non-arithmetic parameters and mismatched signatures.
-State hidden behind an ``#include`` is not visible to this text-level analysis.
+Conditional directives and ``#pragma`` are refused. State hidden behind an
+``#include``, and calls to functions defined in neither source (each draws an
+independent nondet), are not visible to this text-level analysis.
 """
 
 from __future__ import annotations
@@ -79,6 +81,9 @@ _INT_WORD_RE = re.compile(
 )
 _FLOAT_WORD_RE = re.compile(r"float|double")
 _DIRECTIVE_RE = re.compile(r"^[ \t]*#(?:[^\n]|(?<=\\)\n)*", re.MULTILINE)
+_CONDITIONAL_RE = re.compile(
+    r"^[ \t]*#[ \t]*(?:if|ifdef|ifndef|elif|else|endif|pragma)\b", re.MULTILINE
+)
 _INCLUDES = ("stdint.h", "stddef.h", "limits.h", "stdlib.h", "stdbool.h")
 
 
@@ -267,14 +272,13 @@ def render_equivalence_harness(
             inputs.append((b.name, seed))
             ref_args[b.name] = f"&{ref_name}"
             cand_args[b.name] = f"&{b.name}"
-            if not b.const:
-                ro, co = f"{_PRIVATE}out_ref_{b.name}", f"{_PRIVATE}out_{b.name}"
-                outputs.append(_Output(b.name, ro, co))
-                asserts += [
-                    f"    {elem} {ro} = {ref_name};",
-                    f"    {elem} {co} = {b.name};",
-                    f'    __ESBMC_assert({eq(elem, ro, co)}, "{_LABEL}:{b.name}");',
-                ]
+            ro, co = f"{_PRIVATE}out_ref_{b.name}", f"{_PRIVATE}out_{b.name}"
+            outputs.append(_Output(b.name, ro, co))
+            asserts += [
+                f"    {elem} {ro} = {ref_name};",
+                f"    {elem} {co} = {b.name};",
+                f'    __ESBMC_assert({eq(elem, ro, co)}, "{_LABEL}:{b.name}");',
+            ]
             continue
         count = int(b.length) if b.length.strip().isdecimal() else max_len
         body += [
@@ -293,18 +297,17 @@ def render_equivalence_harness(
                 "    }",
             ]
             inputs.append((f"{b.name}[{j}]", seed))
-            if not b.const:
-                label = f"{b.name}[{j}]"
-                ro = f"{_PRIVATE}out_ref_{b.name}_{j}"
-                co = f"{_PRIVATE}out_{b.name}_{j}"
-                outputs.append(_Output(label, ro, co))
-                asserts += [
-                    f"    if (({b.length}) > {j}) {{",
-                    f"        {elem} {ro} = {ref_name}[{j}];",
-                    f"        {elem} {co} = {b.name}[{j}];",
-                    f'        __ESBMC_assert({eq(elem, ro, co)}, "{_LABEL}:{label}");',
-                    "    }",
-                ]
+            label = f"{b.name}[{j}]"
+            ro = f"{_PRIVATE}out_ref_{b.name}_{j}"
+            co = f"{_PRIVATE}out_{b.name}_{j}"
+            outputs.append(_Output(label, ro, co))
+            asserts += [
+                f"    if (({b.length}) > {j}) {{",
+                f"        {elem} {ro} = {ref_name}[{j}];",
+                f"        {elem} {co} = {b.name}[{j}];",
+                f'        __ESBMC_assert({eq(elem, ro, co)}, "{_LABEL}:{label}");',
+                "    }",
+            ]
         ref_args[b.name] = ref_name
         cand_args[b.name] = b.name
 
@@ -412,7 +415,9 @@ def _classify(
     if isinstance(result, Verified):
         return EquivalenceVerified(k, bounds, result.meta)
     if isinstance(result, EsbmcUnknown):
-        reason = UnknownReason[result.reason.name]
+        reason = UnknownReason.__members__.get(
+            result.reason.name, UnknownReason.UNCLASSIFIED
+        )
         return EquivalenceUnknown(k, bounds, reason, reason.value, result.meta)
     if isinstance(result, Error):
         return EquivalenceUnknown(
@@ -534,13 +539,30 @@ def filter_equivalent[M: MutantLike](
 
     Only a VERIFIED check skips a mutant (see `EquivalenceFilter` for the bias that
     implies). VIOLATED, UNKNOWN and refused mutants are kept. `check_kwargs` are
-    forwarded to `checker` (timeout, extra flags, ESBMC binary, ...).
+    forwarded to `checker` (timeout, extra flags, ESBMC binary, ...). The original
+    is first checked against itself once; if that is refused (e.g. the original
+    itself faults under the harness) nothing is skipped and no mutant is run.
+    Raises `ValueError` on duplicate mutant ids.
     """
+    ids = [m.id for m in mutants]
+    if len(set(ids)) != len(ids):
+        raise ValueError("mutant ids must be unique")
     original_refusal: str | None = None
     try:
         _prepare(original, original, symbol)
     except HarnessError as exc:
         original_refusal = str(exc)
+    if original_refusal is None and mutants:
+        baseline = checker(
+            reference=original,
+            candidate=original,
+            symbol=symbol,
+            k=k,
+            max_len=max_len,
+            **check_kwargs,
+        )
+        if isinstance(baseline, EquivalenceRefused):
+            original_refusal = baseline.reason
     kept: list[M] = []
     skipped: list[M] = []
     results: list[tuple[str, EquivalenceResult]] = []
@@ -766,6 +788,11 @@ def _prepare(reference: str, candidate: str, symbol: str) -> tuple[UnitSignature
     for label, source in (("reference", reference), ("candidate", candidate)):
         view = _scan_view(source)
         views[label] = view
+        if _CONDITIONAL_RE.search(mask_comments(source)):
+            raise EquivalenceRefusal(
+                f"{label} source uses a conditional directive or #pragma, which "
+                "would change meaning inside the shared translation unit"
+            )
         if re.search(r"(?<![\w.])main\s*\(", view):
             raise EquivalenceRefusal(f"{label} source mentions main()")
         scan = _scan(view)
@@ -775,7 +802,7 @@ def _prepare(reference: str, candidate: str, symbol: str) -> tuple[UnitSignature
             raise EquivalenceRefusal(f"{label} source does not define `{symbol}`")
         scans[label] = scan
         try:
-            sigs[label] = extract_signature(source, symbol)
+            sigs[label] = extract_signature(mask_comments(source), symbol)
         except HarnessError as exc:
             raise EquivalenceRefusal(f"{label} signature not modelled: {exc}") from exc
         reason = _fragment_refusal(view, symbol) or _signature_refusal(sigs[label])

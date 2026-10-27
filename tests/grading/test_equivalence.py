@@ -112,8 +112,8 @@ def test_buffer_has_private_copies_and_unrolled_fill() -> None:
     assert text.count("free(") == 2
 
 
-def test_const_buffer_is_not_compared_but_mutable_one_is() -> None:
-    assert "forseti:equivalence:a[" not in render(SUM, SUM, "sum")
+def test_const_buffer_is_compared_like_a_mutable_one() -> None:
+    assert "forseti:equivalence:a[1]" in render(SUM, SUM, "sum")
     assert "forseti:equivalence:a[1]" in render(FILL, FILL, "fill")
 
 
@@ -215,6 +215,8 @@ def test_merge_sort_example_is_refused_for_its_mistyped_output() -> None:
         ("int f(int a[x], float x) { return a[0]; }", "not an integer parameter"),
         ("int f(int a[1000]) { return a[0]; }", "literal length 1000"),
         ("int f(int x) { return x; } int f__ref(int x);", "`__ref` name"),
+        ("#ifndef G\n#define G\nint f(int x) { return x; }\n#endif", "conditional"),
+        ("#pragma once\nint f(int x) { return x; }", "conditional"),
     ],
 )
 def test_unmodelled_sources_are_refused_with_a_reason(
@@ -412,6 +414,8 @@ def scripted(table: dict[str, EquivalenceResult]) -> EquivalenceChecker:
     def checker(**kwargs: object) -> EquivalenceResult:
         assert kwargs["reference"] == DOUBLE
         assert kwargs["k"] == 4
+        if kwargs["candidate"] == DOUBLE:
+            return EquivalenceVerified(4, (), META)
         return table[str(kwargs["candidate"])]
 
     return checker
@@ -515,3 +519,41 @@ def test_filter_forwards_check_kwargs() -> None:
     assert seen["timeout_s"] == 9.0
     assert seen["max_len"] == 5
     assert seen["symbol"] == "f"
+
+
+def test_commented_out_signature_does_not_shadow_the_real_one() -> None:
+    src = "/* was: char f(long a) { */ int f(int a) { return a; }"
+    text = render(src, src, "f")
+    assert "int a = nondet_int();" in text
+    assert "int __forseti_ret = f(a);" in text
+
+
+def test_filter_rejects_duplicate_mutant_ids() -> None:
+    with pytest.raises(ValueError, match="unique"):
+        filter_equivalent(
+            DOUBLE,
+            [FakeMutant("m", "a"), FakeMutant("m", "b")],
+            2,
+            symbol="f",
+            checker=scripted({}),
+        )
+
+
+def test_filter_with_faulting_original_runs_the_baseline_once() -> None:
+    calls: list[object] = []
+
+    def checker(**kwargs: object) -> EquivalenceResult:
+        calls.append(kwargs["candidate"])
+        return EquivalenceRefused("reference itself violates a property")
+
+    got = filter_equivalent(
+        DOUBLE,
+        [FakeMutant("a", "x"), FakeMutant("b", "y")],
+        2,
+        symbol="f",
+        checker=checker,
+    )
+    assert calls == [DOUBLE]
+    assert got.skipped == 0
+    assert got.original_refusal == "reference itself violates a property"
+    assert got.undecided == ("a", "b")

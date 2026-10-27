@@ -209,3 +209,24 @@ def test_filter_reports_skipped_equivalent_mutants_separately() -> None:
     assert [m.id for m in got.kept] == ["one-off", "broken", "stateful"]
     assert got.undecided == ("broken", "stateful")
     assert got.to_dict()["skipped"] == 1
+
+
+def test_write_through_a_const_buffer_is_a_divergence() -> None:
+    writes = (
+        "int f(const int *a, int n) {"
+        " int *p = (int *)a; if (n > 0) p[0] = 7; return 0; }"
+    )
+    quiet = "int f(const int *a, int n) { return 0; }"
+    got = check_equivalence(
+        reference=writes, candidate=quiet, symbol="f", k=2, max_len=2
+    )
+    assert isinstance(got, EquivalenceViolated)
+
+
+def test_faulting_original_is_refused_once_by_the_filter() -> None:
+    original = "int f(int a, int b) { return a / b; }"
+    got = filter_equivalent(
+        original, [Mutant("m1", "int f(int a, int b) { return a; }")], 2, symbol="f"
+    )
+    assert got.skipped == 0
+    assert got.original_refusal is not None
