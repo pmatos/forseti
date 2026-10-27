@@ -549,6 +549,30 @@ def test_a_property_that_stops_being_a_candidate_is_reported_not_crashed(
     assert grade.outcome is GradeOutcome.NOT_CANDIDATE
     assert "changed during grading" in grade.reason
     assert grade.grading is None
+    assert got.outcome == "ungraded"
+
+
+def test_a_held_property_lost_to_a_race_makes_the_run_partial(
+    source: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = store_with(source, [make_prop("p1"), make_prop("p2")])
+    real_grade = store.grade
+
+    def racing(property_id: str, grading: Grading) -> Property:
+        if property_id == "p1":
+            store.update_status(property_id, PropertyStatus.REJECTED)
+        return real_grade(property_id, grading)
+
+    monkeypatch.setattr(store, "grade", racing)
+    verify = FakeVerify({("m1", "p1"): violated(), ("m1", "p2"): violated()})
+
+    got = run_grade(
+        source, store, tmp_path, mutants=[make_mutant(1, "m1")], verify=verify
+    )
+
+    assert got.counts()["not_candidate"] == 1
+    assert got.counts()["graded"] == 1
+    assert got.outcome == "partial"
 
 
 def test_the_equivalence_filter_sees_main_renamed_sources(
@@ -783,6 +807,8 @@ def test_record_trace_appends_json_lines(source: Path, tmp_path: Path) -> None:
     ("kwargs", "message"),
     [
         ({"max_len": -1}, "max_len"),
+        ({"max_mutants": 0}, "max_mutants"),
+        ({"max_mutants": -3}, "max_mutants"),
         ({"unwind": 8, "unwind_ladder": (4,)}, "ladder"),
     ],
 )
@@ -815,7 +841,7 @@ def test_mutant_reading_table(
     from forseti.grading.grade import _subject
 
     mutant = make_mutant(1, "m1")
-    subject = _subject(mutant, Unit.from_path(source, "f"))
+    subject = _subject(mutant, Unit.from_path(source, "f"), "f")
     verdict = PropertyVerdict("p", "u", "semantic", outcome, 4, None, "h")
 
     reading = mutant_reading(subject, verdict, 1.5)
@@ -824,3 +850,57 @@ def test_mutant_reading_table(
     assert reading.esbmc_time_s == 1.5
     assert reading.mutant_id == "relational-flip@11:5#0"
     assert reading.k == 4
+
+
+def test_an_unresolved_mutant_verdict_records_why(source: Path) -> None:
+    from forseti.grading.grade import _subject
+
+    subject = _subject(make_mutant(1, "m1"), Unit.from_path(source, "f"), "f")
+    timeout = PropertyVerdict(
+        "p",
+        "u",
+        "semantic",
+        PropertyOutcome.UNKNOWN,
+        4,
+        Unknown(meta(), UnknownReason.TIMEOUT),
+        "h",
+    )
+    vacuous = PropertyVerdict(
+        "p", "u", "semantic", PropertyOutcome.VACUOUS, 4, None, "h"
+    )
+
+    assert mutant_reading(subject, timeout, 0.0).detail == "unknown (timeout)"
+    assert mutant_reading(subject, vacuous, 0.0).detail == "vacuous"
+
+
+def test_a_mutant_of_main_keeps_the_requested_unit_id(tmp_path: Path) -> None:
+    from forseti.grading.grade import _subject
+
+    path = tmp_path / "m.c"
+    path.write_text("int main(void) { return 0; }\n")
+    unit = Unit.from_path(path, "main")
+
+    subject = _subject(make_mutant(1, "m1"), unit, "main")
+
+    assert subject.unit.unit_id == unit.unit_id
+    assert subject.unit.symbol == unit.symbol
+
+
+def test_the_mutant_source_forwards_the_timeout(
+    source: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from forseti.grading import grade as grade_module
+
+    seen: list[dict[str, Any]] = []
+
+    def fake_mutate(path: Path, symbol: str, **kwargs: Any) -> MutationResult:
+        seen.append(kwargs)
+        return MutationResult((), 0)
+
+    monkeypatch.setattr(grade_module, "mutate_function", fake_mutate)
+
+    grade_module.default_mutant_source(timeout_s=300.0)(source, "f")
+    grade_module.default_mutant_source()(source, "f")
+
+    assert seen[0]["timeout_s"] == 300.0
+    assert "timeout_s" not in seen[1]

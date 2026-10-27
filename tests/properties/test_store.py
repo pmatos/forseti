@@ -382,6 +382,37 @@ def test_grade_refuses_a_second_grading() -> None:
     assert reloaded.grading == HELD_HALF
 
 
+@pytest.mark.parametrize("racer", [PropertyStatus.REJECTED, PropertyStatus.GRADED])
+def test_grade_refuses_a_row_that_changed_after_it_was_read(
+    monkeypatch: pytest.MonkeyPatch, racer: PropertyStatus
+) -> None:
+    store = mem_store()
+    prop = make_prop(expression="a")
+    store.add(prop)
+    store._conn.execute(
+        "UPDATE properties SET status = ?, grading_verdict = 'held', "
+        "grading_kill_rate = 1.0, grading_reason = 'x' WHERE property_id = ?",
+        (racer.value, prop.property_id),
+    )
+    store._conn.commit()
+    real_read = store._read_status
+    monkeypatch.setattr(
+        store,
+        "_read_status",
+        lambda pid: (PropertyStatus.CANDIDATE, False),
+    )
+
+    with pytest.raises(InvalidStatusTransition):
+        store.grade(prop.property_id, HELD_HALF)
+
+    monkeypatch.setattr(store, "_read_status", real_read)
+    stored = store.get(prop.property_id)
+    assert stored is not None
+    assert stored.status is racer
+    assert stored.grading is not None
+    assert stored.grading.reason == "x"
+
+
 def test_graded_rows_always_carry_a_kill_rate() -> None:
     store = mem_store()
     store.add(make_prop(expression="a"))

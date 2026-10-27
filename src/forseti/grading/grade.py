@@ -48,7 +48,7 @@ from forseti.core.check import (
     default_unwind_ladder_above,
     validated_max_len,
 )
-from forseti.esbmc import Error, EsbmcResult
+from forseti.esbmc import Error, EsbmcResult, Unknown
 from forseti.orchestrator import (
     HarnessWriterPort,
     PropertyCheckRun,
@@ -149,6 +149,22 @@ class MutantReading:
         }
 
 
+def tally(readings: Sequence[MutantReading]) -> dict[MutantOutcome, int]:
+    """Per-outcome count; every `MutantOutcome` key present (0 if none)."""
+    counts = {outcome: 0 for outcome in MutantOutcome}
+    for reading in readings:
+        counts[reading.outcome] += 1
+    return counts
+
+
+def kill_rate_of(readings: Sequence[MutantReading]) -> float | None:
+    """``killed / (killed + survived)``, or ``None`` when neither happened."""
+    counts = tally(readings)
+    killed = counts[MutantOutcome.KILLED]
+    decided = killed + counts[MutantOutcome.SURVIVED]
+    return killed / decided if decided else None
+
+
 @dataclass(frozen=True)
 class PropertyGrade:
     prop: Property
@@ -161,16 +177,11 @@ class PropertyGrade:
 
     def counts(self) -> dict[str, int]:
         """Per-outcome tally; every `MutantOutcome` key present (0 if none)."""
-        counts = {outcome.value: 0 for outcome in MutantOutcome}
-        for reading in self.readings:
-            counts[reading.outcome.value] += 1
-        return counts
+        return {o.value: n for o, n in tally(self.readings).items()}
 
     @property
     def kill_rate(self) -> float | None:
-        counts = self.counts()
-        decided = counts["killed"] + counts["survived"]
-        return counts["killed"] / decided if decided else None
+        return kill_rate_of(self.readings)
 
     @property
     def esbmc_time_s(self) -> float:
@@ -229,9 +240,16 @@ class GradeRun:
     def outcome(self) -> RunOutcome:
         """``graded`` when every held candidate got a Grading (and there was one),
         ``partial`` when only some did, ``ungraded`` when none did (including a run
-        with no held candidate): nothing graded is never a clean pass."""
+        with no held candidate): nothing graded is never a clean pass. A held
+        candidate that could not be stored (it changed during grading) counts as
+        eligible but ungraded."""
         counts = self.counts()
-        eligible = counts["graded"] + counts["undecided"]
+        unstored = sum(
+            1
+            for g in self.properties
+            if g.outcome is GradeOutcome.NOT_CANDIDATE and g.check is not None
+        )
+        eligible = counts["graded"] + counts["undecided"] + unstored
         if eligible and counts["graded"] == eligible:
             return "graded"
         return "partial" if counts["graded"] else "ungraded"
@@ -317,8 +335,8 @@ class _Subject:
     unit: Unit
 
 
-def _subject(mutant: Mutant, unit: Unit) -> _Subject:
-    renamed = Unit.from_text(unit.path, unit.symbol, mutant.source)
+def _subject(mutant: Mutant, unit: Unit, symbol: str) -> _Subject:
+    renamed = Unit.from_text(unit.path, symbol, mutant.source)
     return _Subject(str(mutant.id), renamed.source_text, mutant, renamed)
 
 
@@ -339,6 +357,10 @@ def mutant_reading(
             outcome = MutantOutcome.SURVIVED
         case PropertyOutcome.UNKNOWN | PropertyOutcome.VACUOUS:
             outcome = MutantOutcome.UNKNOWN
+            if detail is None:
+                detail = verdict.outcome.value
+                if isinstance(verdict.result, Unknown):
+                    detail += f" ({verdict.result.reason.value})"
         case _:
             outcome = MutantOutcome.ERROR
             if isinstance(verdict.result, Error):
@@ -357,23 +379,23 @@ def mutant_reading(
 def kill_reason(grade_readings: Sequence[MutantReading]) -> str:
     """The plain-English reason: the kill count, each survivor by name, then what
     was left out of the rate (``killed 7/9; survived: ...; not counted: ...``)."""
-    tally = {outcome: 0 for outcome in MutantOutcome}
-    survivors: list[str] = []
-    for reading in grade_readings:
-        tally[reading.outcome] += 1
-        if reading.outcome is MutantOutcome.SURVIVED:
-            survivors.append(f"{reading.description} [{reading.mutant_id}]")
-    killed, survived = tally[MutantOutcome.KILLED], tally[MutantOutcome.SURVIVED]
+    counts = tally(grade_readings)
+    survivors = [
+        f"{r.description} [{r.mutant_id}]"
+        for r in grade_readings
+        if r.outcome is MutantOutcome.SURVIVED
+    ]
+    killed, survived = counts[MutantOutcome.KILLED], counts[MutantOutcome.SURVIVED]
     parts = [f"killed {killed}/{killed + survived}"]
     parts.append("survived: " + "; ".join(survivors) if survivors else "no survivors")
     left_out = [
-        f"{tally[outcome]} {label}"
+        f"{counts[outcome]} {label}"
         for outcome, label in (
             (MutantOutcome.UNKNOWN, "unknown"),
             (MutantOutcome.ERROR, "error"),
             (MutantOutcome.SKIPPED, "skipped as equivalent"),
         )
-        if tally[outcome]
+        if counts[outcome]
     ]
     if left_out:
         parts.append("not counted: " + ", ".join(left_out))
@@ -381,9 +403,7 @@ def kill_reason(grade_readings: Sequence[MutantReading]) -> str:
 
 
 def _undecided_reason(readings: Sequence[MutantReading], generated: int) -> str:
-    counts = {o: 0 for o in MutantOutcome}
-    for reading in readings:
-        counts[reading.outcome] += 1
+    counts = tally(readings)
     return (
         "no mutant was killed or survived, so there is no kill rate and the "
         f"property stays a candidate ({generated} mutants generated; "
@@ -419,9 +439,12 @@ def default_mutant_source(
     *,
     max_mutants: int | None = None,
     seed: int = 0,
+    timeout_s: float | None = None,
     esbmc_bin: str = "esbmc",
     extra_flags: Sequence[str] = (),
 ) -> MutantSource:
+    timeout: dict[str, Any] = {} if timeout_s is None else {"timeout_s": timeout_s}
+
     def source(path: Path, symbol: str, /) -> MutationResult:
         return mutate_function(
             path,
@@ -430,6 +453,7 @@ def default_mutant_source(
             seed=seed,
             esbmc_bin=esbmc_bin,
             extra_flags=extra_flags,
+            **timeout,
         )
 
     return source
@@ -464,10 +488,12 @@ def grade_unit(
     property verdict can settle at) and at the property checks' `max_len`.
     `max_mutants`/`seed` cap and fix the mutant sample (roadmap Risk 6). The
     `mutants`, `equivalence`, `verify_for` and `render` ports default to the real
-    ESBMC-backed bindings. `max_len` and the ladder are validated before any
-    ESBMC call.
+    ESBMC-backed bindings. `max_len`, `max_mutants` and the ladder are validated
+    before any ESBMC call.
     """
     max_len = validated_max_len(max_len)
+    if max_mutants is not None and max_mutants < 1:
+        raise ValueError(f"max_mutants must be >= 1, got {max_mutants}")
     ladder = (
         unwind_ladder
         if unwind_ladder is not None
@@ -537,11 +563,12 @@ def grade_unit(
     mutant_source = mutants or default_mutant_source(
         max_mutants=max_mutants,
         seed=seed,
+        timeout_s=timeout_s,
         esbmc_bin=esbmc_bin,
         extra_flags=extra_flags,
     )
     generated = mutant_source(source, symbol)
-    subjects = [_subject(m, unit) for m in generated.mutants]
+    subjects = [_subject(m, unit, symbol) for m in generated.mutants]
     eq_k = ladder[-1] if ladder else unwind
     eq_max_len = DEFAULT_MAX_LEN if max_len is None else max_len
     checker = _TimedEquivalence(
@@ -616,10 +643,7 @@ def _finish(
     store: GradeStorePort,
     generated: int,
 ) -> PropertyGrade:
-    base = PropertyGrade(
-        prop, GradeOutcome.UNDECIDED, "", verdict.outcome, verdict.k, readings
-    )
-    rate = base.kill_rate
+    rate = kill_rate_of(readings)
     if rate is None:
         return PropertyGrade(
             prop,

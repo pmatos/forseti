@@ -313,17 +313,23 @@ class PropertyStore:
             current, _ = self._read_status(property_id)
             if not is_valid_transition(current, PropertyStatus.GRADED):
                 raise InvalidStatusTransition(current, PropertyStatus.GRADED)
-            self._conn.execute(
+            cur = self._conn.execute(
                 "UPDATE properties SET status = ?, grading_verdict = ?, "
-                "grading_kill_rate = ?, grading_reason = ? WHERE property_id = ?",
+                "grading_kill_rate = ?, grading_reason = ? "
+                "WHERE property_id = ? AND status = ?",
                 (
                     PropertyStatus.GRADED.value,
                     grading.verdict.value,
                     grading.kill_rate,
                     grading.reason,
                     property_id,
+                    current.value,
                 ),
             )
+            if cur.rowcount == 0:
+                raise InvalidStatusTransition(
+                    self._read_status(property_id)[0], PropertyStatus.GRADED
+                )
         return self._reread(property_id)
 
     def _read_status(self, property_id: str) -> tuple[PropertyStatus, bool]:
