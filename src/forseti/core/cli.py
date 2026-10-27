@@ -111,8 +111,7 @@ from forseti.esbmc import (
     render_result,
     verify_kwargs,
 )
-from forseti.grading import MutationError, grade_transcript
-from forseti.grading.grade import GradeRun
+from forseti.grading import GradeRun, MutationError, grade_transcript
 from forseti.orchestrator import PropertyCheckRun, property_check_transcript
 from forseti.precond import DEFAULT_MAX_LEN
 from forseti.properties import (

@@ -592,28 +592,31 @@ def grade_unit(
 
     readings: dict[str, list[MutantReading]] = {p.property_id: [] for p in held}
     for index, subject in enumerate(subjects):
+        if subject.id in equivalent_ids:
+            skipped = MutantReading(
+                subject.id,
+                subject.mutant.operator,
+                subject.mutant.description,
+                MutantOutcome.SKIPPED,
+                detail="equivalent to the original up to the bound",
+            )
+            for prop in held:
+                readings[prop.property_id].append(skipped)
+            continue
         for prop in held:
-            if subject.id in equivalent_ids:
-                reading = MutantReading(
-                    subject.id,
-                    subject.mutant.operator,
-                    subject.mutant.description,
-                    MutantOutcome.SKIPPED,
-                    detail="equivalent to the original up to the bound",
-                )
-            else:
-                timer = _TimedVerify(port_for(source))
-                got = check_properties(
-                    subject.unit,
-                    store=_PropertyView([prop]),
-                    render=writer,
-                    verify=timer,
-                    work_dir=work_dir / f"m{index}",
-                    unwind=unwind,
-                    unwind_ladder=ladder,
-                )
-                reading = mutant_reading(subject, got.verdicts[0], timer.seconds)
-            readings[prop.property_id].append(reading)
+            timer = _TimedVerify(port_for(source))
+            got = check_properties(
+                subject.unit,
+                store=_PropertyView([prop]),
+                render=writer,
+                verify=timer,
+                work_dir=work_dir / f"m{index}",
+                unwind=unwind,
+                unwind_ladder=ladder,
+            )
+            readings[prop.property_id].append(
+                mutant_reading(subject, got.verdicts[0], timer.seconds)
+            )
 
     for prop in held:
         grades[prop.property_id] = _finish(
