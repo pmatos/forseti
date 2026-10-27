@@ -28,6 +28,7 @@ from forseti.esbmc import (
     UnknownReason,
     Verdict,
     Verified,
+    Violated,
 )
 from forseti.orchestrator import PropertyVerdict
 from forseti.precond import DEFAULT_MAX_LEN
@@ -55,6 +56,14 @@ def _meta(unwind: int) -> RunMeta:
     )
 
 
+def _reached_probe() -> Violated:
+    return Violated(
+        RunMeta("8.3.0", ("esbmc",), 0, 0.0, "", ""),
+        "Violated property:\n  forseti:non-vacuity",
+        None,
+    )
+
+
 class FakeVerify:
     """A VerifyPort that replays a scripted list of verdicts, recording bounds."""
 
@@ -63,6 +72,8 @@ class FakeVerify:
         self.unwinds: list[int] = []
 
     def __call__(self, source: Path, *, unwind: int) -> EsbmcResult:
+        if source.name.endswith(".probe.c"):
+            return _reached_probe()
         assert self._results, "FakeVerify over-popped: script exhausted"
         self.unwinds.append(unwind)
         return self._results.pop(0)

@@ -111,6 +111,17 @@ HARNESS_MACROS: frozenset[str] = frozenset(
 
 LengthBounds = tuple[tuple[str, int], ...]
 
+# The label the post-call reachability probe (``__ESBMC_assert(0, ...)``) carries,
+# so a reachable site is a recognisable FAILED rather than an anonymous one. The
+# precond stack's non-vacuity probe uses the same label and the same reading
+# (`precond.reachability.classify_site_probe`); `precond.synth` imports it from here.
+NON_VACUITY_LABEL = "forseti:non-vacuity"
+
+
+def non_vacuity_probe(label: str = NON_VACUITY_LABEL) -> str:
+    """The C statement that marks a point reachable: a labelled ``assert(0)``."""
+    return f'__ESBMC_assert(0, "{label}");'
+
 
 @dataclass(frozen=True)
 class PropertyHarness:
@@ -124,6 +135,7 @@ class PropertyHarness:
 
     source_text: str
     length_bounds: LengthBounds = ()
+    probe_source_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -150,6 +162,7 @@ def render_semantic_harness(
     spec: SemanticSpec,
     includes: Sequence[str] = DEFAULT_INCLUDES,
     max_len: int | None = None,
+    probe: bool = False,
 ) -> str:
     """Return a compilable ESBMC harness (C text) for one semantic property.
 
@@ -173,6 +186,12 @@ def render_semantic_harness(
     length genuinely unconstrained -- sound, but the nondet-fill loop then
     iterates an unbounded number of times, so no finite unwind settles it and the
     verdict is always UNKNOWN (#299); the check path passes a small bound instead.
+
+    `probe=True` renders the *vacuity probe* twin (W3.4): byte-identical up to and
+    including the call, with the real assertion replaced by a labelled
+    ``__ESBMC_assert(0, NON_VACUITY_LABEL)``. Verified at the same k, a probe that
+    fires (VIOLATED carrying the label) shows some path reaches the post-call
+    point; a VERIFIED probe shows the postcondition was never evaluated.
     """
     # The source-level guard needs `unit_source`, so it stays here; every
     # `(signature, spec)` guard -- empty postcondition, `result_var` clash, void
@@ -234,7 +253,10 @@ def render_semantic_harness(
         lines.append(f"    {call};")
     else:
         lines.append(f"    {signature.return_ctype} {spec.result_var} = {call};")
-    lines.append(f'    __ESBMC_assert(({postcondition}), "forseti:semantic");')
+    if probe:
+        lines.append(f"    {non_vacuity_probe()}")
+    else:
+        lines.append(f'    __ESBMC_assert(({postcondition}), "forseti:semantic");')
     for buf in malloc_buffers:
         lines.append(f"    free({buf.name});")
     lines.append("    return 0;")
@@ -273,7 +295,9 @@ def build_property_harness(
     """`render_property_harness`, plus the length bounds the harness applied.
 
     The check phase reports those bounds on each verdict so a result scoped to
-    ``len <= N`` is never mistaken for one over every length.
+    ``len <= N`` is never mistaken for one over every length. `probe_source_text`
+    is the vacuity-probe twin of `source_text` (`render_semantic_harness`
+    ``probe=True``), checked at the same k after a HELD.
     """
     signature = extract_signature(unit_source, symbol)
     spec = spec_from_property(prop)
@@ -282,6 +306,13 @@ def build_property_harness(
             unit_source=unit_source, signature=signature, spec=spec, max_len=max_len
         ),
         length_bounds=plan_length_bounds(signature, spec, max_len),
+        probe_source_text=render_semantic_harness(
+            unit_source=unit_source,
+            signature=signature,
+            spec=spec,
+            max_len=max_len,
+            probe=True,
+        ),
     )
 
 

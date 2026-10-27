@@ -119,12 +119,16 @@ class RenderedHarness:
     come. `length_bounds` are the ``(param, max_len)`` caps the harness applied
     to buffer lengths its property's domain left unconstrained (empty if none),
     carried through to the verdict so a bounded result is never reported as
-    unbounded.
+    unbounded. `probe_source_text` is the vacuity-probe twin of `source_text`
+    (same body, labelled ``assert(0)`` after the call in place of the real
+    assertion); `None` means the writer offers none, and a HELD is then withheld
+    rather than passed unprobed.
     """
 
     source_text: str
     language: str = "c"
     length_bounds: LengthBounds = ()
+    probe_source_text: str | None = None
 
 
 class PropertyStorePort(Protocol):

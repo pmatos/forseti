@@ -93,6 +93,58 @@ def test_check_source_resolves_sibling_quoted_include_from_elsewhere(
     assert any((root / "check-work").glob("**/*.c"))
 
 
+def test_check_source_reports_an_unsatisfiable_domain_as_vacuous(
+    tmp_path: Path,
+) -> None:
+    """W3.4 on the production path (unwinding assertions on): ESBMC says VERIFIED
+    for a contradictory domain, but the post-call probe cannot be reached, so the
+    run is never `held` -- and the JSON face says why."""
+    unit = tmp_path / "abs_unit.c"
+    unit.write_text((ORCH_FIXTURES / "abs_unit.c").read_text())
+    unit_id = f"{unit}::my_abs"
+    root = tmp_path / ".forseti"
+    store = PropertyStore.open(root)
+    store.add(_semantic(unit_id, "result >= 0", ("x > 0 && x < 0",)))
+    store.close()
+
+    run = check_source(unit, function="my_abs", store_root=root)
+
+    assert run.counts()["vacuous"] == 1
+    assert run.counts()["held"] == 0
+    assert run.verdicts[0].outcome is PropertyOutcome.VACUOUS
+    assert run.outcome != "held"
+    payload = run.to_dict()
+    assert payload["verdicts"][0]["probe"] == "unreachable"
+
+
+def test_cli_check_json_exits_nonzero_for_a_vacuous_property(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    unit = tmp_path / "abs_unit.c"
+    unit.write_text((ORCH_FIXTURES / "abs_unit.c").read_text())
+    root = tmp_path / ".forseti"
+    store = PropertyStore.open(root)
+    store.add(_semantic(f"{unit}::my_abs", "result >= 0", ("x > 0 && x < 0",)))
+    store.close()
+
+    code = main(
+        [
+            "check",
+            str(unit),
+            "--function",
+            "my_abs",
+            "--store-root",
+            str(root),
+            "--json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["counts"]["vacuous"] == 1
+    assert payload["outcome"] == "unknown"
+    assert code != 0
+
+
 def test_check_source_extra_flags_include_dir_wins_over_sibling_angle_bracket(
     tmp_path: Path,
 ) -> None:

@@ -219,6 +219,36 @@ def test_semantic_skipped_is_reported_but_does_not_block(
     assert "p3" in message
 
 
+_VACUOUS = {
+    "unit_id": "f.c::my_abs",
+    "property_id": "p4",
+    "kind": "semantic",
+    "outcome": "vacuous",
+    "k": 4,
+}
+
+
+def test_semantic_vacuous_is_reported_but_does_not_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _git_init(tmp_path)
+    _patch_summary(
+        monkeypatch,
+        property_gate.SemanticCheckSummary(
+            (), checked=1, deferred=0, vacuous=(_VACUOUS,)
+        ),
+    )
+
+    result = _run_and_capture(tmp_path, monkeypatch, capsys)
+
+    assert "decision" not in result  # never blocks on its own
+    message = result["systemMessage"]
+    assert "VACUOUSLY" in message
+    assert "NOT a held property" in message
+    assert "f.c::my_abs" in message
+    assert "p4" in message
+
+
 def test_needs_contract_unit_note_is_folded_into_the_block_reason(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

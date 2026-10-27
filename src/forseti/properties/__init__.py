@@ -14,6 +14,7 @@ pipeline the rest of W2 (Epic #3) hangs off.
 from .harness import (
     DEFAULT_INCLUDES,
     HARNESS_MACROS,
+    NON_VACUITY_LABEL,
     BufferParam,
     HarnessError,
     LengthBounds,
@@ -81,6 +82,7 @@ __all__ = [
     "DEFAULT_PROMPT",
     "HARNESS_MACROS",
     "MAX_CANDIDATES_DEFAULT",
+    "NON_VACUITY_LABEL",
     "PROMPTS",
     "RESULT_IDENT",
     "SEMANTIC_V1",

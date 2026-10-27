@@ -182,7 +182,10 @@ class SemanticCheckSummary:
     (subprocess timeout, bad build flags, an unparseable payload) -- distinct
     from `unresolved`, which is a property `forseti check` *did* run but
     couldn't settle; a unit that never ran isn't silently indistinguishable
-    from one with nothing to report either (issue #95 review).
+    from one with nothing to report either (issue #95 review). `vacuous` are the
+    same shape for VACUOUS outcomes (W3.4): ESBMC verified the harness but the
+    post-call point is unreachable at that k, so the postcondition was never
+    evaluated. They never count as held and never make the summary `empty`.
     """
 
     violations: tuple[dict[str, Any], ...]
@@ -191,6 +194,7 @@ class SemanticCheckSummary:
     unresolved: tuple[dict[str, Any], ...] = ()
     failed: int = 0
     skipped: tuple[dict[str, Any], ...] = ()
+    vacuous: tuple[dict[str, Any], ...] = ()
 
     @property
     def empty(self) -> bool:
@@ -200,6 +204,7 @@ class SemanticCheckSummary:
             and not self.unresolved
             and not self.failed
             and not self.skipped
+            and not self.vacuous
         )
 
 
@@ -412,6 +417,7 @@ def semantic_check_summary(
     violations: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    vacuous: list[dict[str, Any]] = []
     for verdict in batch.verdicts:
         if not isinstance(verdict, dict):
             continue
@@ -422,6 +428,8 @@ def semantic_check_summary(
             unresolved.append(verdict)
         elif outcome == "skipped":
             skipped.append(verdict)
+        elif outcome == "vacuous":
+            vacuous.append(verdict)
     return SemanticCheckSummary(
         tuple(violations),
         batch.checked,
@@ -429,4 +437,5 @@ def semantic_check_summary(
         tuple(unresolved),
         batch.failed,
         tuple(skipped),
+        tuple(vacuous),
     )

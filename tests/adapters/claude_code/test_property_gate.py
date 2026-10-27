@@ -375,6 +375,29 @@ def test_unresolved_outcomes_are_reported_not_dropped(
     assert not summary.empty  # never a silent pass
 
 
+def test_vacuous_outcomes_never_count_as_held_and_are_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """W3.4: a VACUOUS verdict (verified, but the post-call point is unreachable)
+    is neither a violation nor a clean pass -- it is surfaced in its own bucket
+    and keeps the summary non-empty, so it can never read as an accepted HELD.
+    """
+    source = tmp_path / "f.c"
+    unit_id = f"{source}::my_abs"
+    _add_candidate(tmp_path, unit_id)
+    state = _state(_unit(str(source), "my_abs"))
+
+    monkeypatch.setattr(subprocess, "run", _fake_run(_payload(unit_id, "vacuous")))
+
+    summary = property_gate.semantic_check_summary(str(tmp_path), state)
+
+    assert summary.violations == ()
+    assert summary.unresolved == ()
+    assert len(summary.vacuous) == 1
+    assert summary.vacuous[0]["outcome"] == "vacuous"
+    assert not summary.empty  # never a silent pass
+
+
 def test_skipped_outcomes_are_reported_not_dropped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

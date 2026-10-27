@@ -19,12 +19,14 @@ from forseti.esbmc import Verified, Violated, verify
 from forseti.orchestrator import (
     ListSink,
     PropertyOutcome,
+    PropertyVerdict,
     SemanticHarnessWriter,
     Unit,
     check_properties,
     persist_property_check,
     property_check_transcript,
 )
+from forseti.precond.reachability import ProbeReachability
 from forseti.properties import (
     Property,
     PropertyKind,
@@ -110,3 +112,96 @@ def test_abs_store_sourced_properties_end_to_end(tmp_path: Path) -> None:
     text = property_check_transcript(run)
     assert "HELD" in text
     assert "VIOLATED" in text
+
+
+# --- W3.4: the post-call vacuity probe, against real esbmc ---------------------
+
+_LOOP_SLICE = """\
+int count_to_ten(int x) {
+    int i = 0;
+    while (i < 10) {
+        i++;
+    }
+    return i + (x - x);
+}
+"""
+
+
+def _check_with_real_esbmc(
+    unit: Unit, prop: Property, tmp_path: Path, *, unwind: int
+) -> PropertyVerdict:
+    store = PropertyStore.open(tmp_path / ".forseti")
+    store.add(prop)
+    run = check_properties(
+        unit,
+        store=store,
+        render=SemanticHarnessWriter(),
+        verify=verify,
+        work_dir=tmp_path / "work",
+        unwind=unwind,
+    )
+    store.close()
+    (verdict,) = run.verdicts
+    return verdict
+
+
+def test_unsatisfiable_domain_is_vacuous_not_held(tmp_path: Path) -> None:
+    unit = Unit.from_path(FIXTURES / "abs_unit.c", "my_abs")
+    prop = _semantic(unit.unit_id, "result >= 0", ("x > 0 && x < 0",))
+
+    verdict = _check_with_real_esbmc(unit, prop, tmp_path, unwind=1)
+
+    assert isinstance(verdict.result, Verified)  # ESBMC alone would say HELD
+    assert verdict.outcome is PropertyOutcome.VACUOUS
+    assert verdict.probe is ProbeReachability.UNREACHABLE
+
+
+def test_vacuous_even_for_a_postcondition_that_would_be_violated(
+    tmp_path: Path,
+) -> None:
+    # The domain is empty, so no input exists that could violate this either:
+    # the verdict must not depend on the (false) postcondition.
+    unit = Unit.from_path(FIXTURES / "abs_unit.c", "my_abs")
+    prop = _semantic(unit.unit_id, "result < 0", ("x > 0 && x < 0",))
+
+    verdict = _check_with_real_esbmc(unit, prop, tmp_path, unwind=1)
+
+    assert verdict.outcome is PropertyOutcome.VACUOUS
+
+
+def test_loop_needing_more_than_k_iterations_is_vacuous_at_that_k(
+    tmp_path: Path,
+) -> None:
+    # `forseti.esbmc.verify` cuts paths past k (--no-unwinding-assertions): every
+    # path through the 10-iteration loop is cut at k=2, so the postcondition is
+    # never evaluated and the bare verdict is a (false) VERIFIED.
+    unit = Unit("u.c::count_to_ten", Path("u.c"), "count_to_ten", _LOOP_SLICE)
+    prop = _semantic(unit.unit_id, "result == 10")
+
+    verdict = _check_with_real_esbmc(unit, prop, tmp_path, unwind=2)
+
+    assert isinstance(verdict.result, Verified)
+    assert verdict.outcome is PropertyOutcome.VACUOUS
+    assert verdict.k == 2
+    assert verdict.skip_reason is not None
+    assert "k=2" in verdict.skip_reason
+
+
+def test_same_loop_is_held_once_k_covers_its_iterations(tmp_path: Path) -> None:
+    unit = Unit("u.c::count_to_ten", Path("u.c"), "count_to_ten", _LOOP_SLICE)
+    prop = _semantic(unit.unit_id, "result == 10")
+
+    verdict = _check_with_real_esbmc(unit, prop, tmp_path, unwind=11)
+
+    assert verdict.outcome is PropertyOutcome.HELD
+    assert verdict.probe is ProbeReachability.REACHED
+
+
+def test_a_falsified_property_is_still_violated_not_probed(tmp_path: Path) -> None:
+    unit = Unit.from_path(FIXTURES / "abs_unit.c", "my_abs")
+    prop = _semantic(unit.unit_id, "result >= 0")
+
+    verdict = _check_with_real_esbmc(unit, prop, tmp_path, unwind=1)
+
+    assert verdict.outcome is PropertyOutcome.VIOLATED
+    assert verdict.probe is None

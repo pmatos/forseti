@@ -55,6 +55,8 @@ from dataclasses import dataclass
 from enum import Enum
 
 from forseti.esbmc.units import Param, Unit, find_definition_brace
+from forseti.properties.harness import NON_VACUITY_LABEL as NON_VACUITY_LABEL
+from forseti.properties.harness import non_vacuity_probe
 
 # The default symbolic-length ceiling. A pointer sized by a symbolic length is
 # `malloc(len)` with `len <= max_len`; the loop that consumes it then needs an
@@ -71,10 +73,6 @@ DEFAULT_INCLUDES: tuple[str, ...] = ("stdlib.h",)
 # included source to this with a `#define` (undone right after the `#include`),
 # which leaves the user's file — and the injected copy of it — untouched.
 RENAMED_MAIN = "__forseti_source_main"
-
-# The property label the non-vacuity probe (`__ESBMC_assert(0, ...)`) carries, so
-# a reachable call site is a recognisable FAILED rather than an anonymous one.
-NON_VACUITY_LABEL = "forseti:non-vacuity"
 
 # Prefix of the label each injected *caller obligation* carries (RFC-0003 S3), so
 # a FAILED that is the caller breaking the precondition is told apart from one
@@ -449,7 +447,7 @@ def render_sidecar(
     callee = RENAMED_MAIN if plan.unit.name == "main" else plan.unit.name
     lines.append(f"    {callee}({args});")
     if non_vacuity:
-        lines.append(f'    __ESBMC_assert(0, "{NON_VACUITY_LABEL}");')
+        lines.append(f"    {non_vacuity_probe()}")
     lines.append("    return 0;")
     lines.append("}")
     return "\n".join(lines) + "\n"

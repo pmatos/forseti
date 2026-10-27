@@ -40,8 +40,10 @@ from forseti.esbmc import (
     Violated,
     result_to_dict,
 )
+from forseti.precond.reachability import ProbeReachability, classify_site_probe
 from forseti.properties import (
     CHECKABLE_STATUSES,
+    NON_VACUITY_LABEL,
     HarnessError,
     LengthBounds,
     Property,
@@ -66,7 +68,9 @@ class PropertyOutcome(Enum):
     `HELD`/`VIOLATED`/`UNKNOWN` mirror the ESBMC verdict on the real unit;
     `ERROR` (a tooling/invocation failure) and `SKIPPED` (a reachability kind,
     deferred per ADR-0009 D2) are added so neither is silently coerced into a
-    code verdict.
+    code verdict. `VACUOUS` (W3.4) is added the same way: ESBMC said VERIFIED but
+    the post-call vacuity probe could not reach the assertion at that k, so the
+    postcondition was never evaluated and the result is not a HELD.
     """
 
     HELD = "held"  # Verified up to k
@@ -74,6 +78,7 @@ class PropertyOutcome(Enum):
     UNKNOWN = "unknown"  # inconclusive after the ladder is exhausted
     ERROR = "error"  # esbmc failed (e.g. a harness that didn't compile)
     SKIPPED = "skipped"  # reachability kind, deferred (ADR-0009 D2)
+    VACUOUS = "vacuous"  # Verified, but the post-call point is unreachable at k
 
 
 @dataclass(frozen=True)
@@ -83,7 +88,11 @@ class PropertyVerdict:
     `k` is the bound the verdict settled at (`None` when `SKIPPED`); `result` is
     the raw typed ESBMC result (`None` when `SKIPPED`); `harness_source` is the
     exact harness checked, kept as provenance so #4 can re-render it against
-    mutants. `skip_reason` explains a `SKIPPED` outcome or a render-failure `ERROR`.
+    mutants. `skip_reason` explains a `SKIPPED` outcome, a render-failure `ERROR`,
+    or a vacuity-probe `VACUOUS`/`UNKNOWN`. `probe` is the post-call probe's
+    reading (`None` when no probe ran: anything other than a Verified verdict);
+    on a `VACUOUS`/probe-`UNKNOWN` outcome `result` is the Verified verdict
+    / the probe's own inconclusive result respectively, both at `k`.
     `length_bounds` are the ``(param, max_len)`` caps the harness applied to
     buffer lengths the property's domain left unconstrained, so the verdict reads
     as scoped to ``len <= N`` rather than to every length (empty when none).
@@ -98,6 +107,7 @@ class PropertyVerdict:
     harness_source: str | None
     skip_reason: str | None = None
     length_bounds: LengthBounds = ()
+    probe: ProbeReachability | None = None
 
     @classmethod
     def skipped(
@@ -150,11 +160,13 @@ class PropertyVerdict:
         result: EsbmcResult,
         harness_source: str,
         length_bounds: LengthBounds = (),
+        probe: ProbeReachability | None = None,
+        reason: str | None = None,
     ) -> PropertyVerdict:
         """A property verified to a terminal `outcome` along the k-ladder: the
         settled bound `k`, the raw `result` (kept for #4 to re-render against
-        mutants), and the exact `harness_source` checked. No `skip_reason` — the
-        outcome speaks for itself.
+        mutants), and the exact `harness_source` checked. No `reason` — the
+        outcome speaks for itself — except when the vacuity probe qualified it.
         """
         return cls(
             property_id,
@@ -164,7 +176,9 @@ class PropertyVerdict:
             k=k,
             result=result,
             harness_source=harness_source,
+            skip_reason=reason,
             length_bounds=length_bounds,
+            probe=probe,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -177,6 +191,7 @@ class PropertyVerdict:
             "k": self.k,
             "harness_source": self.harness_source,
             "skip_reason": self.skip_reason,
+            "probe": self.probe.value if self.probe is not None else None,
             "length_bounds": dict(self.length_bounds),
             "result": (
                 _result_payload(self.result, self.k)
@@ -187,6 +202,15 @@ class PropertyVerdict:
 
 
 RunOutcome = Literal["held", "violated", "unknown", "error", "empty"]
+
+# What a `held` (and a `vacuous`) verdict does and does not show. The probe is a
+# reachability witness, not a coverage claim, so it is stated wherever a probed
+# verdict is reported (transcript footer, the vacuous reason, CLI/MCP docs).
+VACUITY_LIMITATION = (
+    "the vacuity probe shows only that some path reaches the post-call point at "
+    "this k; it does not show that k covers every path (paths cut by "
+    "--no-unwinding-assertions can still hide a violation)"
+)
 
 
 @dataclass(frozen=True)
@@ -213,20 +237,23 @@ class PropertyCheckRun:
 
         `violated` > `unknown` > `error` > `empty` (nothing semantically
         checked: no property stored, or every stored one was `skipped`) >
-        `held`. The one field a caller — the CLI's exit code, the MCP `check`
-        payload, and the composed loop (`core/loop.py`) — reads instead of
-        re-deriving verdict severity itself (issue #213): an adapter that
-        recomputed this from `counts()` on its own could drift from the CLI's
-        own policy, or (CLAUDE.md "never silently pass") miss that `empty`
-        must not read as a clean pass just because it shares `held`'s exit
-        code.
+        `held`. A `vacuous` verdict (W3.4) is folded into `unknown`: the
+        property's postcondition was never evaluated, so it is as inconclusive
+        as a timeout and must never read as `held`; `counts()`/`verdicts[]`
+        still tell the two apart. The one field a caller — the CLI's exit
+        code, the MCP `check` payload, and the composed loop (`core/loop.py`) —
+        reads instead of re-deriving verdict severity itself (issue #213): an
+        adapter that recomputed this from `counts()` on its own could drift from
+        the CLI's own policy, or (CLAUDE.md "never silently pass") miss that
+        `empty` must not read as a clean pass just because it shares `held`'s
+        exit code.
         """
         return self._outcome_for_counts(self.counts())
 
     def _outcome_for_counts(self, counts: dict[str, int]) -> RunOutcome:
         if counts["violated"]:
             return "violated"
-        if counts["unknown"]:
+        if counts["unknown"] or counts["vacuous"]:
             return "unknown"
         if counts["error"]:
             return "error"
@@ -277,7 +304,9 @@ class SemanticHarnessWriter:
             max_len=self._max_len,
         )
         return RenderedHarness(
-            source_text=harness.source_text, length_bounds=harness.length_bounds
+            source_text=harness.source_text,
+            length_bounds=harness.length_bounds,
+            probe_source_text=harness.probe_source_text,
         )
 
 
@@ -386,6 +415,23 @@ def check_properties(
             ),
         )
         outcome = _outcome_for(final.result)
+        result = final.result
+        probe: ProbeReachability | None = None
+        reason: str | None = None
+        if outcome is PropertyOutcome.HELD:
+            probed = _probe_post_call(
+                rendered,
+                harness_path=harness_path,
+                verify=verify,
+                k=final.k,
+                verified=final.result,
+            )
+            outcome, result, probe, reason = (
+                probed.outcome,
+                probed.result,
+                probed.probe,
+                probed.reason,
+            )
         verdicts.append(
             PropertyVerdict.settled(
                 prop.property_id,
@@ -393,22 +439,87 @@ def check_properties(
                 kind,
                 outcome,
                 k=final.k,
-                result=final.result,
+                result=result,
                 harness_source=rendered.source_text,
                 length_bounds=rendered.length_bounds,
+                probe=probe,
+                reason=reason,
             )
         )
+        detail: dict[str, Any] = {"property_id": prop.property_id, "kind": kind}
+        if probe is not None:
+            detail["probe"] = probe.value
         emit(
             "property.verdict",
             index=index,
             k=final.k,
             verdict=outcome.value,
-            detail={"property_id": prop.property_id, "kind": kind},
+            detail=detail,
         )
 
     run = PropertyCheckRun(unit.unit_id, tuple(verdicts))
     emit("properties.checked", detail={"unit": unit.unit_id, **run.counts()})
     return run
+
+
+@dataclass(frozen=True)
+class _Probed:
+    outcome: PropertyOutcome
+    result: EsbmcResult
+    probe: ProbeReachability | None
+    reason: str | None
+
+
+def _probe_post_call(
+    rendered: RenderedHarness,
+    *,
+    harness_path: Path,
+    verify: VerifyPort,
+    k: int,
+    verified: EsbmcResult,
+) -> _Probed:
+    """Qualify a Verified verdict: is the post-call point reachable at the same k?
+
+    Runs the harness's probe twin once, at the bound the verdict settled at --
+    never escalated, so it reads the very paths the HELD was decided on.
+    REACHED keeps `HELD`; UNREACHABLE is `VACUOUS` (the postcondition was never
+    evaluated); INCONCLUSIVE (the probe itself was UNKNOWN/ERROR, or fired
+    without its label) is `UNKNOWN`. A writer that supplies no probe also yields
+    `UNKNOWN`: an unprobed Verified is never reported as HELD.
+    """
+    if rendered.probe_source_text is None:
+        return _Probed(
+            PropertyOutcome.UNKNOWN,
+            verified,
+            None,
+            "no vacuity probe available for this harness; a Verified verdict "
+            "is not reported as held without one",
+        )
+    probe_path = harness_path.with_name(harness_path.stem + PROBE_SUFFIX)
+    probe_path.write_text(rendered.probe_source_text)
+    probe_result = verify(probe_path, unwind=k)
+    reading = classify_site_probe(probe_result, label=NON_VACUITY_LABEL)
+    match reading:
+        case ProbeReachability.REACHED:
+            return _Probed(PropertyOutcome.HELD, verified, reading, None)
+        case ProbeReachability.UNREACHABLE:
+            return _Probed(
+                PropertyOutcome.VACUOUS,
+                verified,
+                reading,
+                f"vacuous at k={k}: ESBMC verified the harness but the post-call "
+                "point is unreachable (unsatisfiable domain, or the call never "
+                f"returns within k); {VACUITY_LIMITATION}",
+            )
+        case ProbeReachability.INCONCLUSIVE:
+            return _Probed(
+                PropertyOutcome.UNKNOWN,
+                probe_result,
+                reading,
+                f"vacuity probe inconclusive at k={k}; held is withheld",
+            )
+        case _:
+            assert_never(reading)
 
 
 def _outcome_for(result: EsbmcResult) -> PropertyOutcome:
@@ -440,6 +551,9 @@ def _result_payload(result: EsbmcResult, k: int | None) -> dict[str, Any]:
     over the intrinsic verdict fields the projection owns.
     """
     return {"k": k, **result_to_dict(result)}
+
+
+PROBE_SUFFIX = ".probe.c"
 
 
 def _harness_filename(unit_id: str, property_id: str) -> str:
