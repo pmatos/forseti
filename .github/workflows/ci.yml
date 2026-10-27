@@ -19,11 +19,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Pinned ESBMC release (the upstream v8.5 release is ESBMC 8.5.0).
-  ESBMC_VERSION: "8.5"
+  # Pinned ESBMC release (the upstream v8.6 release is ESBMC 8.6.0).
+  ESBMC_VERSION: "8.6"
   # SHA-256 of the release asset below. Part of the cache key, so a version or
   # asset rotation forces a fresh download + verify. Bump in lockstep.
-  ESBMC_SHA256: "d8da304dd0dfce6c9f488379f03a72e768bce8598c22478c980e1704247352f1"
+  ESBMC_SHA256: "07b00b4a2590fe285edb5ce063ca2e5fbb368bbe556cfe139014c173717637f6"
 
 jobs:
   test:
@@ -60,7 +60,7 @@ jobs:
           rm "/tmp/$ESBMC_ZIP"
 
       - name: Add ESBMC to PATH
-        # v8.5's zip has a top-level `release/` dir (unlike the old per-distro
+        # v8.5+ zips have a top-level `release/` dir (unlike the old per-distro
         # asset), so the binary lands at ~/esbmc/release/bin/esbmc.
         run: echo "$HOME/esbmc/release/bin" >> "$GITHUB_PATH"
 
