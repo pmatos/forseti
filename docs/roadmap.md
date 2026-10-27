@@ -32,7 +32,7 @@ ESBMC fixes and a Lean backend are *supporting*, not the bar
 |---|---|---|---|
 | W1 | **The Loop** (orchestrator) | `src/orchestrator/` | The spine: write→verify→cex→fix |
 | W2 | **Property generation** | `src/properties/` | LLM proposes semantic + reachability properties |
-| W3 | **Differential grading** | `src/grading/` | Mutation-kill scoring — the novel contribution |
+| W3 | **Differential grading** | `src/forseti/grading/` | Mutation-kill scoring — the novel contribution |
 | W4 | **GEPA** | `src/gepa/` | Evolve the property-proposing prompt |
 | W5 | **ESBMC hardening** | fork of `esbmc/esbmc` | Continuous; fork now, upstream in batches ([ADR-0004](adr/0004-esbmc-fork-strategy.md)) |
 | W6 | **Real-code retrofit** | `examples/` | Push loop onto real C/C++ |
