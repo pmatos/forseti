@@ -262,7 +262,7 @@ def render_equivalence_harness(
         elem = _unqual(b.elem_ctype)
         need_nondet(elem)
         ref_name = f"{_PRIVATE}ref_{b.name}"
-        if b.out and b.length.strip() == "1":
+        if _is_cell(b):
             seed = f"{_PRIVATE}in_{b.name}"
             body += [
                 f"    {elem} {seed} = {_nondet(elem)}();",
@@ -296,8 +296,8 @@ def render_equivalence_harness(
                 f"        {ref_name}[{j}] = {seed};",
                 "    }",
             ]
-            inputs.append((f"{b.name}[{j}]", seed))
             label = f"{b.name}[{j}]"
+            inputs.append((label, seed))
             ro = f"{_PRIVATE}out_ref_{b.name}_{j}"
             co = f"{_PRIVATE}out_{b.name}_{j}"
             outputs.append(_Output(label, ro, co))
@@ -326,7 +326,7 @@ def render_equivalence_harness(
         outputs.insert(0, _Output("return", rr, rc))
     body += asserts
     for b in buffers:
-        if not (b.out and b.length.strip() == "1"):
+        if not _is_cell(b):
             body += [f"    free({b.name});", f"    free({_PRIVATE}ref_{b.name});"]
 
     lines = [f"#include <{inc}>" for inc in _INCLUDES]
@@ -663,6 +663,10 @@ def _scan(view: str) -> _Scan:
     return _Scan(functions, state)
 
 
+def _is_cell(buf: BufferParam) -> bool:
+    return buf.out and buf.length.strip() == "1"
+
+
 def _unqual(ctype: str) -> str:
     return " ".join(w for w in ctype.split() if w not in _QUALIFIERS)
 
@@ -719,9 +723,9 @@ def _signature_refusal(signature: UnitSignature) -> str | None:
                 f"parameter `{p.name}` points to non-arithmetic type "
                 f"`{p.elem_ctype}` (struct and typedef pointers are not modelled)"
             )
-        length = p.length.strip()
-        if p.out and length == "1":
+        if _is_cell(p):
             continue
+        length = p.length.strip()
         if length.isdecimal():
             if int(length) > _MAX_LITERAL_LEN:
                 return (
@@ -758,7 +762,7 @@ def _out_param_refusal(signature: UnitSignature, body: str, label: str) -> str |
     (e.g. ``msort``'s ``tmp``), so the harness would model it wrongly.
     """
     for p in signature.params:
-        if not (isinstance(p, BufferParam) and p.out and p.length.strip() == "1"):
+        if not (isinstance(p, BufferParam) and _is_cell(p)):
             continue
         n = re.escape(p.name)
         for use in re.finditer(rf"(?<![\w.]){n}\b", body):
