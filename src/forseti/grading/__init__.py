@@ -1,6 +1,23 @@
 """Differential grading (epic #4): score a property by whether it holds on real
 code and breaks on mutants."""
 
+from .discriminate import (
+    Absorption,
+    Discrimination,
+    Exclusion,
+    ExclusionReason,
+    PairOutcome,
+    PairScore,
+    PropertyScore,
+    PropertySetError,
+    SafetyOutcome,
+    SafetyReading,
+    esbmc_safety_port,
+    load_properties_file,
+    record_trace,
+    score_pair,
+    trace_rows,
+)
 from .mutate import (
     OPERATORS,
     Edit,
@@ -15,12 +32,27 @@ from .mutate import (
 
 __all__ = [
     "OPERATORS",
+    "Absorption",
+    "Discrimination",
     "Edit",
+    "Exclusion",
+    "ExclusionReason",
     "Mutant",
     "MutantId",
     "MutationError",
     "MutationResult",
+    "PairOutcome",
+    "PairScore",
+    "PropertyScore",
+    "PropertySetError",
+    "SafetyOutcome",
+    "SafetyReading",
+    "esbmc_safety_port",
     "esbmc_validator",
     "generate_mutants",
+    "load_properties_file",
     "mutate_function",
+    "record_trace",
+    "score_pair",
+    "trace_rows",
 ]
