@@ -240,6 +240,35 @@ class TestEdgeShapes:
         with pytest.raises(MutationError, match="unbalanced"):
             _mutants("int f(void) { if (1) {\n return 0; }\n")
 
+    def test_malformed_octal_literal_is_not_a_const_site(self) -> None:
+        src = "int f(int a) {\n#if 0\n return a + 09;\n#endif\n return a; }\n"
+        assert _only(src, "const-off-by-one") == []
+
+    def test_plus_minus_after_postfix_increment_is_binary(self) -> None:
+        src = "int f(int a, int b) { return a++ + b-- - 1; }\n"
+        assert [m.description for m in _only(src, "arith-swap")] == [
+            "`+` -> `-` at line 1",
+            "`-` -> `+` at line 1",
+        ]
+
+    def test_output_write_after_case_label_is_a_site(self) -> None:
+        src = (
+            "void f(int a, int *o) {\n"
+            "    switch (a) { case 1: *o = 2; break; default: *o = 3; }\n"
+            "}\n"
+        )
+        assert len(_only(src, "output-havoc")) == 2
+
+    def test_output_havoc_description_line_matches_its_id(self) -> None:
+        src = "void f(int *out) {\n    *out =\n        3;\n}\n"
+        [m] = _only(src, "output-havoc")
+        assert str(m.id).startswith("output-havoc@3:")
+        assert m.description.endswith("at line 3")
+
+    def test_guard_spanning_a_directive_is_not_dropped(self) -> None:
+        src = "int f(int a) {\n if (a)\n#ifdef X\n return 1;\n#endif\n return 2; }\n"
+        assert _only(src, "guard-drop") == []
+
     def test_qualified_return_type_and_attributes(self) -> None:
         src = "static inline const unsigned f(unsigned a) { return a; }\n"
         [m] = _only(src, "output-havoc")
@@ -393,6 +422,16 @@ class TestEsbmcPlumbing:
         for code in (1, 0):
             validate = esbmc_validator("f", esbmc_bin=self._stub(tmp_path, code))
             assert not validate("int f(void) { return 0; }\n")
+
+    def test_unrunnable_esbmc_is_an_error_not_an_invalid_mutant(
+        self, tmp_path: Path
+    ) -> None:
+        stub = tmp_path / "slow-esbmc"
+        stub.write_text("#!/bin/sh\nsleep 5\n")
+        stub.chmod(0o755)
+        validate = esbmc_validator("f", esbmc_bin=str(stub), timeout_s=0.2)
+        with pytest.raises(MutationError, match="cannot run"):
+            validate("int f(void) { return 0; }\n")
 
     def test_unparseable_original_aborts_before_any_scoring(
         self, tmp_path: Path

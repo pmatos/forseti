@@ -9,7 +9,9 @@ check is dropped and counted, never scored.
 
 Mutation is token-level on a comment/literal-masked view of the source. Cheap
 syntactic mutants may be semantically equivalent to the original; nothing here
-claims otherwise -- it only guarantees they compile.
+claims otherwise -- it only guarantees they compile. Sites are taken from every
+preprocessor arm, so a mutant of code the preprocessor drops (an inactive
+``#if`` arm) is also equivalent to the original.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from __future__ import annotations
 import random
 import re
 import shutil
+import subprocess
 import tempfile
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
@@ -64,6 +67,8 @@ _INT_LITERAL_RE = re.compile(
     r"(?P<body>0[xX][0-9a-fA-F]+|0[bB][01]+|[0-9]+)(?P<suffix>[uUlL]*)"
 )
 _GUARD_PREVIEW = 60
+_DIRECTIVE_LINE_RE = re.compile(r"^[ \t]*#", re.MULTILINE)
+_STATEMENT_START = ("{", ";", "}", ")", "else", ":")
 
 
 class MutationError(RuntimeError):
@@ -158,7 +163,7 @@ def _is_binary(tokens: Sequence[Token], i: int) -> bool:
         return True
     if prev.kind == "id":
         return prev.text not in _NOT_AN_OPERAND
-    return prev.text in (")", "]")
+    return prev.text in (")", "]", "++", "--")
 
 
 def _arith(source: str, body: FunctionBody, op_index: int) -> Iterable[_Candidate]:
@@ -183,9 +188,12 @@ def _int_value(text: str) -> int | None:
     if match is None:
         return None
     digits = match["body"]
-    if len(digits) > 1 and digits[0] == "0" and digits[1].isdigit():
-        return int(digits, 8)
-    return int(digits, 0)
+    try:
+        if len(digits) > 1 and digits[0] == "0" and digits[1].isdigit():
+            return int(digits, 8)
+        return int(digits, 0)
+    except ValueError:
+        return None
 
 
 def _const(source: str, body: FunctionBody, op_index: int) -> Iterable[_Candidate]:
@@ -238,8 +246,10 @@ def _guard_drop(source: str, body: FunctionBody, op_index: int) -> Iterable[_Can
             continue
         if end + 1 < len(tokens) and tokens[end + 1].text == "else":
             continue
-        standalone = i == 0 or tokens[i - 1].text in ("{", ";", "}")
         span_end = tokens[end].end
+        if _DIRECTIVE_LINE_RE.search(source, tok.start, span_end):
+            continue
+        standalone = i == 0 or tokens[i - 1].text in ("{", ";", "}")
         text = " ".join(source[tok.start : span_end].split())
         if len(text) > _GUARD_PREVIEW:
             text = text[: _GUARD_PREVIEW - 3] + "..."
@@ -284,7 +294,7 @@ def _havoc_outputs(
     outputs = {out.name: out for out in body.output_params}
     tokens = body.tokens
     for i, tok in enumerate(tokens):
-        if i > 0 and tokens[i - 1].text not in ("{", ";", "}", ")", "else"):
+        if i > 0 and tokens[i - 1].text not in _STATEMENT_START:
             continue
         eq = None
         if tok.text == "*" and i + 2 < len(tokens) and tokens[i + 1].text in outputs:
@@ -302,7 +312,7 @@ def _havoc_outputs(
         start, stop = tokens[eq + 1].start, tokens[end - 1].end
         if source[start:stop] == call:
             continue
-        line = _line_col(source, tok.start)[0]
+        line = _line_col(source, start)[0]
         yield _Candidate(
             op_index,
             start,
@@ -440,7 +450,9 @@ def esbmc_validator(
                     timeout_s=timeout_s,
                     extra_flags=extra_flags,
                 )
-            except ListUnitsError:
+            except ListUnitsError as exc:
+                if isinstance(exc.__cause__, OSError | subprocess.TimeoutExpired):
+                    raise MutationError(f"cannot run {esbmc_bin}: {exc}") from exc
                 return False
         return any(unit.name == symbol for unit in units)
 
