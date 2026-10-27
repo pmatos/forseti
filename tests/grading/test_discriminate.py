@@ -9,7 +9,7 @@ loading.
 from __future__ import annotations
 
 import json
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -43,7 +43,6 @@ from forseti.grading.discriminate import (
     esbmc_safety_port,
     esbmc_verify_for,
     exclusion_for,
-    load_properties,
     load_properties_file,
     properties_from_data,
     reading_from_discharge,
@@ -776,18 +775,6 @@ def test_load_properties_file(tmp_path: Path) -> None:
         load_properties_file(bad, unit_id="u")
     with pytest.raises(PropertySetError, match="cannot read"):
         load_properties_file(tmp_path / "missing.json", unit_id="u")
-
-
-def test_load_properties_from_a_store() -> None:
-    rows = [prop("a"), prop("b")]
-
-    class Store:
-        def list_for_unit(
-            self, unit_id: str, statuses: Collection[PropertyStatus] | None = None
-        ) -> Sequence[Property]:
-            return rows
-
-    assert load_properties(Store(), "u.c::f") == tuple(rows)
 
 
 def test_verify_factory_binds_the_real_runner(tmp_path: Path) -> None:

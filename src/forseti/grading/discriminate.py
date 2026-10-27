@@ -48,7 +48,6 @@ from forseti.orchestrator import (
     HarnessWriterPort,
     PropertyCheckRun,
     PropertyOutcome,
-    PropertyStorePort,
     PropertyVerdict,
     SemanticHarnessWriter,
     Unit,
@@ -679,15 +678,6 @@ def record_trace(store_root: Path, score: PairScore) -> None:
 
 class PropertySetError(ValueError):
     """A property-set file is not a readable list of properties."""
-
-
-def load_properties(
-    store: PropertyStorePort,
-    unit_id: str,
-    statuses: Collection[PropertyStatus] | None = None,
-) -> tuple[Property, ...]:
-    """The stored properties of `unit_id` (every status unless `statuses` is given)."""
-    return tuple(store.list_for_unit(unit_id, statuses))
 
 
 def properties_from_data(data: object, *, unit_id: str) -> tuple[Property, ...]:
