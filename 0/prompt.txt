@@ -1,0 +1,47 @@
+audit and then open pr with changes from entire: 
+
+
+
+<pasted_content id="c984">
+❯ entire enable
+Detected agent: Claude Code
+
+  Selected agents: Claude Code, Codex, Pi
+
+Note: pre-commit detected (.pre-commit-config.yaml)
+
+  If pre-commit reinstalls hooks, run 'entire enable' to restore Entire's hooks.
+
+  ✓ Installed hooks
+  ✓ Configured project
+    .entire/settings.json
+
+Ready.
+
+Make sure to commit these files to your Git repo so Entire works across worktrees and clones:
+  .entire/settings.json
+  .entire/.gitignore
+  .claude/settings.json
+  .codex/hooks.json
+  .pi/extensions/entire/index.ts
+ruff check...........................................(no files to check)Skipped
+ruff format..........................................(no files to check)Skipped
+ty...................................................(no files to check)Skipped
+Conventional Commit......................................................Failed
+- hook id: conventional-pre-commit
+- exit code: 1
+
+[Bad commit message] >> Enable Entire
+Your commit message does not follow Conventional Commits formatting
+https://www.conventionalcommits.org/
+
+Use the --verbose arg for more information
+
+Could not commit them: git commit: exit status 1
+
+Checkpoints will be uploaded when you push to origin.
+  They contain your agent transcripts. If that repo is public, anyone can read them.
+  Secret redaction is best effort, not bulletproof. Review with `entire checkpoint explain`.
+  To stop uploads: `entire configure --local --skip-push-sessions`
+  To use a separate private repo: `entire configure --local --checkpoint-remote github:<owner>/<repo>`
+</pasted_content id="c984">
