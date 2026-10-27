@@ -116,11 +116,16 @@ def test_abs_store_sourced_properties_end_to_end(tmp_path: Path) -> None:
 
 # --- W3.4: the post-call vacuity probe, against real esbmc ---------------------
 
+# ESBMC 8.5 fully unrolls a loop whose trip count it can fold to a constant,
+# whatever --unwind says; the exit test is routed through `j` so the loop is
+# genuinely cut at k.
 _LOOP_SLICE = """\
 int count_to_ten(int x) {
     int i = 0;
-    while (i < 10) {
+    int j = 0;
+    while (j < 10) {
         i++;
+        j = i;
     }
     return i + (x - x);
 }
