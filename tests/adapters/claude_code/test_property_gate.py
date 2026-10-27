@@ -17,6 +17,8 @@ import pytest
 
 from forseti.adapters.claude_code import property_gate
 from forseti.properties import (
+    Grading,
+    GradingVerdict,
     Property,
     PropertyKind,
     PropertyStatus,
@@ -54,6 +56,11 @@ def _add_property(
             expression=expression,
             status=status,
             provenance=Provenance("test", "v1"),
+            grading=(
+                Grading(GradingVerdict.HELD, 0.5, "killed 1/2")
+                if status is PropertyStatus.GRADED
+                else None
+            ),
         )
     )
     store.close()

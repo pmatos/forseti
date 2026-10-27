@@ -3,7 +3,8 @@
 Claude Code, Codex, and opencode all differ in their hooks but agree on MCP, so
 the Core exposes its operations as MCP tools here: `verify` (ESBMC), `propose`
 (the LLM property proposer, #65), `submit` (ingest a host-generated candidate,
-no LLM call, #213), `check` (verify a unit's stored properties, #213), and
+no LLM call, #213), `check` (verify a unit's stored properties, #213), `grade`
+(kill-rate scoring of held properties against mutants, #392), and
 `semantic_loop` (the composed ingest -> check -> outcome operation, #213) --
 one call in place of `propose`/`submit` and `check` separately. Each tool is a
 thin shell over its `forseti.core` entry point and returns the same JSON
@@ -31,6 +32,7 @@ from .check import (
     DEFAULT_UNWIND as CHECK_DEFAULT_UNWIND,
 )
 from .check import check_source
+from .grade import grade_source
 from .loop import parse_loop_mode, run_semantic_loop
 from .propose import (
     DEFAULT_MAX_CANDIDATES,
@@ -61,7 +63,10 @@ _INSTRUCTIONS = (
     "property (`vacuous`: verified, but the post-call point is unreachable at "
     "k, so the property was never evaluated; never a pass). Or call "
     "`semantic_loop` to do ingestion and checking in one call and get back "
-    "Core's own worst-outcome-wins outcome, instead of deriving it yourself."
+    "Core's own worst-outcome-wins outcome, instead of deriving it yourself. "
+    "Call `grade` on a unit with held properties to score each by the mutants it "
+    "kills (bounded verdicts; unknown, error and skipped mutants are reported "
+    "beside the kill rate, never in it)."
 )
 
 
@@ -240,6 +245,61 @@ def check_tool(
     return run.to_dict()
 
 
+def grade_tool(
+    source: str,
+    function: str,
+    store_root: str = str(DEFAULT_STORE_ROOT),
+    unwind: int = CHECK_DEFAULT_UNWIND,
+    unwind_ladder: list[int] | None = None,
+    timeout_s: float = CHECK_TIMEOUT_S,
+    esbmc_bin: str = "esbmc",
+    max_len: int = DEFAULT_MAX_LEN,
+    max_mutants: int | None = None,
+    seed: int = 0,
+) -> dict[str, object]:
+    """Grade a unit's held, candidate properties against mutants of the function.
+
+    Args:
+        source: Path to the source file defining the unit.
+        function: The function under test (the `symbol` of `path::symbol`).
+        store_root: The `.forseti` store directory; each graded property is
+            stored there with its kill rate and reason, status `graded`.
+        unwind: Loop-unwind bound k for the first attempt.
+        unwind_ladder: Bounds tried after `unwind` on an UNKNOWN verdict
+            (default: `default_unwind_ladder_above(unwind)`).
+        timeout_s: Per-attempt esbmc timeout in seconds.
+        esbmc_bin: The esbmc binary to invoke.
+        max_len: Cap on a `(ptr, len)` buffer length the property's domain does
+            not constrain (see `check`); also bounds the equivalence check.
+        max_mutants: Grade against at most this many valid mutants (a seeded
+            sample; default: all).
+        seed: Seed of the `max_mutants` sample.
+
+    Returns:
+        A JSON object: per property, the killed / survived / unknown / error /
+        skipped counts, `kill_rate` (killed / (killed + survived); unknown, error
+        and skipped are never folded in), a `reason` naming each surviving
+        mutant, and the ESBMC time; plus the run `outcome` (graded | partial |
+        ungraded), mutant and equivalence totals, and the `limitations`: every
+        verdict is bounded (up to k, len<=max_len), and skipping equivalent
+        mutants by a bounded check inflates the kill rate. A property with no
+        killed or surviving mutant stays a candidate.
+    """
+    run = grade_source(
+        Path(source),
+        function=function,
+        store_root=Path(store_root),
+        unwind=unwind,
+        unwind_ladder=tuple(unwind_ladder) if unwind_ladder is not None else None,
+        timeout_s=timeout_s,
+        esbmc_bin=esbmc_bin,
+        max_len=max_len,
+        max_mutants=max_mutants,
+        seed=seed,
+    )
+    return run.to_dict()
+
+
 def semantic_loop_tool(
     source: str,
     function: str,
@@ -326,7 +386,7 @@ def semantic_loop_tool(
 
 def build_server(name: str = "forseti") -> MCPServer:
     """An `MCPServer` exposing Forseti Core's tools (`verify`, `propose`,
-    `submit`, `check`, `semantic_loop`)."""
+    `submit`, `check`, `grade`, `semantic_loop`)."""
     server: MCPServer = MCPServer(name, instructions=_INSTRUCTIONS)
     server.add_tool(
         verify_tool,
@@ -357,6 +417,17 @@ def build_server(name: str = "forseti") -> MCPServer:
             "violated | unknown | vacuous | error (plus skipped) per property; "
             "vacuous = verified but the post-call point is unreachable at k "
             "(not a pass)."
+        ),
+    )
+    server.add_tool(
+        grade_tool,
+        name="grade",
+        description=(
+            "Grade a unit's held candidate properties by mutation: kill rate "
+            "(killed / (killed + survived)) and a reason naming each surviving "
+            "mutant, stored with status graded. Unknown, error and skipped "
+            "(equivalent) mutants are counted beside the rate, never in it. "
+            "Bounded verdicts only; skipping equivalent mutants inflates the rate."
         ),
     )
     server.add_tool(

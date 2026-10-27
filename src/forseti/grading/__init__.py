@@ -18,6 +18,17 @@ from .discriminate import (
     score_pair,
     trace_rows,
 )
+from .grade import (
+    GradeOutcome,
+    GradeRun,
+    MutantOutcome,
+    MutantReading,
+    PropertyGrade,
+    grade_transcript,
+    grade_unit,
+)
+from .grade import record_trace as record_grade_trace
+from .grade import trace_rows as grade_trace_rows
 from .mutate import (
     OPERATORS,
     Edit,
@@ -37,12 +48,17 @@ __all__ = [
     "Edit",
     "Exclusion",
     "ExclusionReason",
+    "GradeOutcome",
+    "GradeRun",
     "Mutant",
     "MutantId",
+    "MutantOutcome",
+    "MutantReading",
     "MutationError",
     "MutationResult",
     "PairOutcome",
     "PairScore",
+    "PropertyGrade",
     "PropertyScore",
     "PropertySetError",
     "SafetyOutcome",
@@ -50,8 +66,12 @@ __all__ = [
     "esbmc_safety_port",
     "esbmc_validator",
     "generate_mutants",
+    "grade_trace_rows",
+    "grade_transcript",
+    "grade_unit",
     "load_properties_file",
     "mutate_function",
+    "record_grade_trace",
     "record_trace",
     "score_pair",
     "trace_rows",

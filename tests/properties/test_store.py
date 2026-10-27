@@ -12,6 +12,7 @@ import pytest
 from forseti.properties import (
     DuplicateProperty,
     Grading,
+    GradingRequired,
     GradingVerdict,
     InvalidStatusTransition,
     Property,
@@ -22,6 +23,8 @@ from forseti.properties import (
     Provenance,
     make_property_id,
 )
+
+HELD_HALF = Grading(GradingVerdict.HELD, 0.5, "killed 1/2; survived: m")
 
 
 def make_prop(
@@ -265,7 +268,7 @@ def test_list_for_unit_scopes_and_orders() -> None:
 def test_list_for_unit_filters_by_status() -> None:
     store = mem_store()
     cand = make_prop(expression="a", status=PropertyStatus.CANDIDATE)
-    graded = make_prop(expression="b", status=PropertyStatus.GRADED)
+    graded = make_prop(expression="b", status=PropertyStatus.GRADED, grading=HELD_HALF)
     rejected = make_prop(expression="c", status=PropertyStatus.REJECTED)
     for prop in (cand, graded, rejected):
         store.add(prop)
@@ -284,14 +287,128 @@ def test_list_for_unit_filters_by_status() -> None:
 
 def test_update_status_applies_and_persists() -> None:
     store = mem_store()
+    prop = make_prop(status=PropertyStatus.GRADED, grading=HELD_HALF)
+    store.add(prop)
+
+    updated = store.update_status(prop.property_id, PropertyStatus.ACCEPTED)
+    assert updated.status is PropertyStatus.ACCEPTED
+    assert updated.grading == HELD_HALF
+    reloaded = store.get(prop.property_id)
+    assert reloaded is not None
+    assert reloaded.status is PropertyStatus.ACCEPTED
+
+
+def test_update_status_to_graded_without_a_grading_is_refused() -> None:
+    store = mem_store()
     prop = make_prop()
     store.add(prop)
 
+    with pytest.raises(GradingRequired):
+        store.update_status(prop.property_id, PropertyStatus.GRADED)
+
+    assert store.get(prop.property_id) == prop
+
+
+def test_update_status_to_graded_keeps_a_stored_grading() -> None:
+    store = mem_store()
+    prop = make_prop(grading=HELD_HALF)  # a candidate that already carries one
+    store.add(prop)
+
     updated = store.update_status(prop.property_id, PropertyStatus.GRADED)
+
     assert updated.status is PropertyStatus.GRADED
+    assert updated.grading == HELD_HALF
+
+
+def test_add_graded_without_a_grading_is_refused_not_a_duplicate() -> None:
+    store = mem_store()
+    with pytest.raises(GradingRequired):
+        store.add(make_prop(status=PropertyStatus.GRADED))
+    assert store.list_for_unit("examples/abs.c::my_abs") == ()
+
+
+def test_grade_writes_grading_and_status_together() -> None:
+    store = mem_store()
+    prop = make_prop()
+    store.add(prop)
+
+    graded = store.grade(prop.property_id, HELD_HALF)
+
+    assert graded.status is PropertyStatus.GRADED
+    assert graded.grading == HELD_HALF
+    assert store.get(prop.property_id) == graded
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.5, float("nan")])
+def test_grade_rejects_an_out_of_range_kill_rate(bad: float) -> None:
+    store = mem_store()
+    prop = make_prop()
+    store.add(prop)
+
+    with pytest.raises(ValueError, match="kill_rate"):
+        store.grade(prop.property_id, Grading(GradingVerdict.HELD, bad))
+
+    assert store.get(prop.property_id) == prop
+
+
+def test_grade_unknown_id_raises() -> None:
+    with pytest.raises(PropertyNotFound):
+        mem_store().grade("nope", HELD_HALF)
+
+
+@pytest.mark.parametrize("status", [PropertyStatus.REJECTED, PropertyStatus.ACCEPTED])
+def test_grade_refuses_a_terminal_property(status: PropertyStatus) -> None:
+    store = mem_store()
+    prop = make_prop(status=status)
+    store.add(prop)
+
+    with pytest.raises(InvalidStatusTransition):
+        store.grade(prop.property_id, HELD_HALF)
+
+    assert store.get(prop.property_id) == prop
+
+
+def test_grade_refuses_a_second_grading() -> None:
+    store = mem_store()
+    prop = make_prop()
+    store.add(prop)
+    store.grade(prop.property_id, HELD_HALF)
+
+    with pytest.raises(InvalidStatusTransition):
+        store.grade(prop.property_id, Grading(GradingVerdict.HELD, 1.0, "again"))
+
     reloaded = store.get(prop.property_id)
     assert reloaded is not None
-    assert reloaded.status is PropertyStatus.GRADED
+    assert reloaded.grading == HELD_HALF
+
+
+def test_graded_rows_always_carry_a_kill_rate() -> None:
+    store = mem_store()
+    store.add(make_prop(expression="a"))
+    store.grade(make_prop(expression="a").property_id, HELD_HALF)
+    store.add(make_prop(expression="b"))
+
+    rows = store._conn.execute(
+        "SELECT grading_kill_rate FROM properties WHERE status = 'graded'"
+    ).fetchall()
+    assert rows
+    assert all(row["grading_kill_rate"] is not None for row in rows)
+
+
+def test_trigger_guards_graded_without_grading_against_raw_sql() -> None:
+    # The Python checks are the API; the triggers are the backstop for any other
+    # writer, and they exist on a database created before they did.
+    store = mem_store()
+    store.add(make_prop())
+    with pytest.raises(sqlite3.IntegrityError, match="requires a grading"):
+        store._conn.execute("UPDATE properties SET status = 'graded'")
+    with pytest.raises(sqlite3.IntegrityError, match="requires a grading"):
+        store._conn.execute(
+            "INSERT INTO properties "
+            "(property_id, unit_id, kind, expression, status, "
+            " prompt_id, prompt_version) "
+            "VALUES ('id', 'u::f', 'semantic', 'e', 'graded', 'p', '1')"
+        )
 
 
 def test_update_status_invalid_transition_rolls_back() -> None:
@@ -310,14 +427,14 @@ def test_update_status_invalid_transition_rolls_back() -> None:
 
 def test_update_status_missing_id_raises() -> None:
     with pytest.raises(PropertyNotFound):
-        mem_store().update_status("nope", PropertyStatus.GRADED)
+        mem_store().update_status("nope", PropertyStatus.REJECTED)
 
 
 def test_terminal_status_is_enforced() -> None:
     store = mem_store()
     prop = make_prop()
     store.add(prop)
-    store.update_status(prop.property_id, PropertyStatus.GRADED)
+    store.grade(prop.property_id, HELD_HALF)
     store.update_status(prop.property_id, PropertyStatus.ACCEPTED)
     with pytest.raises(InvalidStatusTransition):
         store.update_status(prop.property_id, PropertyStatus.REJECTED)

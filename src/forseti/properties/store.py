@@ -49,6 +49,16 @@ CREATE TABLE IF NOT EXISTS properties (
 );
 CREATE INDEX IF NOT EXISTS idx_properties_unit        ON properties(unit_id);
 CREATE INDEX IF NOT EXISTS idx_properties_unit_status ON properties(unit_id, status);
+-- A CHECK cannot be added to an existing table, a trigger can: no GRADED row
+-- without a grading, whichever writer reaches the file.
+CREATE TRIGGER IF NOT EXISTS properties_graded_has_grading_insert
+BEFORE INSERT ON properties
+WHEN NEW.status = 'graded' AND NEW.grading_verdict IS NULL
+BEGIN SELECT RAISE(ABORT, 'a graded property requires a grading'); END;
+CREATE TRIGGER IF NOT EXISTS properties_graded_has_grading_update
+BEFORE UPDATE ON properties
+WHEN NEW.status = 'graded' AND NEW.grading_verdict IS NULL
+BEGIN SELECT RAISE(ABORT, 'a graded property requires a grading'); END;
 """
 
 _INSERT = """
@@ -92,6 +102,17 @@ class PropertyNotFound(PropertyStoreError):
     def __init__(self, property_id: str) -> None:
         self.property_id = property_id
         super().__init__(f"no such property: {property_id}")
+
+
+class GradingRequired(PropertyStoreError):
+    """A property would become GRADED without a `Grading`; use `PropertyStore.grade`."""
+
+    def __init__(self, property_id: str) -> None:
+        self.property_id = property_id
+        super().__init__(
+            f"{property_id}: a graded property needs a Grading; "
+            "write it with PropertyStore.grade, not a bare status change"
+        )
 
 
 def _property_to_row(prop: Property) -> dict[str, Any]:
@@ -209,7 +230,12 @@ class PropertyStore:
         self.close()
 
     def add(self, prop: Property) -> None:
-        """Insert `prop`; raise `DuplicateProperty` if its id is already stored."""
+        """Insert `prop`; raise `DuplicateProperty` if its id is already stored.
+
+        A GRADED `prop` must carry its `Grading` (`GradingRequired` otherwise).
+        """
+        if prop.status is PropertyStatus.GRADED and prop.grading is None:
+            raise GradingRequired(prop.property_id)
         try:
             with self._conn:
                 self._conn.execute(_INSERT, _property_to_row(prop))
@@ -259,22 +285,57 @@ class PropertyStore:
 
         Raises `PropertyNotFound` (unknown id) or `InvalidStatusTransition`
         (disallowed move) -- both before any write, so a rejected transition
-        leaves the row untouched.
+        leaves the row untouched. A move to GRADED needs a stored grading
+        (`GradingRequired` otherwise): grade a candidate with `grade`.
         """
         with self._conn:
-            cur = self._conn.execute(
-                "SELECT status FROM properties WHERE property_id = ?", (property_id,)
-            )
-            row = cur.fetchone()
-            if row is None:
-                raise PropertyNotFound(property_id)
-            current = PropertyStatus(row["status"])
+            current, has_grading = self._read_status(property_id)
             if not is_valid_transition(current, new_status):
                 raise InvalidStatusTransition(current, new_status)
+            if new_status is PropertyStatus.GRADED and not has_grading:
+                raise GradingRequired(property_id)
             self._conn.execute(
                 "UPDATE properties SET status = ? WHERE property_id = ?",
                 (new_status.value, property_id),
             )
+        return self._reread(property_id)
+
+    def grade(self, property_id: str, grading: Grading) -> Property:
+        """Store `grading` and move the property to GRADED in one transaction.
+
+        Raises `PropertyNotFound`, `InvalidStatusTransition` (only a CANDIDATE can
+        be graded: GRADED -> GRADED is not a transition) or `ValueError` for a
+        `kill_rate` that is NaN or outside [0, 1]; nothing is written then.
+        """
+        if not 0.0 <= grading.kill_rate <= 1.0:
+            raise ValueError(f"kill_rate must be in [0, 1], got {grading.kill_rate}")
+        with self._conn:
+            current, _ = self._read_status(property_id)
+            if not is_valid_transition(current, PropertyStatus.GRADED):
+                raise InvalidStatusTransition(current, PropertyStatus.GRADED)
+            self._conn.execute(
+                "UPDATE properties SET status = ?, grading_verdict = ?, "
+                "grading_kill_rate = ?, grading_reason = ? WHERE property_id = ?",
+                (
+                    PropertyStatus.GRADED.value,
+                    grading.verdict.value,
+                    grading.kill_rate,
+                    grading.reason,
+                    property_id,
+                ),
+            )
+        return self._reread(property_id)
+
+    def _read_status(self, property_id: str) -> tuple[PropertyStatus, bool]:
+        row = self._conn.execute(
+            "SELECT status, grading_verdict FROM properties WHERE property_id = ?",
+            (property_id,),
+        ).fetchone()
+        if row is None:
+            raise PropertyNotFound(property_id)
+        return PropertyStatus(row["status"]), row["grading_verdict"] is not None
+
+    def _reread(self, property_id: str) -> Property:
         updated = self.get(property_id)
         assert updated is not None  # just written under the same connection
         return updated
