@@ -1,0 +1,65 @@
+{
+  "cli_version": "0.12.2",
+  "checkpoint_id": "01M5YN4GY4XQKS4A2J2081JTHF",
+  "strategy": "manual-commit",
+  "branch": "vibe/393-vacuity-guard",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "src/forseti/adapters/claude_code/property_gate.py",
+    "src/forseti/adapters/claude_code/stop_gate.py",
+    "src/forseti/core/cli.py",
+    "src/forseti/core/mcp_server.py",
+    "src/forseti/orchestrator/check.py",
+    "src/forseti/orchestrator/ports.py",
+    "src/forseti/orchestrator/transcript.py",
+    "src/forseti/precond/synth.py",
+    "src/forseti/properties/__init__.py",
+    "src/forseti/properties/harness.py",
+    "tests/adapters/claude_code/test_property_gate.py",
+    "tests/adapters/claude_code/test_stop_gate_semantic.py",
+    "tests/core/test_core_check.py",
+    "tests/core/test_core_check_integration.py",
+    "tests/core/test_core_loop.py",
+    "tests/core/test_semantic_loop_cli.py",
+    "tests/orchestrator/test_check.py",
+    "tests/orchestrator/test_check_integration.py",
+    "tests/properties/test_harness.py"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 0,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 0,
+    "api_call_count": 0,
+    "subagent_tokens": {
+      "input_tokens": 20,
+      "cache_creation_tokens": 57403,
+      "cache_read_tokens": 1385504,
+      "output_tokens": 5485,
+      "api_call_count": 10
+    }
+  },
+  "redaction": {
+    "replacements": 0,
+    "layers": {
+      "betterleaks": 0,
+      "connection_string": 0,
+      "credential_key": 0,
+      "credential_value": 0,
+      "credentialed_uri": 0,
+      "entropy": 0,
+      "key_context": 0,
+      "provider_token": 0,
+      "shell_stdin": 0
+    }
+  }
+}
