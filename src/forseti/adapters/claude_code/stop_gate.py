@@ -393,6 +393,7 @@ def main() -> int:
                 n_semantic_unresolved=len(semantic.unresolved),
                 n_semantic_failed=semantic.failed,
                 n_semantic_skipped=len(semantic.skipped),
+                n_semantic_vacuous=len(semantic.vacuous),
                 attempt=0,
             )
             return _emit({"systemMessage": "\n\n".join(notes)})
@@ -433,6 +434,7 @@ def main() -> int:
             n_semantic_unresolved=len(semantic.unresolved),
             n_semantic_failed=semantic.failed,
             n_semantic_skipped=len(semantic.skipped),
+            n_semantic_vacuous=len(semantic.vacuous),
         )
         if semantic_blocking:
             _record_semantic_gate_decision(project_dir, semantic, "residual")
@@ -459,6 +461,7 @@ def main() -> int:
         n_semantic_unresolved=len(semantic.unresolved),
         n_semantic_failed=semantic.failed,
         n_semantic_skipped=len(semantic.skipped),
+        n_semantic_vacuous=len(semantic.vacuous),
     )
     if semantic_blocking:
         _record_semantic_gate_decision(project_dir, semantic, "block")

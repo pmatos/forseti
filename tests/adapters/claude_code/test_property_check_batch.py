@@ -38,11 +38,12 @@ def test_empty_selection_starts_no_commands(monkeypatch: pytest.MonkeyPatch) -> 
     ("elapsed", "count", "times_out", "timeout", "expected"),
     [
         (65.5, 1, False, None, (0, 1, 0)),
-        (65.0, 1, True, 35.0, (0, 0, 1)),
+        (65.0, 1, True, 35.0, (0, 1, 0)),
+        (40.0, 1, True, 60.0, (0, 0, 1)),
         (65.0, 2, True, 35.0, (0, 1, 0)),
         (65.0, 2, False, 35.0, (1, 0, 0)),
-        (40.0, 2, True, 60.0, (0, 0, 1)),
-        (0.0, 0, False, 35.0, (1, 0, 0)),
+        (40.0, 2, True, 60.0, (0, 1, 0)),
+        (0.0, 0, False, 60.0, (1, 0, 0)),
         (0.0, 6, False, 100.0, (1, 0, 0)),
     ],
 )
@@ -85,7 +86,7 @@ def test_clamping_does_not_reclassify_tooling_failures(
     monkeypatch.setattr(property_gate.time, "monotonic", lambda: next(ticks))
 
     def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        assert kwargs["timeout"] == 35.0  # natural timeout for two properties is 60
+        assert kwargs["timeout"] == 35.0  # natural timeout for two properties is 110
         if failure == "oserror":
             raise OSError("missing executable")
         return subprocess.CompletedProcess(

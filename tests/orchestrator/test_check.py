@@ -208,7 +208,10 @@ def test_all_held(tmp_path: Path) -> None:
     }
     assert render.calls == 2
     # a harness file was materialized per property (the file esbmc reads).
-    assert len(list((tmp_path / "work").glob("*[!e].c"))) == 2
+    harnesses = [
+        p for p in (tmp_path / "work").glob("*.c") if not p.name.endswith(".probe.c")
+    ]
+    assert len(harnesses) == 2
 
     loaded = [e for e in sink.events if e.type == "properties.loaded"]
     assert loaded[0].detail == {"unit": "u.c::f", "count": 2}
@@ -957,7 +960,10 @@ def test_inconclusive_probe_makes_the_property_unknown(
     (verdict,) = run.verdicts
     assert verdict.outcome is PropertyOutcome.UNKNOWN
     assert verdict.probe is ProbeReachability.INCONCLUSIVE
-    assert verdict.result is probe_result
+    if isinstance(probe_result, Violated):
+        assert isinstance(verdict.result, Verified)
+    else:
+        assert verdict.result is probe_result
     assert run.outcome == "unknown"
     assert run.held() == ()
 

@@ -484,8 +484,11 @@ def _probe_post_call(
     never escalated, so it reads the very paths the HELD was decided on.
     REACHED keeps `HELD`; UNREACHABLE is `VACUOUS` (the postcondition was never
     evaluated); INCONCLUSIVE (the probe itself was UNKNOWN/ERROR, or fired
-    without its label) is `UNKNOWN`. A writer that supplies no probe also yields
-    `UNKNOWN`: an unprobed Verified is never reported as HELD.
+    without its label) is `UNKNOWN`; an Unknown/Error probe result is kept as
+    the cause, but a stray probe `Violated` never replaces the property's own
+    `Verified` -- the probe harness's trace is not its counterexample.
+    A writer that supplies no probe also yields `UNKNOWN`: an unprobed Verified
+    is never reported as HELD.
     """
     if rendered.probe_source_text is None:
         return _Probed(
@@ -514,7 +517,7 @@ def _probe_post_call(
         case ProbeReachability.INCONCLUSIVE:
             return _Probed(
                 PropertyOutcome.UNKNOWN,
-                probe_result,
+                verified if isinstance(probe_result, Violated) else probe_result,
                 reading,
                 f"vacuity probe inconclusive at k={k}; held is withheld",
             )

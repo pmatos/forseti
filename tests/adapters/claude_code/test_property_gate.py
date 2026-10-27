@@ -442,6 +442,7 @@ def test_held_property_reports_no_violation(
 def test_tooling_failure_is_best_effort_not_raised(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(property_gate, "MAX_TOTAL_CHECK_S", 1000.0)
     source = tmp_path / "f.c"
     unit_id = f"{source}::my_abs"
     _add_candidate(tmp_path, unit_id)
@@ -496,10 +497,12 @@ def test_subprocess_timeout_scales_with_stored_property_count(
 
     property_gate.semantic_check_summary(str(tmp_path), state)
 
-    # 3 stored properties -> 3x (per-attempt CHECK_TIMEOUT_S + VERIFY_GRACE_S),
-    # plus margin.
+    # 3 stored properties -> 3x2 runs (verdict + vacuity probe) of
+    # (CHECK_TIMEOUT_S + VERIFY_GRACE_S), plus margin.
     expected = (
-        3 * (property_gate.CHECK_TIMEOUT_S + property_gate.VERIFY_GRACE_S)
+        3
+        * property_gate._ESBMC_RUNS_PER_PROPERTY
+        * (property_gate.CHECK_TIMEOUT_S + property_gate.VERIFY_GRACE_S)
         + property_gate._SUBPROCESS_MARGIN_S
     )
     assert captured["timeout"] == expected
@@ -535,7 +538,9 @@ def test_subprocess_timeout_counts_graded_properties_too(
     property_gate.semantic_check_summary(str(tmp_path), state)
 
     expected = (
-        3 * (property_gate.CHECK_TIMEOUT_S + property_gate.VERIFY_GRACE_S)
+        3
+        * property_gate._ESBMC_RUNS_PER_PROPERTY
+        * (property_gate.CHECK_TIMEOUT_S + property_gate.VERIFY_GRACE_S)
         + property_gate._SUBPROCESS_MARGIN_S
     )
     assert captured["timeout"] == expected
@@ -610,7 +615,7 @@ def test_per_unit_timeout_is_clamped_to_the_remaining_aggregate_budget(
     monkeypatch.setattr(property_gate, "MAX_TOTAL_CHECK_S", 40.0)
     source = tmp_path / "f.c"
     unit_id = f"{source}::my_abs"
-    for i in range(6):  # 6 properties -> 6*(20+5)+10=160s unclamped, way over 40s
+    for i in range(6):  # 6 properties -> 6*2*(20+5)+10=310s unclamped, way over 40s
         _add_candidate(tmp_path, unit_id, expression=f"result >= -{i}")
     state = _state(_unit(str(source), "my_abs"))
 
@@ -627,7 +632,9 @@ def test_per_unit_timeout_is_clamped_to_the_remaining_aggregate_budget(
     property_gate.semantic_check_summary(str(tmp_path), state)
 
     unclamped = (
-        6 * (property_gate.CHECK_TIMEOUT_S + property_gate.VERIFY_GRACE_S)
+        6
+        * property_gate._ESBMC_RUNS_PER_PROPERTY
+        * (property_gate.CHECK_TIMEOUT_S + property_gate.VERIFY_GRACE_S)
         + property_gate._SUBPROCESS_MARGIN_S
     )
     max_total = property_gate.MAX_TOTAL_CHECK_S
@@ -672,6 +679,7 @@ def test_unclamped_timeout_is_still_failed_not_deferred(
     aggregate budget (`test_tooling_failure_is_best_effort_not_raised`'s own
     scenario) -- a `TimeoutExpired` there is a genuine tooling problem, not a
     budget one, so it must stay `failed`."""
+    monkeypatch.setattr(property_gate, "MAX_TOTAL_CHECK_S", 1000.0)
     source = tmp_path / "f.c"
     unit_id = f"{source}::my_abs"
     _add_candidate(tmp_path, unit_id)
@@ -693,7 +701,8 @@ def test_unclamped_timeout_is_still_failed_not_deferred(
     ("remaining", "n_props", "times_out", "expected"),
     [
         (34.5, 1, False, (0, 1, 0)),
-        (35.0, 1, True, (0, 0, 1)),
+        (60.0, 1, True, (0, 0, 1)),
+        (35.0, 1, True, (0, 1, 0)),
         (35.0, 2, True, (0, 1, 0)),
         (35.0, 2, False, (1, 0, 0)),
     ],
@@ -732,7 +741,8 @@ def test_budget_admission_and_timeout_classification_share_the_same_allowance(
     )
 
     assert (summary.checked, summary.deferred, summary.failed) == expected
-    assert timeouts == ([] if remaining < 35.0 else [35.0])
+    expected_timeout = min(remaining, 60.0 if n_props == 1 else 110.0)
+    assert timeouts == ([] if remaining < 35.0 else [expected_timeout])
     assert len(summary.violations) == expected[0]
 
 
@@ -767,7 +777,7 @@ def test_budget_exhaustion_keeps_earlier_verdicts_and_defers_the_unstarted_suffi
         str(tmp_path), _state(*(_unit(f"{n}.c", n) for n in ("c", "b", "a")))
     )
 
-    assert timeouts == [35.0, 70.0]
+    assert timeouts == [60.0, 70.0]
     assert (summary.checked, summary.deferred, summary.failed) == (1, 2, 0)
     assert [v["unit_id"] for v in summary.violations] == ["a.c::a"]
 
