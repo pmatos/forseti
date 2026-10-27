@@ -137,11 +137,13 @@ def _run(
         lambda _s, sym: open_caller_checks(
             sym,
             _s,
-            foreign=foreign,
-            escaped=escaped,
-            aliased=aliased,
-            implicit=implicit,
-            asm_sites=asm_sites,
+            CallerOpenings(
+                foreign=foreign,
+                escaped=escaped,
+                aliased=aliased,
+                implicit=implicit,
+                asm_sites=asm_sites,
+            ),
         )
     )
     return discharge_precondition(
@@ -676,8 +678,21 @@ def test_every_assessment_has_an_exit_code() -> None:
     assert set(ASSESSMENT_EXIT_CODES) == set(Assessment)
 
 
+@pytest.mark.parametrize(
+    "openings",
+    [
+        CallerOpenings((), (), (), (), ()),
+        CallerOpenings(
+            foreign=("header_client",),
+            escaped=("fp",),
+            aliased=("checksum_alias",),
+            implicit=("constructor",),
+            asm_sites=("via_asm",),
+        ),
+    ],
+)
 def test_discharge_reuses_one_analysis_with_the_requested_timeout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, openings: CallerOpenings
 ) -> None:
     # S2 unit planning and S3 caller-completeness analysis are two views over the
     # same translation unit. One operation must acquire that AST once, with the
@@ -689,9 +704,7 @@ def test_discharge_reuses_one_analysis_with_the_requested_timeout(
             return [CALLEE, CALLER]
 
         def caller_openings(self, _symbol: str) -> CallerOpenings:
-            return CallerOpenings(
-                foreign=(), escaped=(), aliased=(), implicit=(), asm_sites=()
-            )
+            return openings
 
     def _analyze(
         source: Path,
@@ -707,7 +720,7 @@ def test_discharge_reuses_one_analysis_with_the_requested_timeout(
 
     src = tmp_path / "frame.c"
     src.write_text(SOURCE)
-    discharge_precondition(
+    result = discharge_precondition(
         src,
         function="sum_bytes",
         max_len=8,
@@ -717,3 +730,9 @@ def test_discharge_reuses_one_analysis_with_the_requested_timeout(
         raw_verify=_raw({}),
     )
     assert seen == [(src, "esbmc", 1.0, ())]
+    expected = open_caller_checks("sum_bytes", src, openings)
+    assert result.callers[0].outcome is CallerOutcome.DISCHARGED
+    assert result.callers[1:] == expected
+    assert result.assessment is (
+        Assessment.ASSUMED_VERIFIED if expected else Assessment.DISCHARGED_VERIFIED
+    )
