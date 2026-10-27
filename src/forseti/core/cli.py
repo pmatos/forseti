@@ -38,6 +38,14 @@ Subcommands:
   a run with nothing checkable (no stored properties, or every stored property
   is reachability-kind and deferred per ADR-0009 D2) says so loudly rather than
   reading as a clean pass.
+- ``forseti grade <source> --function NAME`` — grade that unit's held, candidate
+  properties against mutants of the function (#392): each property's kill rate
+  (``killed / (killed + survived)``) and a reason naming every surviving mutant
+  are stored with the ``GRADED`` status (``--json`` emits the ``GradeRun``
+  payload, with the unknown/error/skipped counts and ESBMC time). Exit 0 when
+  every held property was graded, 2 when some or all were not (never a silent
+  pass), 1 when the run itself fails. Bounded verdicts only: see the limitations
+  the output prints.
 - ``forseti claude-code-hook <name>`` — dispatch to one of the Claude Code
   adapter's verify-gate hooks (RFC-0004). Internal: wired into a project's
   settings file by ``enable-project``, not meant to be run by hand.
@@ -103,6 +111,7 @@ from forseti.esbmc import (
     render_result,
     verify_kwargs,
 )
+from forseti.grading import GradeRun, MutationError, grade_transcript
 from forseti.orchestrator import PropertyCheckRun, property_check_transcript
 from forseti.precond import DEFAULT_MAX_LEN
 from forseti.properties import (
@@ -141,6 +150,7 @@ from .check import (
     DEFAULT_UNWIND_LADDER as CHECK_DEFAULT_UNWIND_LADDER,
 )
 from .check import check_source
+from .grade import grade_source
 from .loop import (
     LOOP_MODE_CHOICES,
     SemanticLoopResult,
@@ -691,6 +701,72 @@ def _run_check(args: argparse.Namespace) -> int:
     else:
         print(_render_check(result))
     return _check_exit_code(result)
+
+
+def _add_grade_parser(
+    sub: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    p = sub.add_parser(
+        "grade",
+        help="grade a unit's held properties by how many mutants they kill",
+        description=(
+            "Check <source>::<function>'s candidate properties on the real code, "
+            "then re-check each held one against mutants of the function "
+            "(equivalent mutants skipped). kill rate = killed / (killed + "
+            "survived); unknown, error and skipped mutants are reported beside it, "
+            "never folded in. Each graded property stores its kill rate and a "
+            "reason naming every surviving mutant and becomes GRADED; a property "
+            "with no killed or surviving mutant stays a candidate. Verdicts are "
+            "bounded (up to k, len<=N), and skipping equivalent mutants by a "
+            "bounded check inflates the kill rate. Exit 0 iff every held property "
+            "was graded, 2 otherwise, 1 on a failed run."
+        ),
+    )
+    _add_unit_store_arguments(p)
+    p.add_argument(
+        "--max-mutants",
+        type=int,
+        default=None,
+        metavar="N",
+        help="grade against at most N valid mutants (a seeded sample; default: all)",
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        metavar="N",
+        help="seed of the --max-mutants sample (default: 0)",
+    )
+    _add_check_phase_arguments(
+        p,
+        json_help="emit the grade run as a JSON object",
+        passthrough_example="... file.c --function f -- -DNDEBUG",
+    )
+    p.set_defaults(func=_run_grade)
+
+
+def _grade_exit_code(run: GradeRun) -> int:
+    return 0 if run.outcome == "graded" else 2
+
+
+def _run_grade(args: argparse.Namespace) -> int:
+    try:
+        result = grade_source(
+            args.source,
+            function=args.function,
+            store_root=args.store_root,
+            max_mutants=args.max_mutants,
+            seed=args.seed,
+            **_check_phase_kwargs(args, timeout_kw="timeout_s"),
+        )
+    except (PropertyStoreError, MutationError, OSError, ValueError) as exc:
+        print(f"forseti grade: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(result.to_dict()))
+    else:
+        print(grade_transcript(result))
+    return _grade_exit_code(result)
 
 
 def _add_semantic_loop_parser(
@@ -1269,6 +1345,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_propose_parser(sub)
     _add_submit_property_parser(sub)
     _add_check_parser(sub)
+    _add_grade_parser(sub)
     _add_semantic_loop_parser(sub)
     _add_claude_code_hook_parser(sub)
     _add_codex_hook_parser(sub)

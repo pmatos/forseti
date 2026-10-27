@@ -101,8 +101,13 @@ class Unit:
         still uses the originally requested `symbol`, matching how the
         property store already keys this unit.
         """
+        return cls.from_text(path, symbol, path.read_text())
+
+    @classmethod
+    def from_text(cls, path: Path, symbol: str, text: str) -> Unit:
+        """`from_path` for source text already in hand (e.g. a mutant of `path`)."""
         source_text = rename_all_declarations_and_definitions(
-            path.read_text(), "main", _RENAMED_MAIN
+            text, "main", _RENAMED_MAIN
         )
         effective_symbol = _RENAMED_MAIN if symbol == "main" else symbol
         return cls(make_unit_id(path, symbol), path, effective_symbol, source_text)

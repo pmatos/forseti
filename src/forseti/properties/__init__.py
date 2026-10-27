@@ -71,6 +71,7 @@ from .proposer import (
 )
 from .store import (
     DuplicateProperty,
+    GradingRequired,
     PropertyNotFound,
     PropertyStore,
     PropertyStoreError,
@@ -93,6 +94,7 @@ __all__ = [
     "ClaudeCliClient",
     "DuplicateProperty",
     "Grading",
+    "GradingRequired",
     "GradingVerdict",
     "HarnessError",
     "InvalidStatusTransition",
