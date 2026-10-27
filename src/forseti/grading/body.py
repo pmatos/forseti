@@ -209,13 +209,15 @@ def locate_body(source: str, symbol: str) -> FunctionBody:
     )
 
 
-def match_paren(tokens: Sequence[Token], idx: int) -> int | None:
-    """Index of the ``)`` closing the ``(`` at `idx`, or ``None``."""
+def match_close(
+    tokens: Sequence[Token], idx: int, open_text: str, close_text: str
+) -> int | None:
+    """Index of the token closing the `open_text` at `idx`, or ``None``."""
     depth = 0
     for i in range(idx, len(tokens)):
-        if tokens[i].text == "(":
+        if tokens[i].text == open_text:
             depth += 1
-        elif tokens[i].text == ")":
+        elif tokens[i].text == close_text:
             depth -= 1
             if depth == 0:
                 return i

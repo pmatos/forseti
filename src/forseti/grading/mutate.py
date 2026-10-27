@@ -33,7 +33,7 @@ from .body import (
     FunctionBody,
     Token,
     locate_body,
-    match_paren,
+    match_close,
     statement_end,
 )
 
@@ -217,7 +217,7 @@ def _guard_end(tokens: Sequence[Token], i: int) -> int | None:
     """Token index ending the ``if (c) return ...;`` guard at `i`, else ``None``."""
     if tokens[i].text != "if" or i + 1 >= len(tokens) or tokens[i + 1].text != "(":
         return None
-    close = match_paren(tokens, i + 1)
+    close = match_close(tokens, i + 1, "(", ")")
     if close is None or close + 1 >= len(tokens):
         return None
     j = close + 1
@@ -262,6 +262,33 @@ def _guard_drop(source: str, body: FunctionBody, op_index: int) -> Iterable[_Can
         )
 
 
+def _havoc_candidate(
+    source: str,
+    body: FunctionBody,
+    op_index: int,
+    tokens: Sequence[Token],
+    value_start: int,
+    ctype: str,
+    what: str,
+) -> _Candidate | None:
+    """Replace the expression statement starting at token `value_start` with a
+    nondet call of `ctype`, or ``None`` if it is not a plain, non-havoc one."""
+    end = statement_end(tokens, value_start)
+    if end is None or end == value_start:
+        return None
+    call = f"{_nondet_name(ctype)}()"
+    start, stop = tokens[value_start].start, tokens[end - 1].end
+    if source[start:stop] == call:
+        return None
+    line = _line_col(source, start)[0]
+    return _Candidate(
+        op_index,
+        start,
+        (Edit(start, stop, call), _prototype(ctype, body.open_brace + 1)),
+        f"havoc {what} with `{call}` at line {line}",
+    )
+
+
 def _havoc_returns(
     source: str, body: FunctionBody, op_index: int
 ) -> Iterable[_Candidate]:
@@ -269,23 +296,14 @@ def _havoc_returns(
     if ctype is None:
         return
     tokens = body.tokens
-    call = f"{_nondet_name(ctype)}()"
     for i, tok in enumerate(tokens):
         if tok.text != "return" or tok.kind != "id" or i + 1 >= len(tokens):
             continue
-        end = statement_end(tokens, i + 1)
-        if end is None or end == i + 1:
-            continue
-        start, stop = tokens[i + 1].start, tokens[end - 1].end
-        if source[start:stop] == call:
-            continue
-        line = _line_col(source, start)[0]
-        yield _Candidate(
-            op_index,
-            start,
-            (Edit(start, stop, call), _prototype(ctype, body.open_brace + 1)),
-            f"havoc returned value with `{call}` at line {line}",
+        cand = _havoc_candidate(
+            source, body, op_index, tokens, i + 1, ctype, "returned value"
         )
+        if cand is not None:
+            yield cand
 
 
 def _havoc_outputs(
@@ -301,37 +319,21 @@ def _havoc_outputs(
             name, eq = tokens[i + 1].text, i + 2
         elif tok.text in outputs and i + 1 < len(tokens) and tokens[i + 1].text == "[":
             name = tok.text
-            eq = _subscript_end(tokens, i + 1)
+            close = match_close(tokens, i + 1, "[", "]")
+            eq = None if close is None else close + 1
         if eq is None or eq >= len(tokens) or tokens[eq].text != "=":
             continue
-        end = statement_end(tokens, eq + 1)
-        if end is None or end == eq + 1:
-            continue
-        ctype = outputs[name].elem_ctype
-        call = f"{_nondet_name(ctype)}()"
-        start, stop = tokens[eq + 1].start, tokens[end - 1].end
-        if source[start:stop] == call:
-            continue
-        line = _line_col(source, start)[0]
-        yield _Candidate(
+        cand = _havoc_candidate(
+            source,
+            body,
             op_index,
-            start,
-            (Edit(start, stop, call), _prototype(ctype, body.open_brace + 1)),
-            f"havoc write through `{name}` with `{call}` at line {line}",
+            tokens,
+            eq + 1,
+            outputs[name].elem_ctype,
+            f"write through `{name}`",
         )
-
-
-def _subscript_end(tokens: Sequence[Token], idx: int) -> int | None:
-    """Index just past the ``]`` matching the ``[`` at `idx`."""
-    depth = 0
-    for i in range(idx, len(tokens)):
-        if tokens[i].text == "[":
-            depth += 1
-        elif tokens[i].text == "]":
-            depth -= 1
-            if depth == 0:
-                return i + 1
-    return None
+        if cand is not None:
+            yield cand
 
 
 def _havoc(source: str, body: FunctionBody, op_index: int) -> Iterable[_Candidate]:
