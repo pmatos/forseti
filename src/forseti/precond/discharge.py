@@ -203,12 +203,7 @@ from .verify import (
 def open_caller_checks(
     function: str,
     source: Path,
-    *,
-    foreign: tuple[str, ...],
-    escaped: tuple[str, ...],
-    aliased: tuple[str, ...],
-    implicit: tuple[str, ...],
-    asm_sites: tuple[str, ...],
+    openings: CallerOpenings,
 ) -> tuple[CallerCheck, ...]:
     """The callers that keep "every caller in this TU" from being a real claim.
 
@@ -225,8 +220,10 @@ def open_caller_checks(
     inside a string clang's own AST dump never prints, so no scan can tell which
     symbol, if any, it reaches (`asm_sites`).
 
-    Pure: names in, `CallerCheck`s out, in a stable order the aggregation relies
-    on — `foreign` (``UNCHECKED``) first, then the four ``UNRESOLVED`` kinds.
+    Pure: a `CallerOpenings` record in, `CallerCheck`s out. This projection owns
+    the category-specific outcomes and diagnostics, in a stable order the
+    aggregation relies on — `foreign` (``UNCHECKED``) first, then the four
+    ``UNRESOLVED`` kinds. Each category preserves its order and duplicates.
     """
     return (
         tuple(
@@ -236,7 +233,7 @@ def open_caller_checks(
                 f"defined outside {source}, so the gate cannot enumerate it as a unit "
                 "or build a harness for it",
             )
-            for name in foreign
+            for name in openings.foreign
         )
         + tuple(
             CallerCheck(
@@ -247,7 +244,7 @@ def open_caller_checks(
                 "enumeration cannot follow may reach it from anywhere in this "
                 "translation unit",
             )
-            for site in escaped
+            for site in openings.escaped
         )
         + tuple(
             CallerCheck(
@@ -257,7 +254,7 @@ def open_caller_checks(
                 "assembly label), and a call written through it references only "
                 "that name, so its callers are not in the set that was checked",
             )
-            for name in aliased
+            for name in openings.aliased
         )
         + tuple(
             CallerCheck(
@@ -267,7 +264,7 @@ def open_caller_checks(
                 "directly at load/unload time, supplying none of the arguments "
                 "any explicit call site in this translation unit does",
             )
-            for kind in implicit
+            for kind in openings.implicit
         )
         + tuple(
             CallerCheck(
@@ -277,23 +274,8 @@ def open_caller_checks(
                 f"{function}() by a path that leaves no `DeclRefExpr` for this "
                 "enumeration to ever see",
             )
-            for site in asm_sites
+            for site in openings.asm_sites
         )
-    )
-
-
-def _caller_checks_from_openings(
-    function: str, source: Path, openings: CallerOpenings
-) -> tuple[CallerCheck, ...]:
-    """Project ESBMC caller-opening facts into discharge outcomes."""
-    return open_caller_checks(
-        function,
-        source,
-        foreign=openings.foreign,
-        escaped=openings.escaped,
-        aliased=openings.aliased,
-        implicit=openings.implicit,
-        asm_sites=openings.asm_sites,
     )
 
 
@@ -317,7 +299,7 @@ def find_open_callers(
     openings = list_caller_openings(
         source, function, esbmc_bin=esbmc_bin, timeout_s=timeout_s
     )
-    return _caller_checks_from_openings(function, source, openings)
+    return open_caller_checks(function, source, openings)
 
 
 def _memoized(lister: Callable[[Path], list[Unit]]) -> Callable[[Path], list[Unit]]:
@@ -407,7 +389,7 @@ def discharge_precondition(
             return analysis_for(path).units()
 
         def openings_from_analysis(path: Path, symbol: str) -> tuple[CallerCheck, ...]:
-            return _caller_checks_from_openings(
+            return open_caller_checks(
                 symbol, path, analysis_for(path).caller_openings(symbol)
             )
 

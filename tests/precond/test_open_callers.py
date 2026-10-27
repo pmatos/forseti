@@ -3,17 +3,22 @@
 The five ways a callee's caller set can be *wider* than what `list_units` reports
 (a header-defined caller, an address escape, an alias, a load-time attribute, a
 GNU inline-asm call) each turn into a `CallerCheck` that withholds the discharge.
-This is the dict-in / `CallerCheck`s-out core: one place that owns the taxonomy,
-testable directly without a translation unit, a filesystem, or esbmc.
+This is the `CallerOpenings`-in / `CallerCheck`s-out core: one place that owns
+the taxonomy, testable directly without a translation unit, a filesystem, or
+esbmc.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from forseti.esbmc import CallerOpenings, ListUnitsError
 from forseti.precond.discharge import (
     CallerCheck,
     CallerOutcome,
+    find_open_callers,
     open_caller_checks,
 )
 
@@ -29,7 +34,7 @@ def _checks(**kw: tuple[str, ...]) -> tuple[CallerCheck, ...]:
         "asm_sites": (),
     }
     defaults.update(kw)
-    return open_caller_checks("sum_bytes", SOURCE, **defaults)
+    return open_caller_checks("sum_bytes", SOURCE, CallerOpenings(**defaults))
 
 
 def test_no_openings_is_empty() -> None:
@@ -97,3 +102,78 @@ def test_multiple_names_in_one_category_are_preserved_in_order() -> None:
     checks = _checks(foreign=("a", "b", "c"))
     assert [c.caller for c in checks] == ["a", "b", "c"]
     assert all(c.outcome is CallerOutcome.UNCHECKED for c in checks)
+
+
+def test_repeated_sites_remain_separate_withholding_reasons() -> None:
+    # One site can open the caller set in several ways. Neither overlapping
+    # categories nor repeated names may erase evidence from the report.
+    checks = _checks(
+        foreign=("shared", "shared"),
+        escaped=("shared", "later"),
+        aliased=("shared",),
+        implicit=("constructor", "destructor"),
+        asm_sites=("shared",),
+    )
+    assert [c.caller for c in checks] == [
+        "shared",
+        "shared",
+        "shared",
+        "later",
+        "shared",
+        "<constructor>",
+        "<destructor>",
+        "shared",
+    ]
+    assert [c.outcome for c in checks] == [
+        CallerOutcome.UNCHECKED,
+        CallerOutcome.UNCHECKED,
+        *([CallerOutcome.UNRESOLVED] * 6),
+    ]
+    assert checks[0] == checks[1]
+    assert len({c.detail for c in checks if c.caller == "shared"}) == 4
+    assert all(c.esbmc_result is None and c.settled_k is None for c in checks)
+
+
+def test_find_open_callers_projects_the_acquired_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = Path("relative path/other.c")
+    openings = CallerOpenings(
+        foreign=("header_client",),
+        escaped=("fp",),
+        aliased=("other_alias",),
+        implicit=("constructor",),
+        asm_sites=("via_asm",),
+    )
+    seen: list[tuple[Path, str, str, float]] = []
+
+    def acquire(
+        path: Path, symbol: str, *, esbmc_bin: str, timeout_s: float
+    ) -> CallerOpenings:
+        seen.append((path, symbol, esbmc_bin, timeout_s))
+        return openings
+
+    monkeypatch.setattr("forseti.precond.discharge.list_caller_openings", acquire)
+    checks = find_open_callers(
+        source, "other", esbmc_bin="custom-esbmc", timeout_s=0.25
+    )
+    assert seen == [(source, "other", "custom-esbmc", 0.25)]
+    assert checks == open_caller_checks("other", source, openings)
+    assert str(source) in checks[0].detail
+    assert all("other()" in c.detail for c in checks[1:])
+
+
+def test_find_open_callers_propagates_acquisition_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = ListUnitsError("could not acquire caller openings")
+
+    def unavailable(
+        path: Path, symbol: str, *, esbmc_bin: str, timeout_s: float
+    ) -> CallerOpenings:
+        raise error
+
+    monkeypatch.setattr("forseti.precond.discharge.list_caller_openings", unavailable)
+    with pytest.raises(ListUnitsError) as excinfo:
+        find_open_callers(SOURCE, "sum_bytes")
+    assert excinfo.value is error
