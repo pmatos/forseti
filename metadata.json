@@ -1,0 +1,49 @@
+{
+  "cli_version": "0.12.2",
+  "checkpoint_id": "01M5YS802SHCAPDG2Z6S3NMJS8",
+  "strategy": "manual-commit",
+  "branch": "vibe/394-discrimination-scorer",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "src/forseti/grading/__init__.py",
+    "src/forseti/grading/discriminate.py",
+    "tests/grading/test_discriminate.py"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 6,
+    "cache_creation_tokens": 1200,
+    "cache_read_tokens": 329971,
+    "output_tokens": 818,
+    "api_call_count": 2,
+    "subagent_tokens": {
+      "input_tokens": 82,
+      "cache_creation_tokens": 118005,
+      "cache_read_tokens": 7705087,
+      "output_tokens": 54414,
+      "api_call_count": 40
+    }
+  },
+  "redaction": {
+    "replacements": 0,
+    "layers": {
+      "betterleaks": 0,
+      "connection_string": 0,
+      "credential_key": 0,
+      "credential_value": 0,
+      "credentialed_uri": 0,
+      "entropy": 0,
+      "key_context": 0,
+      "provider_token": 0,
+      "shell_stdin": 0
+    }
+  }
+}
