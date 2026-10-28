@@ -32,32 +32,30 @@ import json
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from functools import partial
 from pathlib import Path
 from typing import Any, Protocol
 
 from forseti._events import record_event
-from forseti.core.check import (
-    DEFAULT_TIMEOUT_S,
-    DEFAULT_UNWIND,
-    default_unwind_ladder_above,
-    validated_max_len,
-)
-from forseti.esbmc import Verified, Violated, verify
+from forseti.esbmc import Verified, Violated
 from forseti.orchestrator import (
     HarnessWriterPort,
     PropertyCheckRun,
     PropertyOutcome,
     PropertyVerdict,
-    SemanticHarnessWriter,
     Unit,
     VerifyPort,
     check_properties,
-    validated_ladder,
+)
+from forseti.orchestrator.semantic_check import (
+    DEFAULT_TIMEOUT_S,
+    DEFAULT_UNWIND,
+    SemanticCheckPlan,
+)
+from forseti.orchestrator.semantic_check import (
+    esbmc_verify_for as esbmc_verify_for,
 )
 from forseti.precond import DEFAULT_MAX_LEN, Assessment, DischargeResult
 from forseti.precond import discharge_precondition as _discharge_precondition
-from forseti.precond.run import escalating_port
 from forseti.precond.verify import sidecar_verify_port
 from forseti.properties import (
     DEFAULT_INCLUDES,
@@ -298,30 +296,6 @@ def esbmc_safety_port(
     return port
 
 
-def esbmc_verify_for(
-    *,
-    timeout_s: float | None = DEFAULT_TIMEOUT_S,
-    esbmc_bin: str = "esbmc",
-    extra_flags: Sequence[str] = (),
-) -> Callable[[Path], VerifyPort]:
-    """A per-source `VerifyPort` factory, bound like `check_source` binds its own:
-    unwinding assertions on, an under-unwound run escalates, and `-I` the source's
-    directory so a quoted include in the inlined unit resolves."""
-
-    def factory(source: Path) -> VerifyPort:
-        return escalating_port(
-            partial(
-                verify,
-                timeout_s=timeout_s,
-                esbmc_bin=esbmc_bin,
-                extra_flags=(*extra_flags, f"-I{source.resolve().parent}"),
-                no_unwinding_assertions=False,
-            )
-        )
-
-    return factory
-
-
 def exclusion_for(
     fixed: SafetyReading, buggy: SafetyReading | None
 ) -> Exclusion | None:
@@ -422,13 +396,16 @@ def score_pair(
     """
     fixed_unit = Unit.from_path(fixed, symbol)
     buggy_unit = Unit.from_path(buggy, symbol)
-    max_len = validated_max_len(max_len)
-    ladder = (
-        unwind_ladder
-        if unwind_ladder is not None
-        else default_unwind_ladder_above(unwind, max_len)
+    plan = SemanticCheckPlan(
+        unwind=unwind,
+        unwind_ladder=unwind_ladder,
+        max_len=max_len,
+        timeout_s=timeout_s,
+        esbmc_bin=esbmc_bin,
+        render=render,
+        verify_for=verify_for,
     )
-    validated_ladder(unwind, ladder)
+    plan.validate_ladder()
     pair_trigger, signature = _validated_trigger(trigger, buggy_unit)
 
     safety = safety or esbmc_safety_port(
@@ -460,10 +437,8 @@ def score_pair(
     if exclusion is not None:
         return pair(exclusion)
 
-    verify_for = verify_for or esbmc_verify_for(
-        timeout_s=timeout_s, esbmc_bin=esbmc_bin
-    )
-    writer = render or SemanticHarnessWriter(max_len=max_len)
+    verify_for = plan.verify_for
+    writer = plan.writer
     store = _FixedPropertySet(properties)
 
     def run_on(unit: Unit, source: Path, subdir: str) -> PropertyCheckRun:
@@ -474,7 +449,7 @@ def score_pair(
             verify=verify_for(source),
             work_dir=work_dir / subdir,
             unwind=unwind,
-            unwind_ladder=ladder,
+            unwind_ladder=plan.ladder,
         )
 
     fixed_run = run_on(fixed_unit, fixed, "fixed")

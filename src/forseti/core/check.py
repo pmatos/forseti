@@ -48,70 +48,40 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
-from functools import partial
 from pathlib import Path
 
 from forseti.core.events import PROPERTY_CHECK_START, PROPERTY_VERDICT, record_event
 from forseti.core.persistence import open_store
 from forseti.core.propose import DEFAULT_STORE_ROOT
-from forseti.esbmc import verify
 from forseti.orchestrator import (
     PropertyCheckRun,
-    SemanticHarnessWriter,
     Unit,
     VerifyPort,
     check_properties,
 )
+
+# Preserve the documented Core helper imports while sharing their implementation.
+from forseti.orchestrator.semantic_check import (
+    DEFAULT_TIMEOUT_S as DEFAULT_TIMEOUT_S,
+)
+from forseti.orchestrator.semantic_check import (
+    DEFAULT_UNWIND as DEFAULT_UNWIND,
+)
+from forseti.orchestrator.semantic_check import (
+    DEFAULT_UNWIND_LADDER as DEFAULT_UNWIND_LADDER,
+)
+from forseti.orchestrator.semantic_check import (
+    SemanticCheckPlan,
+)
+from forseti.orchestrator.semantic_check import (
+    default_unwind_ladder_above as default_unwind_ladder_above,
+)
+from forseti.orchestrator.semantic_check import (
+    validated_max_len as validated_max_len,
+)
 from forseti.precond import DEFAULT_MAX_LEN
-from forseti.precond.run import escalating_port
 
-# The CLI's own default: a human or a subagent invoking `forseti check`
-# directly owns its own time budget, so it can afford a short ladder — a
-# semantic postcondition over a loop (e.g. "the output is sorted") routinely
-# needs a higher k than the safety gate's fixed DEFAULT_K=1 to stop reporting a
-# spurious UNKNOWN below the loop's trip count (roadmap Risk 1). This is NOT
-# the budget the Claude Code adapter's gate uses for its own (much tighter,
-# per-hook-timeout-bounded) call — see `adapters/claude_code/property_gate.py`
-# for that one; the two are allowed to differ and each documents its own choice.
-DEFAULT_UNWIND = 4
-DEFAULT_UNWIND_LADDER: tuple[int, ...] = (8, 16)
-DEFAULT_TIMEOUT_S = 110.0
 _WORK_SUBDIR = "check-work"
-
-
-def default_unwind_ladder_above(
-    unwind: int, max_len: int | None = None
-) -> tuple[int, ...]:
-    """`DEFAULT_UNWIND_LADDER` rungs above `unwind`, reaching past `max_len`.
-
-    `check_source` derives its ladder this way when `unwind_ladder is None`, so a
-    caller-chosen unwind (e.g. `-k 8`) doesn't collide with the fixed default
-    rungs and raise `ValueError` (issue #95 review). Kept public because the CLI
-    and MCP faces name it in their `--unwind-ladder` help / tool-schema docs as
-    the documented default.
-
-    A `(ptr, len)` fill loop over up to `max_len` elements needs ``k > max_len``
-    (#299), so when no rung clears `max_len` -- a raised `--max-len` against the
-    fixed ``(4, 8, 16)`` ladder -- one final ``max_len + 1`` rung is appended,
-    else that flag value could never settle and would only ever report `unknown`.
-    The same coupling `precond.run.precondition_ladder` derives for `synth`.
-    """
-    rungs = tuple(k for k in DEFAULT_UNWIND_LADDER if k > unwind)
-    if max_len is not None and max_len >= (rungs[-1] if rungs else unwind):
-        rungs += (max_len + 1,)
-    return rungs
-
-
-def validated_max_len(max_len: int | None) -> int | None:
-    """`max_len` unchanged, or `ValueError` if negative.
-
-    ``len <= -1`` on an unsigned length assumes `false`, which would settle every
-    such property vacuously `held`. Called at the top of the Core faces so a bad
-    value fails before any LLM call or event, mirroring `validated_ladder`.
-    """
-    if max_len is not None and max_len < 0:
-        raise ValueError(f"max_len must be >= 0, got {max_len}")
-    return max_len
 
 
 def check_source(
@@ -200,21 +170,16 @@ def check_source(
     an esbmc binary on PATH.
     """
     unit = Unit.from_path(source, function)
-    writer = SemanticHarnessWriter(max_len=validated_max_len(max_len))
-    ladder = (
-        unwind_ladder
-        if unwind_ladder is not None
-        else default_unwind_ladder_above(unwind, max_len)
+    plan = SemanticCheckPlan(
+        unwind=unwind,
+        unwind_ladder=unwind_ladder,
+        max_len=max_len,
+        timeout_s=timeout_s,
+        esbmc_bin=esbmc_bin,
+        extra_flags=extra_flags,
     )
-    verify_fn = verify_port or escalating_port(
-        partial(
-            verify,
-            timeout_s=timeout_s,
-            esbmc_bin=esbmc_bin,
-            extra_flags=(*extra_flags, f"-I{source.resolve().parent}"),
-            no_unwinding_assertions=False,
-        )
-    )
+    writer = plan.writer
+    verify_fn = verify_port or plan.verify_for(source)
     with open_store(store_root) as store:
         record_event(store_root, PROPERTY_CHECK_START, unit_id=unit.unit_id)
         run = check_properties(
@@ -232,7 +197,7 @@ def check_source(
             # half-written file (issue #95 review).
             work_dir=store_root / _WORK_SUBDIR / uuid.uuid4().hex,
             unwind=unwind,
-            unwind_ladder=ladder,
+            unwind_ladder=plan.ladder,
         )
     for verdict in run.verdicts:
         record_event(
