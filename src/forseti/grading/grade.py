@@ -42,23 +42,20 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from forseti._events import record_event
-from forseti.core.check import (
-    DEFAULT_TIMEOUT_S,
-    DEFAULT_UNWIND,
-    default_unwind_ladder_above,
-    validated_max_len,
-)
 from forseti.esbmc import Error, EsbmcResult, Unknown
 from forseti.orchestrator import (
     HarnessWriterPort,
     PropertyCheckRun,
     PropertyOutcome,
     PropertyVerdict,
-    SemanticHarnessWriter,
     Unit,
     VerifyPort,
     check_properties,
-    validated_ladder,
+)
+from forseti.orchestrator.semantic_check import (
+    DEFAULT_TIMEOUT_S,
+    DEFAULT_UNWIND,
+    SemanticCheckPlan,
 )
 from forseti.precond import DEFAULT_MAX_LEN
 from forseti.properties import (
@@ -70,7 +67,6 @@ from forseti.properties import (
     PropertyStatus,
 )
 
-from .discriminate import esbmc_verify_for
 from .equivalence import (
     EquivalenceChecker,
     EquivalenceRefused,
@@ -491,20 +487,24 @@ def grade_unit(
     ESBMC-backed bindings. `max_len`, `max_mutants` and the ladder are validated
     before any ESBMC call.
     """
-    max_len = validated_max_len(max_len)
+    plan = SemanticCheckPlan(
+        unwind=unwind,
+        unwind_ladder=unwind_ladder,
+        max_len=max_len,
+        timeout_s=timeout_s,
+        esbmc_bin=esbmc_bin,
+        extra_flags=extra_flags,
+        render=render,
+        verify_for=verify_for,
+    )
+    max_len = plan.max_len
     if max_mutants is not None and max_mutants < 1:
         raise ValueError(f"max_mutants must be >= 1, got {max_mutants}")
-    ladder = (
-        unwind_ladder
-        if unwind_ladder is not None
-        else default_unwind_ladder_above(unwind, max_len)
-    )
-    validated_ladder(unwind, ladder)
+    plan.validate_ladder()
+    ladder = plan.ladder
     unit = Unit.from_path(source, symbol)
-    writer = render or SemanticHarnessWriter(max_len=max_len)
-    port_for = verify_for or esbmc_verify_for(
-        timeout_s=timeout_s, esbmc_bin=esbmc_bin, extra_flags=extra_flags
-    )
+    writer = plan.writer
+    port_for = plan.verify_for
 
     stored = tuple(store.list_for_unit(unit.unit_id))
     candidates = [p for p in stored if p.status is PropertyStatus.CANDIDATE]
