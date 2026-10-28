@@ -18,7 +18,7 @@ jobs:
     # own PRs — self-reviewing adds no value either.
     if: github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login != 'pmatos'
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
       pull-requests: write
