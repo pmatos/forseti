@@ -1,0 +1,82 @@
+/auto-merge-dependabot
+
+---
+
+/vibe 3
+
+---
+
+<task-notification>
+<task-id>a197703d603f419d7</task-id>
+<tool-use-id>toolu_0156RWw8CPucH9rBzF41gokt</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/a197703d603f419d7.output</output-file>
+<status>completed</status>
+<summary>Agent "Triage epic #3 open children" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Triage of the four "W2 remaining" children of epic #3, against origin/main at `ef0eb97`. I changed nothing. None of the four issues has any comments, so the bodies are the whole record. No open PR or branch touches any of this.
+
+**#63 — ESBMC reachability (`--error-label`)**
+- **Status:** open, parked, not started.
+- **Evidence:**
+  - `--error-label` is in ESBMC 8.6.0 (`esbmc --help`, line 710).
+  - Nothing in `src/` or `tests/` uses it.
+  - `runner.py` has no reachability path.
+  - The kind is inert (`properties/model.py:21`).
+  - The harness refuses it, and the check driver returns `SKIPPED` (`orchestrator/check.py:80`).
+- **Related code:** reachability already works another way. The precond stack injects a labelled `__ESBMC_assert(0, ...)` probe (`precond/reachability.py`), and PR #406 reuses it for the post-call vacuity check.
+- **Remaining:**
+  - A runner reachability request and verdict mapping.
+  - Two fixtures, one reachable and one unreachable.
+  - Re-validation on 8.6.0, since the issue's feasibility note was written against 8.3.0.
+- **Implementable by an agent without a ruling:** no. ADR-0009 D2 says it is unparked "by prioritising reachability properties (#63)". The ADR is immutable, so that means an owner decision, and a decision to use the existing probe instead would need a new superseding ADR. Nothing else in the epic needs it.
+- **Priority:** 3.
+- **Files:** `src/forseti/esbmc/runner.py`, `esbmc/result.py`, new `tests/esbmc/` fixtures.
+
+**#387 — Representation invariants (RFC-0007 kind 1)**
+- **Status:** open, no code. Grep found no invariant kind, renderer or per-type store.
+- **Evidence:**
+  - `PropertyKind` has only `SEMANTIC` and `REACHABILITY` (`model.py:17-21`).
+  - `signature.py` handles pointers as buffers, not structs.
+  - The post-call non-vacuity probe from #406 (`orchestrator/check.py`, `ProbeReachability`) is a reusable building block.
+- **Remaining:**
+  - A new `PropertyKind` and a per-type store.
+  - A renderer: nondet struct, `assume(inv)`, the call, then `assert(inv)` for mutators, and initialiser handling.
+  - A non-vacuity probe that rejects an invariant like `0`.
+  - S0 (`synth`/verify gate) running under an accepted invariant.
+  - CLI output reproducing the issue's table on both ring-buffer examples.
+  - Proposer support can be a follow-up, since hand-written submission via `submit-property` is enough to start.
+- **Implementable without a ruling:** yes, but it is large and research-labelled. RFC-0007 open question 6 (invariant per type versus per function) is already answered in the issue as per type. Suggest splitting it into three pieces: renderer and store; S0 context; proposer.
+- **Priority:** 1. It is the only way to get a Tier-0 bug pair for M2, and without it S0 is noise on any struct-pointer function.
+- **Files:** `properties/model.py`, `store.py`, `harness.py`, `signature.py`, `orchestrator/check.py`, `precond/synth.py`, `core/_precond_cli.py`, `core/cli.py`, `core/mcp_server.py`, `core/submit.py`, `adapters/claude_code/property_gate.py`, `properties/proposer.py`.
+
+**#388 — Proposer input seam**
+- **Status:** open, no code.
+- **Evidence:**
+  - `ProposalRequest` has `unit_id`, `source_text`, `prompt` and `signature`, with no `context` (`proposer.py:71-84`).
+  - `prepare_proposal_request` reads the whole file (`core/_proposal_request.py:33`).
+  - `Provenance` has no `recipe` (`model.py:53-66`).
+  - `_MIGRATED_COLUMNS` and `_migrate_columns` exist as the pattern to copy (`store.py:187`).
+- **Remaining:**
+  - `ProposalRequest.context` and `render_prompt` changes, keeping prompts byte-identical when no recipe is given.
+  - A recipe registry with `baseline`, `sighted` and `blind`, and `Provenance.recipe` plus a store column and migration.
+  - `--recipe` on `propose` and `semantic-loop`, and the matching MCP parameter.
+  - Tests for the acceptance list.
+- **Implementable without a ruling:** yes. The issue is fully specified.
+- **Priority:** 1. It blocks #389 and the whole recipe experiment.
+- **Files:** new `properties/recipes.py`, `properties/proposer.py`, `prompts.py`, `model.py`, `store.py`, `__init__.py`, `core/_proposal_request.py`, `core/propose.py`, `core/submit.py`, `core/loop.py`, `core/cli.py`, `core/mcp_server.py`, `grading/discriminate.py` (`_provenance_from`, line 718).
+
+**#389 — E0 runner**
+- **Status:** open, no code, blocked by #388. There is no runner or manifest anywhere in `src/`.
+- **Remaining:**
+  - A manifest-driven runner (recipe × sample × unit) that calls `check_properties` on the clean source and the twin.
+  - JSONL rows, a resumable run directory, a 30 s per-call timeout, a summary table recomputable from the rows, and fake-port tests plus one gated smoke test.
+- **Implementable without a ruling:** the code, yes. Executing the grid is a separate step: about 54 `claude -p` calls and up to about 5.5 hours of ESBMC. Someone should say go, and `msort` should be dropped or run at a smaller `--max-len`.
+- **Priority:** 2. It measures M1 and M5 only, not M2.
+- **Files:** a new module under `src/forseti/` (for example `grading/` or `experiments/`), `core/cli.py`, `core/events.py` and `core/_cli_trace.py`, plus new tests.
+
+**Questions you asked**
+- **#388 and #387 in parallel:** yes, no hard conflicts. They overlap only textually, in `model.py`, `store.py` (the schema and `_MIGRATED_COLUMNS`), `proposer.py`, `core/cli.py`, `core/mcp_server.py` and `properties/__init__.py`. Both rebases are mechanical, but the second to merge will rebase over the first. Keep #387 out of the proposer prompt and parser, and out of `Provenance`.
+- **#389 waiting on #388:** it should wait for #388 to merge. It consumes the recipe registry, `Provenance.recipe` and the `--recipe` request path, and building on an unmerged branch would stack PRs.
+- **#63 and the epic:** implementing #63 needs an owner ruling, because ADR-0009 D2 parks it. The epic's unchecked box "Reachability support (--error-label)" cannot be ticked without either implementing #63 or an explicit decision to defer it. The epic body also predates D2, and #62, #64, #65 and #66 are closed while all four boxes are still unchecked. To close the epic, the owner must either unpark and ship #63, or rule that W2 ships semantic-only and edit the body to say so. That body edit is not an ADR change.</result>
+<usage><subagent_tokens>103282</subagent_tokens><tool_uses>16</tool_uses><duration_ms>73529</duration_ms></usage>
+</task-notification>
