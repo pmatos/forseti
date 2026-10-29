@@ -15,7 +15,12 @@ from __future__ import annotations
 from forseti.esbmc import EXIT_CODES
 
 from .check import check_source
-from .invariant import check_invariant_source, submit_invariant_source
+from .invariant import (
+    accepted_invariants,
+    check_invariant_source,
+    set_invariant_status,
+    submit_invariant_source,
+)
 from .propose import propose_source
 from .submit import submit_source
 from .verify import Payload, result_to_payload, verify_source
@@ -27,10 +32,12 @@ from .verify import Payload, result_to_payload, verify_source
 __all__ = [
     "EXIT_CODES",
     "Payload",
+    "accepted_invariants",
     "check_invariant_source",
     "check_source",
     "propose_source",
     "result_to_payload",
+    "set_invariant_status",
     "submit_invariant_source",
     "submit_source",
     "verify_source",

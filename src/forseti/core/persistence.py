@@ -42,6 +42,16 @@ if TYPE_CHECKING:
 ProposalChannel = Literal["llm", "submitted"]
 
 
+def store_exists(store_root: Path) -> bool:
+    """Whether `store_root` already holds a store: a read-only caller's guard.
+
+    `open_store` creates the directory and database, so a face that only reads
+    (or settles a row it expects to find) asks this first and never leaves an empty
+    store behind.
+    """
+    return (store_root / "forseti.db").is_file()
+
+
 @contextmanager
 def open_store(store_root: Path) -> Generator[PropertyStore]:
     """Open `store_root`'s `PropertyStore`, translating store failure to a domain error.

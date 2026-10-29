@@ -9,12 +9,14 @@ run trace; this is the queryable property state. Stdlib only (`sqlite3`, `json`)
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import sqlite3
 from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
+from .invariant import is_valid_invariant_transition
 from .model import (
     Grading,
     GradingVerdict,
@@ -345,8 +347,8 @@ class PropertyStore:
 
         Raises `DuplicateProperty` for a stored content id and `WrongPropertyKind`
         for any other kind. There is no grading slot, so a GRADED row is refused
-        (`GradingRequired`). Rows are written once: no status transition or retire
-        path exists yet (moving an invariant to ACCEPTED/REJECTED is a later stage).
+        (`GradingRequired`). A new row is a CANDIDATE;
+        `update_type_invariant_status` moves it to ACCEPTED or REJECTED.
         """
         if prop.kind is not PropertyKind.REP_INVARIANT:
             raise WrongPropertyKind(prop.property_id, prop.kind, expected="add")
@@ -391,6 +393,61 @@ class PropertyStore:
             args += [status.value for status in statuses]
         rows = self._conn.execute(sql + " ORDER BY rowid", args).fetchall()
         return tuple(_row_to_invariant(row) for row in rows)
+
+    def list_for_type_prefix(
+        self,
+        prefix: str,
+        statuses: Collection[PropertyStatus] | None = None,
+    ) -> tuple[Property, ...]:
+        """Invariants of every type whose id starts with `prefix` (``<path>::``).
+
+        The whole-source read the S0 context needs: which types of one file have an
+        invariant, without knowing the file's types up front. `statuses` scopes it
+        as `list_for_unit`'s does.
+        """
+        if statuses is not None and not statuses:
+            return ()
+        sql = "SELECT * FROM type_invariants WHERE substr(type_id, 1, ?) = ?"
+        args: list[str | int] = [len(prefix), prefix]
+        if statuses is not None:
+            sql += f" AND status IN ({','.join('?' * len(statuses))})"
+            args += [status.value for status in statuses]
+        rows = self._conn.execute(sql + " ORDER BY rowid", args).fetchall()
+        return tuple(_row_to_invariant(row) for row in rows)
+
+    def update_type_invariant_status(
+        self, property_id: str, new_status: PropertyStatus
+    ) -> Property:
+        """Atomically validate and apply an invariant's status transition.
+
+        The invariant lifecycle is `is_valid_invariant_transition`'s:
+        ``CANDIDATE -> ACCEPTED | REJECTED``, both terminal. Raises
+        `PropertyNotFound` (unknown id) or `InvalidStatusTransition`, before any
+        write, so a refused move leaves the row untouched. Accepting an invariant
+        makes it the context `forseti synth` assumes for every `T *` function: it
+        is assumed, never discharged at the callers that build a `T`.
+        """
+        with self._conn:
+            current = self.get_type_invariant(property_id)
+            if current is None:
+                raise PropertyNotFound(property_id)
+            if not is_valid_invariant_transition(current.status, new_status):
+                raise InvalidStatusTransition(current.status, new_status)
+            cur = self._conn.execute(
+                "UPDATE type_invariants SET status = ? "
+                "WHERE property_id = ? AND status = ?",
+                (new_status.value, property_id, current.status.value),
+            )
+            if cur.rowcount == 0:  # another writer settled it since the read
+                raise InvalidStatusTransition(current.status, new_status)
+        return dataclasses.replace(current, status=new_status)
+
+    def get_type_invariant(self, property_id: str) -> Property | None:
+        """The representation invariant with `property_id`, or None if absent."""
+        row = self._conn.execute(
+            "SELECT * FROM type_invariants WHERE property_id = ?", (property_id,)
+        ).fetchone()
+        return None if row is None else _row_to_invariant(row)
 
     def update_status(self, property_id: str, new_status: PropertyStatus) -> Property:
         """Atomically validate and apply a status transition; return the result.

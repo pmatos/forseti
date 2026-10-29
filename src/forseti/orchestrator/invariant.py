@@ -17,6 +17,7 @@ from collections.abc import Collection, Sequence
 
 from forseti.properties import (
     INVARIANT_ASSUMPTION_NOTE,
+    INVARIANT_CHECKABLE_STATUSES,
     HarnessError,
     InvariantRole,
     Property,
@@ -68,7 +69,13 @@ class InvariantHarnessWriter:
 
 
 class InvariantsOfType:
-    """A `PropertyStorePort` over the invariants of one type (`path::T`)."""
+    """A `PropertyStorePort` over the invariants of one type (`path::T`).
+
+    The checkable set is the invariant lifecycle's own (`INVARIANT_CHECKABLE_STATUSES`:
+    candidate and accepted, never rejected), not the `statuses` the driver passes:
+    that set (`CHECKABLE_STATUSES`) drops ACCEPTED, but an accepted invariant is the
+    one every `T *` function is assumed under, so it must stay checkable.
+    """
 
     def __init__(self, store: PropertyStore, type_key: str) -> None:
         self._store = store
@@ -79,4 +86,6 @@ class InvariantsOfType:
         unit_id: str,
         statuses: Collection[PropertyStatus] | None = None,
     ) -> Sequence[Property]:
-        return self._store.list_for_type(self._type_key, statuses)
+        if statuses is not None and not statuses:
+            return ()
+        return self._store.list_for_type(self._type_key, INVARIANT_CHECKABLE_STATUSES)

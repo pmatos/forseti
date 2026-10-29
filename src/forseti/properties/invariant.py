@@ -69,6 +69,29 @@ class InvariantRole(Enum):
     INITIALISER = "initialiser"  # establishes it from an arbitrary state
 
 
+# What an inductive check reads. Unlike `CHECKABLE_STATUSES` this keeps ACCEPTED:
+# an accepted invariant is the one every `T *` function is assumed under, so a new
+# or edited mutator must still be checked against it.
+INVARIANT_CHECKABLE_STATUSES = frozenset(
+    {PropertyStatus.CANDIDATE, PropertyStatus.ACCEPTED}
+)
+
+
+def is_valid_invariant_transition(
+    current: PropertyStatus, requested: PropertyStatus
+) -> bool:
+    """True iff a stored invariant may move from `current` to `requested`.
+
+    ``CANDIDATE -> ACCEPTED | REJECTED`` only, both final. An invariant has no
+    grading slot, so it skips GRADED (`is_valid_transition` is the semantic
+    lifecycle's, and is left untouched).
+    """
+    return current is PropertyStatus.CANDIDATE and requested in (
+        PropertyStatus.ACCEPTED,
+        PropertyStatus.REJECTED,
+    )
+
+
 class InvariantNotApplicable(HarnessError):
     """There is nothing invariant-specific to check (not a render failure).
 

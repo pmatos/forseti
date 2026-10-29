@@ -50,13 +50,14 @@ renderer, so the check can never be weaker or stronger than the assumption.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from enum import Enum
 
 from forseti.esbmc.units import Param, Unit, find_definition_brace
 from forseti.properties.harness import NON_VACUITY_LABEL as NON_VACUITY_LABEL
 from forseti.properties.harness import non_vacuity_probe
+from forseti.properties.invariant import InvariantRole, infer_role
 
 # The default symbolic-length ceiling. A pointer sized by a symbolic length is
 # `malloc(len)` with `len <= max_len`; the loop that consumes it then needs an
@@ -73,6 +74,10 @@ DEFAULT_INCLUDES: tuple[str, ...] = ("stdlib.h",)
 # included source to this with a `#define` (undone right after the `#include`),
 # which leaves the user's file — and the injected copy of it — untouched.
 RENAMED_MAIN = "__forseti_source_main"
+
+# Prefix of the C helper a sidecar defines for an assumed representation invariant;
+# followed by the type's identifier-safe name.
+INVARIANT_FN_PREFIX = "__forseti_inv_"
 
 # Prefix of the label each injected *caller obligation* carries (RFC-0003 S3), so
 # a FAILED that is the caller breaking the precondition is told apart from one
@@ -100,6 +105,13 @@ _ELEM_COUNT_NAMES = frozenset({"n", "count", "nmemb", "num", "nelem"})
 # which a `void` pointee hides. Innermost-first (no nested parens), so an atomic
 # function pointer keeps its `(*` and is rejected as one.
 _ATOMIC_WRAPPER_RE = re.compile(r"\b_Atomic\s*\(([^()]*)\)")
+
+# The cv/`restrict` qualifiers clang keeps on a canonical pointer type, as one
+# alternation shared by every reader of a pointee (`_is_pointee_materialisable`,
+# `pointee_type`) so a qualifier learned by one is learned by both.
+_QUALIFIER_PATTERN = (
+    r"\bconst\b|\bvolatile\b|\b__restrict__\b|\b__restrict\b|\brestrict\b"
+)
 
 # Canonical-type tokens that mark an integer (a length must be integral, so a
 # `double len` is not mistaken for a size). Pointers are excluded before this.
@@ -147,11 +159,45 @@ class ParamPlan:
 
 
 @dataclass(frozen=True)
+class AssumedInvariant:
+    """An accepted representation invariant the sidecar assumes (RFC-0007, #387).
+
+    `type_name` is the struct type (``ring_t``), `expressions` the accepted
+    invariant texts over ``self`` (conjoined), `params` the harness variables of the
+    unit's ``T *`` parameters it is assumed over right after they are materialised.
+    It is *assumed*, never discharged at the callers that build a ``T``.
+    """
+
+    type_name: str
+    expressions: tuple[str, ...]
+    params: tuple[str, ...]
+
+    @property
+    def function(self) -> str:
+        """The C helper the sidecar defines for this type's invariant."""
+        return f"{INVARIANT_FN_PREFIX}{re.sub(r'\W+', '_', self.type_name)}"
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "type": self.type_name,
+            "expressions": list(self.expressions),
+            "params": list(self.params),
+        }
+
+
+@dataclass(frozen=True)
 class UnitPlan:
-    """The whole-unit plan: an ordered `ParamPlan` per parameter."""
+    """The whole-unit plan: an ordered `ParamPlan` per parameter.
+
+    `invariants` is empty unless a driver attaches accepted invariants with
+    `bind_invariants`: only `verify_precondition` does, so `discharge`'s sidecars and
+    obligations are rendered exactly as before and its DISCHARGED verdict never
+    rests on an assumed invariant.
+    """
 
     unit: Unit
     params: tuple[ParamPlan, ...]
+    invariants: tuple[AssumedInvariant, ...] = ()
 
     @property
     def resolvable(self) -> bool:
@@ -171,6 +217,60 @@ class UnitPlan:
         assumed about a caller, so there is nothing to discharge.
         """
         return tuple(p for p in self.params if p.role in _POINTER_ROLES)
+
+
+def pointee_type(type_str: str) -> str | None:
+    """The struct type a single-level ``T *`` parameter points to, or None.
+
+    ``ring_t *`` and ``const ring_t *`` give ``ring_t``; ``struct node *`` gives
+    ``struct node`` (whitespace-collapsed, qualifiers dropped). Anything that is not
+    a plain single pointer gives None.
+    """
+    unqualified = " ".join(
+        re.sub(_QUALIFIER_PATTERN, "", _ATOMIC_WRAPPER_RE.sub(r"\1", type_str)).split()
+    )
+    if unqualified.count("*") != 1 or "(" in unqualified:
+        return None
+    if not unqualified.endswith("*"):
+        return None
+    return unqualified[:-1].strip() or None
+
+
+def bind_invariants(
+    plan: UnitPlan,
+    invariants: Mapping[str, Sequence[str]] | None,
+    *,
+    role: InvariantRole | None = None,
+) -> UnitPlan:
+    """`plan` with the `invariants` of each type its ``T *`` parameters point to.
+
+    `invariants` maps a type name to its accepted invariant expressions. Only a
+    `SCALAR_PTR` parameter (one object, no length) is bound: a ``(ptr, len)`` buffer
+    or a fixed array holds many ``T``s and is left as before. A type with no
+    invariants, or none among the parameters, binds nothing and the plan is returned
+    unchanged.
+
+    An *initialiser* is what establishes the invariant, so assuming it at entry
+    would hide a bug in it: nothing is bound for one. `role` defaults to the one
+    `infer_role` reads off the function name, which is deliberately narrow
+    (``init``/``initialise``/``initialize``); name any other initialiser explicitly.
+    """
+    if not invariants:
+        return plan
+    if (role or infer_role(plan.unit.name)) is InvariantRole.INITIALISER:
+        return plan
+    params_by_type: dict[str, list[str]] = {}
+    for p in plan.params:
+        if p.role is not ParamRole.SCALAR_PTR:
+            continue
+        type_name = pointee_type(p.param.type)
+        if type_name is not None and invariants.get(type_name):
+            params_by_type.setdefault(type_name, []).append(p.var)
+    bound = tuple(
+        AssumedInvariant(type_name, tuple(invariants[type_name]), tuple(params))
+        for type_name, params in params_by_type.items()
+    )
+    return plan if not bound else replace(plan, invariants=bound)
 
 
 def _var_name(index: int, param: Param) -> str:
@@ -219,12 +319,7 @@ def _is_pointee_materialisable(type_str: str) -> bool:
     # detected whatever qualifies it — otherwise the qualifier survives and a
     # `void *` would be mis-sized `malloc(sizeof(void))` instead of falling to
     # UNRESOLVED.
-    without_ptr = re.sub(
-        r"\bconst\b|\bvolatile\b|\b__restrict__\b|\b__restrict\b|\brestrict\b"
-        r"|\b_Atomic\b|\*|\s",
-        "",
-        stripped,
-    )
+    without_ptr = re.sub(rf"{_QUALIFIER_PATTERN}|\b_Atomic\b|\*|\s", "", stripped)
     return without_ptr != "void" and without_ptr != ""
 
 
@@ -433,6 +528,14 @@ def render_sidecar(
     lines.append("")
     lines += [f"extern {t} {_nondet_slug(t)}(void);" for t in nondet_types]
     lines.append("")
+    for inv in plan.invariants:
+        body = " && ".join(f"({e.strip()})" for e in inv.expressions)
+        lines += [
+            f"static int {inv.function}(const {inv.type_name} *self) {{",
+            f"    return {body};",
+            "}",
+            "",
+        ]
     lines.append("int main(void) {")
 
     for p in scalars:
@@ -442,6 +545,8 @@ def render_sidecar(
 
     for p in pointers:
         lines.append(f"    {p.param.type} {p.var} = malloc({_pointer_alloc(p)});")
+    for inv in plan.invariants:
+        lines += [f"    __ESBMC_assume({inv.function}({var}));" for var in inv.params]
 
     args = ", ".join(p.var for p in plan.params)
     callee = RENAMED_MAIN if plan.unit.name == "main" else plan.unit.name
