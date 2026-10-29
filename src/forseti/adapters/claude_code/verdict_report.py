@@ -7,10 +7,10 @@ and the trailer — which each hook supplies as a :class:`ReportStyle`. The gram
 (the blocking-failure predicate, the ``✗``-line + counterexample layout, the
 ``CEX_CLIP`` clip, and the ``needs_note`` placement) lives here, once.
 
-Event emission stays in the callers: the hooks interleave their own
-``event_log``/``gate.decision`` events, and :func:`render` hands the classified
-:class:`Partition` back on the :class:`Report` so a caller reads
-``report.partition.failures`` for those events instead of re-classifying.
+The hooks sequence their trace phases through ``_verification_trace`` and own
+their canonical ``gate.decision`` events. :func:`render` hands the classified
+:class:`Partition` back on the :class:`Report`, so trace projection can consume
+the same classification instead of re-classifying.
 """
 
 from __future__ import annotations

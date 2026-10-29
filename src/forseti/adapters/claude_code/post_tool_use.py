@@ -23,7 +23,7 @@ from pathlib import Path
 from forseti.core.events import GATE_DECISION
 from forseti.core.events import record_event as record_core_event
 
-from . import event_log, verdict_report
+from . import _verification_trace, verdict_report
 from . import forseti_gate as gate
 
 _EDIT_STYLE = verdict_report.ReportStyle(
@@ -85,27 +85,10 @@ def main() -> int:
     # and serialized against concurrent PostToolUse hooks).
     verdicts = gate.verify_and_record(file_path, project_dir=project_dir)
 
-    # Trace the loop (best-effort): the edit Claude made, each ESBMC call, then
-    # the gate decision. `duration_s` is per-call accurate even though the events
-    # are logged together after the (serialized) verify batch returns.
     rel = gate.unit_id(project_dir, file_path)
-    event_log.log_event(
-        project_dir,
-        event_log.EDIT,
-        tool=data.get("tool_name", "?"),
-        file=rel,
-        functions=[v.function for v in verdicts],
+    _verification_trace.record_verification(
+        project_dir, rel, data.get("tool_name", "?"), verdicts
     )
-    for v in verdicts:
-        event_log.log_event(
-            project_dir,
-            event_log.VERIFY,
-            unit=v.unit_id,
-            verdict=v.verdict,
-            k=v.k,
-            duration_s=v.duration_s,
-            argv=list(v.argv) if v.argv else None,
-        )
 
     if not verdicts:
         # Either the file defines no functions (any stale units were just
@@ -129,16 +112,7 @@ def main() -> int:
     report = verdict_report.render(verdicts, _EDIT_STYLE)
     part = report.partition
 
-    decision = "block" if report.is_failure else "pass"
-    event_log.log_event(
-        project_dir,
-        event_log.GATE,
-        file=rel,
-        decision=decision,
-        n_failures=len(part.failures),
-        n_needs_contract=len(part.needs),
-        exit_code=report.exit_code,
-    )
+    decision = _verification_trace.record_gate(project_dir, rel, part)
     decided = part.failures if report.is_failure else verdicts
     _record_gate_decision(project_dir, rel, [v.unit_id for v in decided], decision)
     return verdict_report.emit(report)

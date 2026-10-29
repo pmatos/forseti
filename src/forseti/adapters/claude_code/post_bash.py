@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import sys
 
-from . import event_log, verdict_report
+from . import _verification_trace, event_log, verdict_report
 from . import forseti_gate as gate
 
 _OOB_STYLE = verdict_report.ReportStyle(
@@ -44,32 +44,9 @@ def _verify_file(project_dir: str, file_path: str) -> list[gate.UnitVerdict]:
     """Verify one changed C file; trace the edit + each verify like the edit path."""
     verdicts = gate.verify_and_record(file_path, project_dir=project_dir)
     rel = gate.unit_id(project_dir, file_path)
-    event_log.log_event(
-        project_dir,
-        event_log.EDIT,
-        tool="Bash",
-        file=rel,
-        functions=[v.function for v in verdicts],
-    )
-    for v in verdicts:
-        event_log.log_event(
-            project_dir,
-            event_log.VERIFY,
-            unit=v.unit_id,
-            verdict=v.verdict,
-            k=v.k,
-            duration_s=v.duration_s,
-            argv=list(v.argv) if v.argv else None,
-        )
-    part = verdict_report.partition(verdicts)
-    event_log.log_event(
-        project_dir,
-        event_log.GATE,
-        file=rel,
-        decision="block" if part.failures else "pass",
-        n_failures=len(part.failures),
-        n_needs_contract=len(part.needs),
-        exit_code=2 if part.failures else 0,
+    _verification_trace.record_verification(project_dir, rel, "Bash", verdicts)
+    _verification_trace.record_gate(
+        project_dir, rel, verdict_report.partition(verdicts)
     )
     return verdicts
 
