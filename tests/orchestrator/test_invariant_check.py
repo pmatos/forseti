@@ -274,3 +274,42 @@ def test_writers_refuse_each_others_kinds(tmp_path: Path) -> None:
     )
     with pytest.raises(HarnessError, match="semantic"):
         InvariantHarnessWriter().render(unit, semantic)
+
+
+def _stored(expression: str, status: PropertyStatus) -> Property:
+    return Property(
+        property_id=make_property_id(TYPE_KEY, PropertyKind.REP_INVARIANT, expression),
+        unit_id=TYPE_KEY,
+        kind=PropertyKind.REP_INVARIANT,
+        expression=expression,
+        status=status,
+        provenance=Provenance("p", "1", "hand", "human"),
+    )
+
+
+def test_an_accepted_invariant_is_still_checked_a_rejected_one_is(
+    tmp_path: Path,
+) -> None:
+    store = _store()
+    kept = _stored("self->count <= CAP", PropertyStatus.ACCEPTED)
+    dropped = _stored("self->tail < CAP", PropertyStatus.REJECTED)
+    store.add_type_invariant(kept)
+    store.add_type_invariant(dropped)
+    unit = Unit("r.c::rb_push", Path("r.c"), "rb_push", SOURCE)
+    run = check_properties(
+        unit,
+        store=InvariantsOfType(store, TYPE_KEY),
+        render=InvariantHarnessWriter(),
+        verify=Scripted(Verified(_meta()), reached()),
+        work_dir=tmp_path,
+        unwind=4,
+    )
+    assert [v.property_id for v in run.verdicts] == [kept.property_id]
+    assert run.verdicts[0].outcome is PropertyOutcome.HELD
+
+
+def test_the_invariant_view_honours_an_empty_status_scope() -> None:
+    store = _store(INV)
+    view = InvariantsOfType(store, TYPE_KEY)
+    assert view.list_for_unit("r.c::rb_push", ()) == ()
+    assert len(view.list_for_unit("r.c::rb_push")) == 1

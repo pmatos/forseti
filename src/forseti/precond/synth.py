@@ -50,8 +50,8 @@ renderer, so the check can never be weaker or stronger than the assumption.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from enum import Enum
 
 from forseti.esbmc.units import Param, Unit, find_definition_brace
@@ -73,6 +73,10 @@ DEFAULT_INCLUDES: tuple[str, ...] = ("stdlib.h",)
 # included source to this with a `#define` (undone right after the `#include`),
 # which leaves the user's file — and the injected copy of it — untouched.
 RENAMED_MAIN = "__forseti_source_main"
+
+# Prefix of the C helper a sidecar defines for an assumed representation invariant;
+# followed by the type's identifier-safe name.
+INVARIANT_FN_PREFIX = "__forseti_inv_"
 
 # Prefix of the label each injected *caller obligation* carries (RFC-0003 S3), so
 # a FAILED that is the caller breaking the precondition is told apart from one
@@ -147,11 +151,45 @@ class ParamPlan:
 
 
 @dataclass(frozen=True)
+class AssumedInvariant:
+    """An accepted representation invariant the sidecar assumes (RFC-0007, #387).
+
+    `type_name` is the struct type (``ring_t``), `expressions` the accepted
+    invariant texts over ``self`` (conjoined), `params` the harness variables of the
+    unit's ``T *`` parameters it is assumed over right after they are materialised.
+    It is *assumed*, never discharged at the callers that build a ``T``.
+    """
+
+    type_name: str
+    expressions: tuple[str, ...]
+    params: tuple[str, ...]
+
+    @property
+    def function(self) -> str:
+        """The C helper the sidecar defines for this type's invariant."""
+        return f"{INVARIANT_FN_PREFIX}{re.sub(r'\W+', '_', self.type_name)}"
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "type": self.type_name,
+            "expressions": list(self.expressions),
+            "params": list(self.params),
+        }
+
+
+@dataclass(frozen=True)
 class UnitPlan:
-    """The whole-unit plan: an ordered `ParamPlan` per parameter."""
+    """The whole-unit plan: an ordered `ParamPlan` per parameter.
+
+    `invariants` is empty unless a driver attaches accepted invariants with
+    `bind_invariants`: only `verify_precondition` does, so `discharge`'s sidecars and
+    obligations are rendered exactly as before and its DISCHARGED verdict never
+    rests on an assumed invariant.
+    """
 
     unit: Unit
     params: tuple[ParamPlan, ...]
+    invariants: tuple[AssumedInvariant, ...] = ()
 
     @property
     def resolvable(self) -> bool:
@@ -171,6 +209,52 @@ class UnitPlan:
         assumed about a caller, so there is nothing to discharge.
         """
         return tuple(p for p in self.params if p.role in _POINTER_ROLES)
+
+
+def pointee_type(type_str: str) -> str | None:
+    """The struct type a single-level ``T *`` parameter points to, or None.
+
+    ``ring_t *`` and ``const ring_t *`` give ``ring_t``; ``struct node *`` gives
+    ``struct node`` (whitespace-collapsed, qualifiers dropped). Anything that is not
+    a plain single pointer gives None.
+    """
+    unqualified = " ".join(
+        re.sub(
+            r"\bconst\b|\bvolatile\b|\b__restrict__\b|\b__restrict\b|\brestrict\b",
+            "",
+            _ATOMIC_WRAPPER_RE.sub(r"\1", type_str),
+        ).split()
+    )
+    if unqualified.count("*") != 1 or "(" in unqualified:
+        return None
+    if not unqualified.endswith("*"):
+        return None
+    return unqualified[:-1].strip() or None
+
+
+def bind_invariants(
+    plan: UnitPlan, invariants: Mapping[str, Sequence[str]]
+) -> UnitPlan:
+    """`plan` with the `invariants` of each type its ``T *`` parameters point to.
+
+    `invariants` maps a type name to its accepted invariant expressions. Only a
+    `SCALAR_PTR` parameter (one object, no length) is bound: a ``(ptr, len)`` buffer
+    or a fixed array holds many ``T``s and is left as before. A type with no
+    invariants, or none among the parameters, binds nothing and the plan is returned
+    unchanged.
+    """
+    params_by_type: dict[str, list[str]] = {}
+    for p in plan.params:
+        if p.role is not ParamRole.SCALAR_PTR:
+            continue
+        type_name = pointee_type(p.param.type)
+        if type_name is not None and invariants.get(type_name):
+            params_by_type.setdefault(type_name, []).append(p.var)
+    bound = tuple(
+        AssumedInvariant(type_name, tuple(invariants[type_name]), tuple(params))
+        for type_name, params in params_by_type.items()
+    )
+    return plan if not bound else replace(plan, invariants=bound)
 
 
 def _var_name(index: int, param: Param) -> str:
@@ -433,6 +517,14 @@ def render_sidecar(
     lines.append("")
     lines += [f"extern {t} {_nondet_slug(t)}(void);" for t in nondet_types]
     lines.append("")
+    for inv in plan.invariants:
+        body = " && ".join(f"({e.strip()})" for e in inv.expressions)
+        lines += [
+            f"static int {inv.function}(const {inv.type_name} *self) {{",
+            f"    return {body};",
+            "}",
+            "",
+        ]
     lines.append("int main(void) {")
 
     for p in scalars:
@@ -442,6 +534,8 @@ def render_sidecar(
 
     for p in pointers:
         lines.append(f"    {p.param.type} {p.var} = malloc({_pointer_alloc(p)});")
+    for inv in plan.invariants:
+        lines += [f"    __ESBMC_assume({inv.function}({var}));" for var in inv.params]
 
     args = ", ".join(p.var for p in plan.params)
     callee = RENAMED_MAIN if plan.unit.name == "main" else plan.unit.name

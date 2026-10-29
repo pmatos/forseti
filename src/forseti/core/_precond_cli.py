@@ -32,8 +32,10 @@ from forseti.precond import (
 from forseti.precond import (
     DEFAULT_TIMEOUT_S as SYNTH_TIMEOUT_S,
 )
+from forseti.properties import PropertyStoreError
 
 from ._cli_trace import traced
+from .invariant import accepted_invariants
 from .propose import DEFAULT_STORE_ROOT
 
 
@@ -99,12 +101,23 @@ def _add_synth_parser(
             "generated sidecar (the source stays pristine), and verify with "
             "unwinding assertions on + a k-ladder + a non-vacuity check. A pass is "
             "reported honestly as VERIFIED *assuming valid caller pointers* "
-            "(undischarged)."
+            "(undischarged). A struct type with an *accepted* representation "
+            "invariant (`forseti invariant-status`, RFC-0007 #387) is also "
+            "assumed to satisfy it, and the verdict says so: the invariant is "
+            "assumed, never discharged at the callers that construct the type."
         ),
     )
     _add_precondition_arguments(
         p,
         emit_help="print the generated sidecar C harness and exit (no verification)",
+    )
+    p.add_argument(
+        "--no-invariants",
+        action="store_true",
+        help=(
+            "ignore accepted representation invariants: verify against an "
+            "arbitrary instance of each struct type, as without any"
+        ),
     )
     p.set_defaults(func=_run_synth)
 
@@ -134,6 +147,15 @@ def _run_synth(args: argparse.Namespace) -> int:
 
 
 def _synth(args: argparse.Namespace) -> tuple[int, Assessment | None]:
+    try:
+        invariants = (
+            {}
+            if args.no_invariants
+            else accepted_invariants(args.source, store_root=args.store_root)
+        )
+    except (PropertyStoreError, OSError) as exc:
+        print(f"forseti synth: cannot read accepted invariants: {exc}", file=sys.stderr)
+        return ASSESSMENT_EXIT_CODES[Assessment.ERROR], Assessment.ERROR
     if args.emit_only:
         try:
             text = synthesize(
@@ -142,6 +164,7 @@ def _synth(args: argparse.Namespace) -> tuple[int, Assessment | None]:
                 max_len=args.max_len,
                 timeout_s=args.timeout,
                 esbmc_bin=args.esbmc_bin,
+                invariants=invariants,
             )
         except PreconditionUnavailable as exc:
             print(f"forseti synth: {exc.detail}", file=sys.stderr)
@@ -155,11 +178,15 @@ def _synth(args: argparse.Namespace) -> tuple[int, Assessment | None]:
         max_len=args.max_len,
         timeout_s=args.timeout,
         esbmc_bin=args.esbmc_bin,
+        invariants=invariants,
     )
     if args.json:
         print(json.dumps(result.to_dict()))
     else:
         print(f"{args.source}::{args.function}: {result.label}")
+        for inv in result.invariants:
+            conjunction = " && ".join(inv.expressions)
+            print(f"  assumed invariant of {inv.type_name}: {conjunction}")
         if result.assessment is Assessment.VIOLATED and isinstance(
             result.esbmc_result, Violated
         ):

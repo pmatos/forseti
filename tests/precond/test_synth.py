@@ -14,9 +14,12 @@ from forseti.esbmc.units import Param, Unit
 from forseti.precond.synth import (
     NON_VACUITY_LABEL,
     RENAMED_MAIN,
+    AssumedInvariant,
     ParamRole,
     SynthError,
+    bind_invariants,
     plan_unit,
+    pointee_type,
     render_sidecar,
 )
 
@@ -350,3 +353,106 @@ def test_render_one_nondet_prototype_per_distinct_type() -> None:
     text = render_sidecar(plan, "s.c")
     # exactly one `extern int nondet_int(void);` even though two int scalars.
     assert text.count("extern int nondet_int(void);") == 1
+
+
+# --- accepted representation invariants (#387) ----------------------------
+
+
+@pytest.mark.parametrize(
+    ("type_str", "expected"),
+    [
+        ("ring_t *", "ring_t"),
+        ("const ring_t *", "ring_t"),
+        ("ring_t *const", "ring_t"),
+        ("volatile  ring_t *restrict", "ring_t"),
+        ("struct  node *", "struct node"),
+        ("const struct node *", "struct node"),
+        ("_Atomic(ring_t) *", "ring_t"),
+        ("ring_t **", None),
+        ("ring_t", None),
+        ("void (*)(int)", None),
+        ("*", None),
+    ],
+)
+def test_pointee_type_names_the_struct_a_single_pointer_points_to(
+    type_str: str, expected: str | None
+) -> None:
+    assert pointee_type(type_str) == expected
+
+
+def _ring_push() -> Unit:
+    return _unit(Param("r", "ring_t *"), Param("v", "int"), name="rb_push")
+
+
+def test_bind_invariants_attaches_each_types_expressions_to_its_pointers() -> None:
+    plan = bind_invariants(
+        plan_unit(_ring_push()), {"ring_t": ("self->count <= CAP",), "other_t": ("1",)}
+    )
+    assert plan.invariants == (
+        AssumedInvariant("ring_t", ("self->count <= CAP",), ("r",)),
+    )
+
+
+def test_bind_invariants_without_a_matching_type_returns_the_plan_unchanged() -> None:
+    plan = plan_unit(_ring_push())
+    assert bind_invariants(plan, {}) is plan
+    assert bind_invariants(plan, {"other_t": ("1",)}) is plan
+    assert bind_invariants(plan, {"ring_t": ()}) is plan
+
+
+def test_bind_invariants_skips_buffers_and_unresolved_pointers() -> None:
+    sized = _unit(Param("rs", "ring_t *"), Param("n", "unsigned long"), name="f")
+    fixed = _unit(Param("rs", "ring_t *", array_extent=4), name="g")
+    plan_sized, plan_fixed = plan_unit(sized), plan_unit(fixed)
+    assert bind_invariants(plan_sized, {"ring_t": ("1",)}) is plan_sized
+    assert bind_invariants(plan_fixed, {"ring_t": ("1",)}) is plan_fixed
+
+
+def test_bind_invariants_covers_every_pointer_to_the_type() -> None:
+    unit = _unit(Param("dst", "ring_t *"), Param("src", "const ring_t *"), name="copy")
+    (inv,) = bind_invariants(plan_unit(unit), {"ring_t": ("a", "b")}).invariants
+    assert inv.params == ("dst", "src")
+    assert inv.expressions == ("a", "b")
+
+
+def test_render_assumes_the_invariant_after_materialising_and_before_the_call() -> None:
+    plan = bind_invariants(
+        plan_unit(_ring_push()), {"ring_t": ("self->count <= CAP", "self->tail < CAP")}
+    )
+    text = render_sidecar(plan, "/abs/ring.c")
+    helper = "static int __forseti_inv_ring_t(const ring_t *self) {"
+    assert helper in text
+    assert "return (self->count <= CAP) && (self->tail < CAP);" in text
+    alloc = text.index("ring_t * r = malloc(sizeof(*r));")
+    assume = text.index("__ESBMC_assume(__forseti_inv_ring_t(r));")
+    call = text.index("rb_push(r, v);")
+    assert (
+        text.index('#include "/abs/ring.c"')
+        < text.index(helper)
+        < text.index("int main(void) {")
+    )
+    assert alloc < assume < call
+
+
+def test_render_names_a_tagged_structs_helper_with_an_identifier() -> None:
+    unit = _unit(Param("n", "struct node *"), name="bump")
+    text = render_sidecar(
+        bind_invariants(plan_unit(unit), {"struct node": ("self->v >= 0",)}), "s.c"
+    )
+    assert "static int __forseti_inv_struct_node(const struct node *self) {" in text
+
+
+def test_render_without_invariants_is_unchanged() -> None:
+    plan = plan_unit(_ring_push())
+    assert plan.invariants == ()
+    text = render_sidecar(plan, "/abs/ring.c")
+    assert "__forseti_inv" not in text
+    assert "__ESBMC_assume" not in text
+
+
+def test_the_non_vacuity_probe_keeps_the_assumption() -> None:
+    plan = bind_invariants(plan_unit(_ring_push()), {"ring_t": ("0 == self->count",)})
+    text = render_sidecar(plan, "s.c", non_vacuity=True)
+    assert text.index("__ESBMC_assume(__forseti_inv_ring_t(r));") < text.index(
+        NON_VACUITY_LABEL
+    )

@@ -10,7 +10,7 @@ esbmc-gated acceptance test.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 from forseti.esbmc import (
@@ -226,3 +226,133 @@ def test_to_dict_shape(tmp_path: Path) -> None:
     assert payload["assumed"] is True
     assert payload["settled_k"] == 18
     assert {p["name"] for p in payload["params"]} == {"ctx", "data", "len"}
+
+
+# --- S0 under an accepted representation invariant (#387) -------------------
+
+RING_PUSH = Unit("rb_push", (Param("r", "ring_t *"), Param("v", "int")))
+RING_INV = {"ring_t": ("self->count <= CAP",)}
+
+
+def _run_ring(
+    raw: RawVerify, *, tmp: Path, invariants: Mapping[str, Sequence[str]] | None
+) -> PreconditionResult:
+    src = tmp / "ring.c"
+    src.write_text("/* ring */\n")
+    return verify_precondition(
+        src,
+        function="rb_push",
+        max_len=4,
+        ladder_cap=16,
+        work_dir=tmp,
+        raw_verify=raw,
+        list_units_fn=_lister(RING_PUSH),
+        invariants=invariants,
+    )
+
+
+def _reached_raw(harnesses: list[str] | None = None) -> RawVerify:
+    def raw(source: Path, *, unwind: int) -> EsbmcResult:
+        if harnesses is not None:
+            harnesses.append(source.read_text())
+        if _is_nonvacuity(source):
+            return _violated(f"Violated property:\n  {NON_VACUITY_LABEL}")
+        return _verified()
+
+    return raw
+
+
+def test_an_accepted_invariant_is_assumed_and_the_verdict_says_so(
+    tmp_path: Path,
+) -> None:
+    harnesses: list[str] = []
+    result = _run_ring(_reached_raw(harnesses), tmp=tmp_path, invariants=RING_INV)
+
+    assert result.assessment is Assessment.ASSUMED_VERIFIED
+    assert all("__ESBMC_assume(__forseti_inv_ring_t(r));" in h for h in harnesses)
+    assert len(harnesses) == 2  # the verify and its non-vacuity probe
+    assert "accepted representation invariant of ring_t" in result.label
+    assert "not discharged" in result.label
+    payload = result.to_dict()
+    assert payload["assumed"] is True
+    assert payload["assumed_invariants"] == [
+        {"type": "ring_t", "expressions": ["self->count <= CAP"], "params": ["r"]}
+    ]
+
+
+def test_without_invariants_the_verdict_and_payload_are_as_before(
+    tmp_path: Path,
+) -> None:
+    harnesses: list[str] = []
+    result = _run_ring(_reached_raw(harnesses), tmp=tmp_path, invariants=None)
+
+    assert result.assessment is Assessment.ASSUMED_VERIFIED
+    assert not any("__forseti_inv" in h for h in harnesses)
+    assert "invariant" not in result.label
+    assert result.to_dict()["assumed_invariants"] == []
+
+
+def test_an_invariant_of_another_type_changes_nothing(tmp_path: Path) -> None:
+    harnesses: list[str] = []
+    result = _run_ring(
+        _reached_raw(harnesses), tmp=tmp_path, invariants={"other_t": ("1",)}
+    )
+    assert not any("__forseti_inv" in h for h in harnesses)
+    assert "invariant" not in result.label
+
+
+def test_a_violation_under_the_invariant_is_labelled_conditional(
+    tmp_path: Path,
+) -> None:
+    result = _run_ring(lambda s, *, unwind: _oob(), tmp=tmp_path, invariants=RING_INV)
+    assert result.assessment is Assessment.VIOLATED
+    assert "accepted representation invariant of ring_t" in result.label
+
+
+def test_an_unsatisfiable_invariant_is_vacuous_never_assumed_verified(
+    tmp_path: Path,
+) -> None:
+    result = _run_ring(
+        lambda s, *, unwind: _verified(),
+        tmp=tmp_path,
+        invariants={"ring_t": ("self->count > self->count",)},
+    )
+    assert result.assessment is Assessment.VACUOUS
+    assert "assumed representation invariant is contradictory" in result.detail
+    assert "accepted representation invariant of ring_t" in result.label
+    assert "not a pass" in result.label
+
+
+def test_synthesize_renders_the_invariant_assumption(tmp_path: Path) -> None:
+    src = tmp_path / "ring.c"
+    src.write_text("/* ring */\n")
+    text = synthesize(
+        src,
+        function="rb_push",
+        list_units_fn=_lister(RING_PUSH),
+        invariants=RING_INV,
+    )
+    assert "__ESBMC_assume(__forseti_inv_ring_t(r));" in text
+
+
+def test_discharge_never_assumes_an_invariant(tmp_path: Path) -> None:
+    import inspect
+
+    from forseti.precond import discharge_precondition
+
+    assert "invariants" not in inspect.signature(discharge_precondition).parameters
+    harnesses: list[str] = []
+    src = tmp_path / "ring.c"
+    src.write_text("/* ring */\n")
+    discharge_precondition(
+        src,
+        function="rb_push",
+        max_len=4,
+        ladder_cap=16,
+        work_dir=tmp_path,
+        raw_verify=_reached_raw(harnesses),
+        list_units_fn=_lister(RING_PUSH),
+        open_callers_fn=lambda _s, _sym: (),
+    )
+    assert harnesses
+    assert not any("__forseti_inv" in h for h in harnesses)

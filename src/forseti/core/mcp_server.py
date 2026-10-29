@@ -23,7 +23,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from forseti.precond import DEFAULT_MAX_LEN
-from forseti.properties import parse_candidate_list
+from forseti.properties import InvariantRole, parse_candidate_list
 
 from .check import (
     DEFAULT_TIMEOUT_S as CHECK_TIMEOUT_S,
@@ -33,6 +33,7 @@ from .check import (
 )
 from .check import check_source
 from .grade import grade_source
+from .invariant import check_invariant_source
 from .loop import parse_loop_mode, run_semantic_loop
 from .propose import (
     DEFAULT_MAX_CANDIDATES,
@@ -211,6 +212,8 @@ def check_tool(
     timeout_s: float = CHECK_TIMEOUT_S,
     esbmc_bin: str = "esbmc",
     max_len: int = DEFAULT_MAX_LEN,
+    type_name: str | None = None,
+    role: str | None = None,
 ) -> dict[str, object]:
     """Check a unit's stored, checkable properties against ESBMC.
 
@@ -227,6 +230,14 @@ def check_tool(
             not constrain; a verdict is then scoped to `len<=max_len` (reported
             in its `length_bounds`); an explicit `unwind`/`unwind_ladder` must
             reach `max_len + 1` to settle (the default ladder is extended).
+        type_name: A struct type (`ring_t`, `struct node`): check the function
+            against the representation invariant(s) stored for that type instead
+            of its own properties -- nondet instance, invariant assumed at entry,
+            call, invariant asserted at exit. The invariant is *assumed*, never
+            discharged at the callers that construct the type; each verdict says
+            so in its `assumption` field.
+        role: With `type_name`, `method` (assume at entry) or `initialiser`
+            (do not); default inferred from the function name.
 
     Returns:
         A JSON object with the unit id, per-outcome counts, and one verdict
@@ -237,18 +248,35 @@ def check_tool(
         shows some path reaches the post-call point, not that k covers every
         path.
     """
-    run = check_source(
-        Path(source),
-        function=function,
-        store_root=Path(store_root),
-        unwind=unwind,
-        # `None` passes through so check_source derives the ladder above
-        # `unwind` itself; a supplied list is coerced to the tuple it expects.
-        unwind_ladder=tuple(unwind_ladder) if unwind_ladder is not None else None,
-        timeout_s=timeout_s,
-        esbmc_bin=esbmc_bin,
-        max_len=max_len,
-    )
+    # `None` passes through so the check derives the ladder above `unwind`
+    # itself; a supplied list is coerced to the tuple it expects.
+    ladder = tuple(unwind_ladder) if unwind_ladder is not None else None
+    if type_name is None:
+        if role is not None:
+            raise ValueError("role applies to type_name only")
+        run = check_source(
+            Path(source),
+            function=function,
+            store_root=Path(store_root),
+            unwind=unwind,
+            unwind_ladder=ladder,
+            timeout_s=timeout_s,
+            esbmc_bin=esbmc_bin,
+            max_len=max_len,
+        )
+    else:
+        run = check_invariant_source(
+            Path(source),
+            function=function,
+            type_name=type_name,
+            role=None if role is None else InvariantRole(role),
+            store_root=Path(store_root),
+            unwind=unwind,
+            unwind_ladder=ladder,
+            timeout_s=timeout_s,
+            esbmc_bin=esbmc_bin,
+            max_len=max_len,
+        )
     return run.to_dict()
 
 
@@ -431,7 +459,9 @@ def build_server(name: str = "forseti") -> MCPServer:
             "Check a unit's stored properties with ESBMC; returns held | "
             "violated | unknown | vacuous | error (plus skipped) per property; "
             "vacuous = verified but the post-call point is unreachable at k "
-            "(not a pass)."
+            "(not a pass). With type_name, checks the function against that "
+            "struct type's stored representation invariant (assumed, never "
+            "discharged at callers)."
         ),
     )
     server.add_tool(

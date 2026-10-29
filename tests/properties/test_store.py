@@ -671,3 +671,89 @@ def test_open_is_idempotent_over_an_existing_type_table(tmp_path: Path) -> None:
         store.close()
     with PropertyStore.open(root=tmp_path) as again:
         assert len(again.list_for_type(TYPE_KEY)) == 1
+
+
+def test_type_invariant_is_accepted_or_rejected_and_then_final() -> None:
+    store = mem_store()
+    keep = make_inv(expression="self->count <= CAP")
+    drop = make_inv(expression="self->tail < CAP")
+    store.add_type_invariant(keep)
+    store.add_type_invariant(drop)
+
+    accepted = store.update_type_invariant_status(
+        keep.property_id, PropertyStatus.ACCEPTED
+    )
+    rejected = store.update_type_invariant_status(
+        drop.property_id, PropertyStatus.REJECTED
+    )
+
+    assert accepted == dataclasses.replace(keep, status=PropertyStatus.ACCEPTED)
+    assert rejected == dataclasses.replace(drop, status=PropertyStatus.REJECTED)
+    assert store.list_for_type(TYPE_KEY, {PropertyStatus.ACCEPTED}) == (accepted,)
+    for target in (PropertyStatus.REJECTED, PropertyStatus.ACCEPTED):
+        with pytest.raises(InvalidStatusTransition):
+            store.update_type_invariant_status(keep.property_id, target)
+        with pytest.raises(InvalidStatusTransition):
+            store.update_type_invariant_status(drop.property_id, target)
+    assert store.list_for_type(TYPE_KEY) == (accepted, rejected)
+
+
+@pytest.mark.parametrize("target", [PropertyStatus.GRADED, PropertyStatus.CANDIDATE])
+def test_type_invariant_refuses_grading_and_self_transitions(
+    target: PropertyStatus,
+) -> None:
+    store = mem_store()
+    inv = make_inv()
+    store.add_type_invariant(inv)
+    with pytest.raises(InvalidStatusTransition):
+        store.update_type_invariant_status(inv.property_id, target)
+    assert store.list_for_type(TYPE_KEY) == (inv,)
+
+
+def test_type_invariant_status_of_an_unknown_or_unit_property_is_not_found() -> None:
+    store = mem_store()
+    unit = make_prop()
+    store.add(unit)
+    for property_id in ("nope", unit.property_id):
+        with pytest.raises(PropertyNotFound):
+            store.update_type_invariant_status(property_id, PropertyStatus.ACCEPTED)
+    assert store.get(unit.property_id) == unit
+
+
+def test_unit_status_updates_never_touch_type_invariants() -> None:
+    store = mem_store()
+    inv = make_inv()
+    store.add_type_invariant(inv)
+    with pytest.raises(PropertyNotFound):
+        store.update_status(inv.property_id, PropertyStatus.REJECTED)
+    assert store.list_for_type(TYPE_KEY) == (inv,)
+
+
+def test_list_for_type_prefix_reads_every_type_of_one_file() -> None:
+    store = mem_store()
+    ring = make_inv(status=PropertyStatus.ACCEPTED)
+    node = make_inv(
+        type_key="examples/ring_buffer.c::struct node",
+        expression="self->v >= 0",
+        status=PropertyStatus.ACCEPTED,
+    )
+    pending = make_inv(expression="self->tail < CAP")
+    other = make_inv(type_key="examples/ring_buffer.cc::ring_t")
+    for inv in (ring, node, pending, other):
+        store.add_type_invariant(inv)
+
+    prefix = "examples/ring_buffer.c::"
+    assert store.list_for_type_prefix(prefix) == (ring, node, pending)
+    assert store.list_for_type_prefix(prefix, {PropertyStatus.ACCEPTED}) == (
+        ring,
+        node,
+    )
+    assert store.list_for_type_prefix(prefix, ()) == ()
+    assert store.list_for_type_prefix("examples/none.c::") == ()
+
+
+def test_list_for_type_prefix_treats_sql_wildcards_literally() -> None:
+    store = mem_store()
+    store.add_type_invariant(make_inv(type_key="a_c.c::ring_t"))
+    assert store.list_for_type_prefix("a%c.c::") == ()
+    assert store.list_for_type_prefix("a_c.c::") != ()

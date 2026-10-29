@@ -271,6 +271,53 @@ def test_check_tools_expose_and_forward_max_len(
     assert seen == [8, 3, 8, 5]
 
 
+def test_check_tool_exposes_type_name_and_role_for_invariant_checks() -> None:
+    check = next(
+        t for t in asyncio.run(build_server().list_tools()) if t.name == "check"
+    )
+    props = check.input_schema["properties"]
+    assert {"type_name", "role"} <= props.keys()
+    assert "type_name" not in check.input_schema.get("required", [])
+
+
+def test_check_tool_with_type_name_runs_the_invariant_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from forseti.core.mcp_server import InvariantRole
+
+    seen: dict[str, object] = {}
+
+    class _Done(Exception): ...
+
+    def _spy(*_a: object, **kw: object) -> object:
+        seen.update(kw)
+        raise _Done
+
+    def _unit_check(*_a: object, **_kw: object) -> object:
+        raise AssertionError("a type_name check must not read the unit's properties")
+
+    monkeypatch.setattr("forseti.core.mcp_server.check_invariant_source", _spy)
+    monkeypatch.setattr("forseti.core.mcp_server.check_source", _unit_check)
+    with pytest.raises(_Done):
+        check_tool(
+            "u.c", "f", type_name="ring_t", role="initialiser", unwind_ladder=[8]
+        )
+    assert seen["type_name"] == "ring_t"
+    assert seen["role"] is InvariantRole.INITIALISER
+    assert seen["unwind_ladder"] == (8,)
+    assert seen["max_len"] == 8
+
+
+def test_check_tool_role_without_type_name_is_refused() -> None:
+    with pytest.raises(ValueError, match="role applies to type_name only"):
+        check_tool("u.c", "f", role="method")
+
+
+def test_check_tool_rejects_an_unknown_role() -> None:
+    with pytest.raises(ValueError, match="not a valid InvariantRole"):
+        check_tool("u.c", "f", type_name="ring_t", role="boss")
+
+
 def test_semantic_loop_tool_rejects_an_unknown_mode(tmp_path: Path) -> None:
     source = tmp_path / "abs_unit.c"
     source.write_text(_ABS_SLICE)

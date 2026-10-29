@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from forseti.properties import (
+    INVARIANT_CHECKABLE_STATUSES,
     REP_INVARIANT_LABEL,
     HarnessError,
     InvariantNotApplicable,
@@ -17,6 +18,7 @@ from forseti.properties import (
     extract_signature,
     infer_role,
     invariant_reason,
+    is_valid_invariant_transition,
     make_invariant,
     normalised_type_name,
     render_invariant_harness,
@@ -266,3 +268,28 @@ def test_make_invariant_is_a_keyed_candidate_with_a_stable_content_id() -> None:
 def test_type_name_whitespace_is_collapsed() -> None:
     assert normalised_type_name("struct \t node ") == "struct node"
     assert normalised_type_name("ring_t") == "ring_t"
+
+
+@pytest.mark.parametrize(
+    ("current", "requested", "allowed"),
+    [
+        (PropertyStatus.CANDIDATE, PropertyStatus.ACCEPTED, True),
+        (PropertyStatus.CANDIDATE, PropertyStatus.REJECTED, True),
+        (PropertyStatus.CANDIDATE, PropertyStatus.GRADED, False),
+        (PropertyStatus.CANDIDATE, PropertyStatus.CANDIDATE, False),
+        (PropertyStatus.ACCEPTED, PropertyStatus.REJECTED, False),
+        (PropertyStatus.ACCEPTED, PropertyStatus.CANDIDATE, False),
+        (PropertyStatus.REJECTED, PropertyStatus.ACCEPTED, False),
+        (PropertyStatus.GRADED, PropertyStatus.ACCEPTED, False),
+    ],
+)
+def test_invariant_lifecycle_skips_grading_and_both_ends_are_final(
+    current: PropertyStatus, requested: PropertyStatus, allowed: bool
+) -> None:
+    assert is_valid_invariant_transition(current, requested) is allowed
+
+
+def test_an_accepted_invariant_stays_checkable_a_rejected_one_does_not() -> None:
+    assert PropertyStatus.CANDIDATE in INVARIANT_CHECKABLE_STATUSES
+    assert PropertyStatus.ACCEPTED in INVARIANT_CHECKABLE_STATUSES
+    assert PropertyStatus.REJECTED not in INVARIANT_CHECKABLE_STATUSES

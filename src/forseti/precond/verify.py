@@ -20,7 +20,7 @@ memory check): the former escalates the ladder, only the latter is a VIOLATED.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -42,7 +42,9 @@ from .reachability import ProbeReachability
 from .run import ProbeSite, SettledRun, SidecarRunner, sidecar_runner
 from .synth import (
     DEFAULT_MAX_LEN,
+    AssumedInvariant,
     UnitPlan,
+    bind_invariants,
     plan_unit,
     render_sidecar,
 )
@@ -103,21 +105,38 @@ class PreconditionResult:
     plan: UnitPlan | None = None
 
     @property
+    def invariants(self) -> tuple[AssumedInvariant, ...]:
+        """The accepted representation invariants this run assumed (usually none)."""
+        return self.plan.invariants if self.plan is not None else ()
+
+    @property
+    def _invariant_clause(self) -> str:
+        if not self.invariants:
+            return ""
+        types = ", ".join(inv.type_name for inv in self.invariants)
+        return (
+            f" and the accepted representation invariant of {types} "
+            "(assumed, not discharged at callers)"
+        )
+
+    @property
     def label(self) -> str:
         """The one-line honest verdict."""
         if self.assessment is Assessment.ASSUMED_VERIFIED:
             return (
-                "VERIFIED (assuming valid caller pointers — undischarged; "
+                "VERIFIED (assuming valid caller pointers"
+                f"{self._invariant_clause} — undischarged; "
                 f"up to k={self.settled_k}, len<={self.max_len})"
             )
         if self.assessment is Assessment.VIOLATED:
             return (
                 "VIOLATED (real counterexample under the synthesised "
-                f"precondition, k={self.settled_k})"
+                f"precondition{self._invariant_clause}, k={self.settled_k})"
             )
         if self.assessment is Assessment.VACUOUS:
             return (
-                "VACUOUS (synthesised precondition makes the call unreachable "
+                "VACUOUS (synthesised precondition"
+                f"{self._invariant_clause} makes the call unreachable "
                 "— not a pass)"
             )
         if self.assessment is Assessment.NEEDS_CONTRACT:
@@ -135,6 +154,7 @@ class PreconditionResult:
             "settled_k": self.settled_k,
             "max_len": self.max_len,
         }
+        payload["assumed_invariants"] = [inv.to_dict() for inv in self.invariants]
         if self.plan is not None:
             payload["params"] = [
                 {"name": p.var, "type": p.param.type, "role": p.role.value}
@@ -241,6 +261,7 @@ def verify_precondition(
     work_dir: Path | None = None,
     raw_verify: VerifyPort | None = None,
     list_units_fn: Callable[[Path], list[Unit]] | None = None,
+    invariants: Mapping[str, Sequence[str]] | None = None,
 ) -> PreconditionResult:
     """Synthesise a memory precondition for `source::function` and verify it.
 
@@ -250,6 +271,11 @@ def verify_precondition(
     complete program is checkable (one where that rename cannot take — an
     ``#undef main`` in the source — is an ``ERROR`` from esbmc's own
     redefinition diagnostic).
+    `invariants` maps a struct type name to its *accepted* representation invariant
+    expressions (#387): a ``T *`` parameter's materialised object is then assumed to
+    satisfy them (``__ESBMC_assume``) before the call, and the result says so. That
+    is S0 under an *assumed* context -- never discharged here, and never offered to
+    `discharge_precondition`, whose verdict must not rest on one.
     `raw_verify` and `list_units_fn` inject the two esbmc calls for tests;
     production uses `list_units` + assertions-on/force-malloc-success `verify`.
     When `work_dir` is None a temporary directory holds the generated harnesses
@@ -263,6 +289,8 @@ def verify_precondition(
         plan = plan_for(source, function, lister)
     except PreconditionUnavailable as exc:
         return PreconditionResult(function, exc.assessment, exc.detail, plan=exc.plan)
+    if invariants:
+        plan = bind_invariants(plan, invariants)
 
     raw = raw_verify or sidecar_verify_port(timeout_s=timeout_s, esbmc_bin=esbmc_bin)
     with sidecar_runner(
@@ -283,18 +311,21 @@ def synthesize(
     timeout_s: float = DEFAULT_TIMEOUT_S,
     esbmc_bin: str = "esbmc",
     list_units_fn: Callable[[Path], list[Unit]] | None = None,
+    invariants: Mapping[str, Sequence[str]] | None = None,
 ) -> str:
     """Return the sidecar C harness text for `source::function` (no ESBMC verify).
 
     The pure render path exposed for inspection (``forseti synth --emit-only``).
     Raises `PreconditionUnavailable` when the unit is missing or a pointer shape
     is unresolved (L2) — the caller maps that to an exit code, never a silent
-    empty emit.
+    empty emit. `invariants` is `verify_precondition`'s.
     """
     lister = unit_lister(
         esbmc_bin=esbmc_bin, timeout_s=timeout_s, adapter=list_units_fn
     )
     plan = plan_for(source, function, lister)
+    if invariants:
+        plan = bind_invariants(plan, invariants)
     return render_sidecar(plan, str(source.resolve()), max_len=max_len)
 
 
@@ -372,10 +403,16 @@ def _assess_non_vacuity(
                 "verified up to k assuming valid caller pointers; call site reachable",
             )
         case ProbeReachability.UNREACHABLE:
+            contradictory = (
+                "the synthesised precondition or the assumed representation "
+                "invariant is contradictory"
+                if plan.invariants
+                else "the synthesised precondition is contradictory"
+            )
             return outcome(
                 Assessment.VACUOUS,
-                "the assert-at-call-site was unreachable: the synthesised precondition "
-                "is contradictory (a vacuous proof)",
+                f"the assert-at-call-site was unreachable: {contradictory} "
+                "(a vacuous proof)",
             )
         case ProbeReachability.INCONCLUSIVE:
             return outcome(

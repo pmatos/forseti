@@ -19,7 +19,7 @@ from functools import partial
 from pathlib import Path
 
 from forseti.core.check import run_check
-from forseti.core.persistence import persist_proposal
+from forseti.core.persistence import open_store, persist_proposal
 from forseti.core.propose import DEFAULT_STORE_ROOT
 from forseti.core.submit import DEFAULT_PROMPT_ID, DEFAULT_PROMPT_VERSION
 from forseti.orchestrator import (
@@ -41,7 +41,10 @@ from forseti.properties import (
     CandidateSpec,
     DuplicateProperty,
     InvariantRole,
+    Property,
     PropertyKind,
+    PropertyNotFound,
+    PropertyStatus,
     PropertyStore,
     ProposalResult,
     Provenance,
@@ -51,7 +54,7 @@ from forseti.properties import (
     normalised_type_name,
     valid_type_name,
 )
-from forseti.unit_id import make_unit_id
+from forseti.unit_id import make_unit_id, unit_id_prefix, unit_id_symbol
 
 
 def submit_invariant_source(
@@ -123,6 +126,52 @@ def submit_invariant_source(
     return persist_proposal(
         ingest, persist=persist, store_root=store_root, channel="submitted"
     )
+
+
+def set_invariant_status(
+    source: Path,
+    *,
+    type_name: str,
+    property_id: str,
+    status: PropertyStatus,
+    store_root: Path = DEFAULT_STORE_ROOT,
+) -> Property:
+    """Accept or reject the stored invariant `property_id` of `source`::`type_name`.
+
+    ``CANDIDATE -> ACCEPTED | REJECTED`` (`is_valid_invariant_transition`); an
+    accepted invariant is the context `forseti synth` assumes for every ``T *``
+    function (`accepted_invariants`), assumed and never discharged at the callers
+    that build a ``T``. The id must belong to that type: an id of another type or
+    file is `PropertyNotFound`, so a mistyped ``--type`` cannot settle the wrong
+    row. `InvalidStatusTransition` (a `ValueError`) for a refused move; a failed
+    read or write is `PropertyStoreError`.
+    """
+    type_key = make_unit_id(source, normalised_type_name(type_name))
+    with open_store(store_root) as store:
+        if all(p.property_id != property_id for p in store.list_for_type(type_key)):
+            raise PropertyNotFound(property_id)
+        return store.update_type_invariant_status(property_id, status)
+
+
+def accepted_invariants(
+    source: Path, *, store_root: Path = DEFAULT_STORE_ROOT
+) -> dict[str, tuple[str, ...]]:
+    """The accepted invariant expressions of each struct type of `source`.
+
+    The S0 context (#387): ``{type name: expressions}``, empty when nothing was
+    accepted -- including when `store_root` has no store at all, which this read
+    never creates. Keyed by the raw ``source`` spelling the invariants were
+    submitted under, like every unit id.
+    """
+    if not (store_root / "forseti.db").is_file():
+        return {}
+    by_type: dict[str, list[str]] = {}
+    with open_store(store_root) as store:
+        for prop in store.list_for_type_prefix(
+            unit_id_prefix(source), frozenset({PropertyStatus.ACCEPTED})
+        ):
+            by_type.setdefault(unit_id_symbol(prop.unit_id), []).append(prop.expression)
+    return {name: tuple(exprs) for name, exprs in by_type.items()}
 
 
 def _rejection(source_text: str, type_name: str, expression: str) -> str | None:

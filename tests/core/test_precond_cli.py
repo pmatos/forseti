@@ -163,6 +163,178 @@ def test_synth_json_emits_the_result_payload(
     assert payload["assumed"] is True
 
 
+# --- synth under accepted representation invariants (#387) -----------------
+
+
+def _accept_invariant(tmp_path: Path, source: Path) -> Path:
+    from forseti.core import set_invariant_status, submit_invariant_source
+    from forseti.properties import PropertyStatus, PropertyStore
+
+    source.write_text("typedef struct { unsigned count; } ring_t;\n")
+    root = tmp_path / ".forseti"
+    submit_invariant_source(
+        source,
+        type_name="ring_t",
+        expression="self->count <= 4",
+        provider="hand",
+        model="human",
+        store_root=root,
+    )
+    with PropertyStore.open(root) as store:
+        (prop,) = store.list_for_type(f"{source}::ring_t")
+    set_invariant_status(
+        source,
+        type_name="ring_t",
+        property_id=prop.property_id,
+        status=PropertyStatus.ACCEPTED,
+        store_root=root,
+    )
+    return root
+
+
+def _spy_verify(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    seen: dict[str, Any] = {}
+    result = PreconditionResult(
+        function="foo",
+        assessment=Assessment.ASSUMED_VERIFIED,
+        detail="",
+        settled_k=1,
+        max_len=8,
+    )
+
+    def fake(*a: object, **k: Any) -> PreconditionResult:
+        seen.update(k)
+        return result
+
+    monkeypatch.setattr(_precond_cli, "verify_precondition", fake)
+    return seen
+
+
+def test_synth_passes_the_accepted_invariants_of_the_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "ring.c"
+    root = _accept_invariant(tmp_path, source)
+    seen = _spy_verify(monkeypatch)
+    code = main(["synth", str(source), "--function", "foo", "--store-root", str(root)])
+    assert code == 0
+    assert seen["invariants"] == {"ring_t": ("self->count <= 4",)}
+
+
+def test_synth_no_invariants_ignores_the_accepted_ones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "ring.c"
+    root = _accept_invariant(tmp_path, source)
+    seen = _spy_verify(monkeypatch)
+    code = main(
+        [
+            "synth",
+            str(source),
+            "--function",
+            "foo",
+            "--store-root",
+            str(root),
+            "--no-invariants",
+        ]
+    )
+    assert code == 0
+    assert seen["invariants"] == {}
+
+
+def test_synth_emit_only_also_renders_the_accepted_invariants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "ring.c"
+    root = _accept_invariant(tmp_path, source)
+    seen: dict[str, Any] = {}
+
+    def fake(*a: object, **k: Any) -> str:
+        seen.update(k)
+        return "SIDECAR\n"
+
+    monkeypatch.setattr(_precond_cli, "synthesize", fake)
+    code = main(
+        [
+            "synth",
+            str(source),
+            "--function",
+            "foo",
+            "--emit-only",
+            "--store-root",
+            str(root),
+        ]
+    )
+    assert code == 0
+    assert seen["invariants"] == {"ring_t": ("self->count <= 4",)}
+
+
+def test_synth_with_no_store_creates_no_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = _spy_verify(monkeypatch)
+    root = tmp_path / "fresh"
+    assert main(["synth", "x.c", "--function", "foo", "--store-root", str(root)]) == 0
+    assert seen["invariants"] == {}
+    assert not (root / "forseti.db").exists()
+
+
+def test_synth_unreadable_invariant_store_is_an_error_not_a_silent_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from forseti.properties import PropertyStoreError
+
+    def boom(*a: object, **k: object) -> dict[str, tuple[str, ...]]:
+        raise PropertyStoreError("corrupt db")
+
+    monkeypatch.setattr(_precond_cli, "accepted_invariants", boom)
+    seen = _spy_verify(monkeypatch)
+    code = main(["synth", "x.c", "--function", "foo"])
+    assert code == ASSESSMENT_EXIT_CODES[Assessment.ERROR]
+    assert "cannot read accepted invariants: corrupt db" in capsys.readouterr().err
+    assert seen == {}
+
+
+def test_synth_prints_each_assumed_invariant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from forseti.esbmc.units import Param, Unit
+    from forseti.precond import AssumedInvariant, plan_unit
+
+    plan = plan_unit(Unit("foo", (Param("r", "ring_t *"),)))
+    plan = type(plan)(
+        plan.unit, plan.params, (AssumedInvariant("ring_t", ("a", "b"), ("r",)),)
+    )
+    result = PreconditionResult(
+        function="foo",
+        assessment=Assessment.ASSUMED_VERIFIED,
+        detail="",
+        settled_k=1,
+        max_len=8,
+        plan=plan,
+    )
+    monkeypatch.setattr(_precond_cli, "verify_precondition", lambda *a, **k: result)
+    assert main(["synth", "x.c", "--function", "foo"]) == 0
+    out = capsys.readouterr().out
+    assert "accepted representation invariant of ring_t" in out
+    assert "assumed invariant of ring_t: a && b" in out
+
+
+def test_discharge_never_reads_the_invariant_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(*a: object, **k: object) -> dict[str, tuple[str, ...]]:
+        raise AssertionError("discharge must not read accepted invariants")
+
+    monkeypatch.setattr(_precond_cli, "accepted_invariants", boom)
+    monkeypatch.setattr(_precond_cli, "emit_obligations", lambda *a, **k: "X\n")
+    assert main(["discharge", "x.c", "--function", "foo", "--emit-only"]) == 0
+
+
 # --- discharge glue ---------------------------------------------------------
 
 
@@ -282,7 +454,11 @@ def _stub_engine(monkeypatch: pytest.MonkeyPatch, command: str, path: str) -> No
         raise PreconditionUnavailable(Assessment.NEEDS_CONTRACT, "no pointer plan")
 
     verdict = SimpleNamespace(
-        label="x", assessment=Assessment.VIOLATED, callers=[], esbmc_result=None
+        label="x",
+        assessment=Assessment.VIOLATED,
+        callers=[],
+        invariants=(),
+        esbmc_result=None,
     )
     engine = {
         ("synth", "emit"): ("synthesize", lambda *a, **k: "SIDECAR_C\n"),

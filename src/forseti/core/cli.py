@@ -40,7 +40,15 @@ Subcommands:
   checked property (:data:`EXIT_CODES`, VIOLATED > UNKNOWN > ERROR > VERIFIED);
   a run with nothing checkable (no stored properties, or every stored property
   is reachability-kind and deferred per ADR-0009 D2) says so loudly rather than
-  reading as a clean pass.
+  reading as a clean pass. ``--type TYPE`` checks the function against the
+  representation invariant(s) stored for a struct type instead (RFC-0007 kind 1,
+  #387): nondet TYPE, assume at entry, call, assert at exit, each with a
+  non-vacuity probe; the invariant is labelled *assumed*.
+- ``forseti invariant-status <source> --type TYPE --property-id ID
+  accepted|rejected`` — move a stored invariant out of candidate (#387). Both ends
+  are final; there is no grading step. An *accepted* invariant of TYPE is the
+  context ``forseti synth`` then assumes for every ``TYPE *`` function in
+  ``<source>`` (``--no-invariants`` opts out), labelled assumed in its verdict.
 - ``forseti grade <source> --function NAME`` — grade that unit's held, candidate
   properties against mutants of the function (#392): each property's kill rate
   (``killed / (killed + survived)``) and a reason naming every surviving mutant
@@ -121,7 +129,11 @@ from forseti.properties import (
     RECIPES,
     BlankProvenanceError,
     CandidateSpec,
+    InvalidStatusTransition,
+    InvariantRole,
     LLMError,
+    Property,
+    PropertyStatus,
     PropertyStoreError,
     ProposalParseError,
     ProposalResult,
@@ -156,7 +168,11 @@ from .check import (
 )
 from .check import check_source
 from .grade import grade_source
-from .invariant import submit_invariant_source
+from .invariant import (
+    check_invariant_source,
+    set_invariant_status,
+    submit_invariant_source,
+)
 from .loop import (
     LOOP_MODE_CHOICES,
     SemanticLoopResult,
@@ -719,6 +735,27 @@ def _add_check_parser(
         ),
     )
     _add_unit_store_arguments(p)
+    p.add_argument(
+        "--type",
+        dest="type_name",
+        metavar="TYPE",
+        help=(
+            "check the function against the representation invariant(s) stored for "
+            "struct TYPE (ring_t or 'struct node') instead of its own properties: "
+            "nondet TYPE, assume the invariant at entry, call, assert it at exit "
+            "(RFC-0007 kind 1, #387). The invariant is *assumed*, never discharged "
+            "at the callers that construct TYPE"
+        ),
+    )
+    p.add_argument(
+        "--role",
+        choices=[role.value for role in InvariantRole],
+        help=(
+            "--type only: `method` assumes the invariant at entry, `initialiser` "
+            "does not (default: inferred from the function name; an init/initialise/"
+            "initialize name part is an initialiser)"
+        ),
+    )
     _add_check_phase_arguments(
         p,
         json_help="emit the check run as a JSON object",
@@ -747,7 +784,7 @@ def _check_exit_code(run: PropertyCheckRun) -> int:
     return EXIT_CODES[_OUTCOME_VERDICT[run.outcome]]
 
 
-def _render_check(run: PropertyCheckRun) -> str:
+def _render_check(run: PropertyCheckRun, *, type_name: str | None = None) -> str:
     """Human-readable check output: a loud headline for "nothing was actually
     semantically checked", then the full per-property transcript.
 
@@ -755,11 +792,25 @@ def _render_check(run: PropertyCheckRun) -> str:
     stored property is reachability-kind, deferred per ADR-0009 D2) both settle
     `run.outcome == "empty"` (`PropertyCheckRun`) — otherwise indistinguishable
     from "every property held" by exit code alone. CLAUDE.md "never silently
-    pass" applies to the report, not just the exit code.
+    pass" applies to the report, not just the exit code. With `type_name` the run is
+    an invariant check (`check --type`): "nothing stored" and "every check skipped"
+    then say what they mean for an invariant (a const-only function has no exit
+    obligation).
     """
     total = len(run.verdicts)
     lines: list[str] = []
-    if total == 0:
+    if type_name is not None and total == 0:
+        lines.append(
+            "No candidate or accepted representation invariant stored for "
+            f"{type_name} -- nothing was checked. Store one with `forseti "
+            f"submit-property --kind rep-invariant --type {type_name}`."
+        )
+    elif type_name is not None and run.outcome == "empty":
+        lines.append(
+            f"{total} stored invariant{'' if total == 1 else 's'} for {type_name}, "
+            f"all skipped for {run.unit_id}; no invariant was actually checked."
+        )
+    elif total == 0:
         lines.append(
             f"No properties stored for {run.unit_id} -- nothing was checked. "
             "Run `forseti propose` first."
@@ -775,21 +826,116 @@ def _render_check(run: PropertyCheckRun) -> str:
 
 
 def _run_check(args: argparse.Namespace) -> int:
+    if args.type_name is None and args.role is not None:
+        print("forseti check: --role applies to --type only", file=sys.stderr)
+        return 2
     try:
-        result = check_source(
-            args.source,
-            function=args.function,
-            store_root=args.store_root,
-            **_check_phase_kwargs(args, timeout_kw="timeout_s"),
-        )
+        if args.type_name is None:
+            result = check_source(
+                args.source,
+                function=args.function,
+                store_root=args.store_root,
+                **_check_phase_kwargs(args, timeout_kw="timeout_s"),
+            )
+        else:
+            result = check_invariant_source(
+                args.source,
+                function=args.function,
+                type_name=args.type_name,
+                role=None if args.role is None else InvariantRole(args.role),
+                store_root=args.store_root,
+                **_check_phase_kwargs(args, timeout_kw="timeout_s"),
+            )
     except (PropertyStoreError, OSError, ValueError) as exc:
         print(f"forseti check: {exc}", file=sys.stderr)
         return 1
     if args.json:
         print(json.dumps(result.to_dict()))
     else:
-        print(_render_check(result))
+        print(_render_check(result, type_name=args.type_name))
     return _check_exit_code(result)
+
+
+def _add_invariant_status_parser(
+    sub: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    p = sub.add_parser(
+        "invariant-status",
+        help="accept or reject a stored representation invariant",
+        description=(
+            "Move one stored representation invariant of <source>::TYPE from "
+            "candidate to accepted or rejected (both final; there is no grading "
+            "step for an invariant). An accepted invariant is the context "
+            "`forseti synth` assumes for every TYPE * function in <source>: it is "
+            "*assumed* at entry, never discharged at the callers that construct "
+            "TYPE, so an over-strong one can hide a bug. Accept it only after "
+            "`forseti check --type TYPE` holds for the file's TYPE * functions. "
+            "The property id is the one `submit-property` printed."
+        ),
+    )
+    p.add_argument("source", type=Path, help="source file the invariant was stored for")
+    p.add_argument(
+        "--type",
+        dest="type_name",
+        required=True,
+        metavar="TYPE",
+        help="the struct type (ring_t or 'struct node') the invariant is over",
+    )
+    p.add_argument(
+        "--property-id",
+        required=True,
+        metavar="ID",
+        help="the invariant's property id",
+    )
+    p.add_argument(
+        "status",
+        choices=("accepted", "rejected"),
+        help="the status to move the invariant to",
+    )
+    p.add_argument(
+        "--store-root",
+        type=Path,
+        default=DEFAULT_STORE_ROOT,
+        metavar="DIR",
+        help=f"the .forseti store directory (default: {DEFAULT_STORE_ROOT})",
+    )
+    p.add_argument(
+        "--json", action="store_true", help="emit the updated invariant as JSON"
+    )
+    p.set_defaults(func=_run_invariant_status)
+
+
+def _render_invariant_status(prop: Property, type_name: str) -> str:
+    lines = [
+        f"{prop.unit_id}: invariant {prop.property_id} is now "
+        f"{prop.status.value.upper()}",
+        f"  {prop.expression}",
+    ]
+    if prop.status is PropertyStatus.ACCEPTED:
+        lines.append(
+            f"`forseti synth` now assumes it for every {type_name} * function in "
+            "this file (assumed, not discharged at the callers that construct it)."
+        )
+    return "\n".join(lines)
+
+
+def _run_invariant_status(args: argparse.Namespace) -> int:
+    try:
+        prop = set_invariant_status(
+            args.source,
+            type_name=args.type_name,
+            property_id=args.property_id,
+            status=PropertyStatus(args.status),
+            store_root=args.store_root,
+        )
+    except (PropertyStoreError, InvalidStatusTransition, OSError) as exc:
+        print(f"forseti invariant-status: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(prop.to_dict()))
+    else:
+        print(_render_invariant_status(prop, args.type_name))
+    return 0
 
 
 def _add_grade_parser(
@@ -1436,6 +1582,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_propose_parser(sub)
     _add_submit_property_parser(sub)
     _add_check_parser(sub)
+    _add_invariant_status_parser(sub)
     _add_grade_parser(sub)
     _add_semantic_loop_parser(sub)
     _add_claude_code_hook_parser(sub)
