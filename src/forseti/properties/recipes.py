@@ -100,10 +100,9 @@ def _blank(match: re.Match[str]) -> str:
     return re.sub(r"[^\n]", " ", match.group(0))
 
 
-def _code_view(source: str) -> str:
-    """`source` with comments, literals and directives blanked, offsets kept."""
-    masked = mask_string_literals(mask_comments(source))
-    return _DIRECTIVE_RE.sub(_blank, masked)
+def _code_view(no_comments: str) -> str:
+    """Comment-masked source with literals and directives blanked, offsets kept."""
+    return _DIRECTIVE_RE.sub(_blank, mask_string_literals(no_comments))
 
 
 def _is_function_head(head: str) -> bool:
@@ -213,55 +212,6 @@ def _type_names(text: str) -> frozenset[str]:
     return frozenset(names)
 
 
-def _definitions(source: str, code: str, items: list[_Item]) -> list[_Definition]:
-    """Type and macro definitions of the file, in source order."""
-    defs: list[_Definition] = []
-    for item in items:
-        text = code[item.start : item.end]
-        head = _IDENT_RE.match(text)
-        if item.is_function or head is None or head.group() not in _TYPE_HEADS:
-            continue
-        names = _type_names(text)
-        if names:
-            defs.append(
-                _Definition(
-                    item.start,
-                    item.end,
-                    names,
-                    frozenset(_IDENT_RE.findall(text)) - names,
-                    source[item.start : item.end],
-                )
-            )
-    no_comments = mask_comments(source)
-    for match in _DEFINE_RE.finditer(no_comments):
-        text = match.group().strip()
-        name = match.group(1)
-        defs.append(
-            _Definition(
-                match.start(),
-                match.end(),
-                frozenset({name}),
-                frozenset(_IDENT_RE.findall(text)) - {name, "define"},
-                text,
-            )
-        )
-    return sorted(defs, key=lambda d: d.start)
-
-
-def _used_definitions(defs: list[_Definition], seed: str) -> list[_Definition]:
-    used = set(_IDENT_RE.findall(seed))
-    selected: set[int] = set()
-    changed = True
-    while changed:
-        changed = False
-        for index, definition in enumerate(defs):
-            if index not in selected and definition.names & used:
-                selected.add(index)
-                used |= definition.uses
-                changed = True
-    return [defs[index] for index in sorted(selected)]
-
-
 def _comment_spans(source: str) -> list[tuple[int, int]]:
     return [
         match.span()
@@ -275,15 +225,18 @@ class _Scan:
 
     def __init__(self, source: str) -> None:
         self.source = source
-        self.code = _code_view(source)
+        self.no_comments = mask_comments(source)
+        self.code = _code_view(self.no_comments)
         self.items = _top_level_items(self.code)
         self.comments = _comment_spans(source)
 
     def function(self, symbol: str) -> tuple[_Item, int] | None:
         """The definition of `symbol` and the offset of its body's ``{``."""
         brace = find_definition_brace(self.source, symbol)
+        if brace is None:
+            return None
         for item in self.items:
-            if brace is not None and item.is_function and item.brace == brace:
+            if item.is_function and item.brace == brace:
                 return item, brace
         return None
 
@@ -355,7 +308,7 @@ class _Scan:
                         self.source[item.start : item.end],
                     )
                 )
-        for match in _DEFINE_RE.finditer(mask_comments(self.source)):
+        for match in _DEFINE_RE.finditer(self.no_comments):
             text = match.group().strip()
             name = match.group(1)
             defs.append(
