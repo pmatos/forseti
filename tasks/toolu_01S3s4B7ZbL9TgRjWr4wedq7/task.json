@@ -1,0 +1,14 @@
+{
+  "tool_use_id": "toolu_01S3s4B7ZbL9TgRjWr4wedq7",
+  "agent_id": "a61cd26dd686beb0b",
+  "task_description": "Simplify review: reuse",
+  "token_usage": {
+    "input_tokens": 10,
+    "cache_creation_tokens": 43513,
+    "cache_read_tokens": 235735,
+    "output_tokens": 2136,
+    "api_call_count": 5
+  },
+  "started_at": "2026-10-29T13:17:34.080462338+01:00",
+  "completed_at": "2026-10-29T13:17:51.12241951+01:00"
+}

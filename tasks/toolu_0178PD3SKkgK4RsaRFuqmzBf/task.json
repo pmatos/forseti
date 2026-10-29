@@ -1,0 +1,14 @@
+{
+  "tool_use_id": "toolu_0178PD3SKkgK4RsaRFuqmzBf",
+  "agent_id": "aa48728b2cd56f851",
+  "task_description": "Simplify review: altitude",
+  "token_usage": {
+    "input_tokens": 10,
+    "cache_creation_tokens": 42233,
+    "cache_read_tokens": 235027,
+    "output_tokens": 2978,
+    "api_call_count": 5
+  },
+  "started_at": "2026-10-29T13:17:41.126101407+01:00",
+  "completed_at": "2026-10-29T13:18:05.966639995+01:00"
+}
