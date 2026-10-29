@@ -31,6 +31,9 @@ Subcommands:
   (#213): for a host harness, or a configured non-``claude -p`` proposer, that
   generates its own candidates. Exit 0 iff the candidate was accepted, 1 if it
   was rejected or the run itself failed (store/IO) — never a silent no-op.
+  ``--kind rep-invariant --type TYPE`` stores a representation invariant for a
+  struct type instead (RFC-0007 kind 1, #387): a C predicate over ``self``, kept
+  once per type and *assumed* (never discharged at callers) when checked.
 - ``forseti check <source> --function NAME`` — check that unit's stored,
   checkable properties (#66) against ESBMC, one verdict each (``--json`` emits
   the ``PropertyCheckRun`` payload). Exit follows worst-outcome-wins over every
@@ -153,6 +156,7 @@ from .check import (
 )
 from .check import check_source
 from .grade import grade_source
+from .invariant import submit_invariant_source
 from .loop import (
     LOOP_MODE_CHOICES,
     SemanticLoopResult,
@@ -290,12 +294,14 @@ def _run_list_units(args: argparse.Namespace) -> int:
     return 0
 
 
-def _add_unit_store_arguments(p: argparse.ArgumentParser) -> None:
+def _add_unit_store_arguments(
+    p: argparse.ArgumentParser, *, function_required: bool = True
+) -> None:
     """`<source> --function NAME [--store-root DIR]`, shared by propose/check."""
     p.add_argument("source", type=Path, help="source file defining the unit")
     p.add_argument(
         "--function",
-        required=True,
+        required=function_required,
         metavar="NAME",
         help="the function under test (the `symbol` of `path::symbol`)",
     )
@@ -431,14 +437,37 @@ def _add_submit_property_parser(
             "Validate and store one already-formed candidate property for "
             "<source>::<function>, the same static checks `forseti propose` "
             "applies, without invoking any LLM. For a host harness (or a "
-            "configured non-claude proposer) that generates its own candidates."
+            "configured non-claude proposer) that generates its own candidates. "
+            "With --kind rep-invariant, store a representation invariant for a "
+            "struct type instead (--type, no --function)."
         ),
     )
-    _add_unit_store_arguments(p)
+    _add_unit_store_arguments(p, function_required=False)
+    p.add_argument(
+        "--kind",
+        choices=("semantic", "rep-invariant"),
+        default="semantic",
+        help="what the candidate asserts (default: semantic)",
+    )
+    p.add_argument(
+        "--type",
+        dest="type_name",
+        metavar="TYPE",
+        help=(
+            "--kind rep-invariant: the struct type (ring_t or 'struct node') the "
+            "invariant is over; stored once per type, shared by every function "
+            "taking TYPE *"
+        ),
+    )
     p.add_argument(
         "--expression",
         required=True,
-        help='the candidate\'s C boolean expression, e.g. "result >= 0"',
+        help=(
+            'the candidate\'s C boolean expression, e.g. "result >= 0"; for '
+            "--kind rep-invariant, over `self` (a const TYPE *), e.g. "
+            '"self->count <= CAP"; it is *assumed* at entry, never discharged '
+            "at callers"
+        ),
     )
     p.add_argument(
         "--domain",
@@ -509,23 +538,59 @@ def _add_submit_property_parser(
     p.set_defaults(func=_run_submit_property)
 
 
+def _submit_property_usage_error(args: argparse.Namespace) -> str | None:
+    """Why `submit-property`'s flags are inconsistent for its --kind, or None."""
+    if args.kind == "rep-invariant":
+        if not args.type_name:
+            return "--kind rep-invariant requires --type"
+        if args.function or args.domain or args.referenced_params:
+            return (
+                "--kind rep-invariant is per type: --function, --domain and "
+                "--referenced-param do not apply"
+            )
+        return None
+    if args.function is None:
+        return "the following arguments are required: --function"
+    if args.type_name:
+        return "--type applies to --kind rep-invariant only"
+    return None
+
+
 def _run_submit_property(args: argparse.Namespace) -> int:
+    usage = _submit_property_usage_error(args)
+    if usage is not None:
+        print(f"forseti submit-property: {usage}", file=sys.stderr)
+        return 2
     try:
-        result = submit_source(
-            args.source,
-            function=args.function,
-            expression=args.expression,
-            provider=args.provider,
-            model=args.model,
-            domain=args.domain,
-            referenced_params=args.referenced_params,
-            rationale=args.rationale,
-            prompt_id=args.prompt_id,
-            prompt_version=args.prompt_version,
-            persist=not args.no_store,
-            store_root=args.store_root,
-            max_candidates=args.max_candidates,
-        )
+        if args.kind == "rep-invariant":
+            result = submit_invariant_source(
+                args.source,
+                type_name=args.type_name,
+                expression=args.expression,
+                provider=args.provider,
+                model=args.model,
+                rationale=args.rationale,
+                prompt_id=args.prompt_id,
+                prompt_version=args.prompt_version,
+                persist=not args.no_store,
+                store_root=args.store_root,
+            )
+        else:
+            result = submit_source(
+                args.source,
+                function=args.function,
+                expression=args.expression,
+                provider=args.provider,
+                model=args.model,
+                domain=args.domain,
+                referenced_params=args.referenced_params,
+                rationale=args.rationale,
+                prompt_id=args.prompt_id,
+                prompt_version=args.prompt_version,
+                persist=not args.no_store,
+                store_root=args.store_root,
+                max_candidates=args.max_candidates,
+            )
     except (BlankProvenanceError, PropertyStoreError, OSError) as exc:
         print(f"forseti submit-property: {exc}", file=sys.stderr)
         return 1

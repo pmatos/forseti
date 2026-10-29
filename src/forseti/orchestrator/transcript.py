@@ -14,6 +14,8 @@ the property id and kind), and a per-outcome counts footer.
 
 from __future__ import annotations
 
+from forseti.properties import INVARIANT_ASSUMPTION_NOTE, PropertyKind
+
 from .check import VACUITY_LIMITATION, PropertyCheckRun
 from .loop import LoopRun
 from .report import report_for
@@ -68,4 +70,6 @@ def property_check_transcript(run: PropertyCheckRun) -> str:
     lines.append(f"Counts: {summary}")
     if counts["held"] or counts["vacuous"]:
         lines.append(f"Note: {VACUITY_LIMITATION}")
+    if any(v.kind == PropertyKind.REP_INVARIANT.value for v in run.verdicts):
+        lines.append(f"Assumed: {INVARIANT_ASSUMPTION_NOTE}")
     return "\n".join(lines)

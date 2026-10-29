@@ -43,8 +43,10 @@ from forseti.esbmc import (
 from forseti.precond.reachability import ProbeReachability, classify_site_probe
 from forseti.properties import (
     CHECKABLE_STATUSES,
+    INVARIANT_ASSUMPTION_NOTE,
     NON_VACUITY_LABEL,
     HarnessError,
+    InvariantNotApplicable,
     LengthBounds,
     Property,
     PropertyKind,
@@ -182,8 +184,12 @@ class PropertyVerdict:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        """A JSON-serializable dict — the shape the grading harness (#4) reads."""
-        return {
+        """A JSON-serializable dict — the shape the grading harness (#4) reads.
+
+        A representation-invariant verdict adds an ``assumption`` field: the
+        invariant is assumed at entry, not discharged at callers (#387).
+        """
+        payload: dict[str, Any] = {
             "property_id": self.property_id,
             "unit_id": self.unit_id,
             "kind": self.kind,
@@ -199,6 +205,9 @@ class PropertyVerdict:
                 else None
             ),
         }
+        if self.kind == PropertyKind.REP_INVARIANT.value:
+            payload["assumption"] = INVARIANT_ASSUMPTION_NOTE
+        return payload
 
 
 RunOutcome = Literal["held", "violated", "unknown", "error", "empty"]
@@ -367,7 +376,7 @@ def check_properties(
             index=index,
             detail={"property_id": prop.property_id, "kind": kind},
         )
-        if prop.kind is not PropertyKind.SEMANTIC:
+        if prop.kind is PropertyKind.REACHABILITY:
             reason = "reachability harnessing deferred (ADR-0009 D2)"
             verdicts.append(
                 PropertyVerdict.skipped(
@@ -383,6 +392,21 @@ def check_properties(
 
         try:
             rendered = render.render(unit, prop)
+        except InvariantNotApplicable as exc:
+            # A method that cannot mutate its `T *` has no exit obligation: nothing
+            # was checked, which is `skipped` -- never `held`, never an `error`.
+            reason = str(exc)
+            verdicts.append(
+                PropertyVerdict.skipped(
+                    prop.property_id, unit.unit_id, kind, reason=reason
+                )
+            )
+            emit(
+                "property.skipped",
+                index=index,
+                detail={"property_id": prop.property_id, "reason": reason},
+            )
+            continue
         except HarnessError as exc:
             # #64 renders fail-loud on an un-renderable property (e.g. a
             # postcondition that dereferences a scalar-backed output). Record it as

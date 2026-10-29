@@ -62,6 +62,28 @@ WHEN NEW.status = 'graded' AND NEW.grading_verdict IS NULL
 BEGIN SELECT RAISE(ABORT, 'a graded property requires a grading'); END;
 """
 
+# Representation invariants (#387) are keyed by a *type* (`path::T`), not a unit,
+# and live in their own table: `properties.kind` carries a CHECK that cannot be
+# widened on an existing database without rebuilding the table. `CREATE TABLE IF
+# NOT EXISTS` is the whole migration -- an older `forseti.db` simply gains it.
+_TYPE_INVARIANT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS type_invariants (
+    property_id    TEXT PRIMARY KEY,
+    type_id        TEXT NOT NULL,
+    expression     TEXT NOT NULL,
+    description    TEXT,
+    status         TEXT NOT NULL
+                     CHECK (status IN ('candidate','graded','accepted','rejected')),
+    prompt_id      TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    provider       TEXT NOT NULL DEFAULT '',
+    model          TEXT NOT NULL DEFAULT '',
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_type_invariants_type
+    ON type_invariants(type_id, status);
+"""
+
 _INSERT = """
 INSERT INTO properties (
     property_id, unit_id, kind, expression, domain, description, status,
@@ -104,6 +126,17 @@ class PropertyNotFound(PropertyStoreError):
     def __init__(self, property_id: str) -> None:
         self.property_id = property_id
         super().__init__(f"no such property: {property_id}")
+
+
+class WrongPropertyKind(PropertyStoreError):
+    """A property was handed to the store API that does not hold its kind."""
+
+    def __init__(self, property_id: str, kind: PropertyKind, *, expected: str) -> None:
+        self.property_id = property_id
+        self.kind = kind
+        super().__init__(
+            f"{property_id}: a {kind.value} property belongs in {expected}"
+        )
 
 
 class GradingRequired(PropertyStoreError):
@@ -168,6 +201,23 @@ def _row_to_property(row: sqlite3.Row) -> Property:
     )
 
 
+def _row_to_invariant(row: sqlite3.Row) -> Property:
+    return Property(
+        property_id=str(row["property_id"]),
+        unit_id=str(row["type_id"]),
+        kind=PropertyKind.REP_INVARIANT,
+        expression=str(row["expression"]),
+        status=PropertyStatus(row["status"]),
+        provenance=Provenance(
+            prompt_id=str(row["prompt_id"]),
+            prompt_version=str(row["prompt_version"]),
+            provider=str(row["provider"]),
+            model=str(row["model"]),
+        ),
+        description=row["description"],
+    )
+
+
 class PropertyStore:
     """SQLite-backed store of proposed properties, keyed by unit (`path::symbol`)."""
 
@@ -185,6 +235,7 @@ class PropertyStore:
     def _ensure_schema(self) -> None:
         with self._conn:
             self._conn.executescript(_SCHEMA)
+            self._conn.executescript(_TYPE_INVARIANT_SCHEMA)
             self._migrate_columns()
             self._conn.execute("PRAGMA user_version = 1")
 
@@ -236,8 +287,14 @@ class PropertyStore:
     def add(self, prop: Property) -> None:
         """Insert `prop`; raise `DuplicateProperty` if its id is already stored.
 
-        A GRADED `prop` must carry its `Grading` (`GradingRequired` otherwise).
+        A GRADED `prop` must carry its `Grading` (`GradingRequired` otherwise). A
+        representation invariant is per type, not per unit: `WrongPropertyKind`;
+        use `add_type_invariant`.
         """
+        if prop.kind is PropertyKind.REP_INVARIANT:
+            raise WrongPropertyKind(
+                prop.property_id, prop.kind, expected="add_type_invariant"
+            )
         if prop.status is PropertyStatus.GRADED and prop.grading is None:
             raise GradingRequired(prop.property_id)
         try:
@@ -283,6 +340,64 @@ class PropertyStore:
                 (unit_id, *(status.value for status in statuses)),
             )
         return tuple(_row_to_property(row) for row in cur.fetchall())
+
+    def add_type_invariant(self, prop: Property) -> None:
+        """Insert a representation invariant keyed by its type (`prop.unit_id`).
+
+        Raises `DuplicateProperty` for a stored content id and `WrongPropertyKind`
+        for any other kind. There is no grading slot, so a GRADED row is refused
+        (`GradingRequired`).
+        """
+        if prop.kind is not PropertyKind.REP_INVARIANT:
+            raise WrongPropertyKind(prop.property_id, prop.kind, expected="add")
+        if prop.status is PropertyStatus.GRADED:
+            raise GradingRequired(prop.property_id)
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT INTO type_invariants (property_id, type_id, expression, "
+                    "description, status, prompt_id, prompt_version, provider, model) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        prop.property_id,
+                        prop.unit_id,
+                        prop.expression,
+                        prop.description,
+                        prop.status.value,
+                        prop.provenance.prompt_id,
+                        prop.provenance.prompt_version,
+                        prop.provenance.provider,
+                        prop.provenance.model,
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise DuplicateProperty(prop.property_id) from exc
+
+    def get_type_invariant(self, property_id: str) -> Property | None:
+        """The stored representation invariant with `property_id`, or None."""
+        row = self._conn.execute(
+            "SELECT * FROM type_invariants WHERE property_id = ?", (property_id,)
+        ).fetchone()
+        return None if row is None else _row_to_invariant(row)
+
+    def list_for_type(
+        self,
+        type_id: str,
+        statuses: Collection[PropertyStatus] | None = None,
+    ) -> tuple[Property, ...]:
+        """Invariants of `type_id`, in insertion order; `()` if none.
+
+        `statuses` scopes the read exactly as `list_for_unit`'s does.
+        """
+        if statuses is not None and not statuses:
+            return ()
+        sql = "SELECT * FROM type_invariants WHERE type_id = ?"
+        args: list[str] = [type_id]
+        if statuses is not None:
+            sql += f" AND status IN ({','.join('?' * len(statuses))})"
+            args += [status.value for status in statuses]
+        rows = self._conn.execute(sql + " ORDER BY rowid", args).fetchall()
+        return tuple(_row_to_invariant(row) for row in rows)
 
     def update_status(self, property_id: str, new_status: PropertyStatus) -> Property:
         """Atomically validate and apply a status transition; return the result.

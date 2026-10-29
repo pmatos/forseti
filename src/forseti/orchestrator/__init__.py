@@ -14,6 +14,7 @@ from .check import (
     check_properties,
 )
 from .fix import FixProvider, FixRequest, ProviderFixPort, RecordedFixProvider
+from .invariant import InvariantHarnessWriter, InvariantsOfType
 from .ladder import LadderAttempt, validated_ladder, verify_ladder
 from .loop import DEFAULT_MAX_ITERATIONS, Iteration, LoopRun, run_loop
 from .persistence import persist_property_check, persist_run
@@ -47,6 +48,8 @@ __all__ = [
     "FixRequest",
     "GiveUpReason",
     "HarnessWriterPort",
+    "InvariantHarnessWriter",
+    "InvariantsOfType",
     "Iteration",
     "IterationReport",
     "JsonlSink",

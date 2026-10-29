@@ -17,7 +17,7 @@ the only alternative. No libclang/pycparser: the base install is dependency-free
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 
 
@@ -50,6 +50,25 @@ class BufferParam:
     length: str
     const: bool = False
     out: bool = False
+
+
+@dataclass(frozen=True)
+class StructParam(BufferParam):
+    """A pointer to one of the caller-named struct types (a representation-
+    invariant subject, #387): a single instance (`length == "1"`), never a
+    `(buffer, length)` pair.
+
+    A `BufferParam` subtype, so `Param` and every consumer that treats a pointer
+    as a one-element buffer stay valid; the invariant renderer tests for it first
+    and binds one nondet instance passed by address. `elem_ctype` is the type
+    (``ring_t`` or ``struct node``); `const` is about the *pointee*
+    (``const T *p``), the only thing that decides whether the unit can mutate it --
+    ``T *const p`` is still a mutator.
+    """
+
+    @property
+    def type_name(self) -> str:
+        return self.elem_ctype
 
 
 Param = ScalarParam | BufferParam  # sealed union (repo style)
@@ -100,7 +119,9 @@ _INT_TYPE_RE = re.compile(
 _FLOAT_TYPE_RE = re.compile(r"\b(?:float|double)\b")
 
 
-def extract_signature(unit_source: str, symbol: str) -> UnitSignature:
+def extract_signature(
+    unit_source: str, symbol: str, *, struct_types: Collection[str] = ()
+) -> UnitSignature:
     """Best-effort regex parse of `symbol`'s signature from `unit_source`.
 
     No libclang/pycparser (the base install is dependency-free). Isolated from
@@ -113,6 +134,11 @@ def extract_signature(unit_source: str, symbol: str) -> UnitSignature:
     found or a param can't be classified -- non-load-bearing and fail-loud, so a
     parser miss never silently corrupts a harness (the caller can always hand-
     build a `UnitSignature`).
+
+    A pointer whose pointee is one of `struct_types` (spelled as in the source,
+    ``ring_t`` or ``struct node``) is a `StructParam` instead, whatever follows it:
+    ``(ring_t *r, int v)`` is not a buffer of length ``v``. Empty by default, so
+    every existing caller parses exactly as before.
     """
     pattern = re.compile(
         r"([A-Za-z_][\w \t\*]*?[\s\*])" + re.escape(symbol) + r"\s*\(([^)]*)\)\s*\{"
@@ -129,7 +155,7 @@ def extract_signature(unit_source: str, symbol: str) -> UnitSignature:
     return UnitSignature(
         symbol=symbol,
         return_ctype=return_ctype,
-        params=_to_params(raws),
+        params=_to_params(raws, frozenset(struct_types)),
     )
 
 
@@ -186,11 +212,28 @@ def _parse_fragment(frag: str, symbol: str) -> _RawParam:
     )
 
 
-def _to_params(raws: Sequence[_RawParam]) -> tuple[Param, ...]:
+def _to_params(
+    raws: Sequence[_RawParam], struct_types: frozenset[str]
+) -> tuple[Param, ...]:
     params: list[Param] = []
     for i, raw in enumerate(raws):
         if not raw.is_ptr:
             params.append(ScalarParam(ctype=raw.type_str, name=raw.name))
+            continue
+        pointee = _elem_ctype(raw.type_str)
+        if (
+            raw.array_len is None
+            and raw.type_str.count("*") == 1
+            and pointee in struct_types
+        ):
+            params.append(
+                StructParam(
+                    elem_ctype=pointee,
+                    name=raw.name,
+                    length="1",
+                    const=_pointee_is_const(raw.type_str),
+                )
+            )
             continue
         nxt = raws[i + 1] if i + 1 < len(raws) else None
         if raw.array_len:
@@ -227,6 +270,11 @@ def _elem_ctype(type_str: str) -> str:
     """A pointer/array param's element type: drop ``const`` and ``*``."""
     without_const = re.sub(r"\bconst\b", "", type_str).replace("*", " ")
     return " ".join(without_const.split())
+
+
+def _pointee_is_const(type_str: str) -> bool:
+    """``const T *`` (a ``const`` before the ``*``), not ``T *const``."""
+    return re.search(r"\bconst\b[^*]*\*", type_str) is not None
 
 
 def _is_integer_type(type_str: str) -> bool:
