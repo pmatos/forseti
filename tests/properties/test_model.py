@@ -66,6 +66,7 @@ def test_to_dict_roundtrips_fields_without_grading() -> None:
             "prompt_version": "1",
             "provider": "",
             "model": "",
+            "recipe": "",
         },
         "domain": ["x > INT64_MIN"],
         "grading": None,

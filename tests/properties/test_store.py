@@ -499,3 +499,68 @@ def test_ddl_check_guards_kind_against_raw_sql() -> None:
             " prompt_id, prompt_version) "
             "VALUES ('id', 'u::f', 'bogus', 'e', 'candidate', 'p', '1')"
         )
+
+
+def test_recipe_round_trips_through_the_store(tmp_path: Path) -> None:
+    prop = dataclasses.replace(
+        make_prop(), provenance=Provenance("semantic", "1", "p", "m", "blind/v1")
+    )
+    with PropertyStore.open(tmp_path) as store:
+        store.add(prop)
+    with PropertyStore.open(tmp_path) as store:
+        got = store.get(prop.property_id)
+    assert got is not None
+    assert got.provenance == prop.provenance
+    assert got.provenance.to_dict()["recipe"] == "blind/v1"
+
+
+def test_ensure_schema_migrates_a_pre_recipe_db_keeping_its_rows(
+    tmp_path: Path,
+) -> None:
+    """A `forseti.db` written before #388 has no `recipe` column; its rows keep
+    reading back with no recipe and new rows can carry one."""
+    db_path = tmp_path / "forseti.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE properties (
+            property_id       TEXT PRIMARY KEY,
+            unit_id           TEXT NOT NULL,
+            kind              TEXT NOT NULL,
+            expression        TEXT NOT NULL,
+            domain            TEXT NOT NULL DEFAULT '[]',
+            description       TEXT,
+            status            TEXT NOT NULL,
+            prompt_id         TEXT NOT NULL,
+            prompt_version    TEXT NOT NULL,
+            provider          TEXT NOT NULL DEFAULT '',
+            model             TEXT NOT NULL DEFAULT '',
+            grading_verdict   TEXT,
+            grading_kill_rate REAL,
+            grading_reason    TEXT
+        );
+        INSERT INTO properties (property_id, unit_id, kind, expression, status,
+                                prompt_id, prompt_version, provider, model)
+        VALUES ('old', 'u.c::f', 'semantic', 'result > 0', 'candidate',
+                'semantic', '1', 'claude -p', 'sonnet');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with PropertyStore(sqlite3.connect(db_path)) as store:
+        old = store.get("old")
+        assert old is not None
+        assert old.provenance == Provenance("semantic", "1", "claude -p", "sonnet")
+        assert old.provenance.recipe == ""
+
+        new = dataclasses.replace(
+            make_prop(), provenance=Provenance("semantic", "1", "p", "m", "sighted/v1")
+        )
+        store.add(new)
+        got = store.get(new.property_id)
+        assert got is not None
+        assert got.provenance.recipe == "sighted/v1"
+
+    with PropertyStore(sqlite3.connect(db_path)) as reopened:
+        assert reopened.get("old") is not None

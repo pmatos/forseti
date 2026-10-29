@@ -724,5 +724,9 @@ def _provenance_from(raw: object) -> Provenance:
         return value if isinstance(value, str) else ""
 
     return Provenance(
-        text("prompt_id"), text("prompt_version"), text("provider"), text("model")
+        text("prompt_id"),
+        text("prompt_version"),
+        text("provider"),
+        text("model"),
+        text("recipe"),
     )

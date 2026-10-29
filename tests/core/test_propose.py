@@ -17,7 +17,12 @@ import pytest
 
 from forseti.core import propose_source
 from forseti.core.cli import main
-from forseti.properties import LLMError, PropertyStore, PropertyStoreError
+from forseti.properties import (
+    LLMError,
+    PropertyStore,
+    PropertyStoreError,
+    RecipeError,
+)
 
 if TYPE_CHECKING:
     from forseti.properties import LLMClient
@@ -227,3 +232,95 @@ if TYPE_CHECKING:
 
     def _raising_is_client(c: RaisingLLMClient) -> LLMClient:
         return c
+
+
+def test_propose_source_with_a_recipe_sends_the_context_and_stores_its_ref(
+    tmp_path: Path,
+) -> None:
+    source = _write_unit(tmp_path)
+    root = tmp_path / ".forseti"
+    client = FakeLLMClient()
+
+    result = propose_source(
+        source, function="my_abs", store_root=root, client=client, recipe="blind"
+    )
+
+    assert "return (x < 0)" not in client.prompts[0]
+    assert "int64_t my_abs(int64_t x);" in client.prompts[0]
+    with PropertyStore.open(root) as store:
+        stored = store.list_for_unit(f"{source}::my_abs")
+    assert stored
+    assert {p.provenance.recipe for p in stored} == {"blind/v1"}
+    assert result.accepted
+    assert {p.provenance.recipe for p in result.accepted} == {"blind/v1"}
+
+
+def test_propose_source_without_a_recipe_sends_the_whole_file(tmp_path: Path) -> None:
+    source = _write_unit(tmp_path)
+    client = FakeLLMClient()
+    propose_source(source, function="my_abs", persist=False, client=client)
+    assert ABS_SLICE in client.prompts[0]
+
+
+def test_propose_source_rejects_an_unknown_recipe_before_the_llm(
+    tmp_path: Path,
+) -> None:
+    source = _write_unit(tmp_path)
+    client = FakeLLMClient()
+    with pytest.raises(RecipeError):
+        propose_source(
+            source, function="my_abs", persist=False, client=client, recipe="nope"
+        )
+    assert client.prompts == []
+
+
+def test_cli_propose_recipe_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = _write_unit(tmp_path)
+    monkeypatch.setattr("forseti.core.propose.ClaudeCliClient", FakeLLMClient)
+    code = main(
+        [
+            "propose",
+            str(source),
+            "--function",
+            "my_abs",
+            "--no-store",
+            "--json",
+            "--recipe",
+            "sighted",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert {a["provenance"]["recipe"] for a in payload["accepted"]} == {"sighted/v1"}
+
+
+def test_cli_propose_unknown_recipe_is_an_argument_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = _write_unit(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        main(["propose", str(source), "--function", "my_abs", "--recipe", "nope"])
+    assert exc.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
+
+
+def test_cli_propose_recipe_that_cannot_be_built_exits_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = _write_unit(tmp_path)
+    monkeypatch.setattr("forseti.core.propose.ClaudeCliClient", FakeLLMClient)
+    code = main(
+        [
+            "propose",
+            str(source),
+            "--function",
+            "absent",
+            "--no-store",
+            "--recipe",
+            "blind",
+        ]
+    )
+    assert code == 1
+    assert "no definition of 'absent'" in capsys.readouterr().err

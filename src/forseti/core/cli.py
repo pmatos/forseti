@@ -115,12 +115,14 @@ from forseti.grading import GradeRun, MutationError, grade_transcript
 from forseti.orchestrator import PropertyCheckRun, property_check_transcript
 from forseti.precond import DEFAULT_MAX_LEN
 from forseti.properties import (
+    RECIPES,
     BlankProvenanceError,
     CandidateSpec,
     LLMError,
     PropertyStoreError,
     ProposalParseError,
     ProposalResult,
+    RecipeError,
     parse_candidate_list,
 )
 from forseti.update_notice import installed_version, update_notice
@@ -306,6 +308,20 @@ def _add_unit_store_arguments(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_recipe_argument(p: argparse.ArgumentParser, *, scope: str = "") -> None:
+    p.add_argument(
+        "--recipe",
+        choices=tuple(RECIPES),
+        help=(
+            f"{scope}input recipe: what the proposer sees instead of the whole "
+            "file (baseline: minus main and the header comment; sighted: the "
+            "function, its doc comment and the types/macros it uses; blind: "
+            "sighted without the body). Recorded on each stored property "
+            "(default: the whole file)"
+        ),
+    )
+
+
 def _add_propose_parser(
     sub: argparse._SubParsersAction[argparse.ArgumentParser],
 ) -> None:
@@ -349,6 +365,7 @@ def _add_propose_parser(
         metavar="N",
         help=f"cap on accepted candidates (default: {DEFAULT_MAX_CANDIDATES})",
     )
+    _add_recipe_argument(p)
     p.add_argument(
         "--json",
         action="store_true",
@@ -386,8 +403,15 @@ def _run_propose(args: argparse.Namespace) -> int:
             claude_bin=args.claude_bin,
             timeout_s=args.timeout,
             max_candidates=args.max_candidates,
+            recipe=args.recipe,
         )
-    except (LLMError, ProposalParseError, PropertyStoreError, OSError) as exc:
+    except (
+        LLMError,
+        ProposalParseError,
+        PropertyStoreError,
+        RecipeError,
+        OSError,
+    ) as exc:
         print(f"forseti propose: {exc}", file=sys.stderr)
         return 1
     if args.json:
@@ -861,6 +885,7 @@ def _add_semantic_loop_parser(
         metavar="N",
         help=f"cap on accepted candidates (default: {DEFAULT_MAX_CANDIDATES})",
     )
+    _add_recipe_argument(p, scope="--mode propose only: ")
     _add_check_phase_arguments(
         p,
         json_help="emit the run as a JSON object (the MCP tool's payload)",
@@ -969,6 +994,7 @@ def _semantic_loop(
             propose_model=args.propose_model,
             claude_bin=args.claude_bin,
             propose_timeout_s=args.propose_timeout,
+            recipe=args.recipe,
             **_check_phase_kwargs(args, timeout_kw="check_timeout_s"),
         )
     except (

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 from forseti.properties import (
     DEFAULT_PROMPT,
     PROMPTS,
@@ -57,3 +59,33 @@ def test_render_uses_custom_result_ident() -> None:
         result_ident="__ret",
     )
     assert "__ret" in rendered
+
+
+def test_render_without_context_is_byte_identical_to_the_whole_file_prompt() -> None:
+    source = "int64_t my_abs(int64_t x) {\n    return (x < 0) ? -x : x;\n}\n"
+    rendered = render_prompt(
+        SEMANTIC_V1,
+        unit_id="u.c::my_abs",
+        symbol="my_abs",
+        source_text=source,
+        max_candidates=6,
+    )
+    # sha256 of the prompt as rendered before `context` existed (origin/main
+    # at ef0eb97): a change here changes every un-recipe'd proposal.
+    assert (
+        hashlib.sha256(rendered.encode()).hexdigest()
+        == "92786517e96df725293ddf513c958ef26285db65d32ae737e534286d144305e8"
+    )
+
+
+def test_render_shows_the_context_instead_of_the_source() -> None:
+    rendered = render_prompt(
+        SEMANTIC_V1,
+        unit_id="u.c::f",
+        symbol="f",
+        source_text="WHOLE FILE",
+        context="int f(void);",
+    )
+    assert "int f(void);" in rendered
+    assert "WHOLE FILE" not in rendered
+    assert "<<" not in rendered

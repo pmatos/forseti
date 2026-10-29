@@ -109,6 +109,7 @@ def propose_tool(
     model: str = DEFAULT_MODEL,
     timeout_s: float = PROPOSE_TIMEOUT_S,
     max_candidates: int = DEFAULT_MAX_CANDIDATES,
+    recipe: str | None = None,
 ) -> dict[str, object]:
     """Propose candidate properties for a unit and (optionally) store them.
 
@@ -121,6 +122,11 @@ def propose_tool(
         model: The LLM model the proposer calls.
         timeout_s: Per-call timeout for the proposer's LLM invocation.
         max_candidates: Cap on the number of accepted candidates.
+        recipe: Input recipe selecting what the proposer is shown instead of
+            the whole file: "baseline" (whole file minus `main` and the header
+            comment), "sighted" (the function, its doc comment and the
+            types/macros it uses) or "blind" (sighted without the body).
+            Omitted: the whole file. Recorded on each stored property.
 
     Returns:
         A JSON object with the unit id, prompt/backend provenance, and the
@@ -134,6 +140,7 @@ def propose_tool(
         model=model,
         timeout_s=timeout_s,
         max_candidates=max_candidates,
+        recipe=recipe,
     )
     return result.to_dict()
 
@@ -319,6 +326,7 @@ def semantic_loop_tool(
     timeout_s: float = CHECK_TIMEOUT_S,
     esbmc_bin: str = "esbmc",
     max_len: int = DEFAULT_MAX_LEN,
+    recipe: str | None = None,
 ) -> dict[str, object]:
     """The composed semantic-property loop (#213): ingest, then check -- one call.
 
@@ -352,6 +360,12 @@ def semantic_loop_tool(
             not constrain; a verdict is then scoped to `len<=max_len` (reported
             in its `length_bounds`); an explicit `unwind`/`unwind_ladder` must
             reach `max_len + 1` to settle (the default ladder is extended).
+        recipe: `mode="propose"` only -- input recipe selecting what the
+            proposer is shown instead of the whole file: "baseline" (whole
+            file minus `main` and the header comment), "sighted" (the
+            function, its doc comment and the types/macros it uses) or "blind"
+            (sighted without the body). Omitted: the whole file. Recorded on
+            each stored property.
 
     Returns:
         A JSON object with the unit id, `mode`, the per-candidate ingestion
@@ -380,6 +394,7 @@ def semantic_loop_tool(
         check_timeout_s=timeout_s,
         esbmc_bin=esbmc_bin,
         max_len=max_len,
+        recipe=recipe,
     )
     return result.to_dict()
 

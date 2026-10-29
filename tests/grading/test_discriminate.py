@@ -728,6 +728,7 @@ def test_proposer_provenance_is_read_back_and_reported() -> None:
             "prompt_version": "3",
             "provider": "claude -p",
             "model": "sonnet",
+            "recipe": "blind/v1",
             "extra": 1,
         },
     }
@@ -735,7 +736,7 @@ def test_proposer_provenance_is_read_back_and_reported() -> None:
         [entry, {"expression": "f"}, {"expression": "g", "provenance": {"model": 7}}],
         unit_id="u",
     )
-    assert got.provenance == Provenance("blind", "3", "claude -p", "sonnet")
+    assert got.provenance == Provenance("blind", "3", "claude -p", "sonnet", "blind/v1")
     assert bare.provenance == Provenance("", "")
     assert odd.provenance == Provenance("", "")
     score = PropertyScore(

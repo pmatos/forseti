@@ -734,3 +734,52 @@ def test_cli_max_len_flag_reaches_the_check_phase(
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["check"]["verdicts"][0]["length_bounds"] == {"n": 5}
+
+
+def test_cli_propose_mode_recipe_is_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = _write_unit(tmp_path)
+    monkeypatch.setattr("forseti.core.propose.ClaudeCliClient", FakeLLMClient)
+    _patch_verify(monkeypatch, FakeVerify([Verified(_meta())]))
+
+    code = main(
+        [
+            "semantic-loop",
+            str(source),
+            "--function",
+            "my_abs",
+            "--mode",
+            "propose",
+            "--recipe",
+            "blind",
+            "--store-root",
+            str(tmp_path / ".forseti"),
+            "--json",
+        ]
+    )
+    assert code == 0
+    accepted = json.loads(capsys.readouterr().out)["ingestion"][0]["accepted"]
+    assert {a["provenance"]["recipe"] for a in accepted} == {"blind/v1"}
+
+
+def test_cli_recipe_outside_propose_mode_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = _write_unit(tmp_path)
+    code = main(
+        [
+            "semantic-loop",
+            str(source),
+            "--function",
+            "my_abs",
+            "--mode",
+            "check-only",
+            "--recipe",
+            "blind",
+            "--store-root",
+            str(tmp_path / ".forseti"),
+        ]
+    )
+    assert code == 1
+    assert "does not take a recipe" in capsys.readouterr().err

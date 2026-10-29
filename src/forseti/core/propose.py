@@ -48,6 +48,7 @@ def propose_source(
     timeout_s: float = DEFAULT_TIMEOUT_S,
     max_candidates: int = DEFAULT_MAX_CANDIDATES,
     client: LLMClient | None = None,
+    recipe: str | None = None,
 ) -> ProposalResult:
     """Propose candidate properties for a unit's function; optionally store them.
 
@@ -62,8 +63,14 @@ def propose_source(
     `sqlite3.Error` from opening or writing the store (e.g. a corrupt `forseti.db`)
     is translated to `PropertyStoreError`, so both Core faces get a stable
     domain-level failure instead of an uncaught SQLite traceback.
+
+    `recipe` selects what the prompt shows instead of the whole file (`baseline`,
+    `sighted`, `blind`; `RecipeError` if unknown or it cannot be built); `None`
+    sends the whole file. The recipe's project root is `store_root`'s parent.
     """
-    request = prepare_proposal_request(source, function=function)
+    request = prepare_proposal_request(
+        source, function=function, recipe=recipe, project_root=store_root.parent
+    )
     llm = client or ClaudeCliClient(
         model=model, claude_bin=claude_bin, timeout_s=timeout_s
     )
