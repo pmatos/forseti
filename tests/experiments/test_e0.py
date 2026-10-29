@@ -176,13 +176,11 @@ def test_the_checked_in_manifest_describes_the_e0_grid() -> None:
     assert manifest.recipes == ("baseline", "blind", "sighted")
     assert manifest.samples == 3
     assert manifest.esbmc_timeout_s == 30
-    assert len(manifest.cells()) == 54
+    assert len(manifest.cells()) == 36
     assert {u.symbol for u in manifest.units} == {
-        "rb_push",
         "msort",
         "utf8_decode",
         "murmur3_32",
-        "sha1_update",
         "sum_bytes",
     }
     assert not any("abs" in u.path for u in manifest.units)
@@ -200,7 +198,7 @@ def test_the_checked_in_manifest_builds_every_request(
 
     prepared = e0._prepare(manifest, esbmc_bin="esbmc", verify_for=FakeEsbmc())
 
-    assert len(prepared) == 6
+    assert len(prepared) == 4
     for unit in prepared:
         assert set(unit.requests) == {"baseline", "blind", "sighted"}
         assert [t.name for t in unit.targets] == ["clean", "twin"]
