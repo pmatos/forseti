@@ -44,7 +44,7 @@ from .invariant import (
     render_invariant_harness,
     valid_type_name,
 )
-from .llm import ClaudeCliClient, LLMClient, LLMError
+from .llm import ClaudeCliClient, LLMClient, LLMError, LLMUsage
 from .model import (
     CHECKABLE_STATUSES,
     Grading,
@@ -127,6 +127,7 @@ __all__ = [
     "InvariantRole",
     "LLMClient",
     "LLMError",
+    "LLMUsage",
     "LengthBounds",
     "Param",
     "PromptTemplate",

@@ -29,7 +29,7 @@ usable-pair filter narrows this, because S0 passes the buggy version.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -49,6 +49,7 @@ from forseti.orchestrator import (
 from forseti.orchestrator.semantic_check import (
     DEFAULT_TIMEOUT_S,
     DEFAULT_UNWIND,
+    FixedProperties,
     SemanticCheckPlan,
 )
 from forseti.orchestrator.semantic_check import (
@@ -351,19 +352,6 @@ def _inconclusive_reason(fixed: PropertyVerdict, buggy: PropertyVerdict) -> str:
     return "; ".join(parts + notes)
 
 
-class _FixedPropertySet:
-    """A `PropertyStorePort` that serves one property set for any unit id, so the
-    same properties are rendered against both versions (their unit ids differ)."""
-
-    def __init__(self, props: Sequence[Property]) -> None:
-        self._props = tuple(props)
-
-    def list_for_unit(
-        self, unit_id: str, statuses: Collection[PropertyStatus] | None = None
-    ) -> Sequence[Property]:
-        return self._props
-
-
 def score_pair(
     *,
     buggy: Path,
@@ -439,7 +427,7 @@ def score_pair(
 
     verify_for = plan.verify_for
     writer = plan.writer
-    store = _FixedPropertySet(properties)
+    store = FixedProperties(properties)
 
     def run_on(unit: Unit, source: Path, subdir: str) -> PropertyCheckRun:
         return check_properties(

@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from forseti._events import record_event
-from forseti.esbmc import Error, EsbmcResult, Unknown
+from forseti.esbmc import Error, Unknown
 from forseti.orchestrator import (
     HarnessWriterPort,
     PropertyCheckRun,
@@ -55,7 +55,9 @@ from forseti.orchestrator import (
 from forseti.orchestrator.semantic_check import (
     DEFAULT_TIMEOUT_S,
     DEFAULT_UNWIND,
+    FixedProperties,
     SemanticCheckPlan,
+    TimedVerify,
 )
 from forseti.precond import DEFAULT_MAX_LEN
 from forseti.properties import (
@@ -296,31 +298,6 @@ class GradeRun:
         }
 
 
-class _TimedVerify:
-    """A `VerifyPort` that sums the ESBMC time of the runs it forwards."""
-
-    def __init__(self, port: VerifyPort) -> None:
-        self._port = port
-        self.seconds = 0.0
-
-    def __call__(self, source: Path, /, *, unwind: int) -> EsbmcResult:
-        result = self._port(source, unwind=unwind)
-        self.seconds += result.meta.duration_s
-        return result
-
-
-class _PropertyView:
-    """A `PropertyStorePort` over a fixed property list, whatever the unit id."""
-
-    def __init__(self, props: Sequence[Property]) -> None:
-        self._props = tuple(props)
-
-    def list_for_unit(
-        self, unit_id: str, statuses: object = None
-    ) -> Sequence[Property]:
-        return self._props
-
-
 @dataclass(frozen=True)
 class _Subject:
     """A kept mutant as the equivalence filter sees it (`MutantLike`)."""
@@ -508,11 +485,11 @@ def grade_unit(
 
     stored = tuple(store.list_for_unit(unit.unit_id))
     candidates = [p for p in stored if p.status is PropertyStatus.CANDIDATE]
-    baseline_timer = _TimedVerify(port_for(source))
+    baseline_timer = TimedVerify(port_for(source))
     baseline = (
         check_properties(
             unit,
-            store=_PropertyView(candidates),
+            store=FixedProperties(candidates),
             render=writer,
             verify=baseline_timer,
             work_dir=work_dir / "original",
@@ -604,10 +581,10 @@ def grade_unit(
                 readings[prop.property_id].append(skipped)
             continue
         for prop in held:
-            timer = _TimedVerify(port_for(source))
+            timer = TimedVerify(port_for(source))
             got = check_properties(
                 subject.unit,
-                store=_PropertyView([prop]),
+                store=FixedProperties([prop]),
                 render=writer,
                 verify=timer,
                 work_dir=work_dir / f"m{index}",

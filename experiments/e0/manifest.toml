@@ -1,0 +1,61 @@
+# RFC-0007 E0: the recipe x sample proposer grid on Tier 0 (#389).
+#
+#   python -m forseti.experiments.e0 run experiments/e0/manifest.toml --run-dir runs/e0
+#   python -m forseti.experiments.e0 summary runs/e0
+#
+# Run from the repository root: the paths below are read relative to it.
+# 6 kernels x 3 recipes x 3 samples = 54 proposer calls, each followed by ESBMC
+# checks of the accepted properties on the clean source and on its `_bug` twin.
+# `abs` is excluded (RFC-0007, Corpus): its few-shot example contaminates it.
+# E0 measures the machinery, M1 and M5; Tier 0 has no usable bug pair, so the
+# twin columns are reported but are not M2.
+
+name = "e0"
+model = "sonnet"
+recipes = ["baseline", "blind", "sighted"]
+samples = 3
+max_candidates = 6
+
+# ESBMC bounds. `esbmc_timeout_s` bounds each ESBMC invocation (one rung of the
+# unwind ladder, or a vacuity probe), not a whole property. With the default
+# ladder (unwind, then 8, 16) a property that never settles costs up to
+# 3 x 30 s. A unit may override `unwind`, `unwind_ladder` and `max_len`.
+unwind = 4
+max_len = 4
+esbmc_timeout_s = 30
+proposer_timeout_s = 240
+
+[[units]]
+path = "examples/ring_buffer.c"
+symbol = "rb_push"
+twin = "examples/ring_buffer_bug.c"
+
+[[units]]
+path = "examples/merge_sort.c"
+symbol = "msort"
+twin = "examples/merge_sort_bug.c"
+# RFC-0007: UNKNOWN (timeouts) at max_len 4. Re-measured with a stand-in property
+# on ESBMC 8.6.0: at 4 both versions time out at every rung of the ladder; at 2
+# both settle within ~10 s. A smaller bound, as the RFC prescribes, rather than
+# dropping the unit.
+max_len = 2
+
+[[units]]
+path = "examples/utf8_decode.c"
+symbol = "utf8_decode"
+twin = "examples/utf8_decode_bug.c"
+
+[[units]]
+path = "examples/murmurhash.c"
+symbol = "murmur3_32"
+twin = "examples/murmurhash_bug.c"
+
+[[units]]
+path = "examples/sha1.c"
+symbol = "sha1_update"
+twin = "examples/sha1_bug.c"
+
+[[units]]
+path = "examples/frame_checksum.c"
+symbol = "sum_bytes"
+twin = "examples/frame_checksum_bug.c"

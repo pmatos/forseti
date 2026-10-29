@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from forseti.properties import ClaudeCliClient, LLMError
+from forseti.properties import ClaudeCliClient, LLMError, LLMUsage
 
 
 def _install_fake_run(
@@ -110,3 +110,51 @@ def test_os_error_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_run(monkeypatch, raises=OSError("bad fd"))
     with pytest.raises(LLMError, match="invocation failed"):
         ClaudeCliClient().complete("p")
+
+
+def test_complete_with_usage_reports_the_envelope_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    envelope = json.dumps(
+        {
+            "is_error": False,
+            "result": "HELLO",
+            "total_cost_usd": 0.25,
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 34,
+                "cache_read_input_tokens": 5,
+                "cache_creation_input_tokens": 6,
+            },
+        }
+    )
+    _install_fake_run(monkeypatch, stdout=envelope)
+
+    text, usage = ClaudeCliClient().complete_with_usage("p")
+
+    assert text == "HELLO"
+    assert usage == LLMUsage(12, 34, 5, 6, 0.25)
+    assert usage.to_dict()["output_tokens"] == 34
+
+
+def test_complete_with_usage_is_none_when_the_envelope_reports_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_run(
+        monkeypatch,
+        stdout=json.dumps({"is_error": False, "result": "x", "usage": "n/a"}),
+    )
+    assert ClaudeCliClient().complete_with_usage("p") == ("x", None)
+
+
+def test_complete_with_usage_keeps_the_fields_the_envelope_gave(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    envelope = {
+        "is_error": False,
+        "result": "x",
+        "total_cost_usd": True,
+        "usage": {"input_tokens": 7, "output_tokens": "many"},
+    }
+    _install_fake_run(monkeypatch, stdout=json.dumps(envelope))
+    assert ClaudeCliClient().complete_with_usage("p")[1] == LLMUsage(input_tokens=7)
