@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import subprocess
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 # Truncate captured stderr / envelope text in error messages so a runaway model
 # or a stack trace can't bloat the raised exception.
@@ -51,6 +51,53 @@ class LLMClient(Protocol):
 
 
 @dataclass(frozen=True)
+class LLMUsage:
+    """What a provider reported for one completion; ``None`` where it did not.
+
+    Optional beside `LLMClient.complete`: a client that reports usage offers
+    ``complete_with_usage`` (as `ClaudeCliClient` does) and callers that want the
+    numbers look for it, so the `LLMClient` protocol itself is unchanged.
+    """
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_creation_tokens: int | None = None
+    cost_usd: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_creation_tokens": self.cache_creation_tokens,
+            "cost_usd": self.cost_usd,
+        }
+
+
+def _usage_from_envelope(envelope: dict[str, Any]) -> LLMUsage | None:
+    """The usage a ``claude -p`` envelope reports, or `None` when it reports none."""
+    raw = envelope.get("usage")
+    usage = raw if isinstance(raw, dict) else {}
+
+    def count(key: str) -> int | None:
+        value = usage.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    cost = envelope.get("total_cost_usd")
+    reading = LLMUsage(
+        input_tokens=count("input_tokens"),
+        output_tokens=count("output_tokens"),
+        cache_read_tokens=count("cache_read_input_tokens"),
+        cache_creation_tokens=count("cache_creation_input_tokens"),
+        cost_usd=float(cost)
+        if isinstance(cost, int | float) and not isinstance(cost, bool)
+        else None,
+    )
+    return reading if any(v is not None for v in reading.to_dict().values()) else None
+
+
+@dataclass(frozen=True)
 class ClaudeCliClient:
     """`LLMClient` backed by ``claude -p`` (ADR-0009 D3, v1 hardcoded backend).
 
@@ -68,6 +115,13 @@ class ClaudeCliClient:
 
     def complete(self, prompt: str) -> str:
         """Run ``claude -p`` on `prompt`; return the model's text or raise `LLMError`.
+
+        `complete_with_usage` is the same call, with the reported usage beside it.
+        """
+        return self.complete_with_usage(prompt)[0]
+
+    def complete_with_usage(self, prompt: str) -> tuple[str, LLMUsage | None]:
+        """`complete`, plus the envelope's token and cost report (`None` if absent).
 
         ``--output-format json`` yields one envelope
         ``{"type","subtype","is_error","result",...}``; the assistant's text is
@@ -112,7 +166,7 @@ class ClaudeCliClient:
         result = envelope.get("result")
         if not isinstance(result, str) or not result.strip():
             raise LLMError("claude returned an empty or absent result")
-        return result
+        return result, _usage_from_envelope(envelope)
 
 
 if TYPE_CHECKING:
