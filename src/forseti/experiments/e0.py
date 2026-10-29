@@ -46,12 +46,15 @@ The grid (about 54 proposer calls and hours of ESBMC)::
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import json
 import shutil
 import sys
 import time
 import tomllib
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -76,10 +79,8 @@ from forseti.properties import (
     RECIPES,
     ClaudeCliClient,
     LLMClient,
-    LLMError,
     LLMUsage,
     Property,
-    ProposalParseError,
     ProposalRequest,
     RecipeError,
     propose_properties,
@@ -97,10 +98,12 @@ DEFAULT_MODEL = "sonnet"
 
 _MANIFEST_FILE = "manifest.json"
 _WORK_DIR = "work"
+_LOCK_FILE = ".lock"
 _SUMMARY_MD = "summary.md"
 _SUMMARY_JSON = "summary.json"
 
 CellKey = tuple[str, str, int]  # (unit id, recipe ref, sample)
+CheckKey = tuple[CellKey, int, str, str]  # (cell, attempt, property id, target)
 
 
 class E0Error(Exception):
@@ -129,6 +132,28 @@ class UnitSpec:
             ),
             "max_len": self.max_len,
         }
+
+
+_FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
+    "name": str,
+    "model": str,
+    "samples": int,
+    "max_candidates": int,
+    "unwind": int,
+    "max_len": int,
+    "esbmc_timeout_s": (int, float),
+    "proposer_timeout_s": (int, float),
+}
+
+
+def _require_ladder(value: object, where: str) -> None:
+    if value is not None and (
+        not isinstance(value, list)
+        or not all(
+            isinstance(rung, int) and not isinstance(rung, bool) for rung in value
+        )
+    ):
+        raise E0Error(f"{where} must be a list of integers")
 
 
 @dataclass(frozen=True)
@@ -163,19 +188,26 @@ class Manifest:
     def from_dict(cls, data: Mapping[str, Any]) -> Manifest:
         """Build from decoded TOML/JSON; every problem is an `E0Error`."""
         raw = dict(data)
-        raw.pop("recipe_refs", None)  # derived: written to the pinned copy only
+        raw.pop("recipe_refs", None)
+        raw.pop("sources", None)
         units_raw = raw.pop("units", None)
         if not isinstance(units_raw, list) or not units_raw:
             raise E0Error("manifest needs a non-empty `units` list")
         units = tuple(_unit_from(item, index) for index, item in enumerate(units_raw))
-        recipes = tuple(raw.pop("recipes", tuple(RECIPES)))
-        unknown = [name for name in recipes if name not in RECIPES]
-        if unknown or not recipes:
+        recipes_raw = raw.pop("recipes", list(RECIPES))
+        if (
+            not isinstance(recipes_raw, list)
+            or not recipes_raw
+            or any(name not in RECIPES for name in recipes_raw)
+            or len(set(recipes_raw)) != len(recipes_raw)
+        ):
             raise E0Error(
-                f"manifest `recipes` must name registered recipes "
-                f"({', '.join(RECIPES)}); got {list(recipes)}"
+                "manifest `recipes` must be distinct registered recipes "
+                f"({', '.join(RECIPES)}); got {recipes_raw!r}"
             )
+        recipes = tuple(recipes_raw)
         ladder = raw.pop("unwind_ladder", None)
+        _require_ladder(ladder, "manifest `unwind_ladder`")
         try:
             manifest = cls(
                 units=units,
@@ -189,6 +221,10 @@ class Manifest:
         return manifest
 
     def _validate(self) -> None:
+        for field_name, kind in _FIELD_TYPES.items():
+            value = getattr(self, field_name)
+            if not isinstance(value, kind) or isinstance(value, bool):
+                raise E0Error(f"manifest `{field_name}` has the wrong type: {value!r}")
         if not self.name:
             raise E0Error("manifest needs a `name`")
         if self.samples < 1 or self.max_candidates < 1:
@@ -207,7 +243,7 @@ class Manifest:
             "name": self.name,
             "model": self.model,
             "recipes": list(self.recipes),
-            "recipe_refs": [RECIPES[name].ref for name in self.recipes],
+            "recipe_refs": list(self.recipe_refs.values()),
             "samples": self.samples,
             "max_candidates": self.max_candidates,
             "unwind": self.unwind,
@@ -219,6 +255,10 @@ class Manifest:
             "proposer_timeout_s": self.proposer_timeout_s,
             "units": [unit.to_dict() for unit in self.units],
         }
+
+    @property
+    def recipe_refs(self) -> dict[str, str]:
+        return {name: RECIPES[name].ref for name in self.recipes}
 
     def bounds_for(self, unit: UnitSpec) -> Bounds:
         """The ESBMC bounds for `unit`: its overrides over the manifest's."""
@@ -250,8 +290,9 @@ def _unit_from(item: object, index: int) -> UnitSpec:
     if not isinstance(path, str) or not isinstance(symbol, str):
         raise E0Error(f"{where} needs string `path` and `symbol`")
     ladder = raw.pop("unwind_ladder", None)
+    _require_ladder(ladder, f"{where}.unwind_ladder")
     try:
-        return UnitSpec(
+        unit = UnitSpec(
             path=path,
             symbol=symbol,
             unwind_ladder=None if ladder is None else tuple(ladder),
@@ -259,6 +300,15 @@ def _unit_from(item: object, index: int) -> UnitSpec:
         )
     except TypeError as exc:
         raise E0Error(f"{where}: {exc}") from exc
+    for name in ("unwind", "max_len"):
+        value = getattr(unit, name)
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool)
+        ):
+            raise E0Error(f"{where}.{name} must be an integer")
+    if unit.twin is not None and not isinstance(unit.twin, str):
+        raise E0Error(f"{where}.twin must be a path")
+    return unit
 
 
 def load_manifest(path: Path) -> Manifest:
@@ -269,9 +319,6 @@ def load_manifest(path: Path) -> Manifest:
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise E0Error(f"cannot read manifest {path}: {exc}") from exc
     return Manifest.from_dict(data)
-
-
-# --- the rows -------------------------------------------------------------
 
 
 def read_rows(run_dir: Path) -> list[dict[str, Any]]:
@@ -313,12 +360,26 @@ def _cell_key(row: Mapping[str, Any]) -> CellKey:
     return (str(row.get("unit_id")), str(row.get("recipe")), int(row.get("sample", -1)))
 
 
+def _check_key(row: Mapping[str, Any]) -> CheckKey:
+    return (
+        _cell_key(row),
+        int(row.get("attempt", 0)),
+        str(row.get("property_id")),
+        str(row.get("target")),
+    )
+
+
+def _needs_retry(row: Mapping[str, Any]) -> bool:
+    """An ESBMC invocation error on a rendered harness: possibly transient."""
+    return row.get("outcome") == "error" and bool(row.get("rendered"))
+
+
 @dataclass
 class _State:
     """What the rows already say: the latest proposal per cell, and the checks done."""
 
     proposals: dict[CellKey, dict[str, Any]] = field(default_factory=dict)
-    checks: set[tuple[CellKey, int, str, str]] = field(default_factory=set)
+    checks: set[CheckKey] = field(default_factory=set)
 
     @classmethod
     def from_rows(cls, rows: Sequence[dict[str, Any]]) -> _State:
@@ -328,21 +389,12 @@ class _State:
         return state
 
     def add(self, row: dict[str, Any]) -> None:
-        key = _cell_key(row)
         if row["type"] == PROPOSAL_EVENT:
-            self.proposals[key] = row
+            self.proposals[_cell_key(row)] = row
+        elif _needs_retry(row):
+            self.checks.discard(_check_key(row))
         else:
-            self.checks.add(
-                (
-                    key,
-                    int(row.get("attempt", 0)),
-                    str(row["property_id"]),
-                    row["target"],
-                )
-            )
-
-
-# --- the proposer ---------------------------------------------------------
+            self.checks.add(_check_key(row))
 
 
 class _MeteredClient:
@@ -375,13 +427,11 @@ class _TimedVerify:
         self._port = port
         self.seconds = 0.0
         self.runs = 0
-        self.last: EsbmcResult | None = None
 
     def __call__(self, source: Path, /, *, unwind: int) -> EsbmcResult:
         result = self._port(source, unwind=unwind)
         self.seconds += result.meta.duration_s
         self.runs += 1
-        self.last = result
         return result
 
 
@@ -477,15 +527,14 @@ def _propose(
         )
         accepted = result.accepted
         rejected = [rej.to_dict() for rej in result.rejected]
-    except (LLMError, ProposalParseError) as exc:
+    except Exception as exc:  # the paid reply is lost either way: record, retry
         error = f"{type(exc).__name__}: {exc}"
     latency = time.monotonic() - started
-    context = request.context
     row: dict[str, Any] = {
         "run": manifest.name,
         "unit_id": unit.unit_id,
         "symbol": unit.spec.symbol,
-        "recipe": context.recipe if context is not None else "",
+        "recipe": manifest.recipe_refs[recipe],
         "sample": sample,
         "attempt": attempt,
         "prompt": request.prompt.ref,
@@ -576,13 +625,35 @@ def _property_row(
     }
 
 
-# --- the run --------------------------------------------------------------
+def _source_hashes(prepared: Sequence[_Prepared]) -> dict[str, str]:
+    return {
+        str(target.unit.path): hashlib.sha256(
+            target.unit.source_text.encode()
+        ).hexdigest()
+        for unit in prepared
+        for target in unit.targets
+    }
 
 
-def _pin_manifest(run_dir: Path, manifest: Manifest) -> None:
-    """Write the manifest on first use; refuse a run directory pinned to another."""
+@contextmanager
+def _exclusive(run_dir: Path) -> Generator[None]:
+    """Hold the run directory's lock; a second runner on it is refused."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    with (run_dir / _LOCK_FILE).open("w") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise E0Error(f"{run_dir} is in use by another run") from None
+        yield
+
+
+def _pin_manifest(
+    run_dir: Path, manifest: Manifest, sources: Mapping[str, str]
+) -> None:
+    """Write the manifest and the source hashes on first use; refuse a run
+    directory pinned to a different manifest or to different source files."""
     path = run_dir / _MANIFEST_FILE
-    wanted = manifest.to_dict()
+    wanted = {**manifest.to_dict(), "sources": dict(sources)}
     if path.exists():
         try:
             pinned = json.loads(path.read_text(encoding="utf-8"))
@@ -590,11 +661,10 @@ def _pin_manifest(run_dir: Path, manifest: Manifest) -> None:
             raise E0Error(f"cannot read {path}: {exc}") from exc
         if pinned != wanted:
             raise E0Error(
-                f"{run_dir} was started with a different manifest ({path}); "
-                "resume with the same manifest, or use a new --run-dir"
+                f"{run_dir} was started with a different manifest or different "
+                f"source files ({path}); resume unchanged, or use a new --run-dir"
             )
         return
-    run_dir.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(wanted, indent=2) + "\n", encoding="utf-8")
 
 
@@ -626,15 +696,26 @@ def run_grid(
     if verify_for is None and shutil.which(esbmc_bin) is None:
         raise E0Error(f"esbmc not found: {esbmc_bin}")
     prepared = _prepare(manifest, esbmc_bin=esbmc_bin, verify_for=verify_for)
-    _pin_manifest(run_dir, manifest)
+    with _exclusive(run_dir):
+        _pin_manifest(run_dir, manifest, _source_hashes(prepared))
+        _run_cells(manifest, prepared, run_dir, client, say)
+    return summarise(manifest, read_rows(run_dir))
+
+
+def _run_cells(
+    manifest: Manifest,
+    prepared: Sequence[_Prepared],
+    run_dir: Path,
+    client: LLMClient,
+    say: Callable[[str], None],
+) -> None:
     _seal_trace(run_dir)
     state = _State.from_rows(read_rows(run_dir))
     total = len(manifest.cells())
     done = 0
     for unit in prepared:
         for recipe in manifest.recipes:
-            context = unit.requests[recipe].context
-            ref = context.recipe if context is not None else recipe
+            ref = manifest.recipe_refs[recipe]
             for sample in range(manifest.samples):
                 done += 1
                 key = (unit.unit_id, ref, sample)
@@ -677,10 +758,7 @@ def run_grid(
                                 run_dir=run_dir,
                             )
                         )
-    return summarise(manifest, read_rows(run_dir))
 
-
-# --- the summary: computed from the rows, nothing else --------------------
 
 _OUTCOMES = ("held", "violated", "unknown", "vacuous", "error")
 
@@ -741,6 +819,8 @@ class RecipeSummary:
     calls_with_usage: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
     cost_usd: float = 0.0
     targets: dict[str, TargetTally] = field(
         default_factory=lambda: {CLEAN: TargetTally(), TWIN: TargetTally()}
@@ -752,6 +832,8 @@ class RecipeSummary:
         self.calls_with_usage += 1
         self.input_tokens += int(usage.get("input_tokens") or 0)
         self.output_tokens += int(usage.get("output_tokens") or 0)
+        self.cache_read_tokens += int(usage.get("cache_read_tokens") or 0)
+        self.cache_creation_tokens += int(usage.get("cache_creation_tokens") or 0)
         self.cost_usd += float(usage.get("cost_usd") or 0.0)
 
     def to_dict(self) -> dict[str, Any]:
@@ -770,6 +852,8 @@ class RecipeSummary:
             "calls_with_usage": self.calls_with_usage,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_creation_tokens": self.cache_creation_tokens,
             "cost_usd": self.cost_usd,
             "targets": {name: tally.to_dict() for name, tally in self.targets.items()},
         }
@@ -825,7 +909,8 @@ class Summary:
                 r.rejected,
                 f"{r.proposer_latency_s:.1f}",
                 (
-                    f"{r.input_tokens}/{r.output_tokens} "
+                    f"{r.input_tokens}/{r.output_tokens}, cache "
+                    f"{r.cache_read_tokens}/{r.cache_creation_tokens} "
                     f"({r.calls_with_usage}/{r.attempts} calls)"
                     if r.calls_with_usage
                     else "not reported"
@@ -859,7 +944,7 @@ class Summary:
                     "accepted",
                     "rejected",
                     "latency s",
-                    "tokens in/out",
+                    "tokens in/out, cache read/write",
                     "cost $",
                 ],
                 proposer_rows,
@@ -871,34 +956,39 @@ class Summary:
         ]
         missing = sum(r.missing_checks for r in self.recipes)
         if missing:
-            lines.append(f"{missing} property checks have no row yet.")
+            lines.append(
+                f"{missing} property checks have no row yet or ended in an ESBMC "
+                "error (a resume redoes them)."
+            )
         other = sum(t.other for r in self.recipes for t in r.targets.values())
         if other:
             lines.append(f"{other} checks have an outcome outside the columns above.")
         return "\n".join(lines) + "\n"
 
 
-def summarise(manifest: Manifest, rows: Sequence[Mapping[str, Any]]) -> Summary:
-    """The summary of `rows` for `manifest`; the only source of every number."""
+def summarise(
+    manifest: Manifest,
+    rows: Sequence[Mapping[str, Any]],
+    refs: Mapping[str, str] | None = None,
+) -> Summary:
+    """The summary of `rows` for `manifest`; the only source of every number.
+
+    `refs` maps recipe names to the refs the rows carry (a run directory pins
+    them); it defaults to the registry's. A check that ended in an ESBMC error is
+    tallied but still counts as work remaining, since a resume redoes it.
+    """
+    refs = refs or manifest.recipe_refs
     proposals: dict[CellKey, list[Mapping[str, Any]]] = {}
-    checks: dict[tuple[CellKey, int, str, str], Mapping[str, Any]] = {}
+    checks: dict[CheckKey, Mapping[str, Any]] = {}
     for row in rows:
-        key = _cell_key(row)
         if row["type"] == PROPOSAL_EVENT:
-            proposals.setdefault(key, []).append(row)
+            proposals.setdefault(_cell_key(row), []).append(row)
         else:
-            checks[
-                (
-                    key,
-                    int(row.get("attempt", 0)),
-                    str(row["property_id"]),
-                    row["target"],
-                )
-            ] = row
+            checks[_check_key(row)] = row
 
     summaries = []
     for recipe in manifest.recipes:
-        ref = RECIPES[recipe].ref
+        ref = refs[recipe]
         summary = RecipeSummary(ref, cells=len(manifest.units) * manifest.samples)
         for spec in manifest.units:
             unit_id = make_unit_id(Path(spec.path), spec.symbol)
@@ -932,9 +1022,9 @@ def summarise(manifest: Manifest, rows: Sequence[Mapping[str, Any]]) -> Summary:
                                 name,
                             )
                         )
-                        if row is None:
+                        if row is None or _needs_retry(row):
                             missing += 1
-                        else:
+                        if row is not None:
                             summary.targets[name].add(row)
                 summary.missing_checks += missing
                 summary.complete_cells += missing == 0
@@ -950,10 +1040,9 @@ def summary_from_run_dir(run_dir: Path) -> Summary:
         pinned = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise E0Error(f"{run_dir} is not an E0 run directory: {exc}") from exc
-    return summarise(Manifest.from_dict(pinned), read_rows(run_dir))
-
-
-# --- the command line -----------------------------------------------------
+    manifest = Manifest.from_dict(pinned)
+    refs = dict(zip(manifest.recipes, pinned.get("recipe_refs", ()), strict=False))
+    return summarise(manifest, read_rows(run_dir), refs or None)
 
 
 def _build_parser() -> argparse.ArgumentParser:

@@ -37,7 +37,7 @@ from forseti.experiments.e0 import (
     summarise,
     summary_from_run_dir,
 )
-from forseti.properties import LLMError, LLMUsage
+from forseti.properties import LLMError, LLMUsage, Recipe
 
 REPO = Path(__file__).parents[2]
 STEP = 0.5
@@ -126,7 +126,7 @@ class FakeClient:
 
 class UsageClient(FakeClient):
     def complete_with_usage(self, prompt: str) -> tuple[str, LLMUsage | None]:
-        return self.complete(prompt), LLMUsage(100, 20, cost_usd=0.5)
+        return self.complete(prompt), LLMUsage(100, 20, 7, 3, cost_usd=0.5)
 
 
 @pytest.fixture
@@ -168,9 +168,6 @@ def run(
         client=client or FakeClient(),
         verify_for=esbmc or FakeEsbmc(),
     )
-
-
-# --- manifest ---------------------------------------------------------------
 
 
 def test_the_checked_in_manifest_describes_the_e0_grid() -> None:
@@ -246,6 +243,30 @@ def test_manifest_round_trips_through_its_pinned_form() -> None:
         {"name": "m", "units": [{"path": "a.c", "symbol": "f"}], "max_len": -1},
         {"name": "m", "units": [{"path": "a.c", "symbol": "f"}], "bogus": 1},
         {"name": "", "units": [{"path": "a.c", "symbol": "f"}]},
+        {"name": "m", "units": [{"path": "a.c", "symbol": "f"}], "samples": "3"},
+        {"name": "m", "units": [{"path": "a.c", "symbol": "f"}], "samples": True},
+        {"name": "m", "units": [{"path": "a.c", "symbol": "f"}], "recipes": 5},
+        {
+            "name": "m",
+            "units": [{"path": "a.c", "symbol": "f"}],
+            "recipes": ["blind", "blind"],
+        },
+        {
+            "name": "m",
+            "units": [{"path": "a.c", "symbol": "f"}],
+            "esbmc_timeout_s": "30",
+        },
+        {
+            "name": "m",
+            "units": [{"path": "a.c", "symbol": "f"}],
+            "unwind_ladder": "8,16",
+        },
+        {
+            "name": "m",
+            "units": [{"path": "a.c", "symbol": "f", "unwind_ladder": [1.5]}],
+        },
+        {"name": "m", "units": [{"path": "a.c", "symbol": "f", "max_len": "2"}]},
+        {"name": "m", "units": [{"path": "a.c", "symbol": "f", "twin": 3}]},
         {
             "name": "m",
             "units": [{"path": "a.c", "symbol": "f"}],
@@ -265,9 +286,6 @@ def test_load_manifest_reports_an_unreadable_file(tmp_path: Path) -> None:
     broken.write_text("name = ")
     with pytest.raises(E0Error, match="cannot read manifest"):
         load_manifest(broken)
-
-
-# --- a full run -------------------------------------------------------------
 
 
 def test_a_run_writes_one_proposal_row_per_cell_and_one_row_per_property_target(
@@ -363,9 +381,6 @@ def test_a_unit_overrides_the_manifest_bounds(
     for row in rows_of(tmp_path / "r", PROPERTY_EVENT):
         assert (row["unwind"], row["ladder"], row["max_len"]) == (2, [], 3)
         assert row["esbmc_runs"] <= 2  # one run, plus a probe when it held
-
-
-# --- resume -----------------------------------------------------------------
 
 
 def row_signature(run_dir: Path) -> list[tuple[Any, ...]]:
@@ -486,9 +501,6 @@ def test_a_corrupt_proposal_row_is_an_e0_error(
         run(manifest, run_dir)
 
 
-# --- proposer failures ------------------------------------------------------
-
-
 def test_a_failed_proposal_is_recorded_and_retried_on_the_next_run(
     tmp_path: Path, sources: tuple[Path, Path]
 ) -> None:
@@ -528,9 +540,6 @@ def test_an_unparseable_reply_is_a_recorded_proposal_error(
     (row,) = rows_of(tmp_path / "r", PROPOSAL_EVENT)
     assert row["error"].startswith("ProposalParseError")
     assert not summary.complete
-
-
-# --- preflight --------------------------------------------------------------
 
 
 def test_a_missing_symbol_fails_before_any_proposer_call(
@@ -581,9 +590,6 @@ def test_a_missing_esbmc_binary_fails_before_any_proposer_call(
     assert not client.prompts
 
 
-# --- the summary ------------------------------------------------------------
-
-
 def test_usage_is_summed_where_the_provider_reports_it(
     tmp_path: Path, sources: tuple[Path, Path]
 ) -> None:
@@ -596,7 +602,8 @@ def test_usage_is_summed_where_the_provider_reports_it(
     (recipe,) = summary.recipes
     assert (recipe.input_tokens, recipe.output_tokens) == (200, 40)
     assert recipe.cost_usd == 1.0 and recipe.calls_with_usage == 2
-    assert "200/40 (2/2 calls)" in summary.render()
+    assert (recipe.cache_read_tokens, recipe.cache_creation_tokens) == (14, 6)
+    assert "200/40, cache 14/6 (2/2 calls)" in summary.render()
     assert rows_of(tmp_path / "r", PROPOSAL_EVENT)[0]["usage"]["input_tokens"] == 100
 
 
@@ -643,7 +650,9 @@ def test_a_property_check_that_is_missing_from_the_rows_is_reported(
 
     assert not summary.complete
     assert summary.recipes[0].missing_checks == 1
-    assert "1 property checks have no row yet" in summary.render()
+    assert "1 property checks have no row yet or ended in an ESBMC error" in (
+        summary.render()
+    )
     resumed = run(manifest, run_dir)  # a dropped row is simply redone
     assert resumed.complete
 
@@ -679,9 +688,6 @@ def test_outcomes_outside_the_columns_and_vacuous_checks_are_not_dropped() -> No
     assert (clean.checked, clean.rendered) == (3, 1)
     assert (clean.count("vacuous"), clean.count("error"), clean.other) == (1, 1, 1)
     assert "1 checks have an outcome outside the columns" in summary.render()
-
-
-# --- the command line -------------------------------------------------------
 
 
 def write_manifest(tmp_path: Path, sources: tuple[Path, Path]) -> Path:
@@ -772,3 +778,97 @@ def test_an_esbmc_error_is_reported_with_its_message() -> None:
     assert e0._result_detail(e0.Error(meta(), "x" * 300)) == "x" * 200
     assert e0._result_detail(Verified(meta())) is None
     assert e0._result_detail(None) is None
+
+
+def test_an_esbmc_error_is_redone_on_resume_and_keeps_the_run_incomplete(
+    tmp_path: Path, sources: tuple[Path, Path]
+) -> None:
+    manifest = manifest_for(sources, recipes=("blind",), samples=1, twin=False)
+    run_dir = tmp_path / "r"
+
+    class Crashing(FakeEsbmc):
+        def __call__(self, source: Path, /) -> Any:
+            real = super().__call__(source)
+
+            def port(path: Path, /, *, unwind: int) -> EsbmcResult:
+                if "result <= 100" in path.read_text():
+                    return e0.Error(meta(), "esbmc killed")
+                return real(path, unwind=unwind)
+
+            return port
+
+    first = run(manifest, run_dir, esbmc=Crashing())
+
+    assert not first.complete
+    assert first.recipes[0].targets["clean"].count("error") == 1
+    assert "ended in an ESBMC error" in first.render()
+    esbmc = FakeEsbmc()
+    second = run(manifest, run_dir, esbmc=esbmc)
+    assert second.complete
+    assert len(esbmc.checks()) == 1  # only the errored check was redone
+    clean = second.recipes[0].targets["clean"]
+    assert (clean.count("held"), clean.count("error")) == (2, 0)
+
+
+def test_a_render_failure_is_final_and_not_redone(
+    tmp_path: Path, sources: tuple[Path, Path]
+) -> None:
+    key = {"unit_id": "a.c::f", "recipe": "blind/v1", "sample": 0, "attempt": 1}
+    failed = {"type": PROPERTY_EVENT, **key, "property_id": "p", "target": "clean"}
+
+    assert not e0._needs_retry({**failed, "outcome": "error", "rendered": False})
+    assert e0._needs_retry({**failed, "outcome": "error", "rendered": True})
+
+
+def test_an_unexpected_proposer_failure_is_recorded_not_fatal(
+    tmp_path: Path, sources: tuple[Path, Path]
+) -> None:
+    summary = run(
+        manifest_for(sources, recipes=("blind",), samples=1),
+        tmp_path / "r",
+        FakeClient(ValueError("provider blank")),
+    )
+
+    (row,) = rows_of(tmp_path / "r", PROPOSAL_EVENT)
+    assert row["error"] == "ValueError: provider blank"
+    assert not summary.complete
+
+
+def test_a_run_directory_is_pinned_to_the_source_files_it_read(
+    tmp_path: Path, sources: tuple[Path, Path]
+) -> None:
+    manifest = manifest_for(sources, recipes=("blind",), samples=1)
+    run(manifest, tmp_path / "r")
+    sources[1].write_text(TWIN_SRC.replace("return x;", "return x + 1;"))
+    client = FakeClient()
+
+    with pytest.raises(E0Error, match="different source files"):
+        run(manifest, tmp_path / "r", client)
+
+    assert not client.prompts
+
+
+def test_a_second_runner_on_the_same_run_directory_is_refused(
+    tmp_path: Path, sources: tuple[Path, Path]
+) -> None:
+    manifest = manifest_for(sources, recipes=("blind",), samples=1)
+    run_dir = tmp_path / "r"
+    with e0._exclusive(run_dir), pytest.raises(E0Error, match="in use"):
+        run(manifest, run_dir)
+
+    assert run(manifest, run_dir).complete  # released with the first holder
+
+
+def test_the_summary_uses_the_recipe_refs_the_run_was_pinned_to(
+    tmp_path: Path, sources: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run(manifest_for(sources, recipes=("blind",), samples=1), tmp_path / "r")
+    before = summary_from_run_dir(tmp_path / "r")
+    bumped = dict(e0.RECIPES)
+    bumped["blind"] = Recipe("blind", "2", bumped["blind"].build)
+    monkeypatch.setattr(e0, "RECIPES", bumped)
+
+    after = summary_from_run_dir(tmp_path / "r")
+
+    assert after.recipes[0].recipe == "blind/v1"
+    assert untimed(after) == untimed(before)
