@@ -228,3 +228,48 @@ def test_adjacent_line_comments_form_one_doc_comment() -> None:
 def test_a_comment_separated_by_code_is_not_the_doc_comment() -> None:
     source = "/* other */\nint g(void);\nint f(void) { return 0; }\n"
     assert _ctx("sighted", source, "f") == "int f(void) { return 0; }\n"
+
+
+def test_a_header_comment_behind_a_blank_line_is_not_the_doc_comment() -> None:
+    source = "/* BUG header */\n\nint f(int a) { return a; }\n"
+    assert _ctx("blind", source, "f") == "int f(int a);\n"
+    assert _ctx("sighted", source, "f") == "int f(int a) { return a; }\n"
+    assert _ctx("baseline", source, "f") == "int f(int a) { return a; }\n"
+
+
+def test_a_trailing_comment_on_the_previous_statement_is_not_the_doc_comment() -> None:
+    source = "int x; // note\nint f(void) { return 0; }\n"
+    assert _ctx("blind", source, "f") == "int f(void);\n"
+
+
+def test_baseline_strips_every_leading_comment_line_but_keeps_the_doc() -> None:
+    source = (
+        "// line1 BUG\n// line2 leaks\n\n/* more */\n#include <x.h>\n\n"
+        "// doc\nint f(void) { return 0; }\n"
+    )
+    assert _ctx("baseline", source, "f") == (
+        "#include <x.h>\n\n// doc\nint f(void) { return 0; }\n"
+    )
+
+
+def test_every_declarator_of_a_typedef_is_a_name() -> None:
+    source = "typedef struct n { int a; } n_t, *n_p;\nint f(n_t *p) { return p->a; }\n"
+    assert "typedef struct n" in _ctx("blind", source, "f")
+    source = "typedef unsigned a_t, b_t;\nint f(b_t x) { return x; }\n"
+    assert "typedef unsigned a_t, b_t;" in _ctx("blind", source, "f")
+
+
+def test_a_semicolonless_macro_invocation_is_not_part_of_the_next_function() -> None:
+    source = "DECLARE_THING(x)\nint f(int a) { return a; }\n"
+    assert _ctx("sighted", source, "f") == "int f(int a) { return a; }\n"
+
+
+def test_an_initialiser_ending_in_a_paren_is_not_a_function() -> None:
+    source = "static foo_t v = (foo_t){1};\nint f(int a) { return a; }\n"
+    assert _ctx("blind", source, "f") == "int f(int a);\n"
+    assert _ctx("sighted", source, "f") == "int f(int a) { return a; }\n"
+
+
+def test_attributes_after_the_parameter_list_stay_with_the_function() -> None:
+    source = "int f(int a) __attribute__((pure)) { return a; }\n"
+    assert _ctx("sighted", source, "f") == source
