@@ -470,3 +470,24 @@ def test_semantic_loop_stdio_roundtrip_matches_cli_outcome(
     assert cli.returncode == expected_returncode, cli.stderr
     cli_payload = json.loads(cli.stdout)
     assert cli_payload["outcome"] == mcp_payload["outcome"] == expected_outcome
+
+
+def test_propose_tool_takes_a_recipe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    props = next(
+        t for t in asyncio.run(build_server().list_tools()) if t.name == "propose"
+    ).input_schema["properties"]
+    assert "recipe" in props
+    loop_props = next(
+        t for t in asyncio.run(build_server().list_tools()) if t.name == "semantic_loop"
+    ).input_schema["properties"]
+    assert "recipe" in loop_props
+
+    source = tmp_path / "abs_unit.c"
+    source.write_text(_ABS_SLICE)
+    monkeypatch.setattr("forseti.core.propose.ClaudeCliClient", _FakeLLMClient)
+    payload = propose_tool(str(source), "my_abs", persist=False, recipe="sighted")
+    accepted = payload["accepted"]
+    assert isinstance(accepted, list)
+    assert {a["provenance"]["recipe"] for a in accepted} == {"sighted/v1"}

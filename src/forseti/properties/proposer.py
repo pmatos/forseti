@@ -48,6 +48,7 @@ from .model import (
     make_property_id,
 )
 from .prompts import DEFAULT_PROMPT, MAX_CANDIDATES_DEFAULT, RESULT_IDENT, render_prompt
+from .recipes import ProposalContext
 from .store import DuplicateProperty
 
 if TYPE_CHECKING:
@@ -75,13 +76,15 @@ class ProposalRequest:
     when present it unlocks the identifier/parameter checks and the renderability
     gate; when `None` those are skipped and only the source-free static checks
     apply. `source_text` must be a main-free kernel slice -- the same text the
-    harness writer inlines.
+    harness writer inlines. `context`, when present (a recipe's output, #388),
+    is what the prompt shows the model instead of `source_text`.
     """
 
     unit_id: str
     source_text: str
     prompt: PromptTemplate = DEFAULT_PROMPT
     signature: UnitSignature | None = None
+    context: ProposalContext | None = None
 
     @property
     def symbol(self) -> str:
@@ -248,6 +251,7 @@ def propose_properties(
         source_text=request.source_text,
         result_ident=RESULT_IDENT,
         max_candidates=max_candidates,
+        context=None if request.context is None else request.context.text,
     )
     raw = client.complete(prompt)
     specs = parse_candidates(raw)
@@ -256,6 +260,7 @@ def propose_properties(
         prompt_version=template.version,
         provider=client.provider,
         model=client.model,
+        recipe="" if request.context is None else request.context.recipe,
     )
 
     accepted, rejected = _accept_reject(

@@ -57,13 +57,16 @@ class Provenance:
     the prompt that proposed it is metadata. `provider`/`model` name the backend
     that produced the candidate (e.g. "claude -p"/"sonnet", or a host harness's
     own descriptor for a submitted candidate, #213) -- default `""` for
-    provenance built before these fields existed, never guessed.
+    provenance built before these fields existed, never guessed. `recipe` is the
+    input recipe's ref (`recipes.py`, e.g. "blind/v1"); `""` when the proposer
+    saw the whole unit file, as before recipes existed.
     """
 
     prompt_id: str
     prompt_version: str
     provider: str = ""
     model: str = ""
+    recipe: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -71,6 +74,7 @@ class Provenance:
             "prompt_version": self.prompt_version,
             "provider": self.provider,
             "model": self.model,
+            "recipe": self.recipe,
         }
 
 

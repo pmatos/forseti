@@ -66,19 +66,22 @@ def render_prompt(
     source_text: str,
     result_ident: str = RESULT_IDENT,
     max_candidates: int = MAX_CANDIDATES_DEFAULT,
+    context: str | None = None,
 ) -> str:
     """Fill a template's sentinels for one unit; return the ready-to-send prompt.
 
-    `source_text` is substituted *last*: the unit's C source may itself contain
-    text that looks like a sentinel's replacement, and substituting it last means
-    such text is never re-scanned for further tokens.
+    `context` (a recipe's output) is rendered in place of `source_text` when
+    present; `None` keeps the prompt byte-identical to the whole-file one. The
+    rendered source/context is substituted *last*: the unit's C source may itself
+    contain text that looks like a sentinel's replacement, and substituting it
+    last means such text is never re-scanned for further tokens.
     """
     return (
         template.template.replace(_UNIT, unit_id)
         .replace(_SYMBOL, symbol)
         .replace(_RESULT, result_ident)
         .replace(_MAX, str(max_candidates))
-        .replace(_SOURCE, source_text)
+        .replace(_SOURCE, source_text if context is None else context)
     )
 
 

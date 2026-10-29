@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS properties (
     prompt_version    TEXT NOT NULL,
     provider          TEXT NOT NULL DEFAULT '',
     model             TEXT NOT NULL DEFAULT '',
+    recipe            TEXT NOT NULL DEFAULT '',
     grading_verdict   TEXT CHECK (grading_verdict IN ('held','violated','unknown')),
     grading_kill_rate REAL,
     grading_reason    TEXT,
@@ -64,11 +65,11 @@ BEGIN SELECT RAISE(ABORT, 'a graded property requires a grading'); END;
 _INSERT = """
 INSERT INTO properties (
     property_id, unit_id, kind, expression, domain, description, status,
-    prompt_id, prompt_version, provider, model,
+    prompt_id, prompt_version, provider, model, recipe,
     grading_verdict, grading_kill_rate, grading_reason
 ) VALUES (
     :property_id, :unit_id, :kind, :expression, :domain, :description, :status,
-    :prompt_id, :prompt_version, :provider, :model,
+    :prompt_id, :prompt_version, :provider, :model, :recipe,
     :grading_verdict, :grading_kill_rate, :grading_reason
 )
 """
@@ -81,6 +82,7 @@ INSERT INTO properties (
 _MIGRATED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("provider", "TEXT NOT NULL DEFAULT ''"),
     ("model", "TEXT NOT NULL DEFAULT ''"),
+    ("recipe", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -129,6 +131,7 @@ def _property_to_row(prop: Property) -> dict[str, Any]:
         "prompt_version": prop.provenance.prompt_version,
         "provider": prop.provenance.provider,
         "model": prop.provenance.model,
+        "recipe": prop.provenance.recipe,
         "grading_verdict": grading.verdict.value if grading is not None else None,
         "grading_kill_rate": grading.kill_rate if grading is not None else None,
         "grading_reason": grading.reason if grading is not None else None,
@@ -157,6 +160,7 @@ def _row_to_property(row: sqlite3.Row) -> Property:
             prompt_version=str(row["prompt_version"]),
             provider=str(row["provider"]),
             model=str(row["model"]),
+            recipe=str(row["recipe"]),
         ),
         domain=tuple(str(item) for item in json.loads(row["domain"])),
         grading=grading,

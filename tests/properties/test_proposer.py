@@ -23,6 +23,7 @@ from forseti.properties import (
     Property,
     PropertyKind,
     PropertyStatus,
+    ProposalContext,
     ProposalParseError,
     ProposalRequest,
     ScalarParam,
@@ -550,3 +551,34 @@ if TYPE_CHECKING:
 
     def _fake_store_is_candidatestore(s: FakeStore) -> CandidateStore:
         return s
+
+
+def test_recipe_context_replaces_the_source_and_is_recorded_as_provenance() -> None:
+    client = FakeLLMClient(TWO_GOOD)
+    store = FakeStore()
+    request = ProposalRequest(
+        unit_id=ABS_UNIT,
+        source_text=ABS_SOURCE,
+        signature=abs_sig(),
+        context=ProposalContext(recipe="blind/v1", text="int64_t my_abs(int64_t x);\n"),
+    )
+
+    result = propose_properties(request, client=client, store=store)
+
+    assert "int64_t my_abs(int64_t x);" in client.prompts[0]
+    assert "return (x < 0)" not in client.prompts[0]
+    assert result.accepted
+    assert {p.provenance.recipe for p in result.accepted} == {"blind/v1"}
+    assert {p.provenance.recipe for p in store.items.values()} == {"blind/v1"}
+
+
+def test_no_context_sends_the_whole_source_and_records_no_recipe() -> None:
+    client = FakeLLMClient(TWO_GOOD)
+    request = ProposalRequest(
+        unit_id=ABS_UNIT, source_text=ABS_SOURCE, signature=abs_sig()
+    )
+
+    result = propose_properties(request, client=client)
+
+    assert ABS_SOURCE in client.prompts[0]
+    assert {p.provenance.recipe for p in result.accepted} == {""}

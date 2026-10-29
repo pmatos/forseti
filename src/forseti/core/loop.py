@@ -146,6 +146,7 @@ def run_semantic_loop(
     claude_bin: str = "claude",
     propose_timeout_s: float = PROPOSE_DEFAULT_TIMEOUT_S,
     client: LLMClient | None = None,
+    recipe: str | None = None,
     # check phase
     unwind: int = CHECK_DEFAULT_UNWIND,
     unwind_ladder: tuple[int, ...] | None = None,
@@ -161,7 +162,8 @@ def run_semantic_loop(
     `provider`/`model` (the same `BlankProvenanceError` guard `submit_source`
     itself enforces); `mode="propose"` and `mode="check_only"` take no
     `candidates` — passing any is a caller error (`ValueError`), not silently
-    ignored. `unwind_ladder` defaults to `None` and forwards through to
+    ignored; `recipe` (`propose` mode's input recipe, #388) is likewise
+    `propose`-only. `unwind_ladder` defaults to `None` and forwards through to
     `check_source`, which derives the rungs above `unwind` itself — so a
     caller-chosen `unwind` doesn't collide with the fixed default rungs, the
     same as the `check` CLI/MCP faces. `max_len` is `check_source`'s: the cap on
@@ -183,6 +185,8 @@ def run_semantic_loop(
             raise ValueError("mode='submit' requires a nonblank provider and model")
     elif candidates:
         raise ValueError(f"mode={mode!r} does not take candidates")
+    if recipe is not None and mode != "propose":
+        raise ValueError(f"mode={mode!r} does not take a recipe")
 
     ingestion: tuple[ProposalResult, ...]
     match mode:
@@ -198,6 +202,7 @@ def run_semantic_loop(
                     timeout_s=propose_timeout_s,
                     max_candidates=max_candidates,
                     client=client,
+                    recipe=recipe,
                 ),
             )
         case "submit":
