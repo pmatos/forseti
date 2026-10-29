@@ -43,7 +43,6 @@ from forseti.esbmc import (
 from forseti.precond.reachability import ProbeReachability, classify_site_probe
 from forseti.properties import (
     CHECKABLE_STATUSES,
-    INVARIANT_ASSUMPTION_NOTE,
     NON_VACUITY_LABEL,
     HarnessError,
     InvariantNotApplicable,
@@ -110,6 +109,7 @@ class PropertyVerdict:
     skip_reason: str | None = None
     length_bounds: LengthBounds = ()
     probe: ProbeReachability | None = None
+    assumption: str | None = None
 
     @classmethod
     def skipped(
@@ -164,6 +164,7 @@ class PropertyVerdict:
         length_bounds: LengthBounds = (),
         probe: ProbeReachability | None = None,
         reason: str | None = None,
+        assumption: str | None = None,
     ) -> PropertyVerdict:
         """A property verified to a terminal `outcome` along the k-ladder: the
         settled bound `k`, the raw `result` (kept for #4 to re-render against
@@ -181,19 +182,15 @@ class PropertyVerdict:
             skip_reason=reason,
             length_bounds=length_bounds,
             probe=probe,
+            assumption=assumption,
         )
-
-    @property
-    def assumes_invariant(self) -> bool:
-        """Whether a representation invariant was actually assumed for this verdict."""
-        return self.kind == PropertyKind.REP_INVARIANT.value and self.result is not None
 
     def to_dict(self) -> dict[str, Any]:
         """A JSON-serializable dict — the shape the grading harness (#4) reads.
 
-        A representation-invariant verdict that reached ESBMC adds an ``assumption``
-        field: the invariant is assumed at entry, not discharged at callers (#387).
-        A skipped or un-rendered one assumed nothing, so it carries none.
+        A verdict checked under an assumption the harness writer declared (a
+        representation invariant, #387) adds an ``assumption`` field; a skipped or
+        un-rendered one assumed nothing, so it carries none.
         """
         payload: dict[str, Any] = {
             "property_id": self.property_id,
@@ -211,8 +208,8 @@ class PropertyVerdict:
                 else None
             ),
         }
-        if self.assumes_invariant:
-            payload["assumption"] = INVARIANT_ASSUMPTION_NOTE
+        if self.assumption is not None:
+            payload["assumption"] = self.assumption
         return payload
 
 
@@ -375,6 +372,19 @@ def check_properties(
             )
 
     verdicts: list[PropertyVerdict] = []
+
+    def skip(index: int, prop: Property, reason: str) -> None:
+        verdicts.append(
+            PropertyVerdict.skipped(
+                prop.property_id, unit.unit_id, prop.kind.value, reason=reason
+            )
+        )
+        emit(
+            "property.skipped",
+            index=index,
+            detail={"property_id": prop.property_id, "reason": reason},
+        )
+
     for index, prop in enumerate(props):
         kind = prop.kind.value
         emit(
@@ -383,17 +393,7 @@ def check_properties(
             detail={"property_id": prop.property_id, "kind": kind},
         )
         if prop.kind is PropertyKind.REACHABILITY:
-            reason = "reachability harnessing deferred (ADR-0009 D2)"
-            verdicts.append(
-                PropertyVerdict.skipped(
-                    prop.property_id, unit.unit_id, kind, reason=reason
-                )
-            )
-            emit(
-                "property.skipped",
-                index=index,
-                detail={"property_id": prop.property_id, "reason": reason},
-            )
+            skip(index, prop, "reachability harnessing deferred (ADR-0009 D2)")
             continue
 
         try:
@@ -401,17 +401,7 @@ def check_properties(
         except InvariantNotApplicable as exc:
             # A method that cannot mutate its `T *` has no exit obligation: nothing
             # was checked, which is `skipped` -- never `held`, never an `error`.
-            reason = str(exc)
-            verdicts.append(
-                PropertyVerdict.skipped(
-                    prop.property_id, unit.unit_id, kind, reason=reason
-                )
-            )
-            emit(
-                "property.skipped",
-                index=index,
-                detail={"property_id": prop.property_id, "reason": reason},
-            )
+            skip(index, prop, str(exc))
             continue
         except HarnessError as exc:
             # #64 renders fail-loud on an un-renderable property (e.g. a
@@ -466,6 +456,7 @@ def check_properties(
                 length_bounds=rendered.length_bounds,
                 probe=probed.probe,
                 reason=probed.reason,
+                assumption=rendered.assumption,
             )
         )
         detail: dict[str, Any] = {"property_id": prop.property_id, "kind": kind}

@@ -591,9 +591,8 @@ def test_type_invariant_roundtrips_through_its_own_table() -> None:
     store = mem_store()
     inv = make_inv()
     store.add_type_invariant(inv)
-    assert store.get_type_invariant(inv.property_id) == inv
     assert store.list_for_type(TYPE_KEY) == (inv,)
-    assert store.get_type_invariant("missing") is None
+    assert store.list_for_type("examples/other.c::ring_t") == ()
 
 
 def test_type_invariants_are_per_type_and_invisible_to_unit_reads() -> None:
@@ -605,7 +604,7 @@ def test_type_invariants_are_per_type_and_invisible_to_unit_reads() -> None:
     store.add(unit)
     assert store.list_for_type(TYPE_KEY) == (a,)
     assert store.list_for_unit(TYPE_KEY) == (unit,)
-    assert store.get(a.property_id) is None
+    assert store.get(a.property_id) is None  # not a per-unit property
 
 
 def test_list_for_type_keeps_insertion_order_and_filters_by_status() -> None:

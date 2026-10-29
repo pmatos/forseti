@@ -54,7 +54,7 @@ def _main_body(harness: str) -> list[str]:
 def test_struct_pointer_is_not_read_as_a_buffer_length_pair() -> None:
     push = extract_signature(RING, "rb_push", struct_types=("ring_t",))
     assert isinstance(push.params[0], StructParam)
-    assert push.params[0].type_name == "ring_t"
+    assert push.params[0].elem_ctype == "ring_t"
     assert not push.params[0].const
     # without the type named, the same text keeps its (buffer, length) reading
     plain = extract_signature(RING, "rb_push")

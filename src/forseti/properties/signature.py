@@ -66,10 +66,6 @@ class StructParam(BufferParam):
     ``T *const p`` is still a mutator.
     """
 
-    @property
-    def type_name(self) -> str:
-        return self.elem_ctype
-
 
 Param = ScalarParam | BufferParam  # sealed union (repo style)
 

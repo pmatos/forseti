@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import re
 from collections.abc import Sequence
+from functools import partial
 from pathlib import Path
 
 from forseti.core.check import run_check
@@ -81,15 +82,11 @@ def submit_invariant_source(
         )
     type_name = normalised_type_name(type_name)
     type_key = make_unit_id(source, type_name)
-    spec = CandidateSpec(
-        expression=expression.strip(),
-        rationale=rationale,
-        kind=PropertyKind.REP_INVARIANT.value,
-    )
-    reason = _rejection(source.read_text(), type_name, spec.expression)
+    expression = expression.strip()
+    reason = _rejection(source.read_text(), type_name, expression)
     prop = make_invariant(
         type_key=type_key,
-        expression=spec.expression,
+        expression=expression,
         provenance=Provenance(prompt_id, prompt_version, provider, model),
         description=rationale or None,
     )
@@ -98,6 +95,20 @@ def submit_invariant_source(
         if reason is None and store is not None:
             with contextlib.suppress(DuplicateProperty):
                 store.add_type_invariant(prop)
+        rejected = (
+            ()
+            if reason is None
+            else (
+                RejectedCandidate(
+                    CandidateSpec(
+                        expression,
+                        rationale=rationale,
+                        kind=PropertyKind.REP_INVARIANT.value,
+                    ),
+                    reason,
+                ),
+            )
+        )
         return ProposalResult(
             unit_id=type_key,
             prompt_id=prompt_id,
@@ -105,7 +116,7 @@ def submit_invariant_source(
             provider=provider,
             model=model,
             accepted=(prop,) if reason is None else (),
-            rejected=() if reason is None else (RejectedCandidate(spec, reason),),
+            rejected=rejected,
             model_raw="",
         )
 
@@ -166,5 +177,5 @@ def check_invariant_source(
         store_root=store_root,
         unwind=unwind,
         verify_port=verify_port,
-        properties_of=lambda store: InvariantsOfType(store, type_key),
+        properties_of=partial(InvariantsOfType, type_key=type_key),
     )

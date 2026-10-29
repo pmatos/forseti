@@ -29,6 +29,7 @@ from .harness import (
     DEFAULT_INCLUDES,
     PropertyHarness,
     SemanticSpec,
+    _call_arg,
     _defines_main,
     _is_scalar_backed,
     _nondet_ctypes,
@@ -37,14 +38,10 @@ from .harness import (
     non_vacuity_probe,
     plan_length_bounds,
 )
-from .harness import (
-    _call_arg as _plain_call_arg,
-)
 from .model import Property, PropertyKind, PropertyStatus, Provenance, make_property_id
 from .signature import (
     BufferParam,
     HarnessError,
-    Param,
     ScalarParam,
     StructParam,
     UnitSignature,
@@ -230,7 +227,10 @@ def render_invariant_harness(
         lines.append(f"    __ESBMC_assume(({name} >= 0 && {name} <= {bound}));")
     for buf in buffers:
         lines += _render_buffer(buf)
-    args = ", ".join(_call_arg(p) for p in signature.params)
+    args = ", ".join(
+        f"&{p.name}" if isinstance(p, StructParam) else _call_arg(p)
+        for p in signature.params
+    )
     lines.append(f"    {signature.symbol}({args});")
     if probe:
         lines.append(f"    {non_vacuity_probe()}")
@@ -278,11 +278,3 @@ def build_invariant_harness(
         length_bounds=plan_length_bounds(signature, SemanticSpec("1"), max_len),
         probe_source_text=render(True),
     )
-
-
-def _call_arg(param: Param) -> str:
-    """A struct instance is passed by address; every other param as the semantic
-    harness passes it."""
-    if isinstance(param, StructParam):
-        return f"&{param.name}"
-    return _plain_call_arg(param)

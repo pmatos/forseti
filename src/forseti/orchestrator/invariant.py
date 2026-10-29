@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections.abc import Collection, Sequence
 
 from forseti.properties import (
+    INVARIANT_ASSUMPTION_NOTE,
     HarnessError,
     InvariantRole,
     Property,
@@ -62,6 +63,7 @@ class InvariantHarnessWriter:
             source_text=harness.source_text,
             length_bounds=harness.length_bounds,
             probe_source_text=harness.probe_source_text,
+            assumption=INVARIANT_ASSUMPTION_NOTE,
         )
 
 

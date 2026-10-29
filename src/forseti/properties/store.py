@@ -234,8 +234,7 @@ class PropertyStore:
 
     def _ensure_schema(self) -> None:
         with self._conn:
-            self._conn.executescript(_SCHEMA)
-            self._conn.executescript(_TYPE_INVARIANT_SCHEMA)
+            self._conn.executescript(_SCHEMA + _TYPE_INVARIANT_SCHEMA)
             self._migrate_columns()
             self._conn.execute("PRAGMA user_version = 1")
 
@@ -373,13 +372,6 @@ class PropertyStore:
                 )
         except sqlite3.IntegrityError as exc:
             raise DuplicateProperty(prop.property_id) from exc
-
-    def get_type_invariant(self, property_id: str) -> Property | None:
-        """The stored representation invariant with `property_id`, or None."""
-        row = self._conn.execute(
-            "SELECT * FROM type_invariants WHERE property_id = ?", (property_id,)
-        ).fetchone()
-        return None if row is None else _row_to_invariant(row)
 
     def list_for_type(
         self,

@@ -33,7 +33,6 @@ from .harness import (
 )
 from .invariant import (
     INVARIANT_ASSUMPTION_NOTE,
-    INVARIANT_SELF,
     REP_INVARIANT_LABEL,
     InvariantNotApplicable,
     InvariantRole,
@@ -106,7 +105,6 @@ __all__ = [
     "DEFAULT_PROMPT",
     "HARNESS_MACROS",
     "INVARIANT_ASSUMPTION_NOTE",
-    "INVARIANT_SELF",
     "MAX_CANDIDATES_DEFAULT",
     "NON_VACUITY_LABEL",
     "PROMPTS",
