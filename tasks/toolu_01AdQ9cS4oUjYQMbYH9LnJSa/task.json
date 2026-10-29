@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "toolu_01AdQ9cS4oUjYQMbYH9LnJSa",
+  "agent_id": "ac9e840a2f13aabba",
+  "subagent_type": "Explore",
+  "task_description": "Efficiency review",
+  "token_usage": {
+    "input_tokens": 6,
+    "cache_creation_tokens": 44018,
+    "cache_read_tokens": 71900,
+    "output_tokens": 1283,
+    "api_call_count": 3
+  },
+  "started_at": "2026-10-29T13:29:04.198787993+01:00",
+  "completed_at": "2026-10-29T13:29:15.657605965+01:00"
+}
