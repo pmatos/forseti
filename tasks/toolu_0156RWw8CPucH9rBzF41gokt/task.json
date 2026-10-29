@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "toolu_0156RWw8CPucH9rBzF41gokt",
+  "agent_id": "a197703d603f419d7",
+  "subagent_type": "general-purpose",
+  "task_description": "Triage epic #3 open children",
+  "token_usage": {
+    "input_tokens": 28,
+    "cache_creation_tokens": 100691,
+    "cache_read_tokens": 1045286,
+    "output_tokens": 8280,
+    "api_call_count": 14
+  },
+  "started_at": "2026-10-29T08:33:39.17933617+01:00",
+  "completed_at": "2026-10-29T08:34:52.596479084+01:00"
+}
