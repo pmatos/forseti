@@ -47,7 +47,7 @@ harness triggered the check.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from forseti.core.events import PROPERTY_CHECK_START, PROPERTY_VERDICT, record_event
@@ -55,6 +55,7 @@ from forseti.core.persistence import open_store
 from forseti.core.propose import DEFAULT_STORE_ROOT
 from forseti.orchestrator import (
     PropertyCheckRun,
+    PropertyStorePort,
     Unit,
     VerifyPort,
     check_properties,
@@ -80,6 +81,7 @@ from forseti.orchestrator.semantic_check import (
     validated_max_len as validated_max_len,
 )
 from forseti.precond import DEFAULT_MAX_LEN
+from forseti.properties import PropertyStore
 
 _WORK_SUBDIR = "check-work"
 
@@ -178,14 +180,41 @@ def check_source(
         esbmc_bin=esbmc_bin,
         extra_flags=extra_flags,
     )
-    writer = plan.writer
+    return run_check(
+        unit,
+        source=source,
+        plan=plan,
+        store_root=store_root,
+        unwind=unwind,
+        verify_port=verify_port,
+    )
+
+
+def run_check(
+    unit: Unit,
+    *,
+    source: Path,
+    plan: SemanticCheckPlan,
+    store_root: Path,
+    unwind: int,
+    verify_port: VerifyPort | None = None,
+    properties_of: Callable[[PropertyStore], PropertyStorePort] = lambda store: store,
+) -> PropertyCheckRun:
+    """Run `check_properties` for `unit` under `plan`, with Core's events and store.
+
+    The recipe `check_source` and `check_invariant_source` share: open the store
+    (translating `sqlite3.Error`), record `property.check.start`, check in a fresh
+    per-invocation work directory (see the module docstring), then record one
+    `property.verdict` each. `properties_of` picks which stored properties the
+    driver reads (the unit's own by default; an invariant check reads the type's).
+    """
     verify_fn = verify_port or plan.verify_for(source)
     with open_store(store_root) as store:
         record_event(store_root, PROPERTY_CHECK_START, unit_id=unit.unit_id)
         run = check_properties(
             unit,
-            store=store,
-            render=writer,
+            store=properties_of(store),
+            render=plan.writer,
             verify=verify_fn,
             # A per-invocation subdirectory, not the shared `check-work`
             # root: `check_properties` derives a *deterministic* filename

@@ -68,4 +68,6 @@ def property_check_transcript(run: PropertyCheckRun) -> str:
     lines.append(f"Counts: {summary}")
     if counts["held"] or counts["vacuous"]:
         lines.append(f"Note: {VACUITY_LIMITATION}")
+    assumptions = dict.fromkeys(v.assumption for v in run.verdicts if v.assumption)
+    lines.extend(f"Assumed: {assumption}" for assumption in assumptions)
     return "\n".join(lines)

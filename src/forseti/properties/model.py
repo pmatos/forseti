@@ -19,6 +19,9 @@ class PropertyKind(Enum):
 
     SEMANTIC = "semantic"  # a predicate over the unit's behaviour (W2 target)
     REACHABILITY = "reachability"  # representable now, inert (#63 parked, ADR-0009 D2)
+    # a predicate over one struct type (RFC-0007 kind 1, #387): keyed by the type
+    # (`path::T`), not a function, and stored apart from the per-unit properties
+    REP_INVARIANT = "rep_invariant"
 
 
 class PropertyStatus(Enum):

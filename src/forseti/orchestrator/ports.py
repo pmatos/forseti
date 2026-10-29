@@ -127,13 +127,16 @@ class RenderedHarness:
     unbounded. `probe_source_text` is the vacuity-probe twin of `source_text`
     (same body, labelled ``assert(0)`` after the call in place of the real
     assertion); `None` means the writer offers none, and a HELD is then withheld
-    rather than passed unprobed.
+    rather than passed unprobed. `assumption` names a condition the harness assumes
+    rather than checks (a representation invariant, #387); it rides onto every
+    verdict the harness settles so a result is never read as unconditional.
     """
 
     source_text: str
     language: str = "c"
     length_bounds: LengthBounds = ()
     probe_source_text: str | None = None
+    assumption: str | None = None
 
 
 class PropertyStorePort(Protocol):

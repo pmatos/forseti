@@ -21,6 +21,8 @@ from forseti.properties import (
     PropertyStatus,
     PropertyStore,
     Provenance,
+    WrongPropertyKind,
+    make_invariant,
     make_property_id,
 )
 
@@ -564,3 +566,108 @@ def test_ensure_schema_migrates_a_pre_recipe_db_keeping_its_rows(
 
     with PropertyStore(sqlite3.connect(db_path)) as reopened:
         assert reopened.get("old") is not None
+
+
+TYPE_KEY = "examples/ring_buffer.c::ring_t"
+INV = "self->count <= CAP"
+
+
+def make_inv(
+    *,
+    type_key: str = TYPE_KEY,
+    expression: str = INV,
+    status: PropertyStatus = PropertyStatus.CANDIDATE,
+) -> Property:
+    inv = make_invariant(
+        type_key=type_key,
+        expression=expression,
+        provenance=Provenance("host-submitted", "1", provider="hand", model="human"),
+        description="count never exceeds CAP",
+    )
+    return dataclasses.replace(inv, status=status)
+
+
+def test_type_invariant_roundtrips_through_its_own_table() -> None:
+    store = mem_store()
+    inv = make_inv()
+    store.add_type_invariant(inv)
+    assert store.list_for_type(TYPE_KEY) == (inv,)
+    assert store.list_for_type("examples/other.c::ring_t") == ()
+
+
+def test_type_invariants_are_per_type_and_invisible_to_unit_reads() -> None:
+    store = mem_store()
+    a, b = make_inv(), make_inv(type_key="examples/other.c::ring_t")
+    unit = make_prop(unit_id=TYPE_KEY)
+    store.add_type_invariant(a)
+    store.add_type_invariant(b)
+    store.add(unit)
+    assert store.list_for_type(TYPE_KEY) == (a,)
+    assert store.list_for_unit(TYPE_KEY) == (unit,)
+    assert store.get(a.property_id) is None  # not a per-unit property
+
+
+def test_list_for_type_keeps_insertion_order_and_filters_by_status() -> None:
+    store = mem_store()
+    first = make_inv(expression="self->count <= CAP")
+    second = make_inv(expression="self->tail < CAP", status=PropertyStatus.ACCEPTED)
+    store.add_type_invariant(first)
+    store.add_type_invariant(second)
+    assert store.list_for_type(TYPE_KEY) == (first, second)
+    assert store.list_for_type(TYPE_KEY, {PropertyStatus.ACCEPTED}) == (second,)
+    assert store.list_for_type(TYPE_KEY, ()) == ()
+
+
+def test_duplicate_type_invariant_is_refused() -> None:
+    store = mem_store()
+    store.add_type_invariant(make_inv())
+    with pytest.raises(DuplicateProperty):
+        store.add_type_invariant(make_inv())
+
+
+def test_kinds_are_routed_not_coerced() -> None:
+    store = mem_store()
+    with pytest.raises(WrongPropertyKind, match="add_type_invariant"):
+        store.add(make_inv())
+    with pytest.raises(WrongPropertyKind, match="add"):
+        store.add_type_invariant(make_prop())
+    with pytest.raises(GradingRequired):
+        store.add_type_invariant(make_inv(status=PropertyStatus.GRADED))
+    assert store.list_for_type(TYPE_KEY) == ()
+
+
+def test_open_migrates_an_existing_db_by_adding_the_type_table(tmp_path: Path) -> None:
+    """A `forseti.db` from before #387 has `properties` but no invariant table.
+
+    Opening it must keep every existing row and gain the table in place; the
+    `properties.kind` CHECK is untouched (no table rebuild).
+    """
+    store = PropertyStore.open(root=tmp_path)
+    old = make_prop()
+    store.add(old)
+    store.close()
+    conn = sqlite3.connect(tmp_path / "forseti.db")
+    conn.execute("DROP TABLE type_invariants")
+    conn.commit()
+    conn.close()
+
+    reopened = PropertyStore.open(root=tmp_path)
+    try:
+        assert reopened.get(old.property_id) == old
+        inv = make_inv()
+        reopened.add_type_invariant(inv)
+        assert reopened.list_for_type(TYPE_KEY) == (inv,)
+    finally:
+        reopened.close()
+
+
+def test_open_is_idempotent_over_an_existing_type_table(tmp_path: Path) -> None:
+    for _ in range(2):
+        PropertyStore.open(root=tmp_path).close()
+    store = PropertyStore.open(root=tmp_path)
+    try:
+        store.add_type_invariant(make_inv())
+    finally:
+        store.close()
+    with PropertyStore.open(root=tmp_path) as again:
+        assert len(again.list_for_type(TYPE_KEY)) == 1

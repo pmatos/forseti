@@ -45,6 +45,7 @@ from forseti.properties import (
     CHECKABLE_STATUSES,
     NON_VACUITY_LABEL,
     HarnessError,
+    InvariantNotApplicable,
     LengthBounds,
     Property,
     PropertyKind,
@@ -108,6 +109,7 @@ class PropertyVerdict:
     skip_reason: str | None = None
     length_bounds: LengthBounds = ()
     probe: ProbeReachability | None = None
+    assumption: str | None = None
 
     @classmethod
     def skipped(
@@ -162,6 +164,7 @@ class PropertyVerdict:
         length_bounds: LengthBounds = (),
         probe: ProbeReachability | None = None,
         reason: str | None = None,
+        assumption: str | None = None,
     ) -> PropertyVerdict:
         """A property verified to a terminal `outcome` along the k-ladder: the
         settled bound `k`, the raw `result` (kept for #4 to re-render against
@@ -179,11 +182,17 @@ class PropertyVerdict:
             skip_reason=reason,
             length_bounds=length_bounds,
             probe=probe,
+            assumption=assumption,
         )
 
     def to_dict(self) -> dict[str, Any]:
-        """A JSON-serializable dict — the shape the grading harness (#4) reads."""
-        return {
+        """A JSON-serializable dict — the shape the grading harness (#4) reads.
+
+        A verdict checked under an assumption the harness writer declared (a
+        representation invariant, #387) adds an ``assumption`` field; a skipped or
+        un-rendered one assumed nothing, so it carries none.
+        """
+        payload: dict[str, Any] = {
             "property_id": self.property_id,
             "unit_id": self.unit_id,
             "kind": self.kind,
@@ -199,6 +208,9 @@ class PropertyVerdict:
                 else None
             ),
         }
+        if self.assumption is not None:
+            payload["assumption"] = self.assumption
+        return payload
 
 
 RunOutcome = Literal["held", "violated", "unknown", "error", "empty"]
@@ -360,6 +372,19 @@ def check_properties(
             )
 
     verdicts: list[PropertyVerdict] = []
+
+    def skip(index: int, prop: Property, reason: str) -> None:
+        verdicts.append(
+            PropertyVerdict.skipped(
+                prop.property_id, unit.unit_id, prop.kind.value, reason=reason
+            )
+        )
+        emit(
+            "property.skipped",
+            index=index,
+            detail={"property_id": prop.property_id, "reason": reason},
+        )
+
     for index, prop in enumerate(props):
         kind = prop.kind.value
         emit(
@@ -367,22 +392,17 @@ def check_properties(
             index=index,
             detail={"property_id": prop.property_id, "kind": kind},
         )
-        if prop.kind is not PropertyKind.SEMANTIC:
-            reason = "reachability harnessing deferred (ADR-0009 D2)"
-            verdicts.append(
-                PropertyVerdict.skipped(
-                    prop.property_id, unit.unit_id, kind, reason=reason
-                )
-            )
-            emit(
-                "property.skipped",
-                index=index,
-                detail={"property_id": prop.property_id, "reason": reason},
-            )
+        if prop.kind is PropertyKind.REACHABILITY:
+            skip(index, prop, "reachability harnessing deferred (ADR-0009 D2)")
             continue
 
         try:
             rendered = render.render(unit, prop)
+        except InvariantNotApplicable as exc:
+            # A method that cannot mutate its `T *` has no exit obligation: nothing
+            # was checked, which is `skipped` -- never `held`, never an `error`.
+            skip(index, prop, str(exc))
+            continue
         except HarnessError as exc:
             # #64 renders fail-loud on an un-renderable property (e.g. a
             # postcondition that dereferences a scalar-backed output). Record it as
@@ -436,6 +456,7 @@ def check_properties(
                 length_bounds=rendered.length_bounds,
                 probe=probed.probe,
                 reason=probed.reason,
+                assumption=rendered.assumption,
             )
         )
         detail: dict[str, Any] = {"property_id": prop.property_id, "kind": kind}
