@@ -1,0 +1,57 @@
+{
+  "cli_version": "0.12.2",
+  "checkpoint_id": "01M63B3P564VHXJP8VSM798WQM",
+  "strategy": "manual-commit",
+  "branch": "vibe/387-rep-invariants-s1",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "src/forseti/core/invariant.py",
+    "src/forseti/orchestrator/check.py",
+    "src/forseti/orchestrator/invariant.py",
+    "src/forseti/orchestrator/ports.py",
+    "src/forseti/orchestrator/transcript.py",
+    "src/forseti/properties/__init__.py",
+    "src/forseti/properties/invariant.py",
+    "src/forseti/properties/signature.py",
+    "src/forseti/properties/store.py",
+    "tests/properties/test_rep_invariant.py",
+    "tests/properties/test_store.py"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 12,
+    "cache_creation_tokens": 7627,
+    "cache_read_tokens": 627261,
+    "output_tokens": 3660,
+    "api_call_count": 5,
+    "subagent_tokens": {
+      "input_tokens": 22,
+      "cache_creation_tokens": 47802,
+      "cache_read_tokens": 2309830,
+      "output_tokens": 8323,
+      "api_call_count": 10
+    }
+  },
+  "redaction": {
+    "replacements": 0,
+    "layers": {
+      "betterleaks": 0,
+      "connection_string": 0,
+      "credential_key": 0,
+      "credential_value": 0,
+      "credentialed_uri": 0,
+      "entropy": 0,
+      "key_context": 0,
+      "provider_token": 0,
+      "shell_stdin": 0
+    }
+  }
+}

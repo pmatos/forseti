@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "toolu_01TkonS5zKtTcvfcCcuSRwGF",
+  "agent_id": "ad7eae333090f4271",
+  "subagent_type": "Explore",
+  "task_description": "Altitude review",
+  "token_usage": {
+    "input_tokens": 10,
+    "cache_creation_tokens": 46408,
+    "cache_read_tokens": 154262,
+    "output_tokens": 4116,
+    "api_call_count": 5
+  },
+  "started_at": "2026-10-29T09:01:52.912440492+01:00",
+  "completed_at": "2026-10-29T09:02:26.58564602+01:00"
+}

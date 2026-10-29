@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "toolu_01CS9B8tR5RSuVvgXjXw2gi5",
+  "agent_id": "aeae23b022d0640e7",
+  "subagent_type": "Explore",
+  "task_description": "Reuse review",
+  "token_usage": {
+    "input_tokens": 12,
+    "cache_creation_tokens": 56815,
+    "cache_read_tokens": 211995,
+    "output_tokens": 2886,
+    "api_call_count": 6
+  },
+  "started_at": "2026-10-29T09:01:43.604491882+01:00",
+  "completed_at": "2026-10-29T09:02:07.417920067+01:00"
+}
