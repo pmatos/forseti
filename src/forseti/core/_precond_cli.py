@@ -32,7 +32,7 @@ from forseti.precond import (
 from forseti.precond import (
     DEFAULT_TIMEOUT_S as SYNTH_TIMEOUT_S,
 )
-from forseti.properties import PropertyStoreError
+from forseti.properties import InvariantRole, PropertyStoreError
 
 from ._cli_trace import traced
 from .invariant import accepted_invariants
@@ -112,6 +112,16 @@ def _add_synth_parser(
         emit_help="print the generated sidecar C harness and exit (no verification)",
     )
     p.add_argument(
+        "--role",
+        choices=[role.value for role in InvariantRole],
+        help=(
+            "whether the function uses an accepted invariant (`method`, assumed "
+            "at entry) or establishes it (`initialiser`, nothing assumed). "
+            "Default: inferred from the name; only an init/initialise/initialize "
+            "name part is an initialiser, so name any other constructor explicitly"
+        ),
+    )
+    p.add_argument(
         "--no-invariants",
         action="store_true",
         help=(
@@ -154,8 +164,13 @@ def _synth(args: argparse.Namespace) -> tuple[int, Assessment | None]:
             else accepted_invariants(args.source, store_root=args.store_root)
         )
     except (PropertyStoreError, OSError) as exc:
-        print(f"forseti synth: cannot read accepted invariants: {exc}", file=sys.stderr)
+        print(
+            f"forseti synth: cannot read accepted invariants: {exc} "
+            "(--no-invariants skips the read)",
+            file=sys.stderr,
+        )
         return ASSESSMENT_EXIT_CODES[Assessment.ERROR], Assessment.ERROR
+    role = None if args.role is None else InvariantRole(args.role)
     if args.emit_only:
         try:
             text = synthesize(
@@ -165,6 +180,7 @@ def _synth(args: argparse.Namespace) -> tuple[int, Assessment | None]:
                 timeout_s=args.timeout,
                 esbmc_bin=args.esbmc_bin,
                 invariants=invariants,
+                invariant_role=role,
             )
         except PreconditionUnavailable as exc:
             print(f"forseti synth: {exc.detail}", file=sys.stderr)
@@ -179,6 +195,7 @@ def _synth(args: argparse.Namespace) -> tuple[int, Assessment | None]:
         timeout_s=args.timeout,
         esbmc_bin=args.esbmc_bin,
         invariants=invariants,
+        invariant_role=role,
     )
     if args.json:
         print(json.dumps(result.to_dict()))

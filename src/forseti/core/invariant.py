@@ -143,10 +143,13 @@ def set_invariant_status(
     function (`accepted_invariants`), assumed and never discharged at the callers
     that build a ``T``. The id must belong to that type: an id of another type or
     file is `PropertyNotFound`, so a mistyped ``--type`` cannot settle the wrong
-    row. `InvalidStatusTransition` (a `ValueError`) for a refused move; a failed
+    row. `InvalidStatusTransition` (a `ValueError`) for a refused move; a missing store
+    is `PropertyNotFound` and is not created; a failed
     read or write is `PropertyStoreError`.
     """
     type_key = make_unit_id(source, normalised_type_name(type_name))
+    if not (store_root / "forseti.db").is_file():
+        raise PropertyNotFound(property_id)  # nothing stored: do not create a store
     with open_store(store_root) as store:
         if all(p.property_id != property_id for p in store.list_for_type(type_key)):
             raise PropertyNotFound(property_id)

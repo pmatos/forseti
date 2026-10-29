@@ -30,6 +30,7 @@ from forseti.precond.verify import (
     synthesize,
     verify_precondition,
 )
+from forseti.properties import InvariantRole
 
 RawVerify = Callable[..., EsbmcResult]
 
@@ -356,3 +357,33 @@ def test_discharge_never_assumes_an_invariant(tmp_path: Path) -> None:
     )
     assert harnesses
     assert not any("__forseti_inv" in h for h in harnesses)
+
+
+def test_an_initialiser_is_not_assumed_the_invariant_it_establishes(
+    tmp_path: Path,
+) -> None:
+    harnesses: list[str] = []
+    src = tmp_path / "ring.c"
+    src.write_text("/* ring */\n")
+    init = Unit("rb_init", (Param("r", "ring_t *"),))
+
+    def run(role: InvariantRole | None) -> PreconditionResult:
+        return verify_precondition(
+            src,
+            function="rb_init",
+            max_len=4,
+            ladder_cap=16,
+            work_dir=tmp_path,
+            raw_verify=_reached_raw(harnesses),
+            list_units_fn=_lister(init),
+            invariants=RING_INV,
+            invariant_role=role,
+        )
+
+    result = run(None)
+    assert result.assessment is Assessment.ASSUMED_VERIFIED
+    assert result.invariants == ()
+    assert not any("__forseti_inv" in h for h in harnesses)
+
+    forced = run(InvariantRole.METHOD)
+    assert [i.type_name for i in forced.invariants] == ["ring_t"]

@@ -221,6 +221,21 @@ def test_synth_passes_the_accepted_invariants_of_the_source(
     assert seen["invariants"] == {"ring_t": ("self->count <= 4",)}
 
 
+def test_synth_role_is_forwarded_and_defaults_to_inferred(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from forseti.properties import InvariantRole
+
+    source = tmp_path / "ring.c"
+    root = _accept_invariant(tmp_path, source)
+    seen = _spy_verify(monkeypatch)
+    base = ["synth", str(source), "--function", "foo", "--store-root", str(root)]
+    assert main(base) == 0
+    assert seen["invariant_role"] is None
+    assert main([*base, "--role", "initialiser"]) == 0
+    assert seen["invariant_role"] is InvariantRole.INITIALISER
+
+
 def test_synth_no_invariants_ignores_the_accepted_ones(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -293,7 +308,9 @@ def test_synth_unreadable_invariant_store_is_an_error_not_a_silent_fallback(
     seen = _spy_verify(monkeypatch)
     code = main(["synth", "x.c", "--function", "foo"])
     assert code == ASSESSMENT_EXIT_CODES[Assessment.ERROR]
-    assert "cannot read accepted invariants: corrupt db" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "cannot read accepted invariants: corrupt db" in err
+    assert "--no-invariants skips the read" in err
     assert seen == {}
 
 

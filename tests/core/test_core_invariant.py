@@ -389,6 +389,19 @@ def test_set_invariant_status_is_scoped_to_the_named_type_and_file(
     assert accepted_invariants(source, store_root=root) == {}
 
 
+def test_set_invariant_status_without_a_store_creates_none(tmp_path: Path) -> None:
+    root = tmp_path / "typo"
+    with pytest.raises(PropertyNotFound):
+        set_invariant_status(
+            _source(tmp_path),
+            type_name="ring_t",
+            property_id="x",
+            status=PropertyStatus.ACCEPTED,
+            store_root=root,
+        )
+    assert not root.exists()
+
+
 def test_accepted_invariants_without_a_store_creates_nothing(tmp_path: Path) -> None:
     root = tmp_path / ".forseti"
     assert accepted_invariants(_source(tmp_path), store_root=root) == {}

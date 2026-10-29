@@ -57,6 +57,7 @@ from enum import Enum
 from forseti.esbmc.units import Param, Unit, find_definition_brace
 from forseti.properties.harness import NON_VACUITY_LABEL as NON_VACUITY_LABEL
 from forseti.properties.harness import non_vacuity_probe
+from forseti.properties.invariant import InvariantRole, infer_role
 
 # The default symbolic-length ceiling. A pointer sized by a symbolic length is
 # `malloc(len)` with `len <= max_len`; the loop that consumes it then needs an
@@ -104,6 +105,13 @@ _ELEM_COUNT_NAMES = frozenset({"n", "count", "nmemb", "num", "nelem"})
 # which a `void` pointee hides. Innermost-first (no nested parens), so an atomic
 # function pointer keeps its `(*` and is rejected as one.
 _ATOMIC_WRAPPER_RE = re.compile(r"\b_Atomic\s*\(([^()]*)\)")
+
+# The cv/`restrict` qualifiers clang keeps on a canonical pointer type, as one
+# alternation shared by every reader of a pointee (`_is_pointee_materialisable`,
+# `pointee_type`) so a qualifier learned by one is learned by both.
+_QUALIFIER_PATTERN = (
+    r"\bconst\b|\bvolatile\b|\b__restrict__\b|\b__restrict\b|\brestrict\b"
+)
 
 # Canonical-type tokens that mark an integer (a length must be integral, so a
 # `double len` is not mistaken for a size). Pointers are excluded before this.
@@ -219,11 +227,7 @@ def pointee_type(type_str: str) -> str | None:
     a plain single pointer gives None.
     """
     unqualified = " ".join(
-        re.sub(
-            r"\bconst\b|\bvolatile\b|\b__restrict__\b|\b__restrict\b|\brestrict\b",
-            "",
-            _ATOMIC_WRAPPER_RE.sub(r"\1", type_str),
-        ).split()
+        re.sub(_QUALIFIER_PATTERN, "", _ATOMIC_WRAPPER_RE.sub(r"\1", type_str)).split()
     )
     if unqualified.count("*") != 1 or "(" in unqualified:
         return None
@@ -233,7 +237,10 @@ def pointee_type(type_str: str) -> str | None:
 
 
 def bind_invariants(
-    plan: UnitPlan, invariants: Mapping[str, Sequence[str]]
+    plan: UnitPlan,
+    invariants: Mapping[str, Sequence[str]] | None,
+    *,
+    role: InvariantRole | None = None,
 ) -> UnitPlan:
     """`plan` with the `invariants` of each type its ``T *`` parameters point to.
 
@@ -242,7 +249,16 @@ def bind_invariants(
     or a fixed array holds many ``T``s and is left as before. A type with no
     invariants, or none among the parameters, binds nothing and the plan is returned
     unchanged.
+
+    An *initialiser* is what establishes the invariant, so assuming it at entry
+    would hide a bug in it: nothing is bound for one. `role` defaults to the one
+    `infer_role` reads off the function name, which is deliberately narrow
+    (``init``/``initialise``/``initialize``); name any other initialiser explicitly.
     """
+    if not invariants:
+        return plan
+    if (role or infer_role(plan.unit.name)) is InvariantRole.INITIALISER:
+        return plan
     params_by_type: dict[str, list[str]] = {}
     for p in plan.params:
         if p.role is not ParamRole.SCALAR_PTR:
@@ -303,12 +319,7 @@ def _is_pointee_materialisable(type_str: str) -> bool:
     # detected whatever qualifies it — otherwise the qualifier survives and a
     # `void *` would be mis-sized `malloc(sizeof(void))` instead of falling to
     # UNRESOLVED.
-    without_ptr = re.sub(
-        r"\bconst\b|\bvolatile\b|\b__restrict__\b|\b__restrict\b|\brestrict\b"
-        r"|\b_Atomic\b|\*|\s",
-        "",
-        stripped,
-    )
+    without_ptr = re.sub(rf"{_QUALIFIER_PATTERN}|\b_Atomic\b|\*|\s", "", stripped)
     return without_ptr != "void" and without_ptr != ""
 
 

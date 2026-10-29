@@ -85,14 +85,18 @@ def _inductive(
 
 
 def _synth(
-    capsys: pytest.CaptureFixture[str], source: Path, root: Path, *extra: str
+    capsys: pytest.CaptureFixture[str],
+    source: Path,
+    root: Path,
+    *extra: str,
+    function: str = "rb_push",
 ) -> tuple[int, dict[str, Any]]:
     return _run(
         capsys,
         "synth",
         str(source),
         "--function",
-        "rb_push",
+        function,
         "--max-len",
         "4",
         "--store-root",
@@ -199,3 +203,14 @@ def test_a_vacuous_invariant_is_never_held_and_never_a_synth_pass(
     _accept(capsys, CLEAN, root, property_id)
     code, payload = _synth(capsys, CLEAN, root)
     assert (code, payload["assessment"]) == (4, "vacuous")
+
+
+def test_synth_does_not_assume_the_invariant_for_an_initialiser(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / ".forseti"
+    _accept(capsys, CLEAN, root, _submit(capsys, CLEAN, root, INVARIANT))
+
+    code, payload = _synth(capsys, CLEAN, root, function="rb_init")
+    assert (code, payload["assessment"]) == (0, "assumed_verified")
+    assert payload["assumed_invariants"] == []

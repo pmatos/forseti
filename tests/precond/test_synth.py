@@ -22,6 +22,7 @@ from forseti.precond.synth import (
     pointee_type,
     render_sidecar,
 )
+from forseti.properties import InvariantRole
 
 
 def _unit(*params: Param, name: str = "f") -> Unit:
@@ -456,3 +457,26 @@ def test_the_non_vacuity_probe_keeps_the_assumption() -> None:
     assert text.index("__ESBMC_assume(__forseti_inv_ring_t(r));") < text.index(
         NON_VACUITY_LABEL
     )
+
+
+def test_bind_invariants_binds_nothing_for_an_initialiser() -> None:
+    init = plan_unit(_unit(Param("r", "ring_t *"), name="rb_init"))
+    assert bind_invariants(init, {"ring_t": ("1",)}) is init
+
+
+def test_bind_invariants_role_overrides_the_name() -> None:
+    init = plan_unit(_unit(Param("r", "ring_t *"), name="rb_init"))
+    method = plan_unit(_unit(Param("r", "ring_t *"), name="ring_new"))
+    assert bind_invariants(
+        init, {"ring_t": ("1",)}, role=InvariantRole.METHOD
+    ).invariants
+    assert (
+        bind_invariants(method, {"ring_t": ("1",)}, role=InvariantRole.INITIALISER)
+        is method
+    )
+    assert bind_invariants(method, {"ring_t": ("1",)}).invariants  # not inferred
+
+
+def test_bind_invariants_accepts_none() -> None:
+    plan = plan_unit(_ring_push())
+    assert bind_invariants(plan, None) is plan

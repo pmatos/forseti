@@ -37,6 +37,7 @@ from forseti.esbmc import (
     verify,
 )
 from forseti.orchestrator.ports import VerifyPort
+from forseti.properties.invariant import InvariantRole
 
 from .reachability import ProbeReachability
 from .run import ProbeSite, SettledRun, SidecarRunner, sidecar_runner
@@ -262,6 +263,7 @@ def verify_precondition(
     raw_verify: VerifyPort | None = None,
     list_units_fn: Callable[[Path], list[Unit]] | None = None,
     invariants: Mapping[str, Sequence[str]] | None = None,
+    invariant_role: InvariantRole | None = None,
 ) -> PreconditionResult:
     """Synthesise a memory precondition for `source::function` and verify it.
 
@@ -274,7 +276,9 @@ def verify_precondition(
     `invariants` maps a struct type name to its *accepted* representation invariant
     expressions (#387): a ``T *`` parameter's materialised object is then assumed to
     satisfy them (``__ESBMC_assume``) before the call, and the result says so. That
-    is S0 under an *assumed* context -- never discharged here, and never offered to
+    is S0 under an *assumed* context -- not bound at all for an initialiser (it
+    establishes the invariant; `invariant_role`, default inferred from the name) --
+    never discharged here, and never offered to
     `discharge_precondition`, whose verdict must not rest on one.
     `raw_verify` and `list_units_fn` inject the two esbmc calls for tests;
     production uses `list_units` + assertions-on/force-malloc-success `verify`.
@@ -289,8 +293,7 @@ def verify_precondition(
         plan = plan_for(source, function, lister)
     except PreconditionUnavailable as exc:
         return PreconditionResult(function, exc.assessment, exc.detail, plan=exc.plan)
-    if invariants:
-        plan = bind_invariants(plan, invariants)
+    plan = bind_invariants(plan, invariants, role=invariant_role)
 
     raw = raw_verify or sidecar_verify_port(timeout_s=timeout_s, esbmc_bin=esbmc_bin)
     with sidecar_runner(
@@ -312,20 +315,20 @@ def synthesize(
     esbmc_bin: str = "esbmc",
     list_units_fn: Callable[[Path], list[Unit]] | None = None,
     invariants: Mapping[str, Sequence[str]] | None = None,
+    invariant_role: InvariantRole | None = None,
 ) -> str:
     """Return the sidecar C harness text for `source::function` (no ESBMC verify).
 
     The pure render path exposed for inspection (``forseti synth --emit-only``).
     Raises `PreconditionUnavailable` when the unit is missing or a pointer shape
     is unresolved (L2) — the caller maps that to an exit code, never a silent
-    empty emit. `invariants` is `verify_precondition`'s.
+    empty emit. `invariants` and `invariant_role` are `verify_precondition`'s.
     """
     lister = unit_lister(
         esbmc_bin=esbmc_bin, timeout_s=timeout_s, adapter=list_units_fn
     )
     plan = plan_for(source, function, lister)
-    if invariants:
-        plan = bind_invariants(plan, invariants)
+    plan = bind_invariants(plan, invariants, role=invariant_role)
     return render_sidecar(plan, str(source.resolve()), max_len=max_len)
 
 
