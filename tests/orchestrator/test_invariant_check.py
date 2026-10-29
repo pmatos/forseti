@@ -163,6 +163,9 @@ def test_const_only_method_is_skipped_with_a_reason_and_never_verified(
     assert "const ring_t" in verdict.skip_reason
     assert verify.sources == []
     assert run.outcome == "empty"
+    # nothing was assumed or checked, so neither the payload nor the transcript says so
+    assert "assumption" not in verdict.to_dict()
+    assert "Assumed:" not in property_check_transcript(run)
 
 
 def test_unrenderable_function_is_an_error_not_a_skip(tmp_path: Path) -> None:
@@ -178,6 +181,7 @@ def test_unrenderable_function_is_an_error_not_a_skip(tmp_path: Path) -> None:
     )
     (verdict,) = run.verdicts
     assert verdict.outcome is PropertyOutcome.ERROR
+    assert "assumption" not in verdict.to_dict()
     assert verify.sources == []
 
 

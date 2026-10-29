@@ -41,6 +41,7 @@ from .invariant import (
     infer_role,
     invariant_reason,
     make_invariant,
+    normalised_type_name,
     render_invariant_harness,
     valid_type_name,
 )
@@ -161,6 +162,7 @@ __all__ = [
     "is_valid_transition",
     "make_invariant",
     "make_property_id",
+    "normalised_type_name",
     "parse_candidate",
     "parse_candidate_list",
     "parse_candidates",

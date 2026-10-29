@@ -346,7 +346,8 @@ class PropertyStore:
 
         Raises `DuplicateProperty` for a stored content id and `WrongPropertyKind`
         for any other kind. There is no grading slot, so a GRADED row is refused
-        (`GradingRequired`).
+        (`GradingRequired`). Rows are written once: no status transition or retire
+        path exists yet (moving an invariant to ACCEPTED/REJECTED is a later stage).
         """
         if prop.kind is not PropertyKind.REP_INVARIANT:
             raise WrongPropertyKind(prop.property_id, prop.kind, expected="add")

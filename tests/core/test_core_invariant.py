@@ -284,3 +284,27 @@ def test_cli_store_error_exits_one(
     )
     assert code == 1
     assert "forseti submit-property" in capsys.readouterr().err
+
+
+def test_type_name_spelling_does_not_split_the_key(tmp_path: Path) -> None:
+    source, root = tmp_path / "node.c", tmp_path / ".forseti"
+    source.write_text(
+        "struct node { int v; };\nvoid bump(struct node *n) { n->v++; }\n"
+    )
+    result = submit_invariant_source(
+        source,
+        type_name="struct  node",
+        expression="self->v >= 0",
+        provider="hand",
+        model="human",
+        store_root=root,
+    )
+    assert result.unit_id == f"{source}::struct node"
+    run = check_invariant_source(
+        source,
+        function="bump",
+        type_name="struct   node",
+        store_root=root,
+        verify_port=_verify,
+    )
+    assert [v.outcome for v in run.verdicts] == [PropertyOutcome.HELD]

@@ -14,12 +14,11 @@ from __future__ import annotations
 
 import contextlib
 import re
-import uuid
 from collections.abc import Sequence
 from pathlib import Path
 
-from forseti.core.events import PROPERTY_CHECK_START, PROPERTY_VERDICT, record_event
-from forseti.core.persistence import open_store, persist_proposal
+from forseti.core.check import run_check
+from forseti.core.persistence import persist_proposal
 from forseti.core.propose import DEFAULT_STORE_ROOT
 from forseti.core.submit import DEFAULT_PROMPT_ID, DEFAULT_PROMPT_VERSION
 from forseti.orchestrator import (
@@ -28,7 +27,6 @@ from forseti.orchestrator import (
     PropertyCheckRun,
     Unit,
     VerifyPort,
-    check_properties,
 )
 from forseti.orchestrator.semantic_check import (
     DEFAULT_TIMEOUT_S,
@@ -49,11 +47,10 @@ from forseti.properties import (
     RejectedCandidate,
     invariant_reason,
     make_invariant,
+    normalised_type_name,
     valid_type_name,
 )
 from forseti.unit_id import make_unit_id
-
-_WORK_SUBDIR = "check-work"
 
 
 def submit_invariant_source(
@@ -82,6 +79,7 @@ def submit_invariant_source(
         raise BlankProvenanceError(
             f"provider={provider!r} and model={model!r} must both be nonblank"
         )
+    type_name = normalised_type_name(type_name)
     type_key = make_unit_id(source, type_name)
     spec = CandidateSpec(
         expression=expression.strip(),
@@ -99,8 +97,7 @@ def submit_invariant_source(
     def ingest(store: PropertyStore | None) -> ProposalResult:
         if reason is None and store is not None:
             with contextlib.suppress(DuplicateProperty):
-                if store.get_type_invariant(prop.property_id) is None:
-                    store.add_type_invariant(prop)
+                store.add_type_invariant(prop)
         return ProposalResult(
             unit_id=type_key,
             prompt_id=prompt_id,
@@ -150,6 +147,7 @@ def check_invariant_source(
     that only takes ``const T *`` is ``skipped``. `role` defaults to the one inferred
     from the function name (`infer_role`). The remaining knobs are `check_source`'s.
     """
+    type_name = normalised_type_name(type_name)
     unit = Unit.from_path(source, function)
     plan = SemanticCheckPlan(
         unwind=unwind,
@@ -160,25 +158,13 @@ def check_invariant_source(
         extra_flags=extra_flags,
         render=InvariantHarnessWriter(max_len=validated_max_len(max_len), role=role),
     )
-    verify_fn = verify_port or plan.verify_for(source)
-    with open_store(store_root) as store:
-        record_event(store_root, PROPERTY_CHECK_START, unit_id=unit.unit_id)
-        run = check_properties(
-            unit,
-            store=InvariantsOfType(store, make_unit_id(source, type_name)),
-            render=plan.writer,
-            verify=verify_fn,
-            work_dir=store_root / _WORK_SUBDIR / uuid.uuid4().hex,
-            unwind=unwind,
-            unwind_ladder=plan.ladder,
-        )
-    for verdict in run.verdicts:
-        record_event(
-            store_root,
-            PROPERTY_VERDICT,
-            unit_id=verdict.unit_id,
-            property_id=verdict.property_id,
-            outcome=verdict.outcome.value,
-            k=verdict.k,
-        )
-    return run
+    type_key = make_unit_id(source, type_name)
+    return run_check(
+        unit,
+        source=source,
+        plan=plan,
+        store_root=store_root,
+        unwind=unwind,
+        verify_port=verify_port,
+        properties_of=lambda store: InvariantsOfType(store, type_key),
+    )

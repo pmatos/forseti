@@ -18,6 +18,7 @@ from forseti.properties import (
     infer_role,
     invariant_reason,
     make_invariant,
+    normalised_type_name,
     render_invariant_harness,
     valid_type_name,
 )
@@ -204,9 +205,12 @@ def test_build_defaults_role_from_the_name_and_returns_the_probe_twin() -> None:
     ("symbol", "role"),
     [
         ("rb_init", InvariantRole.INITIALISER),
-        ("ring_create", InvariantRole.INITIALISER),
+        ("ring_initialize", InvariantRole.INITIALISER),
         ("init", InvariantRole.INITIALISER),
-        ("rb_new_ring", InvariantRole.INITIALISER),
+        ("ring_create", InvariantRole.METHOD),
+        ("ring_new_slot", InvariantRole.METHOD),
+        ("ring_is_new", InvariantRole.METHOD),
+        ("ring_setup_done", InvariantRole.METHOD),
         ("rb_push", InvariantRole.METHOD),
         ("reinitialise_all", InvariantRole.METHOD),
         ("rb_finish", InvariantRole.METHOD),
@@ -257,3 +261,8 @@ def test_make_invariant_is_a_keyed_candidate_with_a_stable_content_id() -> None:
     assert a.unit_id == "f.c::ring_t"
     assert a.domain == ()
     assert a.property_id == b.property_id != other.property_id
+
+
+def test_type_name_whitespace_is_collapsed() -> None:
+    assert normalised_type_name("struct \t node ") == "struct node"
+    assert normalised_type_name("ring_t") == "ring_t"

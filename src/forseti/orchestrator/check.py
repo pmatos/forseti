@@ -183,11 +183,17 @@ class PropertyVerdict:
             probe=probe,
         )
 
+    @property
+    def assumes_invariant(self) -> bool:
+        """Whether a representation invariant was actually assumed for this verdict."""
+        return self.kind == PropertyKind.REP_INVARIANT.value and self.result is not None
+
     def to_dict(self) -> dict[str, Any]:
         """A JSON-serializable dict — the shape the grading harness (#4) reads.
 
-        A representation-invariant verdict adds an ``assumption`` field: the
-        invariant is assumed at entry, not discharged at callers (#387).
+        A representation-invariant verdict that reached ESBMC adds an ``assumption``
+        field: the invariant is assumed at entry, not discharged at callers (#387).
+        A skipped or un-rendered one assumed nothing, so it carries none.
         """
         payload: dict[str, Any] = {
             "property_id": self.property_id,
@@ -205,7 +211,7 @@ class PropertyVerdict:
                 else None
             ),
         }
-        if self.kind == PropertyKind.REP_INVARIANT.value:
+        if self.assumes_invariant:
             payload["assumption"] = INVARIANT_ASSUMPTION_NOTE
         return payload
 

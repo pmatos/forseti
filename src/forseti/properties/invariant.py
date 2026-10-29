@@ -37,6 +37,9 @@ from .harness import (
     non_vacuity_probe,
     plan_length_bounds,
 )
+from .harness import (
+    _call_arg as _plain_call_arg,
+)
 from .model import Property, PropertyKind, PropertyStatus, Provenance, make_property_id
 from .signature import (
     BufferParam,
@@ -59,9 +62,7 @@ INVARIANT_ASSUMPTION_NOTE = (
 )
 
 _TYPE_NAME = re.compile(r"struct\s+[A-Za-z_]\w*|(?!struct\b)[A-Za-z_]\w*")
-_INITIALISER_NAME = re.compile(
-    r"(?:^|_)(?:init|initialise|initialize|create|new|setup)(?:_|$)", re.IGNORECASE
-)
+_INITIALISER_NAME = re.compile(r"(?:^|_)(?:init|initialise|initialize)(?:_|$)", re.I)
 
 
 class InvariantRole(Enum):
@@ -81,10 +82,23 @@ class InvariantNotApplicable(HarnessError):
 
 
 def infer_role(symbol: str) -> InvariantRole:
-    """`INITIALISER` for a name with an ``init``/``create``/``new``/``setup`` part."""
+    """`INITIALISER` for a name with an ``init``/``initialise``/``initialize`` part.
+
+    Deliberately narrow: a wrong guess drops the entry assumption and reads as a
+    spurious violation, so ``create``/``new``/``setup`` (``ring_new_slot``) are not
+    guessed -- name those with an explicit `role`.
+    """
     if _INITIALISER_NAME.search(symbol):
         return InvariantRole.INITIALISER
     return InvariantRole.METHOD
+
+
+def normalised_type_name(type_name: str) -> str:
+    """`type_name` with whitespace runs collapsed: ``struct  node`` -> ``struct node``.
+
+    The store key and the signature match must agree on one spelling.
+    """
+    return " ".join(type_name.split())
 
 
 def valid_type_name(type_name: str) -> bool:
@@ -180,8 +194,7 @@ def render_invariant_harness(
             )
         raise InvariantNotApplicable(
             f"{signature.symbol!r} takes only const {type_name} *, so it cannot "
-            "break the invariant; the safety checks under an assumed invariant "
-            "are a later stage"
+            "break the invariant, so there is no exit obligation to check"
         )
 
     buffers = [
@@ -268,10 +281,8 @@ def build_invariant_harness(
 
 
 def _call_arg(param: Param) -> str:
-    if isinstance(param, ScalarParam):
-        return param.name
+    """A struct instance is passed by address; every other param as the semantic
+    harness passes it."""
     if isinstance(param, StructParam):
         return f"&{param.name}"
-    if isinstance(param, BufferParam):
-        return f"&{param.name}" if _is_scalar_backed(param) else param.name
-    raise HarnessError(f"unknown Param subtype: {type(param).__name__}")
+    return _plain_call_arg(param)
