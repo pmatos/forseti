@@ -220,7 +220,11 @@ def test_manifest_round_trips_through_its_pinned_form() -> None:
 
     pinned = manifest.to_dict()
 
-    assert pinned["recipe_refs"] == ["baseline/v1", "sighted/v1", "blind/v1"]
+    assert pinned["recipe_refs"] == {
+        "baseline": "baseline/v1",
+        "sighted": "sighted/v1",
+        "blind": "blind/v1",
+    }
     assert Manifest.from_dict(json.loads(json.dumps(pinned))) == manifest
     bounds = manifest.bounds_for(manifest.units[0])
     assert (bounds.unwind, bounds.unwind_ladder, bounds.max_len) == (2, (), 1)

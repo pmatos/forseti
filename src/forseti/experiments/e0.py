@@ -22,19 +22,14 @@ Every number in the summary is computed from those rows (``summarise``); the
 ``summary`` command rebuilds the table from a run directory alone.
 
 Resume: re-running the same command on the same run directory skips every
-proposal and every check that already has a row, so an interrupted run loses at
-most the one ESBMC check that was in flight. A proposal that failed (an LLM or
-parse error) is retried; its newer row supersedes the failed one. A run directory
-is pinned to its manifest: a different manifest is refused. ``record_event`` is
-best-effort, so a row that failed to write is simply redone on the next run and
-the summary reports the missing work.
+proposal and check that already has a row. A failed proposal or an ESBMC error is
+redone (the newer row supersedes). The directory is pinned to its manifest and
+source files, and locked against a second runner. ``record_event`` is best-effort,
+so a row that failed to write is redone and the summary reports the missing work.
 
-Paths in the manifest are read relative to the working directory (run from the
-repository root), and the unit ids are spelt as the manifest spells them.
-
-Vocabulary: a verdict is "no violation found up to k (and len <= max_len)", never
-a proof. ``unknown`` includes ``vacuous`` (the post-call point was unreachable, so
-the property was never evaluated); neither is ever read as held.
+Manifest paths are read relative to the working directory (run from the repository
+root). A verdict is "no violation found up to k (and len <= max_len)", never a
+proof; ``unknown`` and ``vacuous`` are never read as held.
 
 The grid (about 54 proposer calls and hours of ESBMC)::
 
@@ -71,7 +66,9 @@ from forseti.orchestrator import (
 )
 from forseti.orchestrator.semantic_check import (
     DEFAULT_UNWIND,
+    FixedProperties,
     SemanticCheckPlan,
+    TimedVerify,
 )
 from forseti.precond import DEFAULT_MAX_LEN
 from forseti.properties import (
@@ -243,7 +240,7 @@ class Manifest:
             "name": self.name,
             "model": self.model,
             "recipes": list(self.recipes),
-            "recipe_refs": list(self.recipe_refs.values()),
+            "recipe_refs": self.recipe_refs,
             "samples": self.samples,
             "max_candidates": self.max_candidates,
             "unwind": self.unwind,
@@ -360,12 +357,15 @@ def _cell_key(row: Mapping[str, Any]) -> CellKey:
     return (str(row.get("unit_id")), str(row.get("recipe")), int(row.get("sample", -1)))
 
 
+def _check_key_of(
+    cell: CellKey, attempt: object, property_id: object, target: object
+) -> CheckKey:
+    return (cell, int(str(attempt)), str(property_id), str(target))
+
+
 def _check_key(row: Mapping[str, Any]) -> CheckKey:
-    return (
-        _cell_key(row),
-        int(row.get("attempt", 0)),
-        str(row.get("property_id")),
-        str(row.get("target")),
+    return _check_key_of(
+        _cell_key(row), row.get("attempt", 0), row.get("property_id"), row.get("target")
     )
 
 
@@ -420,38 +420,10 @@ class _MeteredClient:
         return text
 
 
-class _TimedVerify:
-    """A `VerifyPort` summing the ESBMC time of every run it forwards."""
-
-    def __init__(self, port: VerifyPort) -> None:
-        self._port = port
-        self.seconds = 0.0
-        self.runs = 0
-
-    def __call__(self, source: Path, /, *, unwind: int) -> EsbmcResult:
-        result = self._port(source, unwind=unwind)
-        self.seconds += result.meta.duration_s
-        self.runs += 1
-        return result
-
-
-class _OneProperty:
-    """A `PropertyStorePort` over one property, whatever the unit id (a twin's)."""
-
-    def __init__(self, prop: Property) -> None:
-        self._prop = prop
-
-    def list_for_unit(
-        self, unit_id: str, statuses: object = None
-    ) -> Sequence[Property]:
-        return (self._prop,)
-
-
 @dataclass(frozen=True)
 class _Target:
     name: str
     unit: Unit
-    bounds: Bounds
     plan: SemanticCheckPlan
 
 
@@ -486,10 +458,10 @@ def _prepare(
             )
             plan.validate_ladder()
             clean = Unit.from_path(Path(spec.path), spec.symbol)
-            targets = [_Target(CLEAN, clean, bounds, plan)]
+            targets = [_Target(CLEAN, clean, plan)]
             if spec.twin is not None:
                 twin = Unit.from_path(Path(spec.twin), spec.symbol)
-                targets.append(_Target(TWIN, twin, bounds, plan))
+                targets.append(_Target(TWIN, twin, plan))
             requests = {
                 recipe: prepare_proposal_request(
                     Path(spec.path), function=spec.symbol, recipe=recipe
@@ -569,14 +541,14 @@ def _check(
     work_dir: Path,
     run_dir: Path,
 ) -> dict[str, Any]:
-    timed = _TimedVerify(target.plan.verify_for(Path(target.unit.path)))
+    timed = TimedVerify(target.plan.verify_for(Path(target.unit.path)))
     run = check_properties(
         target.unit,
-        store=_OneProperty(prop),
+        store=FixedProperties([prop]),
         render=target.plan.writer,
         verify=timed,
         work_dir=work_dir / target.name,
-        unwind=target.bounds.unwind,
+        unwind=target.plan.unwind,
         unwind_ladder=target.plan.ladder,
     )
     (verdict,) = run.verdicts
@@ -592,7 +564,7 @@ def _property_row(
     prop: Property,
     proposal: Mapping[str, Any],
     verdict: PropertyVerdict,
-    timed: _TimedVerify,
+    timed: TimedVerify,
 ) -> dict[str, Any]:
     result = verdict.result
     return {
@@ -618,9 +590,9 @@ def _property_row(
         "probe": verdict.probe.value if verdict.probe is not None else None,
         "length_bounds": dict(verdict.length_bounds),
         "esbmc_version": result.meta.esbmc_version if result is not None else None,
-        "unwind": target.bounds.unwind,
+        "unwind": target.plan.unwind,
         "ladder": list(target.plan.ladder),
-        "max_len": target.bounds.max_len,
+        "max_len": target.plan.max_len,
         "esbmc_timeout_s": manifest.esbmc_timeout_s,
     }
 
@@ -738,11 +710,8 @@ def _run_cells(
                         say(f"{label}: proposal failed: {proposal['error']}")
                 for prop in _accepted(proposal, unit.unit_id):
                     for target in unit.targets:
-                        check = (
-                            key,
-                            proposal["attempt"],
-                            prop.property_id,
-                            target.name,
+                        check = _check_key_of(
+                            key, proposal["attempt"], prop.property_id, target.name
                         )
                         if check in state.checks:
                             continue
@@ -886,15 +855,16 @@ class Summary:
             return lines
 
         def checks(target: str) -> list[list[object]]:
+            tallies = [(r.recipe, r.targets[target]) for r in self.recipes]
             return [
                 [
-                    r.recipe,
-                    r.targets[target].checked,
-                    r.targets[target].rendered,
-                    *(r.targets[target].count(name) for name in _OUTCOMES),
-                    f"{r.targets[target].esbmc_time_s:.1f}",
+                    recipe,
+                    t.checked,
+                    t.rendered,
+                    *(t.count(name) for name in _OUTCOMES),
+                    f"{t.esbmc_time_s:.1f}",
                 ]
-                for r in self.recipes
+                for recipe, t in tallies
             ]
 
         check_header = ["recipe", "checked", "rendered", *_OUTCOMES, "ESBMC s"]
@@ -977,7 +947,7 @@ def summarise(
     them); it defaults to the registry's. A check that ended in an ESBMC error is
     tallied but still counts as work remaining, since a resume redoes it.
     """
-    refs = refs or manifest.recipe_refs
+    refs = refs if refs is not None else manifest.recipe_refs
     proposals: dict[CellKey, list[Mapping[str, Any]]] = {}
     checks: dict[CheckKey, Mapping[str, Any]] = {}
     for row in rows:
@@ -1015,17 +985,15 @@ def summarise(
                 for prop in accepted:
                     for name in names:
                         row = checks.get(
-                            (
-                                key,
-                                int(latest["attempt"]),
-                                str(prop["property_id"]),
-                                name,
+                            _check_key_of(
+                                key, latest["attempt"], prop["property_id"], name
                             )
                         )
-                        if row is None or _needs_retry(row):
+                        if row is None:
                             missing += 1
-                        if row is not None:
-                            summary.targets[name].add(row)
+                            continue
+                        summary.targets[name].add(row)
+                        missing += _needs_retry(row)
                 summary.missing_checks += missing
                 summary.complete_cells += missing == 0
         summaries.append(summary)
@@ -1041,8 +1009,7 @@ def summary_from_run_dir(run_dir: Path) -> Summary:
     except (OSError, json.JSONDecodeError) as exc:
         raise E0Error(f"{run_dir} is not an E0 run directory: {exc}") from exc
     manifest = Manifest.from_dict(pinned)
-    refs = dict(zip(manifest.recipes, pinned.get("recipe_refs", ()), strict=False))
-    return summarise(manifest, read_rows(run_dir), refs or None)
+    return summarise(manifest, read_rows(run_dir), pinned.get("recipe_refs"))
 
 
 def _build_parser() -> argparse.ArgumentParser:

@@ -8,13 +8,14 @@ No source is read, harness rendered or verifier invoked by preparation.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from functools import partial
 from pathlib import Path
 
-from forseti.esbmc import verify
+from forseti.esbmc import EsbmcResult, verify
 from forseti.precond import DEFAULT_MAX_LEN
 from forseti.precond.run import escalating_port
+from forseti.properties import Property, PropertyStatus
 
 from .check import SemanticHarnessWriter
 from .ladder import validated_ladder
@@ -77,6 +78,33 @@ def esbmc_verify_for(
     return factory
 
 
+class TimedVerify:
+    """A `VerifyPort` that sums the ESBMC time and counts the runs it forwards."""
+
+    def __init__(self, port: VerifyPort) -> None:
+        self._port = port
+        self.seconds = 0.0
+        self.runs = 0
+
+    def __call__(self, source: Path, /, *, unwind: int) -> EsbmcResult:
+        result = self._port(source, unwind=unwind)
+        self.seconds += result.meta.duration_s
+        self.runs += 1
+        return result
+
+
+class FixedProperties:
+    """A `PropertyStorePort` over a fixed property list, whatever the unit id."""
+
+    def __init__(self, props: Sequence[Property]) -> None:
+        self._props = tuple(props)
+
+    def list_for_unit(
+        self, unit_id: str, statuses: Collection[PropertyStatus] | None = None
+    ) -> Sequence[Property]:
+        return self._props
+
+
 class SemanticCheckPlan:
     """Prepare compatible bounds and adapters once for a checking operation.
 
@@ -110,6 +138,10 @@ class SemanticCheckPlan:
         self._verify_for = verify_for or esbmc_verify_for(
             timeout_s=timeout_s, esbmc_bin=esbmc_bin, extra_flags=extra_flags
         )
+
+    @property
+    def unwind(self) -> int:
+        return self._unwind
 
     @property
     def max_len(self) -> int | None:
