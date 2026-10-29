@@ -69,18 +69,6 @@ class InvariantRole(Enum):
     INITIALISER = "initialiser"  # establishes it from an arbitrary state
 
 
-# A representation invariant has no grading slot, so it skips GRADED: a human (or a
-# harness acting for one) accepts or rejects a candidate directly, and both are
-# terminal, like every other property's settled states.
-_INVARIANT_ALLOWED: dict[PropertyStatus, frozenset[PropertyStatus]] = {
-    PropertyStatus.CANDIDATE: frozenset(
-        {PropertyStatus.ACCEPTED, PropertyStatus.REJECTED}
-    ),
-    PropertyStatus.GRADED: frozenset(),
-    PropertyStatus.ACCEPTED: frozenset(),
-    PropertyStatus.REJECTED: frozenset(),
-}
-
 # What an inductive check reads. Unlike `CHECKABLE_STATUSES` this keeps ACCEPTED:
 # an accepted invariant is the one every `T *` function is assumed under, so a new
 # or edited mutator must still be checked against it.
@@ -94,10 +82,14 @@ def is_valid_invariant_transition(
 ) -> bool:
     """True iff a stored invariant may move from `current` to `requested`.
 
-    ``CANDIDATE -> ACCEPTED | REJECTED`` only; both are terminal and GRADED is not
-    a state an invariant reaches (`is_valid_transition` is the semantic lifecycle's).
+    ``CANDIDATE -> ACCEPTED | REJECTED`` only, both final. An invariant has no
+    grading slot, so it skips GRADED (`is_valid_transition` is the semantic
+    lifecycle's, and is left untouched).
     """
-    return requested in _INVARIANT_ALLOWED[current]
+    return current is PropertyStatus.CANDIDATE and requested in (
+        PropertyStatus.ACCEPTED,
+        PropertyStatus.REJECTED,
+    )
 
 
 class InvariantNotApplicable(HarnessError):

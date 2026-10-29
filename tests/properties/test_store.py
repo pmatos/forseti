@@ -757,3 +757,13 @@ def test_list_for_type_prefix_treats_sql_wildcards_literally() -> None:
     store.add_type_invariant(make_inv(type_key="a_c.c::ring_t"))
     assert store.list_for_type_prefix("a%c.c::") == ()
     assert store.list_for_type_prefix("a_c.c::") != ()
+
+
+def test_get_type_invariant_reads_only_the_type_table() -> None:
+    store = mem_store()
+    inv, unit = make_inv(), make_prop()
+    store.add_type_invariant(inv)
+    store.add(unit)
+    assert store.get_type_invariant(inv.property_id) == inv
+    assert store.get_type_invariant(unit.property_id) is None
+    assert store.get_type_invariant("nope") is None

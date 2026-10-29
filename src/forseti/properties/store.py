@@ -9,6 +9,7 @@ run trace; this is the queryable property state. Stdlib only (`sqlite3`, `json`)
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import sqlite3
 from collections.abc import Collection
@@ -427,26 +428,26 @@ class PropertyStore:
         is assumed, never discharged at the callers that build a `T`.
         """
         with self._conn:
-            row = self._conn.execute(
-                "SELECT status FROM type_invariants WHERE property_id = ?",
-                (property_id,),
-            ).fetchone()
-            if row is None:
+            current = self.get_type_invariant(property_id)
+            if current is None:
                 raise PropertyNotFound(property_id)
-            current = PropertyStatus(row["status"])
-            if not is_valid_invariant_transition(current, new_status):
-                raise InvalidStatusTransition(current, new_status)
+            if not is_valid_invariant_transition(current.status, new_status):
+                raise InvalidStatusTransition(current.status, new_status)
             cur = self._conn.execute(
                 "UPDATE type_invariants SET status = ? "
                 "WHERE property_id = ? AND status = ?",
-                (new_status.value, property_id, current.value),
+                (new_status.value, property_id, current.status.value),
             )
             if cur.rowcount == 0:  # another writer settled it since the read
-                raise InvalidStatusTransition(current, new_status)
+                raise InvalidStatusTransition(current.status, new_status)
+        return dataclasses.replace(current, status=new_status)
+
+    def get_type_invariant(self, property_id: str) -> Property | None:
+        """The representation invariant with `property_id`, or None if absent."""
         row = self._conn.execute(
             "SELECT * FROM type_invariants WHERE property_id = ?", (property_id,)
         ).fetchone()
-        return _row_to_invariant(row)
+        return None if row is None else _row_to_invariant(row)
 
     def update_status(self, property_id: str, new_status: PropertyStatus) -> Property:
         """Atomically validate and apply a status transition; return the result.

@@ -19,7 +19,7 @@ from functools import partial
 from pathlib import Path
 
 from forseti.core.check import run_check
-from forseti.core.persistence import open_store, persist_proposal
+from forseti.core.persistence import open_store, persist_proposal, store_exists
 from forseti.core.propose import DEFAULT_STORE_ROOT
 from forseti.core.submit import DEFAULT_PROMPT_ID, DEFAULT_PROMPT_VERSION
 from forseti.orchestrator import (
@@ -148,10 +148,11 @@ def set_invariant_status(
     read or write is `PropertyStoreError`.
     """
     type_key = make_unit_id(source, normalised_type_name(type_name))
-    if not (store_root / "forseti.db").is_file():
+    if not store_exists(store_root):
         raise PropertyNotFound(property_id)  # nothing stored: do not create a store
     with open_store(store_root) as store:
-        if all(p.property_id != property_id for p in store.list_for_type(type_key)):
+        stored = store.get_type_invariant(property_id)
+        if stored is None or stored.unit_id != type_key:
             raise PropertyNotFound(property_id)
         return store.update_type_invariant_status(property_id, status)
 
@@ -166,7 +167,7 @@ def accepted_invariants(
     never creates. Keyed by the raw ``source`` spelling the invariants were
     submitted under, like every unit id.
     """
-    if not (store_root / "forseti.db").is_file():
+    if not store_exists(store_root):
         return {}
     by_type: dict[str, list[str]] = {}
     with open_store(store_root) as store:
