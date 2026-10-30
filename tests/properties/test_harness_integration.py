@@ -249,7 +249,7 @@ def _msort_verdict(post: str, tmp_path: Path) -> EsbmcResult:
             spec=spec,
         )
     )
-    return verify(harness, unwind=4, timeout_s=120)
+    return verify(harness, unwind=4, timeout_s=30)
 
 
 def test_msort_true_property_verifies_on_the_range_harness(tmp_path: Path) -> None:

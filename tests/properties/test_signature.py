@@ -82,7 +82,7 @@ def test_extract_signature_void_param_list_has_no_params() -> None:
     assert sig == UnitSignature("zero", "int", ())
 
 
-MSORT_DEF = "static void msort(int *a, int lo, int hi, int *tmp) { }"
+MSORT_DEF = "static void msort(int *a, int lo, int hi, int *tmp) { tmp[lo] = 0; }"
 
 
 def test_extract_signature_range_idiom_sizes_the_buffer_by_its_upper_bound() -> None:
@@ -111,9 +111,32 @@ def test_extract_signature_range_idiom_pairs(lower: str, upper: str) -> None:
     assert sig.params[0] == BufferParam("char", "s", upper)
 
 
-def test_extract_signature_range_idiom_scratch_needs_the_same_element_type() -> None:
-    sig = extract_signature("void f(int *a, int lo, int hi, char *r) { }", "f")
-    assert sig.params[3] == BufferParam("char", "r", "1", out=True)
+@pytest.mark.parametrize(
+    ("tail", "body", "expected"),
+    [
+        ("char *r", "r[1] = 0;", BufferParam("char", "r", "1", out=True)),
+        ("int *pos", "*pos = a[lo];", BufferParam("int", "pos", "1", out=True)),
+        ("int *pos", "pos[0] = a[lo];", BufferParam("int", "pos", "1", out=True)),
+        (
+            "const int *t",
+            "a[lo] = t[hi];",
+            BufferParam("int", "t", "1", const=True, out=False),
+        ),
+        ("int *t", "t[lo] = 0;", BufferParam("int", "t", "hi", out=True)),
+    ],
+)
+def test_extract_signature_range_idiom_scratch_rule(
+    tail: str, body: str, expected: BufferParam
+) -> None:
+    # Only a non-const, same-typed pointer the body indexes past [0] is scratch.
+    sig = extract_signature(f"void f(int *a, int lo, int hi, {tail}) {{ {body} }}", "f")
+    assert sig.params[3] == expected
+
+
+def test_extract_signature_declared_array_length_is_not_a_range_buffer() -> None:
+    sig = extract_signature("void f(int a[4], int lo, int hi, int *r) { r[lo]; }", "f")
+    assert sig.params[0] == BufferParam("int", "a", "4")
+    assert sig.params[3] == BufferParam("int", "r", "1", out=True)
 
 
 def test_extract_signature_non_range_names_keep_the_length_idiom() -> None:

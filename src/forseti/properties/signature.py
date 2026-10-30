@@ -157,8 +157,9 @@ def extract_signature(
 
     A pointer followed by a ``(lo, hi)`` / ``(start, end)`` / ``(begin, end)`` pair
     is the range idiom: the buffer is ``hi`` long, and a trailing non-const pointer
-    of the same element type (a scratch buffer, ``msort``'s ``tmp``) is as long and
-    an output, not a single element.
+    of the same element type that the body subscripts past ``[0]`` (a scratch
+    buffer, ``msort``'s ``tmp``) is as long and an output, not a single element.
+    The upper bound is read as exclusive (``a[lo..hi)``) and matched by name only.
     """
     pattern = re.compile(
         r"([A-Za-z_][\w \t\*]*?[\s\*])" + re.escape(symbol) + r"\s*\(([^)]*)\)\s*\{"
@@ -173,9 +174,9 @@ def extract_signature(
         raise HarnessError(f"could not parse the return type of {symbol!r}")
     raws = [_parse_fragment(frag, symbol) for frag in _split_params(match.group(2))]
     # comments are blanked length-preservingly, so `match` offsets stay valid
-    code = _without_comments(unit_source) if infer_structs or struct_types else ""
+    code = _without_comments(unit_source)
     defined = _struct_definitions_in(code)
-    body = _function_body(code, match.end() - 1) if infer_structs else ""
+    body = _function_body(code, match.end() - 1)
     return UnitSignature(
         symbol=symbol,
         return_ctype=return_ctype,
@@ -368,14 +369,20 @@ def _to_params(
                 )
             )
             continue
-        range_upper = _range_upper_bound(raws[i + 1 : i + 3])
+        range_upper = None if raw.array_len else _range_upper_bound(raws[i + 1 : i + 3])
         if raw.array_len:
             length, out = raw.array_len, False
         elif range_upper is not None:
             length, out = range_upper, False
         elif nxt is not None and not nxt.is_ptr and _is_integer_type(nxt.type_str):
             length, out = nxt.name, False
-        elif nxt is None and scratch_of is not None and scratch_of[0] == pointee:
+        elif (
+            nxt is None
+            and not raw.is_const
+            and scratch_of is not None
+            and scratch_of[0] == pointee
+            and _is_indexed(raw.name, body)
+        ):
             length, out = scratch_of[1], True
         elif nxt is None:
             # a trailing pointer with no length param is a single-element output
@@ -391,7 +398,7 @@ def _to_params(
                 "not the (buffer, length) idiom nor a trailing output; supply a "
                 "UnitSignature explicitly for multi-buffer signatures"
             )
-        if range_upper is not None and scratch_of is None:
+        if range_upper is not None and not raw.is_const and scratch_of is None:
             scratch_of = (pointee, range_upper)
         params.append(
             BufferParam(
@@ -422,6 +429,11 @@ def _range_upper_bound(following: Sequence[_RawParam]) -> str | None:
         return None
     lower, upper = following
     return upper.name if (lower.name, upper.name) in _RANGE_BOUNDS else None
+
+
+def _is_indexed(name: str, body: str) -> bool:
+    """Whether `body` subscripts `name` with something other than a literal ``0``."""
+    return re.search(rf"\b{re.escape(name)}\s*\[\s*(?!0\s*\])", body) is not None
 
 
 def _is_buffer_idiom(raw: _RawParam, nxt: _RawParam | None, body: str) -> bool:
