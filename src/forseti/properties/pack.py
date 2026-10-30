@@ -36,17 +36,20 @@ sibling slices are also capped in count, so one slice cannot starve the rest.
 
 from __future__ import annotations
 
+import os
 import posixpath
 import re
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 from forseti.unit_id import make_unit_id, unit_id_path, unit_id_symbol
 
 from .index import (
     FunctionRef,
+    GitTree,
+    OverlayTree,
     ProjectIndex,
     ProjectIndexError,
     Reach,
@@ -54,10 +57,7 @@ from .index import (
     line_of,
 )
 from .model import PropertyStatus
-from .recipes import ProposalContext
-
-if TYPE_CHECKING:
-    from .store import PropertyStore
+from .store import PropertyStore
 
 Contracts = Callable[[str], Sequence[str]]
 
@@ -151,21 +151,43 @@ class ContextPack:
         ]
         return "\n".join(sections)
 
-    def to_context(self, recipe: str) -> ProposalContext:
-        """The pack as the text a recipe hands the proposer, labelled `recipe`."""
-        return ProposalContext(recipe=recipe, text=self.text)
+
+def _unit_spellings(root: Path, cwd: Path, path: str) -> list[str]:
+    """The ways a store may have spelled the tree-relative `path` of a unit id.
+
+    Core keys units by the path as the user gave it: relative to the project
+    root (the tree path), relative to the working directory, or absolute.
+    """
+    absolute = root / path
+    spellings = [path, os.path.relpath(absolute, cwd), str(absolute)]
+    return list(dict.fromkeys(spellings))
 
 
-def store_contracts(store: PropertyStore) -> Contracts:
-    """Accepted properties of a unit, as one-line contract strings, for callees."""
+def store_contracts(
+    store: PropertyStore, *, root: Path, cwd: Path | None = None
+) -> Contracts:
+    """Accepted properties of a callee, as one-line contract strings.
+
+    `root` is the tree's root, so a tree-relative callee id also finds the
+    properties the store keyed under its working-directory-relative or absolute
+    spelling. The store is read as it is now, not as of the pinned commit.
+    """
+    here = cwd or Path.cwd()
 
     def contracts(unit_id: str) -> Sequence[str]:
-        accepted = store.list_for_unit(unit_id, {PropertyStatus.ACCEPTED})
+        path, symbol = unit_id_path(unit_id), unit_id_symbol(unit_id)
+        accepted = {
+            p.property_id: p
+            for spelling in _unit_spellings(root, here, path)
+            for p in store.list_for_unit(
+                make_unit_id(spelling, symbol), {PropertyStatus.ACCEPTED}
+            )
+        }
         return [
             f"{p.expression} (given {'; '.join(p.domain)})"
             if p.domain
             else p.expression
-            for p in accepted
+            for p in accepted.values()
         ]
 
     return contracts
@@ -380,3 +402,41 @@ def _select(unit_id: str, ranked: list[PackEntry], max_tokens: int) -> ContextPa
         ):
             chosen.append(entry)
     return ContextPack(unit_id, tuple(chosen), omitted=len(ranked) - len(chosen))
+
+
+STORE_DIRNAME = ".forseti"
+
+
+def build_project_pack(
+    unit_id: str,
+    source_text: str,
+    project_root: Path,
+    config: PackConfig | None = None,
+    *,
+    use_store: bool = False,
+) -> ContextPack:
+    """The pack for a unit of the git project containing `project_root`, at HEAD.
+
+    Every file but the unit's own is read from the HEAD commit, so uncommitted and
+    untracked files never reach the pack; the unit's file is `source_text`, the text
+    being worked on. The unit's path is resolved against the working directory and
+    must lie inside the repository. With `use_store`, callees also show the accepted
+    contracts of the project's default store (``.forseti``) when one exists.
+    `ProjectIndexError` for anything that stops the pack (no repository or commit, a
+    path outside it, no such function).
+    """
+    tree = GitTree.at(project_root)
+    try:
+        path = Path(unit_id_path(unit_id)).resolve().relative_to(tree.root.resolve())
+    except ValueError:
+        raise ProjectIndexError(
+            f"{unit_id_path(unit_id)!r} is outside the repository at {tree.root}"
+        ) from None
+    index = ProjectIndex(OverlayTree(tree, {path.as_posix(): source_text}))
+    unit = make_unit_id(path.as_posix(), unit_id_symbol(unit_id))
+    store_dir = project_root / STORE_DIRNAME
+    if use_store and (store_dir / "forseti.db").is_file():
+        with PropertyStore.open(store_dir) as store:
+            contracts = store_contracts(store, root=tree.root)
+            return build_context_pack(index, unit, config, contracts=contracts)
+    return build_context_pack(index, unit, config)

@@ -74,6 +74,7 @@ from forseti.precond import DEFAULT_MAX_LEN
 from forseti.properties import (
     MAX_CANDIDATES_DEFAULT,
     RECIPES,
+    SINGLE_FILE_RECIPES,
     ClaudeCliClient,
     LLMClient,
     LLMUsage,
@@ -171,7 +172,7 @@ class Manifest:
 
     name: str
     units: tuple[UnitSpec, ...]
-    recipes: tuple[str, ...] = tuple(RECIPES)
+    recipes: tuple[str, ...] = SINGLE_FILE_RECIPES
     samples: int = 3
     model: str = DEFAULT_MODEL
     max_candidates: int = MAX_CANDIDATES_DEFAULT
@@ -191,7 +192,7 @@ class Manifest:
         if not isinstance(units_raw, list) or not units_raw:
             raise E0Error("manifest needs a non-empty `units` list")
         units = tuple(_unit_from(item, index) for index, item in enumerate(units_raw))
-        recipes_raw = raw.pop("recipes", list(RECIPES))
+        recipes_raw = raw.pop("recipes", list(SINGLE_FILE_RECIPES))
         if (
             not isinstance(recipes_raw, list)
             or not recipes_raw

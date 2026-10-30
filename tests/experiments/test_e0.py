@@ -152,6 +152,13 @@ def manifest_for(
     return Manifest(**{**defaults, **fields})
 
 
+def test_the_default_grid_stays_single_file() -> None:
+    plain = Manifest(name="m", units=(UnitSpec("a.c", "f"),))
+    assert plain.recipes == ("baseline", "sighted", "blind")
+    data = {"name": "m", "units": [{"path": "a.c", "symbol": "f"}]}
+    assert Manifest.from_dict(data).recipes == plain.recipes
+
+
 def rows_of(run_dir: Path, kind: str) -> list[dict[str, Any]]:
     return [r for r in read_rows(run_dir) if r["type"] == kind]
 
