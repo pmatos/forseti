@@ -115,7 +115,7 @@ from .recipes import (
     RecipeError,
     build_context,
 )
-from .signature import StructParam
+from .signature import StructParam, range_lower_bounds
 from .store import (
     DuplicateProperty,
     GradingRequired,
@@ -215,6 +215,7 @@ __all__ = [
     "plan_length_bounds",
     "propose_invariants",
     "propose_properties",
+    "range_lower_bounds",
     "render_invariant_harness",
     "render_prompt",
     "render_property_harness",

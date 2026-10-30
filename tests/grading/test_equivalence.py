@@ -186,10 +186,31 @@ def test_ring_buffer_example_is_refused() -> None:
     assert "file-scope" in reason
 
 
-def test_merge_sort_example_is_refused_for_its_mistyped_output() -> None:
-    reason = refusal(example_slice("merge_sort.c"), symbol="msort")
-    assert "`tmp`" in reason
+def test_merge_sort_example_is_modelled_with_hi_long_buffers() -> None:
+    src = example_slice("merge_sort.c")
+    harness = render_equivalence_harness(
+        reference_source=src, candidate_source=src, symbol="msort", max_len=2
+    )
+    text = harness.source_text
+    assert harness.length_bounds == (("hi", 2),)
+    assert "int *a = malloc((hi) * sizeof(int));" in text
+    assert "int *tmp = malloc((hi) * sizeof(int));" in text
+    assert "__ESBMC_assume((lo >= 0 && lo <= hi));" in text
+    assert "msort__ref(__forseti_ref_a, lo, hi, __forseti_ref_tmp);" in text
+    labels = {label for label, _ in harness.input_vars}
+    assert {"a[0]", "a[1]", "tmp[0]", "tmp[1]"} <= labels
+
+
+def test_forwarded_trailing_pointer_outside_a_range_is_still_refused() -> None:
+    src = "void g(int *t);\nvoid f(int *a, int n, int *t) { g(t); }\n"
+    reason = refusal(src, symbol="f")
+    assert "`t`" in reason
     assert "dereference" in reason
+
+
+def test_non_range_buffer_gets_no_lower_bound_assumption() -> None:
+    text = render(SUM, SUM, "sum")
+    assert text.count("__ESBMC_assume((n") == 1
 
 
 @pytest.mark.parametrize(

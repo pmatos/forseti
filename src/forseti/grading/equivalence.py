@@ -25,6 +25,9 @@ reported alongside the filter's result.
 Scope of the shared translation unit (v1, fail closed): sources that define a
 file-scope object, a file-scope aggregate, ``main``, or function-local ``static``
 state are refused, as are non-arithmetic parameters and mismatched signatures.
+A ``(buf, lo, hi)`` range-idiom unit is modelled with ``buf`` (and a trailing
+scratch pointer) as ``hi`` long and ``0 <= lo <= hi`` assumed, since a free ``lo``
+addresses outside the buffer in the reference itself (``examples/merge_sort.c``).
 Conditional directives and ``#pragma`` are refused. State hidden behind an
 ``#include``, and calls to functions defined in neither source (each draws an
 independent nondet), are not visible to this text-level analysis.
@@ -66,6 +69,7 @@ from forseti.properties import (
     UnitSignature,
     extract_signature,
     plan_length_bounds,
+    range_lower_bounds,
     renderability_reason,
 )
 
@@ -255,6 +259,8 @@ def render_equivalence_harness(
         inputs.append((p.name, p.name))
     for name, bound in bounds:
         body.append(f"    __ESBMC_assume(({name} >= 0 && {name} <= {bound}));")
+    for lower, upper in range_lower_bounds(signature):
+        body.append(f"    __ESBMC_assume(({lower} >= 0 && {lower} <= {upper}));")
 
     ref_args: dict[str, str] = {p.name: p.name for p in scalars}
     cand_args: dict[str, str] = dict(ref_args)
@@ -758,8 +764,8 @@ def _out_param_refusal(signature: UnitSignature, body: str, label: str) -> str |
     """A single-element output must only be dereferenced.
 
     `extract_signature` types a trailing non-const pointer as a one-element output;
-    a pointer forwarded, indexed or advanced is really a buffer of unknown extent
-    (e.g. ``msort``'s ``tmp``), so the harness would model it wrongly.
+    a pointer forwarded, indexed or advanced is really a buffer of unknown extent,
+    so the harness would model it wrongly.
     """
     for p in signature.params:
         if not (isinstance(p, BufferParam) and _is_cell(p)):
@@ -806,9 +812,7 @@ def _prepare(reference: str, candidate: str, symbol: str) -> tuple[UnitSignature
             raise EquivalenceRefusal(f"{label} source does not define `{symbol}`")
         scans[label] = scan
         try:
-            sigs[label] = extract_signature(
-                mask_comments(source), symbol, range_idiom=False
-            )
+            sigs[label] = extract_signature(mask_comments(source), symbol)
         except HarnessError as exc:
             raise EquivalenceRefusal(f"{label} signature not modelled: {exc}") from exc
         reason = _fragment_refusal(view, symbol) or _signature_refusal(sigs[label])
