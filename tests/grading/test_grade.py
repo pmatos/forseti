@@ -146,10 +146,14 @@ class FakeEquivalence:
     compared with itself is always verified, as the real filter's baseline needs."""
 
     def __init__(
-        self, equivalent: Collection[str] = (), refuse: str | None = None
+        self,
+        equivalent: Collection[str] = (),
+        refuse: str | None = None,
+        assumptions: tuple[str, ...] = (),
     ) -> None:
         self.equivalent = set(equivalent)
         self.refuse = refuse
+        self.assumptions = assumptions
         self.calls: list[dict[str, Any]] = []
 
     def __call__(self, **kwargs: Any) -> Any:
@@ -160,7 +164,7 @@ class FakeEquivalence:
         k = kwargs["k"]
         marker = candidate.split("/*")[1].split("*/")[0]
         if candidate == kwargs["reference"] or marker in self.equivalent:
-            return EquivalenceVerified(k, (), meta())
+            return EquivalenceVerified(k, (), meta(), self.assumptions)
         return EquivalenceUnknown(k, (), EquivalenceUnknownReason.TIMEOUT, "t", meta())
 
 
@@ -660,6 +664,39 @@ def test_a_refused_original_skips_nothing_and_says_so(
     assert got.properties[0].counts()["killed"] == 1
     assert "file-scope state" in grade_transcript(got)
     assert got.to_dict()["equivalence"]["original_refusal"] == "file-scope state"
+
+
+def test_assumed_equivalence_domain_is_surfaced(source: Path, tmp_path: Path) -> None:
+    store = store_with(source, [make_prop("p1")])
+    got = run_grade(
+        source,
+        store,
+        tmp_path,
+        mutants=[make_mutant(1, "m1")],
+        verify=FakeVerify({("m1", "p1"): violated()}),
+        equivalence=FakeEquivalence(equivalent={"m1"}, assumptions=("0 <= lo <= hi",)),
+    )
+
+    assert got.equivalence_assumed == ("0 <= lo <= hi",)
+    assert got.to_dict()["equivalence"]["assumed"] == ["0 <= lo <= hi"]
+    assert "assumed: 0 <= lo <= hi" in grade_transcript(got)
+    run_row = grade_trace_rows(got)[0][1]
+    assert run_row["equivalence_assumed"] == ["0 <= lo <= hi"]
+
+
+def test_no_assumed_domain_is_not_reported(source: Path, tmp_path: Path) -> None:
+    store = store_with(source, [make_prop("p1")])
+    got = run_grade(
+        source,
+        store,
+        tmp_path,
+        mutants=[make_mutant(1, "m1")],
+        verify=FakeVerify({("m1", "p1"): violated()}),
+        equivalence=FakeEquivalence(equivalent={"m1"}),
+    )
+
+    assert got.equivalence_assumed == ()
+    assert "equivalence check assumed" not in grade_transcript(got)
 
 
 def test_esbmc_time_is_recorded_per_check_and_in_total(

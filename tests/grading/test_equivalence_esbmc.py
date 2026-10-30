@@ -120,6 +120,7 @@ def test_in_place_buffer_difference_is_found_in_the_buffer() -> None:
     )
     assert isinstance(got, EquivalenceViolated)
     assert got.witness.diverging.startswith("a[")
+    assert got.assumptions == ()
     assert any(label.startswith("a[") for label, _ in got.witness.inputs)
 
 
@@ -245,6 +246,7 @@ def test_merge_sort_against_itself_is_verified_up_to_k() -> None:
     )
     assert isinstance(got, EquivalenceVerified)
     assert got.length_bounds == (("hi", 2),)
+    assert got.assumptions == ("0 <= lo <= hi",)
 
 
 def test_merge_sort_without_its_tail_drain_is_violated() -> None:
@@ -258,3 +260,4 @@ def test_merge_sort_without_its_tail_drain_is_violated() -> None:
     )
     assert isinstance(got, EquivalenceViolated)
     assert got.witness.diverging.startswith("a[")
+    assert got.assumptions == ("0 <= lo <= hi",)

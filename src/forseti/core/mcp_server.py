@@ -372,7 +372,8 @@ def grade_tool(
         skipped counts, `kill_rate` (killed / (killed + survived); unknown, error
         and skipped are never folded in), a `reason` naming each surviving
         mutant, and the ESBMC time; plus the run `outcome` (graded | partial |
-        ungraded), mutant and equivalence totals, and the `limitations`: every
+        ungraded), mutant and equivalence totals (with the input domain the
+        equivalence check `assumed`, e.g. `0 <= lo <= hi`), and the `limitations`: every
         verdict is bounded (up to k, len<=max_len), and skipping equivalent
         mutants by a bounded check inflates the kill rate. A property with no
         killed or surviving mutant stays a candidate.

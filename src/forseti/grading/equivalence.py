@@ -139,13 +139,15 @@ class Witness:
 class EquivalenceVerified:
     """No divergence found up to `k` and `length_bounds` (not for all inputs).
 
-    For a range-idiom unit the inputs also satisfy ``0 <= lo <= hi``; a divergence
-    only outside that domain is not looked for.
+    `assumptions` lists the input domain the harness assumed (``0 <= lo <= hi``
+    for a range-idiom unit, empty otherwise); a divergence only outside it is not
+    looked for, so the verdict holds under those assumptions.
     """
 
     k: int
     length_bounds: LengthBounds
     meta: RunMeta
+    assumptions: tuple[str, ...] = ()
 
     @property
     def verdict(self) -> EquivalenceVerdict:
@@ -154,13 +156,14 @@ class EquivalenceVerified:
 
 @dataclass(frozen=True)
 class EquivalenceViolated:
-    """The versions disagree on `witness`."""
+    """The versions disagree on `witness`, an input within `assumptions`."""
 
     k: int
     length_bounds: LengthBounds
     witness: Witness
     raw_counterexample: str = field(repr=False)
     meta: RunMeta = field(repr=False)
+    assumptions: tuple[str, ...] = ()
 
     @property
     def verdict(self) -> EquivalenceVerdict:
@@ -213,6 +216,7 @@ class EquivalenceHarness:
     length_bounds: LengthBounds
     input_vars: tuple[tuple[str, str], ...]
     outputs: tuple[_Output, ...]
+    assumptions: tuple[str, ...] = ()
 
 
 def render_equivalence_harness(
@@ -263,7 +267,8 @@ def render_equivalence_harness(
         inputs.append((p.name, p.name))
     for name, bound in bounds:
         body.append(f"    __ESBMC_assume(({name} >= 0 && {name} <= {bound}));")
-    for lower, upper in range_lower_bounds(signature):
+    ranges = range_lower_bounds(signature)
+    for lower, upper in ranges:
         body.append(f"    __ESBMC_assume(({lower} >= 0 && {lower} <= {upper}));")
 
     ref_args: dict[str, str] = {p.name: p.name for p in scalars}
@@ -359,6 +364,7 @@ def render_equivalence_harness(
         length_bounds=bounds,
         input_vars=tuple(inputs),
         outputs=tuple(outputs),
+        assumptions=tuple(f"0 <= {lower} <= {upper}" for lower, upper in ranges),
     )
 
 
@@ -423,7 +429,7 @@ def _classify(
 ) -> EquivalenceResult:
     bounds = harness.length_bounds
     if isinstance(result, Verified):
-        return EquivalenceVerified(k, bounds, result.meta)
+        return EquivalenceVerified(k, bounds, result.meta, harness.assumptions)
     if isinstance(result, EsbmcUnknown):
         reason = UnknownReason.__members__.get(
             result.reason.name, UnknownReason.UNCLASSIFIED
@@ -443,6 +449,7 @@ def _classify(
             _witness(cex, harness, description),
             result.raw_counterexample,
             result.meta,
+            harness.assumptions,
         )
     function = cex.violated_property.loc.function if cex else None
     where = function or "unknown location"
@@ -514,6 +521,18 @@ class EquivalenceFilter[M: MutantLike]:
         return len(self.skipped_equivalent)
 
     @property
+    def assumptions(self) -> tuple[str, ...]:
+        """The input domain assumed by the decided checks (``()`` if none)."""
+        return tuple(
+            dict.fromkeys(
+                a
+                for _, r in self.results
+                if isinstance(r, EquivalenceVerified | EquivalenceViolated)
+                for a in r.assumptions
+            )
+        )
+
+    @property
     def undecided(self) -> tuple[str, ...]:
         """Ids kept because the check was UNKNOWN or refused."""
         return tuple(
@@ -531,6 +550,7 @@ class EquivalenceFilter[M: MutantLike]:
             "kept": [m.id for m in self.kept],
             "undecided": list(self.undecided),
             "original_refusal": self.original_refusal,
+            "assumed": list(self.assumptions),
             "verdicts": {i: r.verdict.value for i, r in self.results},
         }
 
