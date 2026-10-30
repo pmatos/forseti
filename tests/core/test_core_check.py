@@ -336,11 +336,18 @@ def test_check_source_max_len_none_leaves_the_length_unconstrained(
     assert "<= 8" not in verdict.harness_source
 
 
-def test_check_source_reports_no_cap_when_the_domain_bounds_the_length(
+def test_check_source_reports_no_cap_when_the_floor_contradicts_the_cap(
     tmp_path: Path,
 ) -> None:
-    verdict = _buf_verdict(tmp_path, ("n >= 1 && n <= 4",))
+    verdict = _buf_verdict(tmp_path, ("n >= 16 && n <= 20",))
     assert verdict.length_bounds == ()
+
+
+def test_check_source_caps_a_length_the_domain_bounds_above_the_cap(
+    tmp_path: Path,
+) -> None:
+    verdict = _buf_verdict(tmp_path, ("n >= 1 && n <= 100",))
+    assert verdict.length_bounds == (("n", 8),)
 
 
 @pytest.mark.parametrize(

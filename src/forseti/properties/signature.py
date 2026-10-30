@@ -51,6 +51,11 @@ class BufferParam:
     const: bool = False
     out: bool = False
 
+    @property
+    def scalar_backed(self) -> bool:
+        """A single-element output: a plain scalar passed by address, never malloc'd."""
+        return self.out and self.length.strip() == "1"
+
 
 @dataclass(frozen=True)
 class StructParam(BufferParam):
@@ -108,6 +113,20 @@ class UnitSignature:
         """
         return frozenset(
             p.name for p in self.params if isinstance(p, BufferParam) and p.out
+        )
+
+    @property
+    def scratch_param_names(self) -> frozenset[str]:
+        """Names of the output buffers the harness `malloc`s (not scalar-backed).
+
+        A scratch buffer is the one output a domain may name, and only to say it is
+        not NULL (`renderability_reason`): the harness already allocates it non-NULL
+        and leaves its contents for the unit to write.
+        """
+        return frozenset(
+            p.name
+            for p in self.params
+            if isinstance(p, BufferParam) and p.out and not p.scalar_backed
         )
 
     @property

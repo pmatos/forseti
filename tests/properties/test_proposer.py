@@ -323,6 +323,34 @@ def test_domain_over_output_param_rejected() -> None:
     assert reason is not None and "output parameter 'cp'" in reason
 
 
+def scratch_sig() -> UnitSignature:
+    return UnitSignature(
+        symbol="sortish",
+        return_ctype="void",
+        params=(
+            BufferParam(elem_ctype="int", name="a", length="hi"),
+            ScalarParam(ctype="int", name="lo"),
+            ScalarParam(ctype="int", name="hi"),
+            BufferParam(elem_ctype="int", name="tmp", length="hi", out=True),
+        ),
+    )
+
+
+def test_non_null_domain_on_a_scratch_buffer_accepted() -> None:
+    spec = CandidateSpec(
+        expression="hi - lo < 2 || a[lo] == a[lo]", domain=("lo >= 0", "tmp != 0")
+    )
+    assert validate_candidate(spec, scratch_sig()) is None
+
+
+def test_other_domain_on_a_scratch_buffer_still_rejected() -> None:
+    spec = CandidateSpec(
+        expression="hi - lo < 2 || a[lo] == a[lo]", domain=("tmp[0] == 0",)
+    )
+    reason = validate_candidate(spec, scratch_sig())
+    assert reason is not None and "output parameter 'tmp'" in reason
+
+
 def test_output_param_allowed_in_expression() -> None:
     # The same output param IS valid in the postcondition -- the unit writes it --
     # as long as it is named directly (the harness binds it as a scalar).

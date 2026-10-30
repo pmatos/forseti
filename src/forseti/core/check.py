@@ -141,8 +141,9 @@ def check_source(
     finite `unwind` can settle, so such a property could only ever report
     `unknown`. The cap is *reported*, never silent: each verdict carries the
     `length_bounds` it was checked under, so `held` reads as "held up to k,
-    len<=N". A domain clause that mentions the length is authoritative and
-    suppresses the cap for that length (`properties.plan_length_bounds`).
+    len<=N". The cap also applies over a domain's own upper bound (the check
+    stays scoped to ``len <= max_len``); only a domain whose literal lower bound
+    exceeds the cap suppresses it for that length (`properties.plan_length_bounds`).
     `None` restores the genuinely unconstrained length. The fill loop over `len`
     elements needs ``k > max_len``, so a derived default ladder gains a
     ``max_len + 1`` rung when its own top rung does not clear `max_len`

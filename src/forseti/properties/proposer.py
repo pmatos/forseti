@@ -479,9 +479,10 @@ def validate_candidate(
         )
         if render_block is not None:
             return render_block
+        domain_idents = input_params | signature.scratch_param_names | HARNESS_MACROS
         for pre in spec.domain:
             for ident in identifiers(pre):
-                if ident not in (input_params | HARNESS_MACROS):
+                if ident not in domain_idents:
                     return f"domain expr {pre!r} references unknown ident {ident!r}"
         for name in spec.referenced_params:
             if name not in params:

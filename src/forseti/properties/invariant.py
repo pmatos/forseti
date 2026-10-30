@@ -31,7 +31,6 @@ from .harness import (
     SemanticSpec,
     _call_arg,
     _defines_main,
-    _is_scalar_backed,
     _nondet_ctypes,
     _nondet_slug,
     _render_buffer,
@@ -247,7 +246,7 @@ def render_invariant_harness(
         for p in signature.params
         if isinstance(p, BufferParam) and not isinstance(p, StructParam)
     ]
-    malloc_buffers = [b for b in buffers if not _is_scalar_backed(b)]
+    malloc_buffers = [b for b in buffers if not b.scalar_backed]
 
     lines = [f"#include <{inc}>" for inc in includes]
     if malloc_buffers and "stdlib.h" not in includes:

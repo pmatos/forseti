@@ -234,19 +234,25 @@ def test_cap_below_the_unwind_is_needed_to_settle(tmp_path: Path) -> None:
     assert isinstance(result, Unknown)
 
 
-def _msort_verdict(post: str, tmp_path: Path) -> EsbmcResult:
+def _msort_verdict(
+    post: str,
+    tmp_path: Path,
+    domain: tuple[str, ...] = ("lo >= 0", "lo <= hi", "hi <= 2"),
+    max_len: int | None = None,
+) -> EsbmcResult:
     # #425: `msort(int *a, int lo, int hi, int *tmp)` addresses a[lo..hi), so the
     # harness must size `a` and `tmp` by `hi`; sized by `lo` and one element, every
     # property was VIOLATED out of bounds (or UNKNOWN) whatever it claimed.
     source = (Path(__file__).parents[2] / "examples" / "merge_sort.c").read_text()
     unit = source[: source.index("int main(void)")]
-    spec = SemanticSpec(post, ("lo >= 0", "lo <= hi", "hi <= 2"))
+    spec = SemanticSpec(post, domain)
     harness = tmp_path / "msort.c"
     harness.write_text(
         render_semantic_harness(
             unit_source=unit,
             signature=extract_signature(unit, "msort"),
             spec=spec,
+            max_len=max_len,
         )
     )
     return verify(harness, unwind=4, timeout_s=30)
@@ -262,3 +268,13 @@ def test_msort_false_property_is_violated_on_the_range_harness(
 ) -> None:
     result = _msort_verdict("hi - lo < 2 || a[lo] > a[lo + 1]", tmp_path)
     assert isinstance(result, Violated)
+
+
+def test_msort_domain_above_the_cap_is_narrowed_and_settles(tmp_path: Path) -> None:
+    result = _msort_verdict(
+        "hi - lo < 2 || a[lo] <= a[lo + 1]",
+        tmp_path,
+        domain=("lo >= 0", "lo <= hi", "hi <= 4", "tmp != NULL"),
+        max_len=2,
+    )
+    assert isinstance(result, Verified)
