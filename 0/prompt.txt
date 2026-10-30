@@ -1,0 +1,52 @@
+You propose SEMANTIC properties (behavioural postconditions) for ONE C function
+that an ESBMC bounded model checker will check up to a loop bound k. You are NOT
+proving anything -- you propose checkable properties and ESBMC returns a verdict.
+
+Function: msort   (unit id: examples/merge_sort.c::msort)
+Translation unit:
+#include <assert.h>
+
+#define N 4
+
+int nondet_int(void);
+
+static void merge(int *a, int lo, int mid, int hi, int *tmp) {
+    int i = lo, j = mid, k = lo;
+    while (i < mid && j < hi) tmp[k++] = (a[i] <= a[j]) ? a[i++] : a[j++];
+    while (i < mid) tmp[k++] = a[i++];
+    while (j < hi) tmp[k++] = a[j++];
+    for (k = lo; k < hi; k++) a[k] = tmp[k];
+}
+
+static void msort(int *a, int lo, int hi, int *tmp) {
+    if (hi - lo < 2) return;
+    int mid = lo + (hi - lo) / 2;
+    msort(a, lo, mid, tmp);
+    msort(a, mid, hi, tmp);
+    merge(a, lo, mid, hi, tmp);
+}
+
+
+Contract you MUST follow for every candidate:
+- `expression`: a C boolean expression asserted AFTER one call
+  `result = msort(...)`. Refer to the return value ONLY as `result`.
+  Refer to parameters by their exact declared names. Use no other variables.
+- `domain`: a list of C boolean preconditions over the PARAMETERS ONLY (never
+  `result`), emitted as __ESBMC_assume(...) BEFORE the call to constrain the
+  nondeterministic inputs so the property is not vacuously violated. Give the
+  WEAKEST domain that makes the property hold. Use an empty list if none is
+  needed.
+- `referenced_params`: the exact parameter names your `expression` uses.
+- Pure expressions only: no `;`, no assignment, no side effects, no function
+  calls except standard limit macros (INT_MIN, INT64_MAX, UINT_MAX, SIZE_MAX...).
+- `expression` must reference `result` and/or a parameter -- never a constant
+  tautology such as 1==1.
+
+Return ONLY a JSON object (no prose, no markdown fences):
+{"candidates":[
+  {"expression":"result >= 0",
+   "domain":["x > INT64_MIN"],
+   "referenced_params":["x"],
+   "rationale":"abs is non-negative except at the un-negatable minimum"}
+]}
+Propose up to 6 distinct, non-overlapping candidates, strongest first.
