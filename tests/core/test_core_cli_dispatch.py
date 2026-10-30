@@ -45,6 +45,7 @@ def test_every_subcommand_binds_a_callable_handler() -> None:
         "submit-property",
         "check",
         "invariant-status",
+        "invariant-discharge",
         "grade",
         "semantic-loop",
         "claude-code-hook",

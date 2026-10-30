@@ -52,6 +52,13 @@ Subcommands:
   are final; there is no grading step. An *accepted* invariant of TYPE is the
   context ``forseti synth`` then assumes for every ``TYPE *`` function in
   ``<source>`` (``--no-invariants`` opts out), labelled assumed in its verdict.
+- ``forseti invariant-discharge <source> --type TYPE`` — the counterpart of the
+  *assumed* reading (#430): assert TYPE's stored invariant at the entry of every
+  TYPE * function in a generated copy of ``<source>`` and verify each closed caller
+  (one taking no parameters, e.g. ``main``) against it. An invariant is
+  ``discharged`` only for a ``static`` function whose every caller was checked
+  and passed; one a caller does not establish is ``violated``; anything else stays
+  *assumed*, with the reason. Bounded: VERIFIED up to k.
 - ``forseti grade <source> --function NAME`` — grade that unit's held, candidate
   properties against mutants of the function (#392): each property's kill rate
   (``killed / (killed + survived)``) and a reason naming every surviving mutant
@@ -129,6 +136,10 @@ from forseti.esbmc import (
 from forseti.grading import GradeRun, MutationError, grade_transcript
 from forseti.orchestrator import PropertyCheckRun, property_check_transcript
 from forseti.precond import DEFAULT_MAX_LEN
+from forseti.precond.invariant_discharge import (
+    DISCHARGE_EXIT_CODES,
+    invariant_discharge_transcript,
+)
 from forseti.properties import (
     RECIPES,
     BlankProvenanceError,
@@ -175,6 +186,7 @@ from .check import check_source
 from .grade import grade_source
 from .invariant import (
     check_invariant_source,
+    discharge_invariant_source,
     set_invariant_status,
     submit_invariant_source,
 )
@@ -671,7 +683,11 @@ def _parse_ladder(value: str) -> tuple[int, ...]:
 
 
 def _add_check_phase_arguments(
-    p: argparse.ArgumentParser, *, json_help: str, passthrough_example: str
+    p: argparse.ArgumentParser,
+    *,
+    json_help: str,
+    passthrough_example: str,
+    with_max_len: bool = True,
 ) -> None:
     """The check-phase flags shared by `check` and `semantic-loop`.
 
@@ -712,19 +728,20 @@ def _add_check_phase_arguments(
         metavar="SECONDS",
         help=f"per-attempt esbmc timeout in seconds (default: {CHECK_TIMEOUT_S:g})",
     )
-    p.add_argument(
-        "--max-len",
-        type=int,
-        default=DEFAULT_MAX_LEN,
-        metavar="N",
-        help=(
-            "cap on a `(ptr, len)` buffer length the property's domain does not "
-            f"constrain (default: {DEFAULT_MAX_LEN}); a held/violated is then "
-            "scoped to len<=N. The default ladder is extended past N; an "
-            "explicit -k/--unwind-ladder must reach N+1 to settle (a domain "
-            "clause naming the length overrides the cap)"
-        ),
-    )
+    if with_max_len:
+        p.add_argument(
+            "--max-len",
+            type=int,
+            default=DEFAULT_MAX_LEN,
+            metavar="N",
+            help=(
+                "cap on a `(ptr, len)` buffer length the property's domain does not "
+                f"constrain (default: {DEFAULT_MAX_LEN}); a held/violated is then "
+                "scoped to len<=N. The default ladder is extended past N; an "
+                "explicit -k/--unwind-ladder must reach N+1 to settle (a domain "
+                "clause naming the length overrides the cap)"
+            ),
+        )
     p.add_argument("--json", action="store_true", help=json_help)
     add_esbmc_invocation_arguments(
         p,
@@ -785,7 +802,7 @@ def _add_check_parser(
             "struct TYPE (ring_t or 'struct node') instead of its own properties: "
             "nondet TYPE, assume the invariant at entry, call, assert it at exit "
             "(RFC-0007 kind 1, #387). The invariant is *assumed*, never discharged "
-            "at the callers that construct TYPE"
+            "at the callers that construct TYPE (see `forseti invariant-discharge`)"
         ),
     )
     p.add_argument(
@@ -977,6 +994,90 @@ def _run_invariant_status(args: argparse.Namespace) -> int:
     else:
         print(_render_invariant_status(prop, args.type_name))
     return 0
+
+
+def _add_invariant_discharge_parser(
+    sub: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    p = sub.add_parser(
+        "invariant-discharge",
+        help="check that the callers of TYPE * functions establish TYPE's invariant",
+        description=(
+            "An invariant is *assumed* at entry of every TYPE * function; nothing "
+            "in `forseti check --type` says the callers that build a TYPE hand "
+            "over one that satisfies it. This asserts each stored invariant of "
+            "TYPE at the entry of every non-initialiser TYPE * function in a "
+            "generated copy of <source> (the file is not modified) and verifies "
+            "every closed caller (one taking no parameters, e.g. main) against "
+            "it, with a probe that the call is reached. discharged = the "
+            "function is static and every caller was closed, reached the call "
+            "and passed (VERIFIED up to k, for one invocation of each caller); "
+            "violated = a caller reaches the call in a state the invariant does "
+            "not hold on (an invariant its constructor does not establish, or "
+            "an over-strong one); otherwise the invariant stays assumed and the "
+            "reason is printed (externally visible function, a caller that "
+            "takes parameters, no caller). The callers' own assert() calls are "
+            "compiled out. Exit 0 for discharged or still-assumed, 1 violated, "
+            "2 unknown."
+        ),
+    )
+    p.add_argument(
+        "source", type=Path, help="source file defining TYPE and its callers"
+    )
+    p.add_argument(
+        "--type",
+        dest="type_name",
+        required=True,
+        metavar="TYPE",
+        help="the struct type (ring_t or 'struct node') whose invariant to discharge",
+    )
+    p.add_argument(
+        "--initialiser",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "a function that establishes the invariant, so receives no obligation "
+            "(repeatable; init/initialise/initialize names are inferred)"
+        ),
+    )
+    p.add_argument(
+        "--store-root",
+        type=Path,
+        default=DEFAULT_STORE_ROOT,
+        metavar="DIR",
+        help=f"the .forseti store directory (default: {DEFAULT_STORE_ROOT})",
+    )
+    _add_check_phase_arguments(
+        p,
+        json_help="emit the discharge run as a JSON object",
+        passthrough_example="... file.c --type T -- -DNDEBUG",
+        with_max_len=False,
+    )
+    p.set_defaults(func=_run_invariant_discharge)
+
+
+def _run_invariant_discharge(args: argparse.Namespace) -> int:
+    try:
+        result = discharge_invariant_source(
+            args.source,
+            type_name=args.type_name,
+            initialisers=tuple(args.initialiser),
+            store_root=args.store_root,
+            unwind=args.unwind,
+            unwind_ladder=args.unwind_ladder,
+            timeout_s=args.timeout,
+            extra_flags=tuple(args.esbmc_args),
+            esbmc_bin=args.esbmc_bin,
+        )
+    except (PropertyStoreError, ListUnitsError, OSError, ValueError) as exc:
+        print(f"forseti invariant-discharge: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(result.to_dict()))
+    else:
+        print(invariant_discharge_transcript(result))
+    return DISCHARGE_EXIT_CODES[result.outcome]
 
 
 def _add_grade_parser(
@@ -1624,6 +1725,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_submit_property_parser(sub)
     _add_check_parser(sub)
     _add_invariant_status_parser(sub)
+    _add_invariant_discharge_parser(sub)
     _add_grade_parser(sub)
     _add_semantic_loop_parser(sub)
     _add_claude_code_hook_parser(sub)

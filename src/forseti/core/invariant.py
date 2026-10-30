@@ -13,7 +13,7 @@ every verdict says so (`INVARIANT_ASSUMPTION_NOTE`).
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from functools import partial
 from pathlib import Path
 
@@ -21,6 +21,7 @@ from forseti.core.check import run_check
 from forseti.core.persistence import open_store, persist_proposal, store_exists
 from forseti.core.propose import DEFAULT_STORE_ROOT
 from forseti.core.submit import DEFAULT_PROMPT_ID, DEFAULT_PROMPT_VERSION
+from forseti.esbmc import Unit as ClangUnit
 from forseti.orchestrator import (
     InvariantHarnessWriter,
     InvariantsOfType,
@@ -34,8 +35,13 @@ from forseti.orchestrator.semantic_check import (
     SemanticCheckPlan,
     validated_max_len,
 )
-from forseti.precond import DEFAULT_MAX_LEN
+from forseti.precond import DEFAULT_MAX_LEN, CallerCheck
+from forseti.precond.invariant_discharge import (
+    InvariantDischargeRun,
+    discharge_invariants,
+)
 from forseti.properties import (
+    INVARIANT_CHECKABLE_STATUSES,
     BlankProvenanceError,
     CandidateSpec,
     DuplicateProperty,
@@ -221,3 +227,65 @@ def check_invariant_source(
         verify_port=verify_port,
         properties_of=partial(InvariantsOfType, type_key=type_key),
     )
+
+
+def discharge_invariant_source(
+    source: Path,
+    *,
+    type_name: str,
+    initialisers: Sequence[str] = (),
+    store_root: Path = DEFAULT_STORE_ROOT,
+    unwind: int = DEFAULT_UNWIND,
+    unwind_ladder: tuple[int, ...] | None = None,
+    timeout_s: float | None = DEFAULT_TIMEOUT_S,
+    extra_flags: Sequence[str] = (),
+    esbmc_bin: str = "esbmc",
+    verify_port: VerifyPort | None = None,
+    list_units_fn: Callable[[Path], list[ClangUnit]] | None = None,
+    open_callers_fn: Callable[[Path, str], tuple[CallerCheck, ...]] | None = None,
+) -> InvariantDischargeRun:
+    """Check the callers of `source`'s ``type_name *`` functions against its invariants.
+
+    The counterpart of `check_invariant_source`'s *assumed* reading (RFC-0007 kind 1,
+    #430): for each stored, non-rejected invariant of `type_name` and each function
+    of `source` that assumes it (a ``T *`` parameter, not an initialiser: `infer_role`
+    or named in `initialisers`), the invariant is asserted at that function's entry in
+    a generated copy of the file and every closed caller (one taking no parameters,
+    e.g. ``main``) is verified against it. A status is ``discharged`` only when the
+    callee is ``static``, every caller was closed, reached the call and passed; a
+    caller that hands over a state the invariant does not hold on is ``violated``;
+    anything else stays *assumed*, with the reason. All bounded: VERIFIED up to k.
+
+    A missing store, or no stored invariant, gives an empty run (never created or
+    read as a discharge). The remaining knobs are `check_source`'s;
+    `list_units_fn`/`open_callers_fn` inject the clang listing for tests.
+    """
+    type_name = normalised_type_name(type_name)
+    plan = SemanticCheckPlan(
+        unwind=unwind,
+        unwind_ladder=unwind_ladder,
+        max_len=None,
+        timeout_s=timeout_s,
+        esbmc_bin=esbmc_bin,
+        extra_flags=extra_flags,
+    )
+    type_key = make_unit_id(source, type_name)
+    invariants: tuple[Property, ...] = ()
+    if store_exists(store_root):
+        with open_store(store_root) as store:
+            invariants = tuple(
+                store.list_for_type(type_key, INVARIANT_CHECKABLE_STATUSES)
+            )
+    discharges = discharge_invariants(
+        source,
+        type_name=type_name,
+        invariants=invariants,
+        port=verify_port or plan.verify_for(source),
+        unwind=unwind,
+        unwind_ladder=plan.ladder,
+        initialisers=frozenset(initialisers),
+        esbmc_bin=esbmc_bin,
+        list_units_fn=list_units_fn,
+        open_callers_fn=open_callers_fn,
+    )
+    return InvariantDischargeRun(type_key, discharges)
