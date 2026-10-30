@@ -1017,6 +1017,7 @@ def test_domain_upper_bound_gets_the_cap_on_top(domain: str) -> None:
     [
         "n >= 16",
         "n >= 0x10",
+        "n >= 020",
         "n > 8",
         "n == 20",
         "16 <= n",

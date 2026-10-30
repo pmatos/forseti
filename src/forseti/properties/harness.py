@@ -24,7 +24,13 @@ from dataclasses import dataclass
 
 from forseti.esbmc import find_definition_brace
 
-from .cexpr import derefs_or_subscripts, identifiers, references
+from .cexpr import (
+    conjuncts,
+    derefs_or_subscripts,
+    identifiers,
+    references,
+    unwrap_parens,
+)
 from .model import Property, PropertyKind
 from .signature import (
     BufferParam,
@@ -233,7 +239,7 @@ def render_semantic_harness(
     # The buffers `_render_buffer` will `malloc`/`free`, computed once and
     # reused for both: whether the harness needs `<stdlib.h>` and which names
     # need a matching `free()` at the end are the same question.
-    malloc_buffers = [buf for buf in buffers if not _is_scalar_backed(buf)]
+    malloc_buffers = [buf for buf in buffers if not buf.scalar_backed]
 
     lines: list[str] = [f"#include <{inc}>" for inc in includes]
     if malloc_buffers and "stdlib.h" not in includes:
@@ -426,7 +432,7 @@ def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | 
     scalar_outputs = {
         p.name
         for p in signature.params
-        if isinstance(p, BufferParam) and _is_scalar_backed(p)
+        if isinstance(p, BufferParam) and p.scalar_backed
     }
     for name in scalar_outputs:
         if derefs_or_subscripts(spec.postcondition, name):
@@ -457,11 +463,10 @@ def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | 
 
 def _is_non_null_check(clause: str, name: str) -> bool:
     """Whether `clause` is exactly ``name != NULL`` (or ``!= 0``, either order)."""
-    text = _unwrap_parens(clause)
+    text = unwrap_parens(clause)
     ident, null = re.escape(name), r"(?:NULL|0)"
-    return bool(
-        re.fullmatch(rf"{ident}\s*!=\s*{null}", text)
-        or re.fullmatch(rf"{null}\s*!=\s*{ident}", text)
+    return (
+        re.fullmatch(rf"{ident}\s*!=\s*{null}|{null}\s*!=\s*{ident}", text) is not None
     )
 
 
@@ -504,7 +509,7 @@ def plan_length_bounds(
     ]
     capped: list[str] = []
     for buf in buffers:
-        if _is_scalar_backed(buf):
+        if buf.scalar_backed:
             continue
         for ident in identifiers(buf.length):
             if (
@@ -527,50 +532,8 @@ def _contradicts_cap(clause: str, ident: str, max_len: int) -> bool:
     """
     return any(
         (floor := _length_floor(conjunct, ident)) is not None and floor > max_len
-        for conjunct in _conjuncts(clause)
+        for conjunct in conjuncts(clause)
     )
-
-
-def _conjuncts(clause: str) -> list[str]:
-    """The top-level ``&&`` operands of `clause`, or `[clause]` if it has a ``||``."""
-    text = _unwrap_parens(clause)
-    parts: list[str] = []
-    depth, start, i = 0, 0, 0
-    while i < len(text):
-        if text[i] == "(":
-            depth += 1
-        elif text[i] == ")":
-            depth -= 1
-        elif depth == 0 and text.startswith("||", i):
-            return [text]
-        elif depth == 0 and text.startswith("&&", i):
-            parts.append(text[start:i])
-            start = i + 2
-            i += 1
-        i += 1
-    parts.append(text[start:])
-    if len(parts) == 1:
-        return parts
-    return [c for part in parts for c in _conjuncts(part)]
-
-
-def _unwrap_parens(clause: str) -> str:
-    """`clause` without redundant outer parentheses (``((a))`` -> ``a``).
-
-    Only a ``(`` that closes at the very end counts, so ``(a) && (b)`` is intact.
-    """
-    text = clause.strip()
-    while text.startswith("(") and text.endswith(")"):
-        depth, closes_at = 0, -1
-        for pos, char in enumerate(text):
-            depth += (char == "(") - (char == ")")
-            if depth == 0:
-                closes_at = pos
-                break
-        if closes_at != len(text) - 1:
-            break
-        text = text[1:-1].strip()
-    return text
 
 
 def _length_floor(clause: str, ident: str) -> int | None:
@@ -583,19 +546,17 @@ def _length_floor(clause: str, ident: str) -> int | None:
     fullmatch keeps it conservative: ``(a >= 1) && (b >= 1)`` is a non-match
     rather than being misread as one bound.
     """
-    text = _unwrap_parens(clause)
+    text = unwrap_parens(clause)
     name = re.escape(ident)
-    literal = r"(0[xX][0-9a-fA-F]+|\d+)[uUlL]*"
+    literal = r"(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9]\d*)[uUlL]*"
     if match := re.fullmatch(rf"{name}\s*(>=|>|==|!=)\s*{literal}", text):
         op, digits = match.group(1), match.group(2)
     elif match := re.fullmatch(rf"{literal}\s*(<=|<|==|!=)\s*{name}", text):
         op, digits = match.group(2), match.group(1)
     else:
         return None
-    try:
-        value = int(digits, 0)
-    except ValueError:
-        return None
+    base = 16 if digits[:2] in ("0x", "0X") else 8 if digits[0] == "0" else 10
+    value = int(digits, base)
     return {">=": value, ">": value + 1, "<=": value, "<": value + 1, "==": value}.get(
         op, 1 if value == 0 else 0
     )
@@ -660,7 +621,7 @@ def _render_buffer(buf: BufferParam) -> list[str]:
     are nondet-filled element by element; output buffers are left for the unit to
     write.
     """
-    if _is_scalar_backed(buf):
+    if buf.scalar_backed:
         return [f"    {buf.elem_ctype} {buf.name};"]
     lines = [
         f"    __ESBMC_assume(({buf.length}) <= SIZE_MAX / sizeof({buf.elem_ctype}));",
@@ -700,12 +661,8 @@ def _call_arg(param: Param) -> str:
     if isinstance(param, ScalarParam):
         return param.name
     if isinstance(param, BufferParam):
-        return f"&{param.name}" if _is_scalar_backed(param) else param.name
+        return f"&{param.name}" if param.scalar_backed else param.name
     raise HarnessError(f"unknown Param subtype: {type(param).__name__}")
-
-
-def _is_scalar_backed(buf: BufferParam) -> bool:
-    return buf.scalar_backed
 
 
 def _strip_buffer_subscripts(expr: str, buffer_names: Collection[str]) -> str:

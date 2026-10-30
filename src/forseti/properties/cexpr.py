@@ -160,3 +160,45 @@ def derefs_or_subscripts(expr: str, name: str) -> bool:
         if re.match(rf"{n}\b", rest) or re.match(rf"\([^()]*\b{n}\b", rest):
             return True
     return False
+
+
+def conjuncts(clause: str) -> list[str]:
+    """The top-level ``&&`` operands of `clause`, or `[clause]` if it has a ``||``."""
+    text = unwrap_parens(clause)
+    parts: list[str] = []
+    depth, start, i = 0, 0, 0
+    while i < len(text):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+        elif depth == 0 and text.startswith("||", i):
+            return [text]
+        elif depth == 0 and text.startswith("&&", i):
+            parts.append(text[start:i])
+            start = i + 2
+            i += 1
+        i += 1
+    parts.append(text[start:])
+    if len(parts) == 1:
+        return parts
+    return [c for part in parts for c in conjuncts(part)]
+
+
+def unwrap_parens(clause: str) -> str:
+    """`clause` without redundant outer parentheses (``((a))`` -> ``a``).
+
+    Only a ``(`` that closes at the very end counts, so ``(a) && (b)`` is intact.
+    """
+    text = clause.strip()
+    while text.startswith("(") and text.endswith(")"):
+        depth, closes_at = 0, -1
+        for pos, char in enumerate(text):
+            depth += (char == "(") - (char == ")")
+            if depth == 0:
+                closes_at = pos
+                break
+        if closes_at != len(text) - 1:
+            break
+        text = text[1:-1].strip()
+    return text
