@@ -404,39 +404,21 @@ def _select(unit_id: str, ranked: list[PackEntry], max_tokens: int) -> ContextPa
     return ContextPack(unit_id, tuple(chosen), omitted=len(ranked) - len(chosen))
 
 
-STORE_DIRNAME = ".forseti"
-
-
 def build_project_pack(
-    unit_id: str,
-    source_text: str,
-    project_root: Path,
-    config: PackConfig | None = None,
-    *,
-    use_store: bool = False,
+    unit_id: str, source_text: str, config: PackConfig | None = None
 ) -> ContextPack:
-    """The pack for a unit of the git project containing `project_root`, at HEAD.
+    """The pack for a unit of the git repository holding its file, at HEAD.
 
     Every file but the unit's own is read from the HEAD commit, so uncommitted and
     untracked files never reach the pack; the unit's file is `source_text`, the text
-    being worked on. The unit's path is resolved against the working directory and
-    must lie inside the repository. With `use_store`, callees also show the accepted
-    contracts of the project's default store (``.forseti``) when one exists.
-    `ProjectIndexError` for anything that stops the pack (no repository or commit, a
-    path outside it, no such function).
+    being worked on. The unit's path is resolved against the working directory (the
+    file's directory is resolved, the file itself is not followed if it is a
+    symlink). `ProjectIndexError` for anything that stops the pack: no repository or
+    commit, no such function.
     """
-    tree = GitTree.at(project_root)
-    try:
-        path = Path(unit_id_path(unit_id)).resolve().relative_to(tree.root.resolve())
-    except ValueError:
-        raise ProjectIndexError(
-            f"{unit_id_path(unit_id)!r} is outside the repository at {tree.root}"
-        ) from None
-    index = ProjectIndex(OverlayTree(tree, {path.as_posix(): source_text}))
-    unit = make_unit_id(path.as_posix(), unit_id_symbol(unit_id))
-    store_dir = project_root / STORE_DIRNAME
-    if use_store and (store_dir / "forseti.db").is_file():
-        with PropertyStore.open(store_dir) as store:
-            contracts = store_contracts(store, root=tree.root)
-            return build_context_pack(index, unit, config, contracts=contracts)
-    return build_context_pack(index, unit, config)
+    named = Path(unit_id_path(unit_id))
+    path = named.parent.resolve() / named.name
+    tree = GitTree.at(path.parent)
+    rel = path.relative_to(tree.root.resolve()).as_posix()
+    index = ProjectIndex(OverlayTree(tree, {rel: source_text}))
+    return build_context_pack(index, make_unit_id(rel, unit_id_symbol(unit_id)), config)

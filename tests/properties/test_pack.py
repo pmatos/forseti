@@ -782,18 +782,9 @@ def test_recipe_accepts_cwd_relative_paths_and_subdirectory_roots(
 def test_project_recipes_fail_with_recipe_errors(
     repo: Path, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
-    outside = tmp_path_factory.mktemp("outside")
-    (outside / "x.c").write_text("int f(void) { return 0; }\n")
     with pytest.raises(RecipeError, match="rev-parse"):
         recipe_text("callers", repo, source=RING_C)  # no commit yet
     commit(repo, PROJECT, "v1")
-    with pytest.raises(RecipeError, match="outside the repository"):
-        build_context(
-            "callers",
-            unit_id=f"{outside / 'x.c'}::f",
-            source_text="int f(void) { return 0; }\n",
-            project_root=repo,
-        )
     with pytest.raises(RecipeError, match="no definition of 'nope'"):
         build_context(
             "callers",
@@ -801,13 +792,45 @@ def test_project_recipes_fail_with_recipe_errors(
             source_text=RING_C,
             project_root=repo,
         )
+    outside = tmp_path_factory.mktemp("outside")
+    (outside / "x.c").write_text("int f(void) { return 0; }\n")
     with pytest.raises(RecipeError, match="rev-parse"):
         build_context(
             "callers",
             unit_id=f"{outside / 'x.c'}::f",
-            source_text="",
-            project_root=outside,
+            source_text="int f(void) { return 0; }\n",
+            project_root=repo,
         )
+
+
+def test_the_repository_is_the_unit_files_not_the_project_roots(
+    repo: Path, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    commit(repo, PROJECT, "v1")
+    elsewhere = tmp_path_factory.mktemp("elsewhere")
+    path = repo / "src/ring.c"
+    text = build_context(
+        "callers",
+        unit_id=f"{path}::rb_push",
+        source_text=RING_C,
+        project_root=elsewhere,
+    ).text
+    assert "src/app.c::enqueue_all" in text
+
+
+def test_a_symlinked_unit_file_keeps_its_own_path(repo: Path) -> None:
+    commit(repo, PROJECT, "v1")
+    (repo / "src/link.c").symlink_to("ring.c")
+    git(repo, "add", "--", "src/link.c")
+    git(repo, "commit", "-q", "-m", "link")
+    text = build_context(
+        "callers",
+        unit_id=f"{repo / 'src/link.c'}::rb_push",
+        source_text=RING_C + "/* via link */\n",
+        project_root=repo,
+    ).text
+    assert "src/link.c::rb_push" in text
+    assert "src/ring.c::rb_push" not in text
 
 
 def test_overlay_tree_replaces_and_adds_files() -> None:
@@ -818,39 +841,7 @@ def test_overlay_tree_replaces_and_adds_files() -> None:
     assert [tree.read(p) for p in tree.paths()] == ["new", "b", "c"]
 
 
-def test_full_recipe_shows_accepted_contracts_under_any_spelling(
-    repo: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    commit(repo, PROJECT, "v1")
-    (repo / ".forseti").mkdir()
-    monkeypatch.chdir(repo)
-    spellings = {
-        "advance": "src/ring.c",
-        "rb_init": str(repo / "src/ring.c"),
-    }
-    with PropertyStore.open(repo / ".forseti") as store:
-        for symbol, spelling in spellings.items():
-            unit = f"{spelling}::{symbol}"
-            expression = f"holds_{symbol}"
-            store.add(
-                Property(
-                    property_id=make_property_id(
-                        unit, PropertyKind.SEMANTIC, expression, ()
-                    ),
-                    unit_id=unit,
-                    kind=PropertyKind.SEMANTIC,
-                    expression=expression,
-                    status=PropertyStatus.ACCEPTED,
-                    provenance=Provenance("p", "1"),
-                )
-            )
-    full = recipe_text("full", repo)
-    assert "// accepted: holds_advance" in full
-    assert "// accepted: holds_rb_init" not in full  # rb_push does not call rb_init
-    assert "accepted:" not in recipe_text("callers", repo)
-
-
-def test_full_recipe_without_a_store_just_omits_contracts(repo: Path) -> None:
+def test_recipes_do_not_read_a_store(repo: Path) -> None:
     commit(repo, PROJECT, "v1")
     assert "accepted:" not in recipe_text("full", repo)
     assert not (repo / ".forseti").exists()

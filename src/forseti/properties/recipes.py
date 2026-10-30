@@ -19,11 +19,13 @@ The first three recipes are single-file (they read only the source text):
   transcribed from the implementation.
 
 The project recipes build a context pack (`forseti.properties.pack`) from the git
-project containing the project root, as of its HEAD commit, with the unit's file
-taken from the source text. They are `callers` (target, types, call sites), `tests`
-(target, types, tests that call it) and `full` (every slice, plus the callees'
-accepted contracts from the project's default store when there is one). They need a
-git repository with a commit, and fail with `RecipeError` otherwise.
+repository holding the unit's file, as of its HEAD commit, with the unit's file taken
+from the source text. They are `callers` (target, types, call sites), `tests` (target,
+types, tests that call it) and `full` (every slice). They need a git repository with a
+commit, and fail with `RecipeError` otherwise. The ref does not record which commit
+HEAD was, so a run that must be reproduced pins the checkout (the replay runner's
+job). The callees' accepted contracts are not shown: they would make a ref depend on
+the store's state as well.
 
 The scan is lexical (comments, literals and directives masked), not a parse; it
 reads the same text ESBMC will, and degrades by omission rather than guessing.
@@ -126,16 +128,13 @@ def _baseline(unit_id: str, source: str, project_root: Path) -> str:
     return "".join(out).strip("\n") + "\n"
 
 
-def _project_recipe(
-    name: str, slices: set[SliceKind], *, use_store: bool = False
-) -> Recipe:
+def _project_recipe(name: str, slices: set[SliceKind]) -> Recipe:
     config = PackConfig(slices=frozenset(slices))
 
     def build(unit_id: str, source: str, project_root: Path) -> str:
+        del project_root
         try:
-            return build_project_pack(
-                unit_id, source, project_root, config, use_store=use_store
-            ).text
+            return build_project_pack(unit_id, source, config).text
         except ProjectIndexError as exc:
             raise RecipeError(f"recipe {name!r}: {exc}") from exc
 
@@ -154,7 +153,7 @@ RECIPES: dict[str, Recipe] = {
         Recipe("blind", "1", _blind),
         _project_recipe("callers", _SIGHTED | {SliceKind.CALLERS}),
         _project_recipe("tests", _SIGHTED | {SliceKind.TESTS}),
-        _project_recipe("full", set(ALL_SLICES), use_store=True),
+        _project_recipe("full", set(ALL_SLICES)),
     )
 }
 
