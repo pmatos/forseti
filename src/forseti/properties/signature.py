@@ -174,10 +174,18 @@ def extract_signature(
     if not return_ctype:
         raise HarnessError(f"could not parse the return type of {symbol!r}")
     raws = [_parse_fragment(frag, symbol) for frag in _split_params(match.group(2))]
+    ranged = any(
+        raw.is_ptr and _range_upper_bound(raws[i + 1 : i + 3]) is not None
+        for i, raw in enumerate(raws)
+    )
     # comments are blanked length-preservingly, so `match` offsets stay valid
-    code = _without_comments(unit_source)
+    code = (
+        _without_comments(unit_source)
+        if infer_structs or struct_types or ranged
+        else ""
+    )
     defined = _struct_definitions_in(code)
-    body = _function_body(code, match.end() - 1)
+    body = _function_body(code, match.end() - 1) if infer_structs or ranged else ""
     return UnitSignature(
         symbol=symbol,
         return_ctype=return_ctype,
@@ -370,25 +378,29 @@ def _to_params(
                 )
             )
             continue
-        range_upper = None if raw.array_len else _range_upper_bound(raws[i + 1 : i + 3])
+        range_upper = _range_upper_bound(raws[i + 1 : i + 3])
         if raw.array_len:
             length, out = raw.array_len, False
         elif range_upper is not None:
             length, out = range_upper, False
+            if not raw.is_const and scratch_of is None:
+                scratch_of = (pointee, range_upper)
         elif nxt is not None and not nxt.is_ptr and _is_integer_type(nxt.type_str):
             length, out = nxt.name, False
-        elif (
-            nxt is None
-            and not raw.is_const
-            and scratch_of is not None
-            and scratch_of[0] == pointee
-            and not _is_single_element(raw.name, body)
-        ):
-            length, out = scratch_of[1], True
         elif nxt is None:
             # a trailing pointer with no length param is a single-element output
             # (e.g. utf8_decode's `uint32_t *cp`); non-const -> written by the unit.
-            length, out = "1", not raw.is_const
+            # After a range buffer it is scratch of that length unless the body
+            # confines it to `*p` / `p[0]`.
+            if (
+                scratch_of is not None
+                and scratch_of[0] == pointee
+                and not raw.is_const
+                and not _is_single_element(raw.name, body)
+            ):
+                length, out = scratch_of[1], True
+            else:
+                length, out = "1", not raw.is_const
         else:
             # an interior pointer not followed by its integer length: ambiguous
             # (e.g. `dot(const int *a, const int *b, size_t n)`). Fail loud rather
@@ -399,8 +411,6 @@ def _to_params(
                 "not the (buffer, length) idiom nor a trailing output; supply a "
                 "UnitSignature explicitly for multi-buffer signatures"
             )
-        if range_upper is not None and not raw.is_const and scratch_of is None:
-            scratch_of = (pointee, range_upper)
         params.append(
             BufferParam(
                 elem_ctype=_elem_ctype(raw.type_str),
