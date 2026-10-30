@@ -186,7 +186,7 @@ def test_injection_is_a_same_line_block_that_leaves_every_line_number() -> None:
         source_path="/proj/x.c",
     )
     block = (
-        f" {{ const ring_t *self = r; __ESBMC_assert(({INVARIANT}), "
+        f" {{ const ring_t *self = r; __ESBMC_assert(!self || ({INVARIANT}), "
         f'"{DISCHARGE_LABEL_PREFIX}rb_push:r"); }}'
     )
     assert block in copy
@@ -200,6 +200,18 @@ def test_injection_is_a_same_line_block_that_leaves_every_line_number() -> None:
     assert injected[3].startswith("static int rb_push(ring_t *r, int v) {")
 
 
+def test_a_null_pointer_is_not_a_value_the_invariant_fails_on() -> None:
+    copy = inject_invariant_obligation(
+        SOURCE,
+        PUSH,
+        ("r",),
+        type_name="ring_t",
+        expression=INVARIANT,
+        source_path="x.c",
+    )
+    assert "const ring_t *self = r; __ESBMC_assert(!self || (" in copy
+
+
 def test_a_parameter_named_self_is_asserted_over_directly() -> None:
     copy = inject_invariant_obligation(
         SOURCE,
@@ -209,10 +221,8 @@ def test_a_parameter_named_self_is_asserted_over_directly() -> None:
         expression=INVARIANT,
         source_path="/proj/x.c",
     )
-    assert (
-        f' {{ __ESBMC_assert(({INVARIANT}), "{DISCHARGE_LABEL_PREFIX}rb_len:self"); }}'
-        in copy
-    )
+    label = f"{DISCHARGE_LABEL_PREFIX}rb_len:self"
+    assert f' {{ __ESBMC_assert(!self || ({INVARIANT}), "{label}"); }}' in copy
     assert "const ring_t *self = self" not in copy
 
 

@@ -212,3 +212,29 @@ def test_cli_failures_exit_one(
     monkeypatch.setattr("forseti.core.cli.discharge_invariant_source", broken)
     assert main(["invariant-discharge", "x.c", "--type", "ring_t"]) == 1
     assert "esbmc parse failed" in capsys.readouterr().err
+
+
+def test_the_parse_sees_the_same_flags_and_budget_the_verifier_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, root = _setup(tmp_path)
+    seen: dict[str, object] = {}
+
+    def fake_analyze(path: Path, **kw: object) -> object:
+        seen.update(kw)
+        raise ListUnitsError("stop here")
+
+    monkeypatch.setattr(
+        "forseti.precond.invariant_discharge.analyze_translation_unit", fake_analyze
+    )
+    with pytest.raises(ListUnitsError):
+        discharge_invariant_source(
+            source,
+            type_name="ring_t",
+            store_root=root,
+            timeout_s=300.0,
+            extra_flags=("-DFEATURE",),
+            verify_port=_port(Verified(_meta())),
+        )
+    assert seen["extra_flags"] == ("-DFEATURE",)
+    assert seen["timeout_s"] == 300.0

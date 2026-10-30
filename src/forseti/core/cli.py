@@ -700,7 +700,8 @@ def _add_check_phase_arguments(
 
     `--max-len` (#299) mirrors `synth --max-len` (same name, same default) but
     caps only a `(ptr, len)` length the property's own domain leaves
-    unconstrained.
+    unconstrained; `with_max_len=False` leaves it out for a subcommand with no
+    buffer lengths (`invariant-discharge`).
     """
     p.add_argument(
         "-k",

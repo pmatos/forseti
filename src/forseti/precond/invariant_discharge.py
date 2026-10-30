@@ -69,6 +69,7 @@ from .synth import RENAMED_MAIN, SynthError, _line_directive, pointee_type
 DISCHARGE_LABEL_PREFIX = "forseti:rep-invariant-entry:"
 DISCHARGE_SITE_LABEL_PREFIX = "forseti:rep-invariant-site:"
 
+_PARSE_TIMEOUT_S = 30.0
 _NDEBUG_PRELUDE = "#ifndef NDEBUG\n#define NDEBUG\n#endif\n"
 
 
@@ -195,9 +196,14 @@ def assuming_functions(
 
 
 def _entry_check(callee: str, param: str, type_name: str, expression: str) -> str:
-    assertion = (
-        f'__ESBMC_assert(({expression}), "{DISCHARGE_LABEL_PREFIX}{callee}:{param}");'
-    )
+    """The block asserting `expression` over `param`; a NULL `param` is no ``T``.
+
+    The guard keeps a caller that deliberately passes NULL to a NULL-tolerant
+    callee from failing on the assertion's own dereference, which would read as a
+    fault of the caller rather than of the invariant.
+    """
+    label = f"{DISCHARGE_LABEL_PREFIX}{callee}:{param}"
+    assertion = f'__ESBMC_assert(!self || ({expression}), "{label}");'
     if param == "self":
         return f"{{ {assertion} }}"
     return f"{{ const {type_name} *self = {param}; {assertion} }}"
@@ -520,7 +526,8 @@ def discharge_invariants(
     initialisers: frozenset[str] = frozenset(),
     work_dir: Path | None = None,
     esbmc_bin: str = "esbmc",
-    timeout_s: float = 30.0,
+    timeout_s: float | None = None,
+    extra_flags: Sequence[str] = (),
     list_units_fn: Callable[[Path], list[Unit]] | None = None,
     open_callers_fn: Callable[[Path, str], tuple[CallerCheck, ...]] | None = None,
 ) -> tuple[InvariantDischarge, ...]:
@@ -530,8 +537,9 @@ def discharge_invariants(
     ``(unwind, *unwind_ladder)`` on UNKNOWN (`ValueError` for a malformed
     ladder). With neither listing hook injected, unit planning and
     caller-completeness share one translation-unit AST (as
-    `discharge_precondition` does). `ListUnitsError` propagates when the
-    translation unit cannot be parsed at all.
+    `discharge_precondition` does), parsed under the same `extra_flags` the
+    verifier compiles with so both see the same translation unit.
+    `ListUnitsError` propagates when it cannot be parsed at all.
     """
     if (list_units_fn is None) != (open_callers_fn is None):
         raise ValueError("inject both list_units_fn and open_callers_fn, or neither")
@@ -540,7 +548,10 @@ def discharge_invariants(
         return ()
     if list_units_fn is None or open_callers_fn is None:
         analysis: TranslationUnitAnalysis = analyze_translation_unit(
-            source, esbmc_bin=esbmc_bin, timeout_s=timeout_s
+            source,
+            esbmc_bin=esbmc_bin,
+            timeout_s=timeout_s or _PARSE_TIMEOUT_S,
+            extra_flags=extra_flags,
         )
         units = analysis.units()
 

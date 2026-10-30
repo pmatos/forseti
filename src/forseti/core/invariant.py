@@ -285,6 +285,8 @@ def discharge_invariant_source(
         unwind_ladder=plan.ladder,
         initialisers=frozenset(initialisers),
         esbmc_bin=esbmc_bin,
+        timeout_s=timeout_s,
+        extra_flags=extra_flags,
         list_units_fn=list_units_fn,
         open_callers_fn=open_callers_fn,
     )
