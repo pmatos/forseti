@@ -14,8 +14,9 @@ render one self-contained ESBMC harness per function:
 
 The invariant is *assumed* at entry, never discharged at the callers that build a
 ``T``: a VERIFIED (up to k) reading is conditional on it, and an over-strong
-invariant can hide a bug. Pure: returns source *text* only, like `harness.py`, whose
-probe twin and nondet/buffer helpers this reuses.
+invariant can hide a bug. Pure: returns source *text* only, like `harness.py`.
+Both renderers share parameter storage through `_harness_parameters`; the probe
+twin and length-bound policy live in `harness.py`.
 """
 
 from __future__ import annotations
@@ -24,24 +25,19 @@ import re
 from collections.abc import Sequence
 from enum import Enum
 
+from ._harness_parameters import prepare_parameters
 from .cexpr import references, unsafe_reason
 from .harness import (
     DEFAULT_INCLUDES,
     PropertyHarness,
     SemanticSpec,
-    _call_arg,
     _defines_main,
-    _nondet_ctypes,
-    _nondet_slug,
-    _render_buffer,
     non_vacuity_probe,
     plan_length_bounds,
 )
 from .model import Property, PropertyKind, PropertyStatus, Provenance, make_property_id
 from .signature import (
-    BufferParam,
     HarnessError,
-    ScalarParam,
     StructParam,
     UnitSignature,
     extract_signature,
@@ -241,19 +237,11 @@ def render_invariant_harness(
             "break the invariant, so there is no exit obligation to check"
         )
 
-    buffers = [
-        p
-        for p in signature.params
-        if isinstance(p, BufferParam) and not isinstance(p, StructParam)
-    ]
-    malloc_buffers = [b for b in buffers if not b.scalar_backed]
-
-    lines = [f"#include <{inc}>" for inc in includes]
-    if malloc_buffers and "stdlib.h" not in includes:
-        lines.append("#include <stdlib.h>")
-    lines += ["", unit_source.strip("\n"), ""]
-    for ctype in _nondet_ctypes(signature.params):
-        lines.append(f"{ctype} {_nondet_slug(ctype)}(void);")
+    prepared = prepare_parameters(
+        signature.params, includes=includes, struct_type=type_name
+    )
+    lines = [*prepared.headers, "", unit_source.strip("\n"), ""]
+    lines += prepared.prototypes
     lines += [
         f"static int {_INVARIANT_FN}(const {type_name} *{INVARIANT_SELF}) {{",
         f"    return ({expression.strip()});",
@@ -262,23 +250,15 @@ def render_invariant_harness(
         f"/* forseti: representation invariant, role={role.value} */",
         "int main(void) {",
     ]
-    for scalar in (p for p in signature.params if isinstance(p, ScalarParam)):
-        lines.append(
-            f"    {scalar.ctype} {scalar.name} = {_nondet_slug(scalar.ctype)}();"
-        )
-    for struct in structs:
-        lines.append(f"    {type_name} {struct.name} = {_nondet_slug(type_name)}();")
+    lines += prepared.scalar_declarations
+    for struct, declaration in prepared.struct_declarations:
+        lines += declaration
         if role is InvariantRole.METHOD:
             lines.append(f"    __ESBMC_assume({_INVARIANT_FN}(&{struct.name}));")
     for name, bound in plan_length_bounds(signature, SemanticSpec("1"), max_len):
         lines.append(f"    __ESBMC_assume(({name} >= 0 && {name} <= {bound}));")
-    for buf in buffers:
-        lines += _render_buffer(buf)
-    args = ", ".join(
-        f"&{p.name}" if isinstance(p, StructParam) else _call_arg(p)
-        for p in signature.params
-    )
-    lines.append(f"    {signature.symbol}({args});")
+    lines += prepared.buffer_setup
+    lines.append(f"    {signature.symbol}({prepared.arguments});")
     if probe:
         lines.append(f"    {non_vacuity_probe()}")
     else:
@@ -287,7 +267,7 @@ def render_invariant_harness(
                 f"    __ESBMC_assert({_INVARIANT_FN}(&{struct.name}), "
                 f'"{REP_INVARIANT_LABEL}");'
             )
-    lines += [f"    free({buf.name});" for buf in malloc_buffers]
+    lines += prepared.cleanup
     lines += ["    return 0;", "}"]
     return "\n".join(lines) + "\n"
 
