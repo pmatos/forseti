@@ -806,7 +806,9 @@ def _prepare(reference: str, candidate: str, symbol: str) -> tuple[UnitSignature
             raise EquivalenceRefusal(f"{label} source does not define `{symbol}`")
         scans[label] = scan
         try:
-            sigs[label] = extract_signature(mask_comments(source), symbol)
+            sigs[label] = extract_signature(
+                mask_comments(source), symbol, range_idiom=False
+            )
         except HarnessError as exc:
             raise EquivalenceRefusal(f"{label} signature not modelled: {exc}") from exc
         reason = _fragment_refusal(view, symbol) or _signature_refusal(sigs[label])

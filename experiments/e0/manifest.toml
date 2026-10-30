@@ -37,10 +37,11 @@ twin = "examples/ring_buffer_bug.c"
 path = "examples/merge_sort.c"
 symbol = "msort"
 twin = "examples/merge_sort_bug.c"
-# RFC-0007: UNKNOWN (timeouts) at max_len 4. Re-measured with a stand-in property
-# on ESBMC 8.6.0: at 4 both versions time out at every rung of the ladder; at 2
-# both settle within ~10 s. A smaller bound, as the RFC prescribes, rather than
-# dropping the unit.
+# `a` and `tmp` are sized by `hi` (the (lo, hi) range idiom, #425); before that fix
+# they were sized by `lo` and one element, so every clean-version property was
+# VIOLATED out of bounds or UNKNOWN. ESBMC 8.6.0, unwind 4, one true property:
+# max_len 2 settles in ~4 s, 3 in ~14 s, and 4 (needs k = 5) takes ~46 s, over the
+# 30 s per-call timeout. The bound stays 2, as RFC-0007 prescribes for this unit.
 max_len = 2
 
 [[units]]

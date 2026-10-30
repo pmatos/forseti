@@ -130,6 +130,7 @@ def extract_signature(
     *,
     struct_types: Collection[str] = (),
     infer_structs: bool = False,
+    range_idiom: bool = True,
 ) -> UnitSignature:
     """Best-effort regex parse of `symbol`'s signature from `unit_source`.
 
@@ -154,6 +155,15 @@ def extract_signature(
     parameter follows it *and* the body indexes or advances the pointer
     (``(point_t *pts, size_t n)`` with ``pts[i]`` stays the buffer idiom). A struct
     the source does not define keeps the old reading.
+
+    A pointer followed by a ``(lo, hi)`` / ``(start, end)`` / ``(begin, end)`` pair
+    is the range idiom: the buffer is ``hi`` long, and a trailing non-const pointer
+    of the same element type that the body does not confine to ``*p`` / ``p[0]`` (a
+    scratch buffer, ``msort``'s ``tmp``) is as long and an output, not a single
+    element.
+    The upper bound is read as exclusive (``a[lo..hi)``) and matched by name only.
+    `range_idiom=False` keeps the plain ``(buf, len)`` reading for a caller whose
+    behaviour is pinned to it (the equivalence filter refuses such a unit).
     """
     pattern = re.compile(
         r"([A-Za-z_][\w \t\*]*?[\s\*])" + re.escape(symbol) + r"\s*\(([^)]*)\)\s*\{"
@@ -167,14 +177,24 @@ def extract_signature(
     if not return_ctype:
         raise HarnessError(f"could not parse the return type of {symbol!r}")
     raws = [_parse_fragment(frag, symbol) for frag in _split_params(match.group(2))]
+    ranged = range_idiom and any(
+        raw.is_ptr and _range_upper_bound(raws[i + 1 : i + 3]) is not None
+        for i, raw in enumerate(raws)
+    )
     # comments are blanked length-preservingly, so `match` offsets stay valid
-    code = _without_comments(unit_source) if infer_structs or struct_types else ""
+    code = (
+        _without_comments(unit_source)
+        if infer_structs or struct_types or ranged
+        else ""
+    )
     defined = _struct_definitions_in(code)
-    body = _function_body(code, match.end() - 1) if infer_structs else ""
+    body = _function_body(code, match.end() - 1) if infer_structs or ranged else ""
     return UnitSignature(
         symbol=symbol,
         return_ctype=return_ctype,
-        params=_to_params(raws, frozenset(struct_types), defined, infer_structs, body),
+        params=_to_params(
+            raws, frozenset(struct_types), defined, infer_structs, body, range_idiom
+        ),
     )
 
 
@@ -339,8 +359,10 @@ def _to_params(
     defined: Mapping[str, tuple[str, ...]],
     infer: bool,
     body: str,
+    range_idiom: bool,
 ) -> tuple[Param, ...]:
     params: list[Param] = []
+    scratch_of: tuple[str, str] | None = None
     for i, raw in enumerate(raws):
         if not raw.is_ptr:
             params.append(ScalarParam(ctype=raw.type_str, name=raw.name))
@@ -362,14 +384,29 @@ def _to_params(
                 )
             )
             continue
+        range_upper = _range_upper_bound(raws[i + 1 : i + 3]) if range_idiom else None
         if raw.array_len:
             length, out = raw.array_len, False
+        elif range_upper is not None:
+            length, out = range_upper, False
+            if not raw.is_const and scratch_of is None:
+                scratch_of = (pointee, range_upper)
         elif nxt is not None and not nxt.is_ptr and _is_integer_type(nxt.type_str):
             length, out = nxt.name, False
         elif nxt is None:
             # a trailing pointer with no length param is a single-element output
             # (e.g. utf8_decode's `uint32_t *cp`); non-const -> written by the unit.
-            length, out = "1", not raw.is_const
+            # After a range buffer it is scratch of that length unless the body
+            # confines it to `*p` / `p[0]`.
+            if (
+                scratch_of is not None
+                and scratch_of[0] == pointee
+                and not raw.is_const
+                and not _is_single_element(raw.name, body)
+            ):
+                length, out = scratch_of[1], True
+            else:
+                length, out = "1", not raw.is_const
         else:
             # an interior pointer not followed by its integer length: ambiguous
             # (e.g. `dot(const int *a, const int *b, size_t n)`). Fail loud rather
@@ -390,6 +427,37 @@ def _to_params(
             )
         )
     return tuple(params)
+
+
+_RANGE_BOUNDS = (("lo", "hi"), ("start", "end"), ("begin", "end"))
+
+
+def _range_upper_bound(following: Sequence[_RawParam]) -> str | None:
+    """The upper-bound param when a pointer is followed by a ``(lo, hi)`` pair.
+
+    ``msort(int *a, int lo, int hi, ...)`` addresses ``a[lo..hi)``, so the buffer
+    holds ``hi`` elements; reading ``lo`` as its length (the ``(buf, len)`` idiom)
+    allocates it too short and every property over it fails out of bounds (#425).
+    Matched on the conventional names only, so ``(buf, n, m)`` keeps its reading.
+    """
+    if len(following) < 2 or any(
+        p.is_ptr or not _is_integer_type(p.type_str) for p in following
+    ):
+        return None
+    lower, upper = following
+    return upper.name if (lower.name, upper.name) in _RANGE_BOUNDS else None
+
+
+def _is_single_element(name: str, body: str) -> bool:
+    """Whether `body` only ever touches ``*name`` / ``name[0]`` of a pointer.
+
+    A pointer that is also subscripted past ``[0]``, or only handed on to a callee
+    (``msort`` passes ``tmp`` to ``merge``), may be longer than one element.
+    """
+    ident = re.escape(name)
+    if re.search(rf"\b{ident}\s*\[\s*(?!0\s*\])", body):
+        return False
+    return re.search(rf"\*\s*{ident}\b|\b{ident}\s*\[\s*0\s*\]", body) is not None
 
 
 def _is_buffer_idiom(raw: _RawParam, nxt: _RawParam | None, body: str) -> bool:
