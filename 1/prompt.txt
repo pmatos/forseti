@@ -1,0 +1,532 @@
+/auto-merge-dependabot
+
+---
+
+/vibe 3
+
+---
+
+<task-notification>
+<task-id>a197703d603f419d7</task-id>
+<tool-use-id>toolu_0156RWw8CPucH9rBzF41gokt</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/a197703d603f419d7.output</output-file>
+<status>completed</status>
+<summary>Agent "Triage epic #3 open children" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Triage of the four "W2 remaining" children of epic #3, against origin/main at `ef0eb97`. I changed nothing. None of the four issues has any comments, so the bodies are the whole record. No open PR or branch touches any of this.
+
+**#63 — ESBMC reachability (`--error-label`)**
+- **Status:** open, parked, not started.
+- **Evidence:**
+  - `--error-label` is in ESBMC 8.6.0 (`esbmc --help`, line 710).
+  - Nothing in `src/` or `tests/` uses it.
+  - `runner.py` has no reachability path.
+  - The kind is inert (`properties/model.py:21`).
+  - The harness refuses it, and the check driver returns `SKIPPED` (`orchestrator/check.py:80`).
+- **Related code:** reachability already works another way. The precond stack injects a labelled `__ESBMC_assert(0, ...)` probe (`precond/reachability.py`), and PR #406 reuses it for the post-call vacuity check.
+- **Remaining:**
+  - A runner reachability request and verdict mapping.
+  - Two fixtures, one reachable and one unreachable.
+  - Re-validation on 8.6.0, since the issue's feasibility note was written against 8.3.0.
+- **Implementable by an agent without a ruling:** no. ADR-0009 D2 says it is unparked "by prioritising reachability properties (#63)". The ADR is immutable, so that means an owner decision, and a decision to use the existing probe instead would need a new superseding ADR. Nothing else in the epic needs it.
+- **Priority:** 3.
+- **Files:** `src/forseti/esbmc/runner.py`, `esbmc/result.py`, new `tests/esbmc/` fixtures.
+
+**#387 — Representation invariants (RFC-0007 kind 1)**
+- **Status:** open, no code. Grep found no invariant kind, renderer or per-type store.
+- **Evidence:**
+  - `PropertyKind` has only `SEMANTIC` and `REACHABILITY` (`model.py:17-21`).
+  - `signature.py` handles pointers as buffers, not structs.
+  - The post-call non-vacuity probe from #406 (`orchestrator/check.py`, `ProbeReachability`) is a reusable building block.
+- **Remaining:**
+  - A new `PropertyKind` and a per-type store.
+  - A renderer: nondet struct, `assume(inv)`, the call, then `assert(inv)` for mutators, and initialiser handling.
+  - A non-vacuity probe that rejects an invariant like `0`.
+  - S0 (`synth`/verify gate) running under an accepted invariant.
+  - CLI output reproducing the issue's table on both ring-buffer examples.
+  - Proposer support can be a follow-up, since hand-written submission via `submit-property` is enough to start.
+- **Implementable without a ruling:** yes, but it is large and research-labelled. RFC-0007 open question 6 (invariant per type versus per function) is already answered in the issue as per type. Suggest splitting it into three pieces: renderer and store; S0 context; proposer.
+- **Priority:** 1. It is the only way to get a Tier-0 bug pair for M2, and without it S0 is noise on any struct-pointer function.
+- **Files:** `properties/model.py`, `store.py`, `harness.py`, `signature.py`, `orchestrator/check.py`, `precond/synth.py`, `core/_precond_cli.py`, `core/cli.py`, `core/mcp_server.py`, `core/submit.py`, `adapters/claude_code/property_gate.py`, `properties/proposer.py`.
+
+**#388 — Proposer input seam**
+- **Status:** open, no code.
+- **Evidence:**
+  - `ProposalRequest` has `unit_id`, `source_text`, `prompt` and `signature`, with no `context` (`proposer.py:71-84`).
+  - `prepare_proposal_request` reads the whole file (`core/_proposal_request.py:33`).
+  - `Provenance` has no `recipe` (`model.py:53-66`).
+  - `_MIGRATED_COLUMNS` and `_migrate_columns` exist as the pattern to copy (`store.py:187`).
+- **Remaining:**
+  - `ProposalRequest.context` and `render_prompt` changes, keeping prompts byte-identical when no recipe is given.
+  - A recipe registry with `baseline`, `sighted` and `blind`, and `Provenance.recipe` plus a store column and migration.
+  - `--recipe` on `propose` and `semantic-loop`, and the matching MCP parameter.
+  - Tests for the acceptance list.
+- **Implementable without a ruling:** yes. The issue is fully specified.
+- **Priority:** 1. It blocks #389 and the whole recipe experiment.
+- **Files:** new `properties/recipes.py`, `properties/proposer.py`, `prompts.py`, `model.py`, `store.py`, `__init__.py`, `core/_proposal_request.py`, `core/propose.py`, `core/submit.py`, `core/loop.py`, `core/cli.py`, `core/mcp_server.py`, `grading/discriminate.py` (`_provenance_from`, line 718).
+
+**#389 — E0 runner**
+- **Status:** open, no code, blocked by #388. There is no runner or manifest anywhere in `src/`.
+- **Remaining:**
+  - A manifest-driven runner (recipe × sample × unit) that calls `check_properties` on the clean source and the twin.
+  - JSONL rows, a resumable run directory, a 30 s per-call timeout, a summary table recomputable from the rows, and fake-port tests plus one gated smoke test.
+- **Implementable without a ruling:** the code, yes. Executing the grid is a separate step: about 54 `claude -p` calls and up to about 5.5 hours of ESBMC. Someone should say go, and `msort` should be dropped or run at a smaller `--max-len`.
+- **Priority:** 2. It measures M1 and M5 only, not M2.
+- **Files:** a new module under `src/forseti/` (for example `grading/` or `experiments/`), `core/cli.py`, `core/events.py` and `core/_cli_trace.py`, plus new tests.
+
+**Questions you asked**
+- **#388 and #387 in parallel:** yes, no hard conflicts. They overlap only textually, in `model.py`, `store.py` (the schema and `_MIGRATED_COLUMNS`), `proposer.py`, `core/cli.py`, `core/mcp_server.py` and `properties/__init__.py`. Both rebases are mechanical, but the second to merge will rebase over the first. Keep #387 out of the proposer prompt and parser, and out of `Provenance`.
+- **#389 waiting on #388:** it should wait for #388 to merge. It consumes the recipe registry, `Provenance.recipe` and the `--recipe` request path, and building on an unmerged branch would stack PRs.
+- **#63 and the epic:** implementing #63 needs an owner ruling, because ADR-0009 D2 parks it. The epic's unchecked box "Reachability support (--error-label)" cannot be ticked without either implementing #63 or an explicit decision to defer it. The epic body also predates D2, and #62, #64, #65 and #66 are closed while all four boxes are still unchecked. To close the epic, the owner must either unpark and ship #63, or rule that W2 ships semantic-only and edit the body to say so. That body edit is not an ADR change.</result>
+<usage><subagent_tokens>103282</subagent_tokens><tool_uses>16</tool_uses><duration_ms>73529</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>adcfaf3737d27d6dd</task-id>
+<tool-use-id>toolu_01NxvVERghheje86TYDudVv2</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/adcfaf3737d27d6dd.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix #388 proposer input seam" is waiting on its own background work</summary>
+<note>This agent stopped with background work of its own still running. It may resume on its own when that work completes or reports, and the same task-id notifies again if it does; the result below may be interim.</note>
+<result>#388 is implemented and ready: PR https://github.com/pmatos/forseti/pull/416. CI is green on the final head SHA. I did not merge.
+
+**What shipped**
+- **Context field:** `ProposalRequest.context`, and `render_prompt` shows it in place of the whole file when present. Without `--recipe` the prompt is byte-identical to before. A test pins this with a sha256 of the pre-change prompt.
+- **Recipes:** `baseline`, `sighted` and `blind`, all single-file and deterministic. They live in the new `src/forseti/properties/recipes.py`. `blind` picks its type and macro definitions from the signature only, so nothing in its pack comes from the body. Objects the body reads, such as globals and tables, are out of scope for v1; the module docstring says so.
+- **Provenance:** `Provenance.recipe` defaults to `""` and is stored in a new `recipe` column added through `_migrate_columns`. A pre-existing `forseti.db` migrates and its old rows read back with no recipe.
+- **CLI and MCP:** `--recipe` on `propose` and `semantic-loop`, plus a `recipe` parameter on the MCP `propose` and `semantic_loop` tools. In `semantic-loop` it is accepted only with `--mode propose`; other modes refuse it instead of ignoring it.
+- **Wire shape:** a property's `provenance` dict now carries an extra `"recipe": ""` key. I updated the one existing test that pinned that dict (`tests/properties/test_model.py`).
+- **Other-agent overlap:** the diff touches `model.py`, `store.py`, `proposer.py`, `core/cli.py` and `core/mcp_server.py` as small additive hunks, so the concurrent #387 work may need a textual rebase. No invariant code was touched.
+
+**Acceptance coverage** (new `tests/properties/test_recipes.py` plus additions to the existing test files)
+- `blind` contains no body statement, checked on all 14 `examples/*.c`.
+- `baseline` has no `main` and no header comment on every example.
+- The recipe id round-trips through the store, and a pre-recipe db migrates.
+- The same input always gives the same context.
+
+**Checks on SHA d0b4d66**
+- Passing: `test`, `workflow-lint`, `Validate PR title`, `codecov/patch`, `codecov/project`, CodeQL and the four Analyze jobs.
+- `claude-review` was skipped.
+- `Lint commits` did not run: it triggers only on pushes to main.
+- A local full `pytest` run had one failure, `tests/test_release_preparation.py`, because the worktree venv has no `build` module. CI's `test` job passes.
+
+**Review and simplify**
+- `/code-review high --comment` first ran against the wrong target: it reviewed the last commit on main and applied nothing. I re-ran it as `/code-review high --comment 416` and applied the fixes by hand in the worktree, since the forked review can't be pointed at a worktree.
+- It posted 7 inline comments. Five fixes are in commit 2ed036b, with tests: the doc-comment adjacency rule, multi-line `//` header stripping, multi-declarator typedefs, a macro with no trailing semicolon, and an initialiser ending in `)`. Two more are fixed or documented as noted below. One was deferred and answered in the thread.
+- `/simplify` led to one commit: it removed dead duplicate helpers and a repeated comment-masking pass. I skipped two suggestions: dropping the unused `project_root` argument, because the issue specifies that seam, and reusing `grading.body.masked_view`, because that would make `properties` import `grading`, which already imports `properties`.
+
+**Filed**
+- #418: when the same candidate is re-proposed under a different recipe, the store keeps the first run's provenance, so per-recipe attribution is lost when recipes share a store. I left it as is because provenance staying outside the content id is the existing design, and recorded the options in the issue.
+
+**#388 is done** apart from merging. The PR body says "Part of #3" and "Fixes #388".
+
+**Cleanup:** the worktree at `/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/scratchpad/wt-388` is left in place for a possible rebase.
+
+repo: pmatos/forseti
+issue: 388
+PR: 416
+SHA: d0b4d66254fdc4da90440a800f3ea7a090115453
+checks: test pass; workflow-lint pass; Validate PR title pass; Lint commits not run (triggers on pushes to main only); codecov/patch pass; codecov/project pass; CodeQL pass; Analyze (actions, c-cpp, javascript-typescript, python) pass; claude-review skipped
+needsRuling:
+needsMeasurement:</result>
+<usage><subagent_tokens>244247</subagent_tokens><tool_uses>80</tool_uses><duration_ms>1690486</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>byx1ricz8</task-id>
+<tool-use-id>toolu_01HM9BP1n63dLXS6pfPfN9as</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/byx1ricz8.output</output-file>
+<status>completed</status>
+<summary>Background command "Wait for post-merge CI on 356f71a" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a2eb6147322ab7118</task-id>
+<tool-use-id>toolu_01KSiv8JPAPXWD9NqnwuzwPW</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/a2eb6147322ab7118.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix #387 stage 1 invariants" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Stage 1 of #387 is in PR #417, but I can't report READY. It now conflicts with main, so CI never ran on the final head.
+
+main moved after my last push: #416 (recipes, `356f71a`) merged. The conflict is mechanical, in `src/forseti/properties/__init__.py` (export lists) and `tests/properties/test_store.py` (imports and appended tests). `cli.py`, `store.py` and `model.py` auto-merge. Per instructions I did not rebase, so the orchestrator needs to hand the rebase back.
+
+On the last push, `532588b`, only Lint PR title and the CodeQL jobs ran, all green; `test` and Workflow Lint were not triggered. The earlier head `120c59b` was green on CI (`test`) and Workflow Lint, but that is older than my last push, so I report it as not run for `532588b`. Locally on `532588b`:
+- ruff, format and ty are clean.
+- The core, orchestrator, properties and adapters tests pass (1531 passed, 1 skipped).
+- The full suite passed earlier on the first commit, apart from `tests/test_release_preparation.py`, which fails because the `build` module is missing in this environment.
+
+**What shipped in stage 1**
+- A new `PropertyKind.REP_INVARIANT`. Invariants are stored per type, keyed `path::T`, in a new `type_invariants` table. It is created on open with `CREATE TABLE IF NOT EXISTS`, so an existing `.forseti/forseti.db` gains it in place. A test covers this.
+- The invariant is a C expression over `self` (a `const T *`), written to the harness as `__forseti_inv`. `forseti submit-property --kind rep-invariant --type T` stores one; submission checks the expression is pure and names `self`.
+- The renderer in `properties/invariant.py`:
+  - Method: nondet T, `__ESBMC_assume(inv)` at entry, the call, `__ESBMC_assert(inv, "forseti:rep-invariant")` at exit for each non-const `T *`.
+  - Initialiser: no entry assume.
+  - Const-only method: `skipped` with a reason, never held.
+- The non-vacuity probe reuses `check_properties` and the #406 post-call probe. A vacuous invariant such as `0` or `self-&gt;count &gt; self-&gt;count` comes back `vacuous`, never `held`.
+- Results are labelled as assumed: verdicts that assumed an invariant carry an `assumption` field, and the transcript prints an `Assumed:` line.
+- Core gets `submit_invariant_source` and `check_invariant_source`. `run_check` now holds the check recipe shared with `check_source`.
+- Verified with ESBMC 8.6.0 on `examples/`:
+  - `ring_buffer.c`: `rb_push`, `rb_pop` and `rb_init` all HELD (verified up to k=4, probe reached).
+  - `ring_buffer_bug.c`: `rb_push` VIOLATED, and the counterexample carries the `forseti:rep-invariant` label, so a bounds failure cannot satisfy the test. `rb_pop` and `rb_init` HELD.
+  - The integration test pins this.
+
+**Review outcome:** the `/code-review` agent did not apply fixes itself, so I fixed the real findings by hand: narrower initialiser-role inference, type-name whitespace normalisation, assumption labelling only on verdicts that assumed it, and the shared check recipe. `/simplify` applied the dead-API trim (`get_type_invariant`, `StructParam.type_name` and `INVARIANT_SELF` removed) and carries the assumption on the harness writer's output rather than keying it on kind.
+
+**Remaining for later stages**
+- S0 context under an accepted invariant in `synth` and the verify gate.
+- A status lifecycle for type invariants (nothing moves one to ACCEPTED or REJECTED yet).
+- The CLI that reproduces the full table, plus a `check` entry point for invariants.
+- Proposer prompt and parser support, MCP `submit_property`, and discharge at callers that construct `T`.
+- Deferred review items: a shared harness skeleton with `render_semantic_harness` (needs public helpers in `harness.py`), per-unit render caching, and generalising the store by table.
+
+I filed nothing new. I commented on #387 pointing at #417, and the PR body says "Part of #3" and "Part of #387" with no closing keyword. No new ADR is needed and nothing needs a human ruling. The worktree is kept at `/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/scratchpad/wt-387`.
+
+repo: pmatos/forseti
+issue: 387
+PR: 417
+SHA: 532588b24b43e81d66474a2a2f470dd84ae4c5bb
+checks: Lint PR title success; CodeQL and Analyze (actions, c-cpp, javascript-typescript, python) success; test not run on this SHA (PR conflicts with main after #416); Workflow Lint not run on this SHA; claude-review skipping. Earlier head 120c59b: test, Workflow Lint, Lint PR title success.
+needsRuling:
+needsMeasurement:</result>
+<usage><subagent_tokens>292311</subagent_tokens><tool_uses>96</tool_uses><duration_ms>2058582</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>adcfaf3737d27d6dd</task-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/adcfaf3737d27d6dd.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix #388 proposer input seam" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>That notification is the last background wait finishing. It doesn't change anything in the report above.
+
+PR #416 is READY at head `d0b4d66254fdc4da90440a800f3ea7a090115453`, and the required checks I reported are all green on that SHA (`test`, `workflow-lint`, `Validate PR title`). I did not merge. `Lint commits` did not run on the PR, since it only triggers on pushes to main.
+
+repo: pmatos/forseti
+issue: 388
+PR: 416
+SHA: d0b4d66254fdc4da90440a800f3ea7a090115453
+checks: test pass; workflow-lint pass; Validate PR title pass; Lint commits not run (triggers on pushes to main only); codecov/patch pass; codecov/project pass; CodeQL pass; Analyze (actions, c-cpp, javascript-typescript, python) pass; claude-review skipped
+needsRuling:
+needsMeasurement:</result>
+<usage><subagent_tokens>243517</subagent_tokens><tool_uses>80</tool_uses><duration_ms>2145560</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a26829b27d169da89</task-id>
+<tool-use-id>toolu_01XZL98dqm4DPNiPbGw1zKBX</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/a26829b27d169da89.output</output-file>
+<status>failed</status>
+<summary>Agent "Fix #389 E0 runner" failed: Agent terminated early due to an API error: You've hit your 5-hour limit · resets 1:10pm (Europe/Berlin) (error type rate_limit, HTTP 429, request id req_011CgWCSPmQ6dbMiVQDLUdCi, model sent to the API: claude-sonnet-5-5)</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once. This agent's work so far is saved. The limit resets at 1:10pm (Europe/Berlin). Once its requests are accepted again, send the agent a message (SendMessage) to let it continue from where it stopped instead of starting a new agent.</note>
+<result>Start with the llm.py usage extension (tests first).</result>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>buub3fgus</task-id>
+<tool-use-id>toolu_01FMgerYS8esz3fep5rc179s</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/buub3fgus.output</output-file>
+<status>completed</status>
+<summary>Background command "Wait for post-merge CI on cef48a4" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>byfjubqxh</task-id>
+<tool-use-id>toolu_019PH2SWcU9xiBcgvH8CgXPb</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/byfjubqxh.output</output-file>
+<status>completed</status>
+<summary>Background command "Wait until load drops below core count" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+vibe status report for epic #3 (pmatos/forseti). Report in under 150 words and start NO new feature work: done, in progress, blocked, next, pending rulings. Facts from gh/git/CI only (gh pr list --search '"Part of #3" in:body' --state all; gh issue view 3; main CI). If nothing is running while work remains, report 'idle with work remaining'.
+
+---
+
+vibe status report for epic #3 (pmatos/forseti). Report in under 150 words and start NO new feature work: done, in progress, blocked, next, pending rulings. Facts from gh/git/CI only (gh pr list --search '"Part of #3" in:body' --state all; gh issue view 3; main CI). If nothing is running while work remains, report 'idle with work remaining'.
+
+---
+
+vibe status report for epic #3 (pmatos/forseti). Report in under 150 words and start NO new feature work: done, in progress, blocked, next, pending rulings. Facts from gh/git/CI only (gh pr list --search '"Part of #3" in:body' --state all; gh issue view 3; main CI). If nothing is running while work remains, report 'idle with work remaining'.
+
+---
+
+vibe status report for epic #3 (pmatos/forseti). Report in under 150 words and start NO new feature work: done, in progress, blocked, next, pending rulings. Facts from gh/git/CI only (gh pr list --search '"Part of #3" in:body' --state all; gh issue view 3; main CI). If nothing is running while work remains, report 'idle with work remaining'.
+
+---
+
+Your claude.ai usage limit has reset. Continue the task you were working on when the limit was reached; do not repeat work that is already complete.
+
+---
+
+vibe status report for epic #3 (pmatos/forseti). Report in under 150 words and start NO new feature work: done, in progress, blocked, next, pending rulings. Facts from gh/git/CI only (gh pr list --search '"Part of #3" in:body' --state all; gh issue view 3; main CI). If nothing is running while work remains, report 'idle with work remaining'.
+
+---
+
+<task-notification>
+<task-id>a26829b27d169da89</task-id>
+<tool-use-id>toolu_01MhKD3ANSC3AbYUKnSFx73n</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/a26829b27d169da89.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix #389 E0 runner" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>READY. PR #419 is open and all required checks passed on final head ce5ebb1: `test`, `workflow-lint` and `Validate PR title`. CodeQL and codecov passed too, and `claude-review` was skipped. I did not run the E0 grid and did not merge.
+
+**What shipped**
+- The runner is `python -m forseti.experiments.e0` with `run` and `summary` commands. It lives in `src/forseti/experiments/e0.py`.
+- **Per cell:** for each unit × recipe × sample it builds the #388 request, calls the proposer, and checks each accepted property on the clean source and on the twin.
+- **Rows:** `e0.proposal` and `e0.property` rows go to the run directory's `events.jsonl`. Each proposal is written before any check, so it is never paid for twice. The summary is recomputed from the rows alone.
+- **Resume:** re-running skips every proposal and check that already has a row. Failed proposals and ESBMC errors are redone. A torn last line is repaired, and the run directory is pinned to its manifest and source hashes and locked against a second runner.
+- **ESBMC:** the timeout is per invocation (default 30 s) and is set in the manifest.
+- **Tokens:** `ClaudeCliClient.complete_with_usage` is an additive method on `ClaudeCliClient` that reports token usage and cost. `LLMClient` is unchanged.
+- **Manifest:** `experiments/e0/manifest.toml` holds the 6 non-`abs` kernels × `baseline`/`blind`/`sighted` × 3 samples, which is 54 cells.
+- **Shared code:** /simplify moved `TimedVerify` and `FixedProperties` into `orchestrator/semantic_check.py`. `grading/grade.py` and `grading/discriminate.py` now use them instead of private copies.
+- **Review fixes:** `/code-review` returned its findings without applying anything, so I applied the valid ones myself. That covered redoing ESBMC errors, locking the run directory, source pinning, cache-token counts and manifest validation.
+- **Tests:** the unit tests use fake proposer and verifier ports. There is one ESBMC-gated smoke test on `utf8_decode` (clean held, twin violated). New code covers about 99.8% of branches.
+- **Docs:** I added the `e0.*` row types to the event table in `docs/design/0001-harness-portability.md`.
+
+**#389 is not done.** The acceptance box "The E0 grid runs unattended to completion" cannot be ticked without executing the grid, so the PR says "Part of #389" and "Part of #3". Resume is covered by tests, but the full unattended run is not. The owner runs this from the repo root:
+```
+python -m forseti.experiments.e0 run experiments/e0/manifest.toml --run-dir runs/e0
+python -m forseti.experiments.e0 summary runs/e0
+```
+Exit 0 means every cell is complete, 2 means work remains (re-run to resume), and 1 means the run failed.
+
+**msort:** I kept the unit at `max_len = 2` instead of dropping it. On ESBMC 8.6.0, with a placeholder property, both versions time out at every rung at `max_len` 4 and settle in about 10 s at 2. That was measured with a stand-in property, so the real run should confirm it.
+
+**Not done**
+- **Local suite:** the only local failure is `tests/test_release_preparation.py` (`No module named build` for the system python). It fails the same way on untouched main, and CI `test` passed.
+- **Skipped simplify findings:** I did not move the torn-line reader into `_events.py`, split `e0.py` into several modules, or convert the summary classes to `asdict`.
+- **Filed:** nothing.
+- **Cleanup:** the worktree is kept as instructed, at `/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/scratchpad/wt-389`.
+
+repo: pmatos/forseti
+issue: 389
+PR: 419
+SHA: ce5ebb122304c72a1767c1f1d6063b493794e826
+checks: test pass; workflow-lint pass; Validate PR title pass; CodeQL pass; codecov/patch pass; codecov/project pass; claude-review skipping
+needsRuling:
+needsMeasurement:</result>
+<usage><subagent_tokens>283878</subagent_tokens><tool_uses>35</tool_uses><duration_ms>904515</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>brwhyx5uo</task-id>
+<tool-use-id>toolu_01FzW43BtzXsmnBEtw6YuRSX</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/brwhyx5uo.output</output-file>
+<status>completed</status>
+<summary>Background command "Wait for post-merge CI on 17df0fb" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a002424ccf22958db</task-id>
+<tool-use-id>toolu_0178SK5ZaoevF8NXroyGEEah</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/a002424ccf22958db.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix #387 stage 2" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Stage 2 of #387 is up as PR #421, and every required check passed on its final head 839f2d8. The one non-pass line in the check list is `claude-review` (skipping). `Validate PR title` was re-read at the last poll, not run-verified against the SHA. Nothing is merged.
+
+**What shipped**
+- **Lifecycle:** a type invariant moves candidate to accepted or rejected, and both are final. It skips `graded`, so the shared semantic lifecycle is untouched. A human settles it with `forseti invariant-status &lt;src&gt; --type T --property-id ID accepted|rejected`.
+- **Check entry point:** `forseti check &lt;src&gt; --function F --type T [--role method|initialiser]` runs the inductive check. The MCP `check` tool takes optional `type_name` and `role`. Accepted invariants stay checkable, rejected ones do not.
+- **S0 under the invariant:** `forseti synth` assumes an accepted invariant of `T` for each single-object `T *` parameter, with a non-vacuity probe. Results say *assumed*, and the JSON carries `assumed_invariants`. `--no-invariants` opts out. An initialiser gets no assumption (found in the code review); `--role` overrides the name-based guess. `discharge` is not given any invariant, and a test pins that.
+- **Evidence table through the CLI:** `tests/core/test_invariant_cli_integration.py` pins it with real ESBMC on `ring_buffer.c` and `ring_buffer_bug.c`.
+  - **`synth rb_push`:** VIOLATED before acceptance, VERIFIED (assumed) after, on both files.
+  - **`check --type` on `rb_push`:** clean is held; bug is VIOLATED with the `forseti:rep-invariant` label.
+  - **`rb_pop` and `rb_init`:** held on both.
+  - **Vacuous invariant:** reported `vacuous`, and `synth` gives VACUOUS (exit 4).
+- **Unit tests** cover each piece. Full suite: 2530 passed locally, with one existing failure, `tests/test_release_preparation.py`, which needs the `build` module that is not installed here.
+- **Review rounds:** the code review (high) ran but applied nothing and posted no comments, so I fixed its valid findings myself, posted a summary comment on the PR, and ran /simplify.
+
+**What remains of #387**
+- **Claude Code verify gate under an accepted invariant: not done.** The gate marks every pointer-taking unit `needs_contract` and never runs ESBMC on it (#122). Running `T *` units under an invariant would turn non-blocking units into blocking ones, which changes the gate's exclusion. The Codex and Oh My Pi hooks share the gate. Needs a ruling.
+- **Proposer prompt and parser support, plus the MCP `submit` tool for the kind:** filed as #420, a sub-issue of #3, labelled enhancement and research like #387, with no closing keywords.
+- **Discharge at callers that construct `T`:** still open, so every result stays labelled assumed.
+
+In my judgment the acceptance list is met. All four boxes are covered by this PR and #417, with the unit tests and the integration test. The Scope items still open are the gate, the proposer and discharge, listed above.
+
+**Decisions in the PR body**
+- Accepted is final, so there is no un-accept. Making it revocable would change the lifecycle convention.
+- Accepting does not require a passing `check --type`. Gating it needs a rule for which functions count.
+- Invariants are keyed by the raw source path spelling, so `x.c` and `./x.c` do not share one.
+
+The worktree is left in place at `/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/scratchpad/wt-387b`, and nothing was rebased.
+
+repo: pmatos/forseti
+issue: 387
+PR: 421
+SHA: 839f2d8af9f5827f2a24a05607bad64e66bbee56
+checks: test success; workflow-lint success; Validate PR title success; codecov/patch success; codecov/project success; CodeQL success; Analyze (actions, c-cpp, javascript-typescript, python) success; claude-review skipping
+needsRuling: Should the Claude Code verify gate (and the Codex and Oh My Pi hooks that share it) run `T *` functions under an ACCEPTED invariant? Today every pointer-taking unit is `needs_contract` and never reaches ESBMC (#122). Doing it would make those units blocking, which changes the gate's exclusion. Not implemented. Also: should an ACCEPTED invariant be revocable? The lifecycle convention makes it final, and `synth --no-invariants` is the only per-run escape. Left as is.
+needsMeasurement:</result>
+<usage><subagent_tokens>301751</subagent_tokens><tool_uses>105</tool_uses><duration_ms>1464086</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>b5d3wq2wg</task-id>
+<tool-use-id>toolu_01PTafASoGRohuktdM4CMqNm</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/b5d3wq2wg.output</output-file>
+<status>completed</status>
+<summary>Background command "Wait for post-merge CI on ccfd0b6" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+Ask me about the rulings - provide enough context so I understand what we're doing so we can unblock progress and complete the epic.
+
+---
+
+ask again
+
+---
+
+<task-notification>
+<task-id>b8fefdfr6</task-id>
+<tool-use-id>toolu_016wnzWGmFoL19fJq1aRS1T2</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/b8fefdfr6.output</output-file>
+<status>completed</status>
+<summary>Background command "Notify when E0 pilot finishes" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+Yes, I meant Context as input to the proposer.
+Anyway, lets follow the recommendation for now. And yes, diagnose the 6 errors.
+
+---
+
+1. drop - but add it back with build struct field support (add to exisitng issue or create a new one).
+2. yes
+
+---
+
+<task-notification>
+<task-id>brng8u4mj</task-id>
+<tool-use-id>toolu_01D5HbZBRNPpVCB4oeLDS6sq</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/brng8u4mj.output</output-file>
+<status>completed</status>
+<summary>Background command "Wait for CI on PR 424" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bchqau46w</task-id>
+<tool-use-id>toolu_01AM27maSW9iYVrxhx1VJ1KM</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/bchqau46w.output</output-file>
+<status>completed</status>
+<summary>Background command "Wait for post-merge CI on a65ab70" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+go
+
+---
+
+<task-notification>
+<task-id>bnkqfpinn</task-id>
+<tool-use-id>toolu_011hANryrunhScR3e5YqZBk5</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/bnkqfpinn.output</output-file>
+<status>completed</status>
+<summary>Background command "Start full E0 grid run in background" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bm029ywk1</task-id>
+<summary>Monitor event: "E0 grid progress and completion"</summary>
+<event>[Monitor expired after 30m with no events delivered. Re-arm it if you still need the watch — and widen the filter if silence was unexpected.]</event>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bl92138zo</task-id>
+<summary>Monitor event: "E0 grid progress and completion"</summary>
+<event>progress: 6/36 cells started</event>
+If this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bl92138zo</task-id>
+<summary>Monitor event: "E0 grid progress and completion"</summary>
+<event>[Monitor expired after 30m with 1 event delivered. Re-arm it if you still need the watch.]</event>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bb56512ov</task-id>
+<summary>Monitor event: "E0 grid progress and completion"</summary>
+<event>[Monitor expired after 30m with no events delivered. Re-arm it if you still need the watch — and widen the filter if silence was unexpected.]</event>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>brygnc6n0</task-id>
+<summary>Monitor event: "E0 grid progress and completion"</summary>
+<event>progress: 17/36 cells started</event>
+If this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>brygnc6n0</task-id>
+<summary>Monitor event: "E0 grid progress and completion"</summary>
+<event>progress: 24/36 cells started</event>
+If this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>brygnc6n0</task-id>
+<summary>Monitor event: "E0 grid progress and completion"</summary>
+<event>progress: 31/36 cells started</event>
+If this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>brygnc6n0</task-id>
+<tool-use-id>toolu_01MM5Nskq3odFESCgAEHMwep</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/brygnc6n0.output</output-file>
+<status>completed</status>
+<summary>Monitor "E0 grid progress and completion" stream ended</summary>
+<event>process ended; exit=0
+Verdicts are bounded: no violation found up to k (and len &lt;= max_len). `unknown` and `vacuous` are never held. `rendered` counts checks whose harness was built.</event>
+If this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.
+</task-notification>
+
+---
+
+Lets deal with these questions - ask me the necessary questions and provide me with the required context so that I can make the rulings necessary for us to proceed.
