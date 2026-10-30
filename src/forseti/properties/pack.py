@@ -43,6 +43,7 @@ from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from forseti.unit_id import make_unit_id, unit_id_path, unit_id_symbol
 
@@ -57,7 +58,9 @@ from .index import (
     line_of,
 )
 from .model import PropertyStatus
-from .store import PropertyStore
+
+if TYPE_CHECKING:
+    from .store import PropertyStore
 
 Contracts = Callable[[str], Sequence[str]]
 
@@ -419,6 +422,6 @@ def build_project_pack(
     named = Path(unit_id_path(unit_id))
     path = named.parent.resolve() / named.name
     tree = GitTree.at(path.parent)
-    rel = path.relative_to(tree.root.resolve()).as_posix()
+    rel = path.relative_to(tree.root).as_posix()
     index = ProjectIndex(OverlayTree(tree, {rel: source_text}))
     return build_context_pack(index, make_unit_id(rel, unit_id_symbol(unit_id)), config)

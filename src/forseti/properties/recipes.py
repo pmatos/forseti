@@ -128,8 +128,8 @@ def _baseline(unit_id: str, source: str, project_root: Path) -> str:
     return "".join(out).strip("\n") + "\n"
 
 
-def _project_recipe(name: str, slices: set[SliceKind]) -> Recipe:
-    config = PackConfig(slices=frozenset(slices))
+def _project_recipe(name: str, slices: frozenset[SliceKind]) -> Recipe:
+    config = PackConfig(slices=slices)
 
     def build(unit_id: str, source: str, project_root: Path) -> str:
         del project_root
@@ -141,7 +141,7 @@ def _project_recipe(name: str, slices: set[SliceKind]) -> Recipe:
     return Recipe(name, "1", build)
 
 
-_SIGHTED = {SliceKind.TARGET, SliceKind.TYPES}
+_SIGHTED = frozenset({SliceKind.TARGET, SliceKind.TYPES})
 
 SINGLE_FILE_RECIPES = ("baseline", "sighted", "blind")
 
@@ -153,7 +153,7 @@ RECIPES: dict[str, Recipe] = {
         Recipe("blind", "1", _blind),
         _project_recipe("callers", _SIGHTED | {SliceKind.CALLERS}),
         _project_recipe("tests", _SIGHTED | {SliceKind.TESTS}),
-        _project_recipe("full", set(ALL_SLICES)),
+        _project_recipe("full", ALL_SLICES),
     )
 }
 
