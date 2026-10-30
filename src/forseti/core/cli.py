@@ -360,7 +360,9 @@ def _add_recipe_argument(p: argparse.ArgumentParser, *, scope: str = "") -> None
             "function, its doc comment and the types/macros it uses; blind: "
             "sighted without the body; callers, tests, full: the git project "
             "around the function at HEAD, adding its call sites, its tests, or "
-            "everything). Recorded on each stored property "
+            "everything; callees: the function, its types and its callees' "
+            "signatures with the accepted contracts in --store-root, whose "
+            "digest is part of the recorded ref). Recorded on each stored property "
             "(default: the whole file)"
         ),
     )

@@ -79,6 +79,7 @@ from .pack import (
     SliceKind,
     build_context_pack,
     build_project_pack,
+    store_contract_source,
     store_contracts,
 )
 from .prompts import (
@@ -221,6 +222,7 @@ __all__ = [
     "render_semantic_harness",
     "renderability_reason",
     "spec_from_property",
+    "store_contract_source",
     "store_contracts",
     "submit_candidates",
     "type_name_reason",

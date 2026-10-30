@@ -24,8 +24,15 @@ from the source text. They are `callers` (target, types, call sites), `tests` (t
 types, tests that call it) and `full` (every slice). They need a git repository with a
 commit, and fail with `RecipeError` otherwise. The ref does not record which commit
 HEAD was, so a run that must be reproduced pins the checkout (the replay runner's
-job). The callees' accepted contracts are not shown: they would make a ref depend on
-the store's state as well.
+job). Of these, `full` shows no accepted contracts.
+
+The store recipe, `callees` (target, types, and each callee's signature, doc comment
+and accepted contracts), reads the explicit store the proposal uses. A ref that
+depended on live store state would not be reproducible, so the ref carries a digest of
+the contracts shown, ``callees/v1+<digest>``: the same tree and store state give the
+same pack and the same ref, and a changed store state gives a different ref. It needs
+a contract source (`build_context(contracts_for=...)`); a store that does not exist is
+an empty one.
 
 The scan is lexical (comments, literals and directives masked), not a parse; it
 reads the same text ESBMC will, and degrades by omission rather than guessing.
@@ -44,7 +51,13 @@ from forseti.unit_id import unit_id_symbol
 
 from .cscan import Definition, Item, Scan
 from .index import ProjectIndexError
-from .pack import ALL_SLICES, PackConfig, SliceKind, build_project_pack
+from .pack import (
+    ALL_SLICES,
+    ContractSource,
+    PackConfig,
+    SliceKind,
+    build_project_pack,
+)
 
 
 class RecipeError(ValueError):
@@ -59,15 +72,26 @@ class ProposalContext:
     text: str
 
 
+Build = Callable[[str, str, Path, ContractSource | None], tuple[str, str]]
+
+
 @dataclass(frozen=True)
 class Recipe:
+    """A named, versioned context builder.
+
+    `build` maps ``(unit id, source text, project root, contract source)`` to the
+    context text and a suffix for the ref (``""``, or ``"+<digest>"`` for a recipe
+    that reads a store, which sets `reads_store`).
+    """
+
     name: str
     version: str
-    build: Callable[[str, str, Path], str]
+    build: Build
+    reads_store: bool = False
 
     @property
     def ref(self) -> str:
-        """The provenance label, e.g. ``"blind/v1"``."""
+        """The provenance label, e.g. ``"blind/v1"`` (a store recipe adds a digest)."""
         return f"{self.name}/v{self.version}"
 
 
@@ -128,17 +152,44 @@ def _baseline(unit_id: str, source: str, project_root: Path) -> str:
     return "".join(out).strip("\n") + "\n"
 
 
-def _project_recipe(name: str, slices: frozenset[SliceKind]) -> Recipe:
+def _plain(build: Callable[[str, str, Path], str]) -> Build:
+    def run(
+        unit_id: str, source: str, project_root: Path, contracts_for: object
+    ) -> tuple[str, str]:
+        del contracts_for
+        return build(unit_id, source, project_root), ""
+
+    return run
+
+
+def _project_recipe(
+    name: str, slices: frozenset[SliceKind], *, reads_store: bool = False
+) -> Recipe:
     config = PackConfig(slices=slices)
 
-    def build(unit_id: str, source: str, project_root: Path) -> str:
+    def build(
+        unit_id: str,
+        source: str,
+        project_root: Path,
+        contracts_for: ContractSource | None,
+    ) -> tuple[str, str]:
         del project_root
+        if reads_store and contracts_for is None:
+            raise RecipeError(
+                f"recipe {name!r} reads accepted contracts from a store; give it one"
+            )
         try:
-            return build_project_pack(unit_id, source, config).text
+            pack = build_project_pack(
+                unit_id,
+                source,
+                config,
+                contracts_for=contracts_for if reads_store else None,
+            )
         except ProjectIndexError as exc:
             raise RecipeError(f"recipe {name!r}: {exc}") from exc
+        return pack.text, f"+{pack.contracts_digest}" if reads_store else ""
 
-    return Recipe(name, "1", build)
+    return Recipe(name, "1", build, reads_store)
 
 
 _SIGHTED = frozenset({SliceKind.TARGET, SliceKind.TYPES})
@@ -148,27 +199,35 @@ SINGLE_FILE_RECIPES = ("baseline", "sighted", "blind")
 RECIPES: dict[str, Recipe] = {
     recipe.name: recipe
     for recipe in (
-        Recipe("baseline", "1", _baseline),
-        Recipe("sighted", "1", _sighted),
-        Recipe("blind", "1", _blind),
+        Recipe("baseline", "1", _plain(_baseline)),
+        Recipe("sighted", "1", _plain(_sighted)),
+        Recipe("blind", "1", _plain(_blind)),
         _project_recipe("callers", _SIGHTED | {SliceKind.CALLERS}),
         _project_recipe("tests", _SIGHTED | {SliceKind.TESTS}),
         _project_recipe("full", ALL_SLICES),
+        _project_recipe("callees", _SIGHTED | {SliceKind.CALLEES}, reads_store=True),
     )
 }
 
 
 def build_context(
-    recipe: str, *, unit_id: str, source_text: str, project_root: Path
+    recipe: str,
+    *,
+    unit_id: str,
+    source_text: str,
+    project_root: Path,
+    contracts_for: ContractSource | None = None,
 ) -> ProposalContext:
-    """Run the registered recipe `recipe`; `RecipeError` if it is not registered."""
+    """Run the registered recipe `recipe`; `RecipeError` if it is not registered.
+
+    `contracts_for` serves a store recipe only (`RecipeError` if it needs one and has
+    none); the other recipes ignore it.
+    """
     try:
         selected = RECIPES[recipe]
     except KeyError:
         raise RecipeError(
             f"unknown recipe {recipe!r}; choose one of {', '.join(RECIPES)}"
         ) from None
-    return ProposalContext(
-        recipe=selected.ref,
-        text=selected.build(unit_id, source_text, project_root),
-    )
+    text, suffix = selected.build(unit_id, source_text, project_root, contracts_for)
+    return ProposalContext(recipe=selected.ref + suffix, text=text)

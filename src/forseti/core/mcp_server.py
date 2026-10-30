@@ -130,7 +130,9 @@ def propose_tool(
         recipe: Input recipe selecting what the proposer is shown instead of
             the whole file: "baseline" (whole file minus `main` and the header
             comment), "sighted" (the function, its doc comment and the
-            types/macros it uses) or "blind" (sighted without the body).
+            types/macros it uses), "blind" (sighted without the body) or
+            "callees" (sighted plus its callees' signatures and the accepted
+            contracts in `store_root`; the ref records a digest of them).
             Omitted: the whole file. Recorded on each stored property.
         kind: "semantic" (default) or "rep-invariant": propose representation
             invariants of the struct type `type_name` instead, over `self`, a
@@ -448,8 +450,10 @@ def semantic_loop_tool(
         recipe: `mode="propose"` only -- input recipe selecting what the
             proposer is shown instead of the whole file: "baseline" (whole
             file minus `main` and the header comment), "sighted" (the
-            function, its doc comment and the types/macros it uses) or "blind"
-            (sighted without the body). Omitted: the whole file. Recorded on
+            function, its doc comment and the types/macros it uses), "blind"
+            (sighted without the body) or "callees" (sighted plus its callees'
+            signatures and the accepted contracts in `store_root`; the ref
+            records a digest of them). Omitted: the whole file. Recorded on
             each stored property.
 
     Returns:
