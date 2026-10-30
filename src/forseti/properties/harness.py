@@ -336,7 +336,7 @@ def nondet_struct_note(signature: UnitSignature) -> str | None:
     and the harness never discharges that at a caller that does build one, so a
     result is conditional on the domain and is *assumed*, not unconditional.
     """
-    structs = [p for p in signature.params if isinstance(p, StructParam)]
+    structs = signature.struct_params
     if not structs:
         return None
     subjects = ", ".join(f"{p.name} ({p.elem_ctype})" for p in structs)

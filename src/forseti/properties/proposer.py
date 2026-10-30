@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
@@ -423,13 +423,14 @@ def validate_candidate(
         params = signature.param_names
         input_params = signature.input_param_names
         allowed = params | {RESULT_IDENT} | HARNESS_MACROS
+        structs = {p.name: p for p in signature.struct_params}
         for ident in expr_idents:
             if ident not in allowed:
                 return f"expression references unknown identifier {ident!r}" + (
-                    _field_hint(ident, signature)
+                    _field_hint(ident, structs)
                 )
         for text in (spec.expression, *spec.domain):
-            member_block = _member_reason(text, signature)
+            member_block = _member_reason(text, structs)
             if member_block is not None:
                 return member_block
         # The two signature-dependent emission rules -- a scalar-backed output must
@@ -452,10 +453,6 @@ def validate_candidate(
     return None
 
 
-def _struct_params(signature: UnitSignature) -> dict[str, StructParam]:
-    return {p.name: p for p in signature.params if isinstance(p, StructParam)}
-
-
 def _struct_note(signature: UnitSignature | None) -> str | None:
     """What the model must know about a struct-pointer parameter, or None without one.
 
@@ -465,11 +462,11 @@ def _struct_note(signature: UnitSignature | None) -> str | None:
     """
     if signature is None:
         return None
-    structs = _struct_params(signature)
-    if not structs:
+    if not signature.struct_params:
         return None
     lines = ["Struct parameters (the contract above applies, with these additions):"]
-    for name, struct in structs.items():
+    for struct in signature.struct_params:
+        name = struct.name
         fields = f"; fields: {', '.join(struct.fields)}" if struct.fields else ""
         lines.append(f"- `{name}` points to a `{struct.elem_ctype}`{fields}")
     lines += [
@@ -478,17 +475,16 @@ def _struct_note(signature: UnitSignature | None) -> str | None:
         "(`r->count <= 4`), and `expression` sees the state AFTER the call.",
         "- A constant the source `#define`s (`CAP`) is unavailable: write the number.",
     ]
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines)
 
 
-def _member_reason(text: str, signature: UnitSignature) -> str | None:
+def _member_reason(text: str, structs: Mapping[str, StructParam]) -> str | None:
     """Why `text` misuses a struct parameter's members, or None.
 
     Only the first hop off a struct parameter is resolved (``r->count``); deeper
     members and ``->`` off any other name are left to the compiler, which reports
     them as an ``error`` verdict, never a pass.
     """
-    structs = _struct_params(signature)
     for base, op, member in member_accesses(text):
         struct = structs.get(base)
         if struct is None:
@@ -507,9 +503,9 @@ def _member_reason(text: str, signature: UnitSignature) -> str | None:
     return None
 
 
-def _field_hint(ident: str, signature: UnitSignature) -> str:
+def _field_hint(ident: str, structs: Mapping[str, StructParam]) -> str:
     """A pointer to the right spelling when `ident` is a field of a struct parameter."""
-    owners = [p.name for p in _struct_params(signature).values() if ident in p.fields]
+    owners = [p.name for p in structs.values() if ident in p.fields]
     if not owners:
         return ""
     return f" (a field of {owners[0]!r}: write {owners[0]}->{ident})"

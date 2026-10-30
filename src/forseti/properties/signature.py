@@ -89,6 +89,11 @@ class UnitSignature:
     params: tuple[Param, ...]
 
     @property
+    def struct_params(self) -> tuple[StructParam, ...]:
+        """The struct-pointer parameters (one nondet instance each)."""
+        return tuple(p for p in self.params if isinstance(p, StructParam))
+
+    @property
     def param_names(self) -> frozenset[str]:
         """Every parameter name, regardless of role."""
         return frozenset(p.name for p in self.params)
@@ -162,8 +167,10 @@ def extract_signature(
     if not return_ctype:
         raise HarnessError(f"could not parse the return type of {symbol!r}")
     raws = [_parse_fragment(frag, symbol) for frag in _split_params(match.group(2))]
-    defined = struct_definitions(unit_source) if infer_structs or struct_types else {}
-    body = _function_body(unit_source, match.end() - 1) if infer_structs else ""
+    # comments are blanked length-preservingly, so `match` offsets stay valid
+    code = _without_comments(unit_source) if infer_structs or struct_types else ""
+    defined = _struct_definitions_in(code)
+    body = _function_body(code, match.end() - 1) if infer_structs else ""
     return UnitSignature(
         symbol=symbol,
         return_ctype=return_ctype,
@@ -177,6 +184,7 @@ _COMMENT_OR_LITERAL = re.compile(
 _STRUCT_HEAD = re.compile(r"\bstruct\b\s*(\w+)?\s*\{")
 _FIELD_FUNCTION_POINTER = re.compile(r"\(\s*\*\s*(\w+)")
 _FIELD_NOISE = re.compile(r"\[[^\]]*\]|:\s*\w+\s*$|=.*$|\*")
+_TYPEDEF_BEFORE = re.compile(r"\btypedef\s*\Z")
 _TYPEDEF_TAIL = re.compile(r"\s*([^;{}]*);")
 
 
@@ -192,7 +200,10 @@ def struct_definitions(unit_source: str) -> dict[str, tuple[str, ...]]:
     yields an empty field list, which a caller reads as "unknown", never as "these
     are all the fields".
     """
-    text = _without_comments(unit_source)
+    return _struct_definitions_in(_without_comments(unit_source))
+
+
+def _struct_definitions_in(text: str) -> dict[str, tuple[str, ...]]:
     found: dict[str, tuple[str, ...]] = {}
     for head in _STRUCT_HEAD.finditer(text):
         close = _matching_brace(text, head.end() - 1)
@@ -201,7 +212,7 @@ def struct_definitions(unit_source: str) -> dict[str, tuple[str, ...]]:
         fields = _struct_fields(text[head.end() : close])
         if head.group(1):
             found.setdefault(f"struct {head.group(1)}", fields)
-        if re.search(r"\btypedef\s*$", text[: head.start()]):
+        if _TYPEDEF_BEFORE.search(text, max(0, head.start() - 64), head.start()):
             tail = _TYPEDEF_TAIL.match(text, close + 1)
             for declarator in (tail.group(1) if tail else "").split(","):
                 name = declarator.strip()
@@ -211,15 +222,14 @@ def struct_definitions(unit_source: str) -> dict[str, tuple[str, ...]]:
 
 
 def _without_comments(text: str) -> str:
-    """`text` with comments blanked; string and character literals are kept whole."""
+    """`text` with comments blanked to spaces (same length); literals are kept whole."""
     return _COMMENT_OR_LITERAL.sub(
-        lambda m: m.group(0) if m.group(0)[0] in "\"'" else " ", text
+        lambda m: m.group(0) if m.group(0)[0] in "\"'" else " " * len(m.group(0)), text
     )
 
 
 def _function_body(text: str, open_at: int) -> str:
-    close = _matching_brace(text, open_at)
-    return _without_comments(text[open_at : close if close is not None else None])
+    return text[open_at : _matching_brace(text, open_at)]
 
 
 def _matching_brace(text: str, open_at: int) -> int | None:

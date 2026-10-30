@@ -87,7 +87,7 @@ def render_prompt(
         .replace(_MAX, str(max_candidates))
         .replace(_SOURCE, source_text if context is None else context)
     )
-    return rendered if note is None else f"{rendered}\n{note}"
+    return rendered if note is None else f"{rendered}\n{note}\n"
 
 
 _SEMANTIC_V1_TEXT = """\
