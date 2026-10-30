@@ -61,10 +61,10 @@ from forseti.orchestrator.ports import VerifyPort
 from forseti.properties import Property
 from forseti.properties.invariant import InvariantRole, infer_role
 
-from .discharge import _self_reachable, open_caller_checks
+from .discharge import open_caller_checks, self_reachable
 from .model import CallerCheck, CallerOutcome
 from .reachability import ProbeReachability, classify_site_probe
-from .synth import RENAMED_MAIN, SynthError, _line_directive, pointee_type
+from .synth import RENAMED_MAIN, SynthError, line_directive, pointee_type
 
 DISCHARGE_LABEL_PREFIX = "forseti:rep-invariant-entry:"
 DISCHARGE_SITE_LABEL_PREFIX = "forseti:rep-invariant-site:"
@@ -209,6 +209,19 @@ def _entry_check(callee: str, param: str, type_name: str, expression: str) -> st
     return f"{{ const {type_name} *self = {param}; {assertion} }}"
 
 
+def _inject_at_entry(
+    source_text: str, callee: Unit, checks: Sequence[str], source_path: str
+) -> str:
+    brace = find_definition_brace(
+        source_text, callee.name, callee.def_line, callee.predefined_guards
+    )
+    if brace is None:
+        raise SynthError(f"no definition of {callee.name}() found in the source text")
+    injected = "".join(f" {check}" for check in checks)
+    copy = source_text[: brace + 1] + injected + source_text[brace + 1 :]
+    return _NDEBUG_PRELUDE + line_directive(source_path) + copy
+
+
 def inject_invariant_obligation(
     source_text: str,
     callee: Unit,
@@ -217,7 +230,6 @@ def inject_invariant_obligation(
     type_name: str,
     expression: str,
     source_path: str,
-    site_probe: bool = False,
 ) -> str:
     """`source_text` with the invariant asserted at `callee`'s entry.
 
@@ -225,30 +237,27 @@ def inject_invariant_obligation(
     of `params` is inserted immediately after the definition's ``{`` on that same
     line, so every line number matches the original. A parameter itself named
     ``self`` is asserted over directly (aliasing it would initialise it from
-    itself). With `site_probe` the obligation is replaced by one labelled
-    ``assert(0)`` marking the entry, which a caller that reaches the call makes
-    fail: the reachability reading that keeps a dead call site from discharging
-    vacuously. ``NDEBUG`` and a ``#line`` restoring `source_path` are prepended
+    itself). ``NDEBUG`` and a ``#line`` restoring `source_path` are prepended
     without shifting any line. `SynthError` for an unnamed parameter or a
     definition that is not isolable.
     """
     if any(not name for name in params):
         raise SynthError(f"{callee.name}() has an unnamed {type_name} * parameter")
-    brace = find_definition_brace(
-        source_text, callee.name, callee.def_line, callee.predefined_guards
-    )
-    if brace is None:
-        raise SynthError(f"no definition of {callee.name}() found in the source text")
-    if site_probe:
-        checks = [f'__ESBMC_assert(0, "{DISCHARGE_SITE_LABEL_PREFIX}{callee.name}");']
-    else:
-        checks = [
-            _entry_check(callee.name, name, type_name, expression.strip())
-            for name in params
-        ]
-    injected = "".join(f" {check}" for check in checks)
-    copy = source_text[: brace + 1] + injected + source_text[brace + 1 :]
-    return _NDEBUG_PRELUDE + _line_directive(source_path) + copy
+    checks = [
+        _entry_check(callee.name, name, type_name, expression.strip())
+        for name in params
+    ]
+    return _inject_at_entry(source_text, callee, checks, source_path)
+
+
+def inject_site_probe(source_text: str, callee: Unit, *, source_path: str) -> str:
+    """`source_text` with one labelled ``assert(0)`` at `callee`'s entry.
+
+    A caller that reaches the call makes it fail: the reachability reading that
+    keeps a dead call site from discharging vacuously.
+    """
+    check = f'__ESBMC_assert(0, "{DISCHARGE_SITE_LABEL_PREFIX}{callee.name}");'
+    return _inject_at_entry(source_text, callee, [check], source_path)
 
 
 def render_caller_harness(copy_path: Path, caller: str) -> str:
@@ -438,27 +447,6 @@ def _discharge_function(
             detail,
         )
 
-    resolved = str(source.resolve())
-    try:
-        obligations = inject_invariant_obligation(
-            source_text,
-            callee,
-            params,
-            type_name=type_name,
-            expression=prop.expression,
-            source_path=resolved,
-        )
-        site = inject_invariant_obligation(
-            source_text,
-            callee,
-            params,
-            type_name=type_name,
-            expression=prop.expression,
-            source_path=resolved,
-            site_probe=True,
-        )
-    except SynthError as exc:
-        return incomplete(f"the obligation could not be injected: {exc}")
     try:
         unenumerable = open_callers_fn(source, callee.name)
     except ListUnitsError as exc:
@@ -478,6 +466,20 @@ def _discharge_function(
             detail = f"{detail}; the caller set is also open: {why}"
         return incomplete(detail)
 
+    resolved = str(source.resolve())
+    try:
+        obligations = inject_invariant_obligation(
+            source_text,
+            callee,
+            params,
+            type_name=type_name,
+            expression=prop.expression,
+            source_path=resolved,
+        )
+        site = inject_site_probe(source_text, callee, source_path=resolved)
+    except SynthError as exc:
+        return incomplete(f"the obligation could not be injected: {exc}")
+
     stem = f"{callee.name}__inv"
     obligations_path = run.work_dir / f"{stem}__obligations.c"
     obligations_path.write_text(obligations)
@@ -488,7 +490,7 @@ def _discharge_function(
         _check_caller(caller, callee, obligations_path, site_path, run)
         for caller in referrers
     )
-    if _self_reachable(list(units), callee.name):
+    if self_reachable(list(units), callee.name):
         # The assert fires at every entry, so one failing run cannot say whether a
         # caller's value or a re-entry the body made broke it: blaming the caller
         # would accuse code that handed over exactly what it built.

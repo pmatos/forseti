@@ -36,6 +36,7 @@ from forseti.precond.invariant_discharge import (
     assuming_functions,
     discharge_invariants,
     inject_invariant_obligation,
+    inject_site_probe,
     invariant_discharge_transcript,
     render_caller_harness,
 )
@@ -242,15 +243,7 @@ def test_every_parameter_of_the_type_gets_a_block() -> None:
 
 
 def test_site_probe_replaces_the_obligation_with_a_labelled_assert() -> None:
-    copy = inject_invariant_obligation(
-        SOURCE,
-        PUSH,
-        ("r",),
-        type_name="ring_t",
-        expression=INVARIANT,
-        source_path="x.c",
-        site_probe=True,
-    )
+    copy = inject_site_probe(SOURCE, PUSH, source_path="x.c")
     assert f'__ESBMC_assert(0, "{DISCHARGE_SITE_LABEL_PREFIX}rb_push");' in copy
     assert DISCHARGE_LABEL_PREFIX not in copy
 
