@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "toolu_0182noq6H8qdjX8NCEC3uuy1",
+  "agent_id": "a2b4c830fffde9742",
+  "subagent_type": "general-purpose",
+  "task_description": "Fix #436 callee contracts slice",
+  "token_usage": {
+    "input_tokens": 78,
+    "cache_creation_tokens": 125573,
+    "cache_read_tokens": 4024782,
+    "output_tokens": 34018,
+    "api_call_count": 38
+  },
+  "started_at": "2026-10-30T10:54:05.252445617+01:00",
+  "completed_at": "2026-10-30T11:12:02.784301092+01:00"
+}
