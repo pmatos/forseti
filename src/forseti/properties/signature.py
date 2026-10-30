@@ -146,8 +146,9 @@ def extract_signature(
 
     `infer_structs=True` additionally treats a pointer to any struct *defined in
     `unit_source`* (`struct_definitions`) as a `StructParam`, unless an integer
-    parameter named like a length follows it (``(point_t *pts, size_t n)`` stays
-    the buffer idiom). A struct the source does not define keeps the old reading.
+    parameter follows it *and* the body indexes or advances the pointer
+    (``(point_t *pts, size_t n)`` with ``pts[i]`` stays the buffer idiom). A struct
+    the source does not define keeps the old reading.
     """
     pattern = re.compile(
         r"([A-Za-z_][\w \t\*]*?[\s\*])" + re.escape(symbol) + r"\s*\(([^)]*)\)\s*\{"
@@ -162,19 +163,17 @@ def extract_signature(
         raise HarnessError(f"could not parse the return type of {symbol!r}")
     raws = [_parse_fragment(frag, symbol) for frag in _split_params(match.group(2))]
     defined = struct_definitions(unit_source) if infer_structs or struct_types else {}
+    body = _function_body(unit_source, match.end() - 1) if infer_structs else ""
     return UnitSignature(
         symbol=symbol,
         return_ctype=return_ctype,
-        params=_to_params(
-            raws,
-            frozenset(struct_types),
-            defined,
-            infer=defined if infer_structs else {},
-        ),
+        params=_to_params(raws, frozenset(struct_types), defined, infer_structs, body),
     )
 
 
-_COMMENT = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
+_COMMENT_OR_LITERAL = re.compile(
+    r"""/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'""", re.DOTALL
+)
 _STRUCT_HEAD = re.compile(r"\bstruct\b\s*(\w+)?\s*\{")
 _FIELD_FUNCTION_POINTER = re.compile(r"\(\s*\*\s*(\w+)")
 _FIELD_NOISE = re.compile(r"\[[^\]]*\]|:\s*\w+\s*$|=.*$|\*")
@@ -187,19 +186,19 @@ def struct_definitions(unit_source: str) -> dict[str, tuple[str, ...]]:
     ``typedef struct {...} ring_t;`` is keyed ``ring_t``; ``struct node {...}`` is
     keyed ``struct node``; ``typedef struct node {...} node_t;`` gets both. Regex,
     comment-aware and best-effort like the rest of this parser: a member of a
-    nested struct is not listed (the nested member is named, not its contents), a
-    struct only reachable through an ``#include`` is not seen, and a definition it
-    cannot read is left out rather than guessed.
+    nested struct is not listed (the nested member is named, not its contents), and
+    a struct only reachable through an ``#include`` is not seen. A body with a
+    member it cannot name (an anonymous union/struct member, an ``__attribute__``)
+    yields an empty field list, which a caller reads as "unknown", never as "these
+    are all the fields".
     """
-    text = _COMMENT.sub(" ", unit_source)
+    text = _without_comments(unit_source)
     found: dict[str, tuple[str, ...]] = {}
     for head in _STRUCT_HEAD.finditer(text):
         close = _matching_brace(text, head.end() - 1)
         if close is None:
             continue
         fields = _struct_fields(text[head.end() : close])
-        if not fields:
-            continue
         if head.group(1):
             found.setdefault(f"struct {head.group(1)}", fields)
         if re.search(r"\btypedef\s*$", text[: head.start()]):
@@ -209,6 +208,18 @@ def struct_definitions(unit_source: str) -> dict[str, tuple[str, ...]]:
                 if re.fullmatch(r"[A-Za-z_]\w*", name):
                     found.setdefault(name, fields)
     return found
+
+
+def _without_comments(text: str) -> str:
+    """`text` with comments blanked; string and character literals are kept whole."""
+    return _COMMENT_OR_LITERAL.sub(
+        lambda m: m.group(0) if m.group(0)[0] in "\"'" else " ", text
+    )
+
+
+def _function_body(text: str, open_at: int) -> str:
+    close = _matching_brace(text, open_at)
+    return _without_comments(text[open_at : close if close is not None else None])
 
 
 def _matching_brace(text: str, open_at: int) -> int | None:
@@ -234,29 +245,29 @@ def _struct_fields(body: str) -> tuple[str, ...]:
         elif depth == 0:
             flat.append(ch)
     names: list[str] = []
-    for declaration in "".join(flat).split(";"):
-        names += _declared_names(declaration)
+    for declaration in "".join(flat).split(";")[:-1]:
+        declared = _declared_names(declaration)
+        if declared is None:
+            return ()
+        names += declared
     return tuple(dict.fromkeys(names))
 
 
-def _declared_names(declaration: str) -> list[str]:
+def _declared_names(declaration: str) -> list[str] | None:
+    """The member names one declaration declares, or None if one cannot be named."""
     if pointer := _FIELD_FUNCTION_POINTER.search(declaration):
         return [pointer.group(1)]
     names: list[str] = []
     for index, declarator in enumerate(_split_params(declaration)):
         words = _FIELD_NOISE.sub(" ", declarator).split()
         # the first declarator carries the type, so a lone word there is an
-        # unnamed bit-field (``int : 3``) or a bare type, not a member
-        if len(words) > (1 if index == 0 else 0) and re.fullmatch(r"\w+", words[-1]):
-            names.append(words[-1])
+        # unnamed member (``int : 3``, an anonymous union), not a named one
+        if len(words) <= (1 if index == 0 else 0) or not re.fullmatch(
+            r"\w+", words[-1]
+        ):
+            return None
+        names.append(words[-1])
     return names
-
-
-_LENGTH_NAME = re.compile(
-    r"(?:n|len|length|size|count|num|nmemb|cap|capacity)|.*_(?:len|length|size|count|n)"
-    r"|(?:n|num)_.*",
-    re.IGNORECASE,
-)
 
 
 @dataclass(frozen=True)
@@ -316,7 +327,8 @@ def _to_params(
     raws: Sequence[_RawParam],
     struct_types: frozenset[str],
     defined: Mapping[str, tuple[str, ...]],
-    infer: Mapping[str, tuple[str, ...]],
+    infer: bool,
+    body: str,
 ) -> tuple[Param, ...]:
     params: list[Param] = []
     for i, raw in enumerate(raws):
@@ -327,7 +339,8 @@ def _to_params(
         nxt = raws[i + 1] if i + 1 < len(raws) else None
         single = raw.array_len is None and raw.type_str.count("*") == 1
         if single and (
-            pointee in struct_types or (pointee in infer and not _is_length_param(nxt))
+            pointee in struct_types
+            or (infer and pointee in defined and not _is_buffer_idiom(raw, nxt, body))
         ):
             params.append(
                 StructParam(
@@ -369,14 +382,16 @@ def _to_params(
     return tuple(params)
 
 
-def _is_length_param(raw: _RawParam | None) -> bool:
-    """An integer parameter named like a count: the (buffer, length) idiom's tail."""
-    return (
-        raw is not None
-        and not raw.is_ptr
-        and _is_integer_type(raw.type_str)
-        and _LENGTH_NAME.fullmatch(raw.name) is not None
-    )
+def _is_buffer_idiom(raw: _RawParam, nxt: _RawParam | None, body: str) -> bool:
+    """A struct pointer followed by an integer that the body treats as an array.
+
+    ``(point_t *pts, size_t n)`` with ``pts[i]`` is a buffer of ``n`` structs;
+    ``(ring_t *r, int n)`` with ``r->count`` is one instance and a scalar.
+    """
+    if nxt is None or nxt.is_ptr or not _is_integer_type(nxt.type_str):
+        return False
+    name = re.escape(raw.name)
+    return re.search(rf"\b{name}\s*\[|\b{name}\s*\+|\+\+\s*{name}\b", body) is not None
 
 
 def _elem_ctype(type_str: str) -> str:

@@ -341,9 +341,10 @@ def nondet_struct_note(signature: UnitSignature) -> str | None:
         return None
     subjects = ", ".join(f"{p.name} ({p.elem_ctype})" for p in structs)
     return (
-        f"{subjects} start as nondet struct values: any field contents, including "
-        "states no caller can build; a result holds only under the domain and is "
-        "not discharged at the callers that construct the type"
+        f"{subjects} start as nondet struct values: any field contents (pointer "
+        "members included), including states no caller can build; a result holds "
+        "only under the domain and is not discharged at the callers that construct "
+        "the type"
     )
 
 

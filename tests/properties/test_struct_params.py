@@ -70,14 +70,10 @@ void sha1_update(sha1_ctx *ctx, const uint8_t *data, size_t len) {
 """
 
 
-def _ring_sig() -> object:
-    return extract_signature(RING, "rb_push", infer_structs=True)
-
-
 def test_struct_definitions_read_typedefs_tags_and_both() -> None:
     src = """\
     typedef struct { int a; char *name; void (*cb)(int); } plain_t;
-    struct node { struct node *next; unsigned flags : 3, : 2; long v[4], w; };
+    struct node { struct node *next; unsigned flags : 3; long v[4], w; };
     typedef struct pair { int x, y; } pair_t, *pair_p;
     typedef struct { struct { int deep; } inner; int top; } nested_t;
     """
@@ -92,6 +88,31 @@ def test_struct_definitions_read_typedefs_tags_and_both() -> None:
 def test_struct_definitions_ignore_comments_and_unreadable_bodies() -> None:
     src = "/* struct ghost { int g; }; */ // struct ghost2 { int g; };\nstruct s {"
     assert struct_definitions(src) == {}
+
+
+def test_a_literal_that_opens_a_comment_does_not_swallow_a_struct() -> None:
+    src = (
+        'const char *s = "a /* b";\n'
+        "typedef struct { int a; } t;\n"
+        'const char *u = "c */ d";\n'
+    )
+    assert struct_definitions(src) == {"t": ("a",)}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "union { int a; int b; }; int c;",
+        "struct { int x; int y; }; int b;",
+        "int a __attribute__((aligned(4))); int b;",
+        "int a; int : 3; int b;",
+    ],
+)
+def test_a_member_that_cannot_be_named_makes_the_field_list_unknown(
+    body: str,
+) -> None:
+    # empty means "unknown", so the validator checks no member against it
+    assert struct_definitions(f"typedef struct {{ {body} }} t;") == {"t": ()}
 
 
 def test_a_defined_struct_pointer_is_one_instance_not_a_buffer_length_pair() -> None:
@@ -117,12 +138,26 @@ def test_struct_pointer_beside_a_buffer_pair() -> None:
     assert isinstance(length, ScalarParam)
 
 
-def test_struct_pointer_followed_by_a_length_keeps_the_buffer_idiom() -> None:
+def test_struct_pointer_the_body_indexes_keeps_the_buffer_idiom() -> None:
     src = (
-        "typedef struct { int x; } pt;\nint sum(const pt *pts, size_t n) { return 0; }"
+        "typedef struct { int x; } pt;\n"
+        "int sum(const pt *pts, size_t n) {\n"
+        "    int t = 0;\n"
+        "    for (size_t i = 0; i < n; i++) t += pts[i].x;\n"
+        "    return t;\n"
+        "}"
     )
     sig = extract_signature(src, "sum", infer_structs=True)
     assert not any(isinstance(p, StructParam) for p in sig.params)
+
+
+def test_struct_handle_beside_a_count_named_scalar_is_one_instance() -> None:
+    src = (
+        "typedef struct { int total; } stats_t;\n"
+        "void add(stats_t *s, size_t count) { s->total += (int)count; }"
+    )
+    sig = extract_signature(src, "add", infer_structs=True)
+    assert isinstance(sig.params[0], StructParam)
 
 
 def test_an_undefined_struct_keeps_the_old_reading() -> None:
@@ -145,6 +180,10 @@ def test_member_names_are_not_variable_references() -> None:
         ("r", "->", "count"),
         ("p", ".", "x"),
         ("a", "->", "b"),
+    ]
+    assert member_accesses("v>r.count && w<r->tail") == [
+        ("r", ".", "count"),
+        ("r", "->", "tail"),
     ]
 
 
@@ -186,6 +225,13 @@ def test_dot_access_through_the_pointer_is_rejected() -> None:
 
 def test_members_off_other_names_are_left_to_the_compiler() -> None:
     assert _validate("result == 0 || r->buf[0] >= 0 || v->x > 0") is None
+
+
+def test_a_comparison_before_a_dot_access_is_still_rejected() -> None:
+    reason = _validate("v>r.count")
+    assert reason is not None and "r->count" in reason
+    reason = _validate("v>r->bogus")
+    assert reason is not None and "'bogus'" in reason
 
 
 def test_a_struct_without_a_visible_field_list_checks_no_member() -> None:
@@ -270,6 +316,7 @@ def test_struct_pointer_writer_output_is_labelled_assumed() -> None:
     harness = build_property_harness(unit_source=RING, symbol="rb_push", prop=prop)
     assert harness.assumption is not None
     assert "r (ring_t)" in harness.assumption and "nondet" in harness.assumption
+    assert "pointer members" in harness.assumption
     unit = Unit("ring.c::rb_push", Path("ring.c"), "rb_push", RING)
     rendered = SemanticHarnessWriter().render(unit, prop)
     assert rendered.assumption == harness.assumption

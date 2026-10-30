@@ -58,7 +58,9 @@ _CLOSING_CAST = re.compile(
 _MEMBER = re.compile(r"(->|\.)\s*[A-Za-z_]\w*")
 # `base->field` / `base.field` where `base` is a bare identifier, not itself a member
 # access or the tail of a call/subscript/cast (`a->b->c` yields only `a->b`).
-_MEMBER_ACCESS = re.compile(r"(?<![\w.>)\]])([A-Za-z_]\w*)\s*(->|\.)\s*([A-Za-z_]\w*)")
+_MEMBER_ACCESS = re.compile(
+    r"(?<!->)(?<![\w.)\]])([A-Za-z_]\w*)\s*(->|\.)\s*([A-Za-z_]\w*)"
+)
 
 
 def _without_members(expr: str) -> str:
