@@ -4,8 +4,8 @@ A verification unit is keyed `<path>::<symbol>` (ADR-0009): a source path and th
 symbol of the function within it. ~10 producers used to hand-format that with an
 f-string and one consumer re-parsed it with a bare `split`, so the join and split
 rules could drift with nothing to enforce them. This leaf owns them: `make_unit_id`
-joins, `unit_id_symbol` recovers the symbol, `unit_id_prefix` builds the
-"every unit under this path" match prefix.
+joins, `unit_id_symbol` and `unit_id_path` recover the halves, `unit_id_prefix`
+builds the "every unit under this path" match prefix.
 
 Scope is the `::` separator only. This module deliberately does **not** normalize or
 validate the path: each producer keeps its own left-operand spelling — Core's raw
@@ -47,6 +47,15 @@ def unit_id_symbol(unit_id: str) -> str:
     separator-less id reads as all-symbol.
     """
     return unit_id.split(_SEP, 1)[1] if _SEP in unit_id else unit_id
+
+
+def unit_id_path(unit_id: str) -> str:
+    """The path half of `unit_id`: everything before the FIRST ``::``.
+
+    The counterpart of `unit_id_symbol`; a string with no ``::`` is returned
+    unchanged, so a separator-less id reads as all-path here and all-symbol there.
+    """
+    return unit_id.split(_SEP, 1)[0]
 
 
 def unit_id_prefix(path: str | os.PathLike[str]) -> str:

@@ -221,7 +221,7 @@ class Scan:
 
     def definitions_used(self, seed: str) -> list[Definition]:
         """Type/macro definitions `seed` (code text) needs, transitively."""
-        defs = self._definitions()
+        defs = self.definitions()
         used = set(IDENT_RE.findall(seed))
         selected: set[int] = set()
         changed = True
@@ -234,7 +234,7 @@ class Scan:
                     changed = True
         return [defs[index] for index in sorted(selected)]
 
-    def _definitions(self) -> list[Definition]:
+    def definitions(self) -> list[Definition]:
         """Type and macro definitions of the file, in source order."""
         defs: list[Definition] = []
         for item in self.items:
