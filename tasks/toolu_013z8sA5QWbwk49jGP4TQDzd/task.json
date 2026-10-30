@@ -1,0 +1,14 @@
+{
+  "tool_use_id": "toolu_013z8sA5QWbwk49jGP4TQDzd",
+  "agent_id": "a0811f8220d1fc459",
+  "task_description": "Efficiency review s2",
+  "token_usage": {
+    "input_tokens": 6,
+    "cache_creation_tokens": 40196,
+    "cache_read_tokens": 122828,
+    "output_tokens": 1666,
+    "api_call_count": 3
+  },
+  "started_at": "2026-10-30T09:38:59.769797619+01:00",
+  "completed_at": "2026-10-30T09:39:16.805696346+01:00"
+}

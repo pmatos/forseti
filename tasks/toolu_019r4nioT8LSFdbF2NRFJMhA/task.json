@@ -1,0 +1,14 @@
+{
+  "tool_use_id": "toolu_019r4nioT8LSFdbF2NRFJMhA",
+  "agent_id": "adfdf3330a438f4eb",
+  "task_description": "Reuse review s2",
+  "token_usage": {
+    "input_tokens": 8,
+    "cache_creation_tokens": 41677,
+    "cache_read_tokens": 182844,
+    "output_tokens": 1428,
+    "api_call_count": 4
+  },
+  "started_at": "2026-10-30T09:38:55.207265165+01:00",
+  "completed_at": "2026-10-30T09:39:10.876116859+01:00"
+}
