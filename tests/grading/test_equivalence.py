@@ -555,6 +555,23 @@ def test_filter_reports_the_assumed_domain() -> None:
     assert got.to_dict()["assumed"] == ["0 <= lo <= hi"]
 
 
+def test_filter_assumptions_dedupe_and_include_violated() -> None:
+    domain = ("0 <= lo <= hi",)
+    table: dict[str, EquivalenceResult] = {
+        "a": EquivalenceVerified(4, (), META, domain),
+        "b": EquivalenceVerified(4, (), META, domain),
+        "c": EquivalenceViolated(4, (), counterexample_witness(), "raw", META, domain),
+    }
+    got = filter_equivalent(
+        DOUBLE,
+        [FakeMutant("m1", "a"), FakeMutant("m2", "b"), FakeMutant("m3", "c")],
+        4,
+        symbol="f",
+        checker=scripted(table),
+    )
+    assert got.assumptions == domain
+
+
 def test_filter_without_a_range_idiom_reports_no_assumption() -> None:
     table: dict[str, EquivalenceResult] = {"eq": EquivalenceVerified(4, (), META)}
     got = filter_equivalent(
