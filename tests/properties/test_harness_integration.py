@@ -271,8 +271,6 @@ def test_msort_false_property_is_violated_on_the_range_harness(
 
 
 def test_msort_domain_above_the_cap_is_narrowed_and_settles(tmp_path: Path) -> None:
-    # #438: `hi <= 4` against `max_len = 2` used to leave `hi` up to 4 and time out;
-    # the cap now narrows it, and a non-NULL domain on the scratch buffer renders.
     result = _msort_verdict(
         "hi - lo < 2 || a[lo] <= a[lo + 1]",
         tmp_path,

@@ -51,6 +51,11 @@ class BufferParam:
     const: bool = False
     out: bool = False
 
+    @property
+    def scalar_backed(self) -> bool:
+        """A single-element output: a plain scalar passed by address, never malloc'd."""
+        return self.out and self.length.strip() == "1"
+
 
 @dataclass(frozen=True)
 class StructParam(BufferParam):
@@ -121,7 +126,7 @@ class UnitSignature:
         return frozenset(
             p.name
             for p in self.params
-            if isinstance(p, BufferParam) and p.out and p.length.strip() != "1"
+            if isinstance(p, BufferParam) and p.out and not p.scalar_backed
         )
 
     @property

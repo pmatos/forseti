@@ -1000,12 +1000,10 @@ def test_max_len_caps_an_unconstrained_length_before_the_allocation() -> None:
         "(n >= 1) && (n >= 2)",
         "n >= 1 || n == 20",
         "n != 0 && n <= 100",
+        "n >= 010",
     ],
 )
 def test_domain_upper_bound_gets_the_cap_on_top(domain: str) -> None:
-    # #438: an upper bound above `max_len` (`n < 100`) used to suppress the cap and
-    # leave the length unbounded in practice (UNKNOWN at every rung). The cap now
-    # applies whenever the domain's floor leaves room, narrowing what is checked.
     out = _render_first(domain, max_len=8)
     assert _CAP_N in out
     assert out.index(_CAP_N) < out.index(_ALLOC_A_N)

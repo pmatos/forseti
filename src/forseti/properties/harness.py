@@ -577,7 +577,7 @@ def _length_floor(clause: str, ident: str) -> int | None:
     """The smallest length a literal lower-bound `clause` on `ident` allows.
 
     Recognises only ``ident >= N``, ``ident > N``, ``ident == N``, ``ident != N``
-    and their mirrored forms (``N <= ident``), with a decimal or hex literal `N`
+    and their mirrored forms (``N <= ident``), with a decimal, hex or octal literal `N`
     and optional integer suffix; returns None for anything else (a conjunction, an
     upper bound, an expression), which the caller does not read as a floor. The
     fullmatch keeps it conservative: ``(a >= 1) && (b >= 1)`` is a non-match
@@ -592,7 +592,10 @@ def _length_floor(clause: str, ident: str) -> int | None:
         op, digits = match.group(2), match.group(1)
     else:
         return None
-    value = int(digits, 16) if digits[:2] in ("0x", "0X") else int(digits)
+    try:
+        value = int(digits, 0)
+    except ValueError:
+        return None
     return {">=": value, ">": value + 1, "<=": value, "<": value + 1, "==": value}.get(
         op, 1 if value == 0 else 0
     )
@@ -702,7 +705,7 @@ def _call_arg(param: Param) -> str:
 
 
 def _is_scalar_backed(buf: BufferParam) -> bool:
-    return buf.out and buf.length.strip() == "1"
+    return buf.scalar_backed
 
 
 def _strip_buffer_subscripts(expr: str, buffer_names: Collection[str]) -> str:

@@ -337,8 +337,6 @@ def scratch_sig() -> UnitSignature:
 
 
 def test_non_null_domain_on_a_scratch_buffer_accepted() -> None:
-    # #438: `tmp != 0` on msort's scratch buffer used to be rejected as
-    # constraining an output parameter (and, past that, as an unknown ident).
     spec = CandidateSpec(
         expression="hi - lo < 2 || a[lo] == a[lo]", domain=("lo >= 0", "tmp != 0")
     )
