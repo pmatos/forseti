@@ -14,7 +14,12 @@ from pathlib import Path
 
 import pytest
 
-from forseti.unit_id import make_unit_id, unit_id_prefix, unit_id_symbol
+from forseti.unit_id import (
+    make_unit_id,
+    unit_id_path,
+    unit_id_prefix,
+    unit_id_symbol,
+)
 
 
 def _legacy_symbol(unit_id: str) -> str:
@@ -98,3 +103,18 @@ def test_prefix_selects_units_under_one_path() -> None:
     prefix = unit_id_prefix("dir/f.c")
     assert make_unit_id("dir/f.c", "g").startswith(prefix)
     assert not make_unit_id("dir/f2.c", "g").startswith(prefix)
+
+
+@pytest.mark.parametrize(
+    ("unit_id", "path"),
+    [
+        ("examples/abs.c::my_abs", "examples/abs.c"),
+        ("p.cc::Foo::bar", "p.cc"),
+        ("../x.c::f", "../x.c"),
+        ("no-separator", "no-separator"),
+    ],
+)
+def test_unit_id_path_is_everything_before_the_first_separator(
+    unit_id: str, path: str
+) -> None:
+    assert unit_id_path(unit_id) == path
