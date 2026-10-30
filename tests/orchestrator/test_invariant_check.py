@@ -45,6 +45,7 @@ typedef struct { unsigned head, tail, count; } ring_t;
 void rb_init(ring_t *r) { r->head = r->tail = r->count = 0; }
 int rb_push(ring_t *r, int v) { return 1; }
 unsigned rb_count(const ring_t *r) { return r->count; }
+int rb_cap(int x) { return x; }
 """
 TYPE_KEY = "r.c::ring_t"
 INV = "self->count <= CAP"
@@ -228,9 +229,9 @@ def test_transcript_states_the_invariant_is_assumed(tmp_path: Path) -> None:
     assert f"Assumed: {INVARIANT_ASSUMPTION_NOTE}" in transcript
 
 
-def test_semantic_verdicts_carry_no_assumption_field(tmp_path: Path) -> None:
+def _semantic_run(symbol: str, tmp_path: Path) -> PropertyCheckRun:
     store = PropertyStore(sqlite3.connect(":memory:"))
-    unit = Unit("r.c::rb_push", Path("r.c"), "rb_count", SOURCE)
+    unit = Unit("r.c::" + symbol, Path("r.c"), symbol, SOURCE)
     store.add(
         Property(
             property_id="sem1",
@@ -241,7 +242,7 @@ def test_semantic_verdicts_carry_no_assumption_field(tmp_path: Path) -> None:
             provenance=Provenance("t", "1"),
         )
     )
-    run = check_properties(
+    return check_properties(
         unit,
         store=store,
         render=SemanticHarnessWriter(),
@@ -249,8 +250,22 @@ def test_semantic_verdicts_carry_no_assumption_field(tmp_path: Path) -> None:
         work_dir=tmp_path,
         unwind=4,
     )
+
+
+def test_scalar_semantic_verdicts_carry_no_assumption_field(tmp_path: Path) -> None:
+    run = _semantic_run("rb_cap", tmp_path)
     assert "assumption" not in run.verdicts[0].to_dict()
     assert "Assumed:" not in property_check_transcript(run)
+
+
+def test_struct_semantic_verdicts_assume_a_nondet_struct_not_the_invariant(
+    tmp_path: Path,
+) -> None:
+    run = _semantic_run("rb_count", tmp_path)
+    assumption = run.verdicts[0].to_dict()["assumption"]
+    assert "r (ring_t)" in assumption and "nondet" in assumption
+    assert assumption != INVARIANT_ASSUMPTION_NOTE
+    assert f"Assumed: {assumption}" in property_check_transcript(run)
 
 
 def test_writers_refuse_each_others_kinds(tmp_path: Path) -> None:

@@ -22,13 +22,13 @@ from __future__ import annotations
 
 import contextlib
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 from forseti.unit_id import unit_id_symbol
 
-from .cexpr import identifiers, unsafe_reason
+from .cexpr import identifiers, member_accesses, unsafe_reason
 
 # The macro allowlist (`HARNESS_MACROS`) is owned by the harness writer -- the
 # module that emits the includes -- so the accepted-without-declaration set and
@@ -49,6 +49,7 @@ from .model import (
 )
 from .prompts import DEFAULT_PROMPT, MAX_CANDIDATES_DEFAULT, RESULT_IDENT, render_prompt
 from .recipes import ProposalContext
+from .signature import StructParam
 from .store import DuplicateProperty
 
 if TYPE_CHECKING:
@@ -252,6 +253,7 @@ def propose_properties(
         result_ident=RESULT_IDENT,
         max_candidates=max_candidates,
         context=None if request.context is None else request.context.text,
+        note=_struct_note(request.signature),
     )
     raw = client.complete(prompt)
     specs = parse_candidates(raw)
@@ -421,9 +423,16 @@ def validate_candidate(
         params = signature.param_names
         input_params = signature.input_param_names
         allowed = params | {RESULT_IDENT} | HARNESS_MACROS
+        structs = {p.name: p for p in signature.struct_params}
         for ident in expr_idents:
             if ident not in allowed:
-                return f"expression references unknown identifier {ident!r}"
+                return f"expression references unknown identifier {ident!r}" + (
+                    _field_hint(ident, structs)
+                )
+        for text in (spec.expression, *spec.domain):
+            member_block = _member_reason(text, structs)
+            if member_block is not None:
+                return member_block
         # The two signature-dependent emission rules -- a scalar-backed output must
         # be named directly (not `*cp`/`cp[0]`/`*(cp+0)`) and a precondition must
         # not constrain an output -- are owned by the harness writer, the module
@@ -442,6 +451,64 @@ def validate_candidate(
             if name not in params:
                 return f"referenced_params includes non-parameter {name!r}"
     return None
+
+
+def _struct_note(signature: UnitSignature | None) -> str | None:
+    """What the model must know about a struct-pointer parameter, or None without one.
+
+    The prompt's contract says "parameters by their exact declared names", which a
+    model reads as bare field names (``count``) the harness cannot resolve; the
+    harness binds the pointer, so a field is ``r->count``.
+    """
+    if signature is None:
+        return None
+    if not signature.struct_params:
+        return None
+    lines = ["Struct parameters (the contract above applies, with these additions):"]
+    for struct in signature.struct_params:
+        name = struct.name
+        fields = f"; fields: {', '.join(struct.fields)}" if struct.fields else ""
+        lines.append(f"- `{name}` points to a `{struct.elem_ctype}`{fields}")
+    lines += [
+        "- Read state through the pointer (`r->count`), never as a bare field name.",
+        "- Each starts as an arbitrary value of its type: `domain` may constrain it "
+        "(`r->count <= 4`), and `expression` sees the state AFTER the call.",
+        "- A constant the source `#define`s (`CAP`) is unavailable: write the number.",
+    ]
+    return "\n".join(lines)
+
+
+def _member_reason(text: str, structs: Mapping[str, StructParam]) -> str | None:
+    """Why `text` misuses a struct parameter's members, or None.
+
+    Only the first hop off a struct parameter is resolved (``r->count``); deeper
+    members and ``->`` off any other name are left to the compiler, which reports
+    them as an ``error`` verdict, never a pass.
+    """
+    for base, op, member in member_accesses(text):
+        struct = structs.get(base)
+        if struct is None:
+            continue
+        if op == ".":
+            return (
+                f"{base!r} is a pointer to {struct.elem_ctype}; "
+                f"write {base}->{member}, not {base}.{member}"
+            )
+        if struct.fields and member not in struct.fields:
+            return (
+                f"unknown field {member!r} of {struct.elem_ctype} "
+                f"(parameter {base!r}); "
+                f"fields: {', '.join(struct.fields)}"
+            )
+    return None
+
+
+def _field_hint(ident: str, structs: Mapping[str, StructParam]) -> str:
+    """A pointer to the right spelling when `ident` is a field of a struct parameter."""
+    owners = [p.name for p in structs.values() if ident in p.fields]
+    if not owners:
+        return ""
+    return f" (a field of {owners[0]!r}: write {owners[0]}->{ident})"
 
 
 def _strip_fences(text: str) -> str:

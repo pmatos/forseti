@@ -39,7 +39,7 @@ def prepare_proposal_request(
     source_text = source.read_text()
     unit_id = make_unit_id(source, function)
     try:
-        signature = extract_signature(source_text, function)
+        signature = extract_signature(source_text, function, infer_structs=True)
     except HarnessError:
         signature = None
     context = (

@@ -4,12 +4,12 @@
 #   python -m forseti.experiments.e0 summary runs/e0
 #
 # Run from the repository root: the paths below are read relative to it.
-# 4 kernels x 3 recipes x 3 samples = 36 proposer calls, each followed by ESBMC
+# 6 kernels x 3 recipes x 3 samples = 54 proposer calls, each followed by ESBMC
 # checks of the accepted properties on the clean source and on its `_bug` twin.
 # `abs` is excluded (RFC-0007, Corpus): its few-shot example contaminates it.
-# `rb_push` and `sha1_update` are excluded until the semantic path handles
-# struct-pointer parameters (#422): the pilot got 0 accepted properties and only
-# render errors from them. Add them back with that issue.
+# `rb_push` and `sha1_update` take a struct pointer: the semantic path binds it as
+# a nondet struct (#422), so their results are *assumed* over states no caller may
+# build, not unconditional. The pilot (#389) had dropped them until that landed.
 # E0 measures the machinery, M1 and M5; Tier 0 has no usable bug pair, so the
 # twin columns are reported but are not M2.
 
@@ -27,6 +27,11 @@ unwind = 4
 max_len = 4
 esbmc_timeout_s = 30
 proposer_timeout_s = 240
+
+[[units]]
+path = "examples/ring_buffer.c"
+symbol = "rb_push"
+twin = "examples/ring_buffer_bug.c"
 
 [[units]]
 path = "examples/merge_sort.c"
@@ -47,6 +52,11 @@ twin = "examples/utf8_decode_bug.c"
 path = "examples/murmurhash.c"
 symbol = "murmur3_32"
 twin = "examples/murmurhash_bug.c"
+
+[[units]]
+path = "examples/sha1.c"
+symbol = "sha1_update"
+twin = "examples/sha1_bug.c"
 
 [[units]]
 path = "examples/frame_checksum.c"
