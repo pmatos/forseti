@@ -93,7 +93,7 @@ def propose_source(
     domain-level failure instead of an uncaught SQLite traceback.
 
     `recipe` selects what the prompt shows instead of the whole file (`baseline`,
-    `sighted`, `blind`; `RecipeError` if unknown or it cannot be built); `None`
+    `sighted`, `blind`, ...; `RecipeError` if unknown or it cannot be built); `None`
     sends the whole file. The recipe's project root is `store_root`'s parent, and
     `callees` shows the accepted contracts `store_root`'s store holds when the
     request is prepared (its digest is in the recorded recipe ref).

@@ -190,8 +190,7 @@ def store_contracts(
 
     `root` is the tree's root, so a tree-relative callee id also finds the
     properties the store keyed under its working-directory-relative or absolute
-    spelling. The store is read as it is now, not as of the pinned commit, and the
-    contracts of a callee come back sorted, so equal stores give equal text.
+    spelling. The store is read as it is now, not as of the pinned commit.
     """
     here = cwd or Path.cwd()
 
@@ -204,12 +203,12 @@ def store_contracts(
                 make_unit_id(spelling, symbol), {PropertyStatus.ACCEPTED}
             )
         }
-        return sorted(
+        return [
             f"{p.expression} (given {'; '.join(p.domain)})"
             if p.domain
             else p.expression
             for p in accepted.values()
-        )
+        ]
 
     return contracts
 
@@ -279,7 +278,7 @@ def _callee_entries(
             continue
         unit = make_unit_id(callee.path, name)
         known = (
-            tuple(_one_line(c) for c in contracts(unit))
+            tuple(sorted(_one_line(c) for c in contracts(unit)))
             if contracts is not None
             else ()
         )
