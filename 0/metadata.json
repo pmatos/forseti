@@ -3,7 +3,7 @@
   "checkpoint_id": "01M65XB7AD5C3H1JAMJ5MZVCBS",
   "session_id": "b509f435-6492-45cf-806a-b095d0a8617b",
   "strategy": "manual-commit",
-  "created_at": "2026-10-30T08:03:17.386388329Z",
+  "created_at": "2026-10-30T08:03:26.14051107Z",
   "branch": "vibe/423-project-index",
   "checkpoints_count": 13,
   "save_step_count": 2,
@@ -11,8 +11,8 @@
   "agent": "Claude Code",
   "model": "claude-sonnet-5-5",
   "turn_id": "ef36995fc533",
-  "checkpoint_transcript_start": 1446,
-  "transcript_lines_at_start": 1446,
+  "checkpoint_transcript_start": 1447,
+  "transcript_lines_at_start": 1447,
   "compact_transcript_start": 186,
   "token_usage": {
     "input_tokens": 0,
@@ -21,11 +21,11 @@
     "output_tokens": 0,
     "api_call_count": 0,
     "subagent_tokens": {
-      "input_tokens": 14,
-      "cache_creation_tokens": 9605,
-      "cache_read_tokens": 1233763,
-      "output_tokens": 4822,
-      "api_call_count": 7
+      "input_tokens": 2,
+      "cache_creation_tokens": 1214,
+      "cache_read_tokens": 161331,
+      "output_tokens": 427,
+      "api_call_count": 1
     }
   },
   "redaction": {
