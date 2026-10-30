@@ -103,7 +103,7 @@ transplanting a contract has one property a modular check would not: the assert
 fires at *every* entry, so a re-entry that breaks the precondition cannot slip
 past — it fails inside whatever caller's run reached it. What that costs is
 *blame*: one failing run cannot say which entry broke it. So a callee that can
-re-enter itself (`_self_reachable`, direct or through a cycle) is verified against
+re-enter itself (`self_reachable`, direct or through a cycle) is verified against
 its own harness too, which satisfies the obligation at the outer entry by
 construction — but that harness, like every other caller's, explores recursion
 only from the translation unit's own initial ambient state (RFC-0003 S2
@@ -495,7 +495,7 @@ def _discharge(
     # re-entry's, and no caller should be blamed for it.
     reentrant = (
         tuple(u for u in units if u.name == function)
-        if _self_reachable(units, function)
+        if self_reachable(units, function)
         else ()
     )
     # Whether this TU is the callee's whole world. A `static` callee cannot be
@@ -542,7 +542,7 @@ def _discharge(
     return _aggregate(function, unit_result, checks + unenumerable, anchored, internal)
 
 
-def _self_reachable(units: list[Unit], function: str) -> bool:
+def self_reachable(units: list[Unit], function: str) -> bool:
     """Whether `function` can re-enter itself through this TU's references.
 
     A breadth-first walk of `Unit.calls`, so an indirect cycle (``f`` → ``g`` →

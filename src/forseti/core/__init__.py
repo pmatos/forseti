@@ -18,6 +18,7 @@ from .check import check_source
 from .invariant import (
     accepted_invariants,
     check_invariant_source,
+    discharge_invariant_source,
     set_invariant_status,
     submit_invariant_source,
 )
@@ -35,6 +36,7 @@ __all__ = [
     "accepted_invariants",
     "check_invariant_source",
     "check_source",
+    "discharge_invariant_source",
     "propose_invariant_source",
     "propose_source",
     "result_to_payload",

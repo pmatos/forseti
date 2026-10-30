@@ -633,7 +633,7 @@ def _obligation_targets(plan: UnitPlan) -> tuple[ParamPlan, ...]:
     return pointers
 
 
-def _line_directive(source_path: str) -> str:
+def line_directive(source_path: str) -> str:
     """A ``#line`` directive that reports `source_path` from line 1 onward.
 
     ``#line N "file"`` tells the preprocessor that the *next* physical line is
@@ -708,4 +708,4 @@ def inject_obligations(
     copy = source_text[: brace + 1] + injected + source_text[brace + 1 :]
     if source_path is None:
         return copy
-    return _line_directive(source_path) + copy
+    return line_directive(source_path) + copy

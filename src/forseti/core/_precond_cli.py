@@ -104,7 +104,8 @@ def _add_synth_parser(
             "(undischarged). A struct type with an *accepted* representation "
             "invariant (`forseti invariant-status`, RFC-0007 #387) is also "
             "assumed to satisfy it, and the verdict says so: the invariant is "
-            "assumed, never discharged at the callers that construct the type."
+            "assumed here; `forseti invariant-discharge` checks the callers that "
+            "construct the type."
         ),
     )
     _add_precondition_arguments(
