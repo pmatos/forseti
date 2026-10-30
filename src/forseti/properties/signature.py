@@ -130,6 +130,7 @@ def extract_signature(
     *,
     struct_types: Collection[str] = (),
     infer_structs: bool = False,
+    range_idiom: bool = True,
 ) -> UnitSignature:
     """Best-effort regex parse of `symbol`'s signature from `unit_source`.
 
@@ -161,6 +162,8 @@ def extract_signature(
     scratch buffer, ``msort``'s ``tmp``) is as long and an output, not a single
     element.
     The upper bound is read as exclusive (``a[lo..hi)``) and matched by name only.
+    `range_idiom=False` keeps the plain ``(buf, len)`` reading for a caller whose
+    behaviour is pinned to it (the equivalence filter refuses such a unit).
     """
     pattern = re.compile(
         r"([A-Za-z_][\w \t\*]*?[\s\*])" + re.escape(symbol) + r"\s*\(([^)]*)\)\s*\{"
@@ -174,7 +177,7 @@ def extract_signature(
     if not return_ctype:
         raise HarnessError(f"could not parse the return type of {symbol!r}")
     raws = [_parse_fragment(frag, symbol) for frag in _split_params(match.group(2))]
-    ranged = any(
+    ranged = range_idiom and any(
         raw.is_ptr and _range_upper_bound(raws[i + 1 : i + 3]) is not None
         for i, raw in enumerate(raws)
     )
@@ -189,7 +192,9 @@ def extract_signature(
     return UnitSignature(
         symbol=symbol,
         return_ctype=return_ctype,
-        params=_to_params(raws, frozenset(struct_types), defined, infer_structs, body),
+        params=_to_params(
+            raws, frozenset(struct_types), defined, infer_structs, body, range_idiom
+        ),
     )
 
 
@@ -354,6 +359,7 @@ def _to_params(
     defined: Mapping[str, tuple[str, ...]],
     infer: bool,
     body: str,
+    range_idiom: bool,
 ) -> tuple[Param, ...]:
     params: list[Param] = []
     scratch_of: tuple[str, str] | None = None
@@ -378,7 +384,7 @@ def _to_params(
                 )
             )
             continue
-        range_upper = _range_upper_bound(raws[i + 1 : i + 3])
+        range_upper = _range_upper_bound(raws[i + 1 : i + 3]) if range_idiom else None
         if raw.array_len:
             length, out = raw.array_len, False
         elif range_upper is not None:
