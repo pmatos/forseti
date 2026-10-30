@@ -268,11 +268,12 @@ def _call_entries(
     if not want_tests and index.is_file_local(target):
         reach = Reach.FILE
     for path in index.files_in_reach(target.path, reach):
-        if is_test_path(path) is not want_tests or (
-            path != target.path and index.has_local(path, target.name)
-        ):
+        if is_test_path(path) is not want_tests:
             continue
-        for site in index.call_sites(path, target.name):
+        sites = index.call_sites(path, target.name)
+        if sites and path != target.path and index.has_local(path, target.name):
+            continue
+        for site in sites:
             own = (path, site.caller) == (target.path, target.name)
             if not own and (want_tests or site.caller not in skipped):
                 found.setdefault((path, site.caller), []).append(site.line)

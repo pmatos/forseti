@@ -33,10 +33,12 @@ from typing import Protocol
 from .cscan import IDENT_RE, Definition, Item, Scan
 
 C_SUFFIXES = (".c", ".h")
+_GIT_TIMEOUT_S = 30
 
 _ATTRIBUTE_RE = re.compile(r"__attribute__\s*\(\(.*?\)\)", re.DOTALL)
 _TRAILING_IDENT_RE = re.compile(r"(\w+)\s*$")
-_CALL_RE = re.compile(r"(?<![\w.])(?<!->)(\w+)\s*\(")
+_NOT_MEMBER = r"(?<![\w.])(?<!->)"
+_CALL_RE = re.compile(rf"{_NOT_MEMBER}(\w+)\s*\(")
 _NOT_CALLS = frozenset(
     {
         "if",
@@ -116,7 +118,10 @@ class MappingTree:
 def _git(root: Path, *args: str) -> bytes:
     try:
         done = subprocess.run(
-            ["git", "-C", str(root), *args], capture_output=True, check=True
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            check=True,
+            timeout=_GIT_TIMEOUT_S,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         detail = getattr(exc, "stderr", b"") or b""
@@ -213,16 +218,16 @@ def line_of(source: str, offset: int) -> int:
 class ProjectIndex:
     """Queries over the C files of a `SourceTree`, with per-file results cached."""
 
-    def __init__(
-        self, tree: SourceTree, *, suffixes: Sequence[str] = C_SUFFIXES
-    ) -> None:
+    def __init__(self, tree: SourceTree) -> None:
         self.tree = tree
-        self.files = tuple(p for p in tree.paths() if p.endswith(tuple(suffixes)))
+        self.files = tuple(p for p in tree.paths() if p.endswith(C_SUFFIXES))
         self._file_set = frozenset(self.files)
         self._sources: dict[str, str] = {}
         self._scans: dict[str, Scan] = {}
         self._refs: dict[str, tuple[FunctionRef, ...]] = {}
         self._calls: dict[tuple[str, str], tuple[CallSite, ...]] = {}
+        self._local: dict[tuple[str, int], bool] = {}
+        self._names: dict[tuple[str, Reach], dict[str, tuple[str, Definition]]] = {}
 
     def source(self, path: str) -> str:
         if path not in self._sources:
@@ -259,7 +264,11 @@ class ProjectIndex:
         text = scan.code[item.start : item.end]
         if item.is_function:
             name = _trailing_call_name(scan.code[item.start : item.brace])
-            return _ref(path, name, item, item.brace) if name else None
+            return (
+                FunctionRef(path, name, item.start, item.end, item.brace)
+                if name
+                else None
+            )
         head = IDENT_RE.match(text)
         if head is None or head.group() == "typedef" or not text.endswith(";"):
             return None
@@ -267,7 +276,7 @@ class ProjectIndex:
         if "=" in declarator:
             return None
         name = _trailing_call_name(declarator)
-        return _ref(path, name, item, None) if name else None
+        return FunctionRef(path, name, item.start, item.end, None) if name else None
 
     def definition(self, path: str, name: str) -> FunctionRef | None:
         """The definition of `name` in `path`, or None (also for an unknown path)."""
@@ -280,12 +289,15 @@ class ProjectIndex:
 
     def is_file_local(self, ref: FunctionRef) -> bool:
         """A ``static`` function of a ``.c`` file: no other file can call it."""
-        if not ref.path.endswith(".c"):
-            return False
-        head = self.scan(ref.path).code[ref.start : ref.brace or ref.end]
-        while (flat := _PARENS_RE.sub(" ", head)) != head:
-            head = flat
-        return "static" in IDENT_RE.findall(head)
+        key = (ref.path, ref.start)
+        if key not in self._local:
+            head = self.scan(ref.path).code[ref.start : ref.brace or ref.end]
+            while (flat := _PARENS_RE.sub(" ", head)) != head:
+                head = flat
+            self._local[key] = ref.path.endswith(".c") and "static" in IDENT_RE.findall(
+                head
+            )
+        return self._local[key]
 
     def has_local(self, path: str, name: str) -> bool:
         """Whether `path` holds its own file-local function called `name`."""
@@ -313,7 +325,7 @@ class ProjectIndex:
             sites: list[CallSite] = []
             if name in source:
                 scan = self.scan(path)
-                call = re.compile(rf"(?<![\w.])(?<!->){re.escape(name)}\s*\(")
+                call = re.compile(rf"{_NOT_MEMBER}{re.escape(name)}\s*\(")
                 for ref in self.functions(path):
                     if ref.brace is None:
                         continue
@@ -336,6 +348,19 @@ class ProjectIndex:
         )
         return tuple(names)
 
+    def _definition_names(
+        self, origin: str, reach: Reach
+    ) -> dict[str, tuple[str, Definition]]:
+        key = (origin, reach)
+        if key not in self._names:
+            names: dict[str, tuple[str, Definition]] = {}
+            for path in self.files_in_reach(origin, reach):
+                for definition in self.scan(path).definitions():
+                    for name in definition.names:
+                        names.setdefault(name, (path, definition))
+            self._names[key] = names
+        return self._names[key]
+
     def definitions_used(
         self, seed: str, origin: str, reach: Reach, depth: int
     ) -> list[tuple[str, Definition]]:
@@ -347,11 +372,7 @@ class ProjectIndex:
         unit's own file, each in source order.
         """
         paths = self.files_in_reach(origin, reach)
-        by_name: dict[str, tuple[str, Definition]] = {}
-        for path in paths:
-            for definition in self.scan(path).definitions():
-                for name in definition.names:
-                    by_name.setdefault(name, (path, definition))
+        by_name = self._definition_names(origin, reach)
         taken: dict[tuple[str, int], tuple[str, Definition]] = {}
         frontier = set(IDENT_RE.findall(seed))
         for _ in range(depth):
@@ -366,7 +387,3 @@ class ProjectIndex:
             frontier = {use for _, d in fresh.values() for use in d.uses}
         rank = {path: i for i, path in enumerate(paths[1:] + paths[:1])}
         return sorted(taken.values(), key=lambda pd: (rank[pd[0]], pd[1].start))
-
-
-def _ref(path: str, name: str, item: Item, brace: int | None) -> FunctionRef:
-    return FunctionRef(path, name, item.start, item.end, brace)
