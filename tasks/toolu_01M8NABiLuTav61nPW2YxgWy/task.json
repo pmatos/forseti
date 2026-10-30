@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "toolu_01M8NABiLuTav61nPW2YxgWy",
+  "agent_id": "ab0832dcd614b440a",
+  "subagent_type": "Explore",
+  "task_description": "Simplify review: reuse",
+  "token_usage": {
+    "input_tokens": 14,
+    "cache_creation_tokens": 50932,
+    "cache_read_tokens": 250281,
+    "output_tokens": 3356,
+    "api_call_count": 7
+  },
+  "started_at": "2026-10-30T09:08:11.747460762+01:00",
+  "completed_at": "2026-10-30T09:08:45.123826706+01:00"
+}
