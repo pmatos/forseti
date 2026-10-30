@@ -157,8 +157,9 @@ def extract_signature(
 
     A pointer followed by a ``(lo, hi)`` / ``(start, end)`` / ``(begin, end)`` pair
     is the range idiom: the buffer is ``hi`` long, and a trailing non-const pointer
-    of the same element type that the body subscripts past ``[0]`` (a scratch
-    buffer, ``msort``'s ``tmp``) is as long and an output, not a single element.
+    of the same element type that the body does not confine to ``*p`` / ``p[0]`` (a
+    scratch buffer, ``msort``'s ``tmp``) is as long and an output, not a single
+    element.
     The upper bound is read as exclusive (``a[lo..hi)``) and matched by name only.
     """
     pattern = re.compile(
@@ -381,7 +382,7 @@ def _to_params(
             and not raw.is_const
             and scratch_of is not None
             and scratch_of[0] == pointee
-            and _is_indexed(raw.name, body)
+            and not _is_single_element(raw.name, body)
         ):
             length, out = scratch_of[1], True
         elif nxt is None:
@@ -431,9 +432,16 @@ def _range_upper_bound(following: Sequence[_RawParam]) -> str | None:
     return upper.name if (lower.name, upper.name) in _RANGE_BOUNDS else None
 
 
-def _is_indexed(name: str, body: str) -> bool:
-    """Whether `body` subscripts `name` with something other than a literal ``0``."""
-    return re.search(rf"\b{re.escape(name)}\s*\[\s*(?!0\s*\])", body) is not None
+def _is_single_element(name: str, body: str) -> bool:
+    """Whether `body` only ever touches ``*name`` / ``name[0]`` of a pointer.
+
+    A pointer that is also subscripted past ``[0]``, or only handed on to a callee
+    (``msort`` passes ``tmp`` to ``merge``), may be longer than one element.
+    """
+    ident = re.escape(name)
+    if re.search(rf"\b{ident}\s*\[\s*(?!0\s*\])", body):
+        return False
+    return re.search(rf"\*\s*{ident}\b|\b{ident}\s*\[\s*0\s*\]", body) is not None
 
 
 def _is_buffer_idiom(raw: _RawParam, nxt: _RawParam | None, body: str) -> bool:

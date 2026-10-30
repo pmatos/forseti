@@ -82,7 +82,9 @@ def test_extract_signature_void_param_list_has_no_params() -> None:
     assert sig == UnitSignature("zero", "int", ())
 
 
-MSORT_DEF = "static void msort(int *a, int lo, int hi, int *tmp) { tmp[lo] = 0; }"
+MSORT_DEF = (
+    "static void msort(int *a, int lo, int hi, int *tmp) { msort(a, lo, hi, tmp); }"
+)
 
 
 def test_extract_signature_range_idiom_sizes_the_buffer_by_its_upper_bound() -> None:
@@ -115,6 +117,7 @@ def test_extract_signature_range_idiom_pairs(lower: str, upper: str) -> None:
     ("tail", "body", "expected"),
     [
         ("char *r", "r[1] = 0;", BufferParam("char", "r", "1", out=True)),
+        ("int *t", "g(t);", BufferParam("int", "t", "hi", out=True)),
         ("int *pos", "*pos = a[lo];", BufferParam("int", "pos", "1", out=True)),
         ("int *pos", "pos[0] = a[lo];", BufferParam("int", "pos", "1", out=True)),
         (
@@ -128,7 +131,7 @@ def test_extract_signature_range_idiom_pairs(lower: str, upper: str) -> None:
 def test_extract_signature_range_idiom_scratch_rule(
     tail: str, body: str, expected: BufferParam
 ) -> None:
-    # Only a non-const, same-typed pointer the body indexes past [0] is scratch.
+    # Scratch: non-const, same-typed, and not confined to *p / p[0] by the body.
     sig = extract_signature(f"void f(int *a, int lo, int hi, {tail}) {{ {body} }}", "f")
     assert sig.params[3] == expected
 
