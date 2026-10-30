@@ -34,6 +34,7 @@ from .harness import (
 from .index import (
     GitTree,
     MappingTree,
+    OverlayTree,
     ProjectIndex,
     ProjectIndexError,
     Reach,
@@ -77,6 +78,7 @@ from .pack import (
     PackEntry,
     SliceKind,
     build_context_pack,
+    build_project_pack,
     store_contracts,
 )
 from .prompts import (
@@ -107,6 +109,7 @@ from .proposer import (
 )
 from .recipes import (
     RECIPES,
+    SINGLE_FILE_RECIPES,
     ProposalContext,
     Recipe,
     RecipeError,
@@ -138,6 +141,7 @@ __all__ = [
     "REP_INVARIANT_V1",
     "RESULT_IDENT",
     "SEMANTIC_V1",
+    "SINGLE_FILE_RECIPES",
     "BlankProvenanceError",
     "BufferParam",
     "CandidateSpec",
@@ -160,6 +164,7 @@ __all__ = [
     "LLMUsage",
     "LengthBounds",
     "MappingTree",
+    "OverlayTree",
     "PackConfig",
     "PackEntry",
     "Param",
@@ -192,6 +197,7 @@ __all__ = [
     "build_context",
     "build_context_pack",
     "build_invariant_harness",
+    "build_project_pack",
     "build_property_harness",
     "extract_signature",
     "infer_role",

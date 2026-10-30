@@ -346,7 +346,9 @@ def _add_recipe_argument(p: argparse.ArgumentParser, *, scope: str = "") -> None
             f"{scope}input recipe: what the proposer sees instead of the whole "
             "file (baseline: minus main and the header comment; sighted: the "
             "function, its doc comment and the types/macros it uses; blind: "
-            "sighted without the body). Recorded on each stored property "
+            "sighted without the body; callers, tests, full: the git project "
+            "around the function at HEAD, adding its call sites, its tests, or "
+            "everything). Recorded on each stored property "
             "(default: the whole file)"
         ),
     )

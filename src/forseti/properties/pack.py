@@ -36,17 +36,21 @@ sibling slices are also capped in count, so one slice cannot starve the rest.
 
 from __future__ import annotations
 
+import os
 import posixpath
 import re
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from forseti.unit_id import make_unit_id, unit_id_path, unit_id_symbol
 
 from .index import (
     FunctionRef,
+    GitTree,
+    OverlayTree,
     ProjectIndex,
     ProjectIndexError,
     Reach,
@@ -54,7 +58,6 @@ from .index import (
     line_of,
 )
 from .model import PropertyStatus
-from .recipes import ProposalContext
 
 if TYPE_CHECKING:
     from .store import PropertyStore
@@ -151,21 +154,43 @@ class ContextPack:
         ]
         return "\n".join(sections)
 
-    def to_context(self, recipe: str) -> ProposalContext:
-        """The pack as the text a recipe hands the proposer, labelled `recipe`."""
-        return ProposalContext(recipe=recipe, text=self.text)
+
+def _unit_spellings(root: Path, cwd: Path, path: str) -> list[str]:
+    """The ways a store may have spelled the tree-relative `path` of a unit id.
+
+    Core keys units by the path as the user gave it: relative to the project
+    root (the tree path), relative to the working directory, or absolute.
+    """
+    absolute = root / path
+    spellings = [path, os.path.relpath(absolute, cwd), str(absolute)]
+    return list(dict.fromkeys(spellings))
 
 
-def store_contracts(store: PropertyStore) -> Contracts:
-    """Accepted properties of a unit, as one-line contract strings, for callees."""
+def store_contracts(
+    store: PropertyStore, *, root: Path, cwd: Path | None = None
+) -> Contracts:
+    """Accepted properties of a callee, as one-line contract strings.
+
+    `root` is the tree's root, so a tree-relative callee id also finds the
+    properties the store keyed under its working-directory-relative or absolute
+    spelling. The store is read as it is now, not as of the pinned commit.
+    """
+    here = cwd or Path.cwd()
 
     def contracts(unit_id: str) -> Sequence[str]:
-        accepted = store.list_for_unit(unit_id, {PropertyStatus.ACCEPTED})
+        path, symbol = unit_id_path(unit_id), unit_id_symbol(unit_id)
+        accepted = {
+            p.property_id: p
+            for spelling in _unit_spellings(root, here, path)
+            for p in store.list_for_unit(
+                make_unit_id(spelling, symbol), {PropertyStatus.ACCEPTED}
+            )
+        }
         return [
             f"{p.expression} (given {'; '.join(p.domain)})"
             if p.domain
             else p.expression
-            for p in accepted
+            for p in accepted.values()
         ]
 
     return contracts
@@ -380,3 +405,23 @@ def _select(unit_id: str, ranked: list[PackEntry], max_tokens: int) -> ContextPa
         ):
             chosen.append(entry)
     return ContextPack(unit_id, tuple(chosen), omitted=len(ranked) - len(chosen))
+
+
+def build_project_pack(
+    unit_id: str, source_text: str, config: PackConfig | None = None
+) -> ContextPack:
+    """The pack for a unit of the git repository holding its file, at HEAD.
+
+    Every file but the unit's own is read from the HEAD commit, so uncommitted and
+    untracked files never reach the pack; the unit's file is `source_text`, the text
+    being worked on. The unit's path is resolved against the working directory (the
+    file's directory is resolved, the file itself is not followed if it is a
+    symlink). `ProjectIndexError` for anything that stops the pack: no repository or
+    commit, no such function.
+    """
+    named = Path(unit_id_path(unit_id))
+    path = named.parent.resolve() / named.name
+    tree = GitTree.at(path.parent)
+    rel = path.relative_to(tree.root).as_posix()
+    index = ProjectIndex(OverlayTree(tree, {rel: source_text}))
+    return build_context_pack(index, make_unit_id(rel, unit_id_symbol(unit_id)), config)

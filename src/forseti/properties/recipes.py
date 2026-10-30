@@ -8,8 +8,7 @@ recipe's ``ref`` (``name/vN``) is recorded on every property it helped propose
 (`Provenance.recipe`). A shipped version's behaviour is immutable; change a recipe
 by registering a new version.
 
-The v1 recipes are single-file (they read only the source text; the project root
-is part of the seam for the project-index recipes of RFC-0007 T1):
+The first three recipes are single-file (they read only the source text):
 
 - ``baseline``: today's whole file, minus any ``main`` and the leading file-header
   comment (both leak the answer on ``examples/``).
@@ -18,6 +17,15 @@ is part of the seam for the project-index recipes of RFC-0007 T1):
 - ``blind``: ``sighted`` without the target body: its signature, doc comment, and
   only the definitions the *signature* uses, so nothing in the pack can be
   transcribed from the implementation.
+
+The project recipes build a context pack (`forseti.properties.pack`) from the git
+repository holding the unit's file, as of its HEAD commit, with the unit's file taken
+from the source text. They are `callers` (target, types, call sites), `tests` (target,
+types, tests that call it) and `full` (every slice). They need a git repository with a
+commit, and fail with `RecipeError` otherwise. The ref does not record which commit
+HEAD was, so a run that must be reproduced pins the checkout (the replay runner's
+job). The callees' accepted contracts are not shown: they would make a ref depend on
+the store's state as well.
 
 The scan is lexical (comments, literals and directives masked), not a parse; it
 reads the same text ESBMC will, and degrades by omission rather than guessing.
@@ -35,6 +43,8 @@ from pathlib import Path
 from forseti.unit_id import unit_id_symbol
 
 from .cscan import Definition, Item, Scan
+from .index import ProjectIndexError
+from .pack import ALL_SLICES, PackConfig, SliceKind, build_project_pack
 
 
 class RecipeError(ValueError):
@@ -118,12 +128,32 @@ def _baseline(unit_id: str, source: str, project_root: Path) -> str:
     return "".join(out).strip("\n") + "\n"
 
 
+def _project_recipe(name: str, slices: frozenset[SliceKind]) -> Recipe:
+    config = PackConfig(slices=slices)
+
+    def build(unit_id: str, source: str, project_root: Path) -> str:
+        del project_root
+        try:
+            return build_project_pack(unit_id, source, config).text
+        except ProjectIndexError as exc:
+            raise RecipeError(f"recipe {name!r}: {exc}") from exc
+
+    return Recipe(name, "1", build)
+
+
+_SIGHTED = frozenset({SliceKind.TARGET, SliceKind.TYPES})
+
+SINGLE_FILE_RECIPES = ("baseline", "sighted", "blind")
+
 RECIPES: dict[str, Recipe] = {
     recipe.name: recipe
     for recipe in (
         Recipe("baseline", "1", _baseline),
         Recipe("sighted", "1", _sighted),
         Recipe("blind", "1", _blind),
+        _project_recipe("callers", _SIGHTED | {SliceKind.CALLERS}),
+        _project_recipe("tests", _SIGHTED | {SliceKind.TESTS}),
+        _project_recipe("full", ALL_SLICES),
     )
 }
 

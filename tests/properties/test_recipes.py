@@ -9,7 +9,12 @@ import pytest
 
 from forseti.esbmc import find_definition_brace, mask_comments
 from forseti.grading.body import locate_body
-from forseti.properties import RECIPES, RecipeError, build_context
+from forseti.properties import (
+    RECIPES,
+    SINGLE_FILE_RECIPES,
+    RecipeError,
+    build_context,
+)
 
 EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
 
@@ -74,7 +79,8 @@ def _code_words(text: str) -> set[str]:
 
 
 def test_registry_has_the_three_single_file_recipes() -> None:
-    assert set(RECIPES) == {"baseline", "sighted", "blind"}
+    assert SINGLE_FILE_RECIPES == ("baseline", "sighted", "blind")
+    assert set(SINGLE_FILE_RECIPES) < set(RECIPES)
     assert RECIPES["blind"].ref == "blind/v1"
     ctx = build_context(
         "blind", unit_id="u.c::bag_add", source_text=SOURCE, project_root=Path()
@@ -93,7 +99,7 @@ def test_missing_target_is_an_error(recipe: str) -> None:
         _ctx(recipe, SOURCE, "absent")
 
 
-@pytest.mark.parametrize("recipe", sorted(RECIPES))
+@pytest.mark.parametrize("recipe", sorted(SINGLE_FILE_RECIPES))
 def test_same_input_always_yields_the_same_context(recipe: str, tmp_path: Path) -> None:
     first = _ctx(recipe, SOURCE, "bag_add")
     assert _ctx(recipe, SOURCE, "bag_add") == first

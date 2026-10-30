@@ -9,17 +9,23 @@ from pathlib import Path
 
 import pytest
 
+from forseti.core._proposal_request import prepare_proposal_request
 from forseti.properties import (
+    RECIPES,
+    SINGLE_FILE_RECIPES,
     Property,
     PropertyKind,
     PropertyStatus,
     PropertyStore,
     Provenance,
+    RecipeError,
+    build_context,
     make_property_id,
 )
 from forseti.properties.index import (
     GitTree,
     MappingTree,
+    OverlayTree,
     ProjectIndex,
     ProjectIndexError,
     Reach,
@@ -439,7 +445,7 @@ def test_store_contracts_reads_accepted_properties_only() -> None:
         )
         prop("tail == 0", PropertyStatus.ACCEPTED, ())
         prop("head == 7", PropertyStatus.CANDIDATE, ())
-        contracts = store_contracts(store)
+        contracts = store_contracts(store, root=Path("/project"))
         assert contracts(unit) == [
             "tail < SLOTS (given count < SLOTS; tail < SLOTS)",
             "tail == 0",
@@ -447,13 +453,6 @@ def test_store_contracts_reads_accepted_properties_only() -> None:
         assert contracts("src/ring.c::rb_init") == []
         text = build(PackConfig(slices={SliceKind.CALLEES}), contracts=contracts)
     assert "// accepted: tail == 0" in text
-
-
-def test_to_context_labels_the_recipe() -> None:
-    index = ProjectIndex(MappingTree(PROJECT))
-    pack = build_context_pack(index, UNIT)
-    context = pack.to_context("callers/v1")
-    assert (context.recipe, context.text) == ("callers/v1", pack.text)
 
 
 @pytest.mark.parametrize(
@@ -678,3 +677,210 @@ def test_git_tree_rejects_a_bad_revision(repo: Path) -> None:
         GitTree.at(repo, "no-such-ref")
     with pytest.raises(ProjectIndexError, match="rev-parse"):
         GitTree.at(repo.parent / "elsewhere", "HEAD")
+
+
+def recipe_text(recipe: str, repo: Path, source: str | None = None) -> str:
+    path = repo / "src/ring.c"
+    return build_context(
+        recipe,
+        unit_id=f"{path}::rb_push",
+        source_text=path.read_text() if source is None else source,
+        project_root=repo,
+    ).text
+
+
+def test_project_recipes_are_registered_beside_the_single_file_ones() -> None:
+    assert SINGLE_FILE_RECIPES == ("baseline", "sighted", "blind")
+    refs = {name: RECIPES[name].ref for name in RECIPES}
+    assert refs == {
+        "baseline": "baseline/v1",
+        "sighted": "sighted/v1",
+        "blind": "blind/v1",
+        "callers": "callers/v1",
+        "tests": "tests/v1",
+        "full": "full/v1",
+    }
+
+
+def test_each_project_recipe_selects_its_slices(repo: Path) -> None:
+    commit(repo, PROJECT, "v1")
+    callers = recipe_text("callers", repo)
+    assert "src/app.c::enqueue_all" in callers
+    assert "test_push_when_full" not in callers
+    assert "functions it calls" not in callers
+    assert "#define CAP 4" in callers and "r->buf[r->tail] = v;" in callers
+
+    tests = recipe_text("tests", repo)
+    assert "test_push_when_full" in tests and "enqueue_all" not in tests
+
+    full = recipe_text("full", repo)
+    for part in (
+        "enqueue_all",
+        "test_push_when_full",
+        "static void advance",
+        "rb_init",
+    ):
+        assert part in full
+
+
+def test_the_unit_file_is_the_current_text_everything_else_is_head(
+    repo: Path,
+) -> None:
+    commit(repo, PROJECT, "v1")
+    edited = RING_C.replace("return 0;", "return -1; /* edited */")
+    (repo / "src/ring.c").write_text(edited)
+    (repo / "src/app.c").write_text(
+        APP_C + "int uncommitted(ring_t *r) { return rb_push(r, 5); }\n"
+    )
+    (repo / "tests/test_new.c").write_text(
+        "static void test_new(void) { rb_push(0, 1); }\n"
+    )
+    text = recipe_text("full", repo, source=edited)
+    assert "return -1; /* edited */" in text
+    assert "uncommitted" not in text and "test_new" not in text
+    assert "src/app.c::enqueue_all" in text
+
+
+def test_recipe_packs_see_only_the_head_commit(repo: Path) -> None:
+    first = commit(repo, PROJECT, "v1")
+    v1_text = recipe_text("full", repo)
+    commit(
+        repo,
+        {
+            "src/later.c": (
+                '#include "ring.h"\nint later(ring_t *r) { return rb_push(r, 1); }\n'
+            ),
+            "tests/test_later.c": "static void test_later(void) { rb_push(0, 7); }\n",
+        },
+        "v2",
+    )
+    at_v2 = recipe_text("full", repo)
+    assert "later" in at_v2 and "test_later" in at_v2
+
+    git(repo, "checkout", "-q", first)
+    assert recipe_text("full", repo) == v1_text
+    assert "later" not in v1_text
+
+
+def test_recipe_accepts_cwd_relative_paths_and_subdirectory_roots(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commit(repo, PROJECT, "v1")
+    expected = recipe_text("callers", repo)
+    monkeypatch.chdir(repo / "src")
+    text = build_context(
+        "callers",
+        unit_id="ring.c::rb_push",
+        source_text=(repo / "src/ring.c").read_text(),
+        project_root=Path(),
+    ).text
+    assert text.replace("src/ring.c::rb_push", "X") == expected.replace(
+        "src/ring.c::rb_push", "X"
+    )
+
+
+def test_project_recipes_fail_with_recipe_errors(
+    repo: Path, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    with pytest.raises(RecipeError, match="rev-parse"):
+        recipe_text("callers", repo, source=RING_C)  # no commit yet
+    commit(repo, PROJECT, "v1")
+    with pytest.raises(RecipeError, match="no definition of 'nope'"):
+        build_context(
+            "callers",
+            unit_id=f"{repo / 'src/ring.c'}::nope",
+            source_text=RING_C,
+            project_root=repo,
+        )
+    outside = tmp_path_factory.mktemp("outside")
+    (outside / "x.c").write_text("int f(void) { return 0; }\n")
+    with pytest.raises(RecipeError, match="rev-parse"):
+        build_context(
+            "callers",
+            unit_id=f"{outside / 'x.c'}::f",
+            source_text="int f(void) { return 0; }\n",
+            project_root=repo,
+        )
+
+
+def test_the_repository_is_the_unit_files_not_the_project_roots(
+    repo: Path, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    commit(repo, PROJECT, "v1")
+    elsewhere = tmp_path_factory.mktemp("elsewhere")
+    path = repo / "src/ring.c"
+    text = build_context(
+        "callers",
+        unit_id=f"{path}::rb_push",
+        source_text=RING_C,
+        project_root=elsewhere,
+    ).text
+    assert "src/app.c::enqueue_all" in text
+
+
+def test_a_symlinked_unit_file_keeps_its_own_path(repo: Path) -> None:
+    commit(repo, PROJECT, "v1")
+    (repo / "src/link.c").symlink_to("ring.c")
+    git(repo, "add", "--", "src/link.c")
+    git(repo, "commit", "-q", "-m", "link")
+    text = build_context(
+        "callers",
+        unit_id=f"{repo / 'src/link.c'}::rb_push",
+        source_text=RING_C + "/* via link */\n",
+        project_root=repo,
+    ).text
+    assert "src/link.c::rb_push" in text
+    assert "src/ring.c::rb_push" not in text
+
+
+def test_overlay_tree_replaces_and_adds_files() -> None:
+    tree = OverlayTree(
+        MappingTree({"a.c": "old", "b.c": "b"}), {"a.c": "new", "c.c": "c"}
+    )
+    assert tree.paths() == ["a.c", "b.c", "c.c"]
+    assert [tree.read(p) for p in tree.paths()] == ["new", "b", "c"]
+
+
+def test_recipes_do_not_read_a_store(repo: Path) -> None:
+    commit(repo, PROJECT, "v1")
+    assert "accepted:" not in recipe_text("full", repo)
+    assert not (repo / ".forseti").exists()
+
+
+def test_store_contracts_maps_tree_paths_to_the_stores_spelling(
+    tmp_path: Path,
+) -> None:
+    root, cwd = tmp_path / "proj", tmp_path / "proj" / "sub"
+    cwd.mkdir(parents=True)
+    spellings = {
+        "src/a.c": "by_tree_path",
+        "../src/a.c": "by_cwd_path",
+        str(root / "src/a.c"): "by_absolute_path",
+    }
+    with PropertyStore(sqlite3.connect(":memory:")) as store:
+        for spelling, expression in spellings.items():
+            unit = f"{spelling}::f"
+            store.add(
+                Property(
+                    property_id=make_property_id(
+                        unit, PropertyKind.SEMANTIC, expression, ()
+                    ),
+                    unit_id=unit,
+                    kind=PropertyKind.SEMANTIC,
+                    expression=expression,
+                    status=PropertyStatus.ACCEPTED,
+                    provenance=Provenance("p", "1"),
+                )
+            )
+        found = store_contracts(store, root=root, cwd=cwd)("src/a.c::f")
+    assert sorted(found) == sorted(spellings.values())
+
+
+def test_a_project_recipe_flows_into_the_proposal_request(repo: Path) -> None:
+    commit(repo, PROJECT, "v1")
+    request = prepare_proposal_request(
+        repo / "src/ring.c", function="rb_push", recipe="callers", project_root=repo
+    )
+    assert request.context is not None
+    assert request.context.recipe == "callers/v1"
+    assert "src/app.c::enqueue_all" in request.context.text

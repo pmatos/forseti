@@ -115,6 +115,24 @@ class MappingTree:
         return self.files[path]
 
 
+@dataclass(frozen=True)
+class OverlayTree:
+    """`base` with some files replaced (or added) by in-memory text.
+
+    How the unit's current, possibly uncommitted, text enters a pack without the
+    working tree being read for anything else.
+    """
+
+    base: SourceTree
+    files: Mapping[str, str]
+
+    def paths(self) -> Sequence[str]:
+        return sorted({*self.base.paths(), *self.files})
+
+    def read(self, path: str) -> str:
+        return self.files[path] if path in self.files else self.base.read(path)
+
+
 def _git(root: Path, *args: str) -> bytes:
     try:
         done = subprocess.run(
@@ -133,16 +151,23 @@ def _git(root: Path, *args: str) -> bytes:
 
 @dataclass(frozen=True)
 class GitTree:
-    """The files of one commit, read from the object database."""
+    """The files of one commit, read from the object database.
+
+    `root` is the repository's top level, and every path is relative to it.
+    """
 
     root: Path
     commit: str
 
     @classmethod
     def at(cls, root: Path, revision: str = "HEAD") -> GitTree:
-        """Pin `revision` (any commit-ish) to its full SHA, once."""
+        """Pin `revision` (any commit-ish) to its full SHA, once.
+
+        `root` may be any directory inside the repository.
+        """
+        top = _git(root, "rev-parse", "--show-toplevel").decode().strip()
         sha = _git(root, "rev-parse", "--verify", f"{revision}^{{commit}}")
-        return cls(root, sha.decode().strip())
+        return cls(Path(top), sha.decode().strip())
 
     def paths(self) -> Sequence[str]:
         out = _git(
