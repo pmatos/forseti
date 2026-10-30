@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
@@ -39,6 +39,7 @@ from .harness import (
     UnitSignature,
     renderability_reason,
 )
+from .invariant import INVARIANT_ASSUMPTION_NOTE
 from .llm import LLMClient
 from .model import (
     Property,
@@ -99,7 +100,8 @@ class CandidateSpec:
 
     Mirrors the JSON contract the prompt asks for. `kind` is captured only so a
     stray non-semantic candidate can be rejected (ADR-0009 D2); the prompt never
-    asks for it, so it is usually `None`.
+    asks for it, so it is usually `None`. `type_name` (the JSON ``type``) names the
+    struct type of a ``rep-invariant`` candidate (#420); a semantic candidate has none.
     """
 
     expression: str
@@ -107,6 +109,7 @@ class CandidateSpec:
     referenced_params: tuple[str, ...] = ()
     rationale: str = ""
     kind: str | None = None
+    type_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -135,6 +138,8 @@ class ProposalResult:
     `to_dict` is the JSON shape #44 serialises (mirrors `core/verify.py`'s
     payload style). `provider`/`model` record the backend for telemetry; the
     persisted `Property.provenance` carries only prompt id/version by design.
+    An accepted representation invariant adds an `assumption` note: it is assumed,
+    never discharged at the callers that construct the type.
     """
 
     unit_id: str
@@ -146,8 +151,15 @@ class ProposalResult:
     rejected: tuple[RejectedCandidate, ...]
     model_raw: str
 
+    @property
+    def assumption(self) -> str | None:
+        """The note an accepted representation invariant carries, else `None`."""
+        if any(prop.kind is PropertyKind.REP_INVARIANT for prop in self.accepted):
+            return INVARIANT_ASSUMPTION_NOTE
+        return None
+
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "unit_id": self.unit_id,
             "prompt_id": self.prompt_id,
             "prompt_version": self.prompt_version,
@@ -156,6 +168,9 @@ class ProposalResult:
             "accepted": [prop.to_dict() for prop in self.accepted],
             "rejected": [rej.to_dict() for rej in self.rejected],
         }
+        if self.assumption is not None:
+            payload["assumption"] = self.assumption
+        return payload
 
 
 class ProposalParseError(ValueError):
@@ -169,6 +184,39 @@ class BlankProvenanceError(ValueError):
     -- a blank value from `submit_candidates` would be stored identically and
     make a fresh submission indistinguishable from migrated data.
     """
+
+
+def accept_candidates(
+    specs: Sequence[CandidateSpec],
+    *,
+    reason_for: Callable[[CandidateSpec], str | None],
+    build: Callable[[CandidateSpec], Property],
+    max_candidates: int,
+) -> tuple[list[Property], list[RejectedCandidate]]:
+    """Gate `specs` through `reason_for`, building `build(spec)` survivors in order.
+
+    The one cap and batch-duplicate (content id) policy for every proposer kind:
+    `reason_for` is the kind's static check (None passes), `build` makes its
+    ``CANDIDATE`` property.
+    """
+    accepted: list[Property] = []
+    rejected: list[RejectedCandidate] = []
+    seen: set[str] = set()
+    for spec in specs:
+        if len(accepted) >= max_candidates:
+            rejected.append(RejectedCandidate(spec, "over max_candidates"))
+            continue
+        reason = reason_for(spec)
+        if reason is not None:
+            rejected.append(RejectedCandidate(spec, reason))
+            continue
+        prop = build(spec)
+        if prop.property_id in seen:
+            rejected.append(RejectedCandidate(spec, "duplicate in batch"))
+            continue
+        seen.add(prop.property_id)
+        accepted.append(prop)
+    return accepted, rejected
 
 
 def _accept_reject(
@@ -186,18 +234,10 @@ def _accept_reject(
     (`validate_candidate`) and batch-duplicate dedup by content id, so a
     submitted candidate can't bypass a check an LLM-proposed one is held to.
     """
-    accepted: list[Property] = []
-    rejected: list[RejectedCandidate] = []
-    seen: set[str] = set()
-    for spec in specs:
-        if len(accepted) >= max_candidates:
-            rejected.append(RejectedCandidate(spec, "over max_candidates"))
-            continue
-        reason = validate_candidate(spec, signature)
-        if reason is not None:
-            rejected.append(RejectedCandidate(spec, reason))
-            continue
-        prop = Property(
+    return accept_candidates(
+        specs,
+        reason_for=lambda spec: validate_candidate(spec, signature),
+        build=lambda spec: Property(
             property_id=make_property_id(
                 unit_id, PropertyKind.SEMANTIC, spec.expression, spec.domain
             ),
@@ -208,13 +248,9 @@ def _accept_reject(
             provenance=provenance,
             domain=spec.domain,
             description=spec.rationale or None,
-        )
-        if prop.property_id in seen:
-            rejected.append(RejectedCandidate(spec, "duplicate in batch"))
-            continue
-        seen.add(prop.property_id)
-        accepted.append(prop)
-    return accepted, rejected
+        ),
+        max_candidates=max_candidates,
+    )
 
 
 def _persist(accepted: Sequence[Property], store: CandidateStore | None) -> None:
@@ -352,8 +388,8 @@ def parse_candidates(model_text: str) -> tuple[CandidateSpec, ...]:
     Tolerates a markdown ```` ```json ... ``` ```` fence and either a
     ``{"candidates":[...]}`` object or a bare top-level list. Every element must
     be an object with a non-empty string ``expression``; ``domain`` /
-    ``referenced_params`` (string lists) and ``rationale`` / ``kind`` (strings)
-    are optional. Anything else fails loud -- never a silent empty result.
+    ``referenced_params`` (string lists) and ``rationale`` / ``kind`` / ``type``
+    (strings) are optional. Anything else fails loud -- never a silent empty result.
     """
     text = _strip_fences(model_text)
     try:
@@ -545,6 +581,7 @@ def parse_candidate(elem: object, index: int) -> CandidateSpec:
         ),
         rationale=_opt_str(elem.get("rationale")),
         kind=elem.get("kind") if isinstance(elem.get("kind"), str) else None,
+        type_name=_opt_type_name(elem.get("type")),
     )
 
 
@@ -556,6 +593,12 @@ def _str_tuple(value: object, index: int, field: str) -> tuple[str, ...]:
             f"candidate {index} field {field!r} must be a list of strings"
         )
     return tuple(v.strip() for v in value if v.strip())
+
+
+def _opt_type_name(value: object) -> str | None:
+    """The candidate's struct type, or `None`: lenient like ``kind``, so a stray
+    ``type`` never fails a semantic batch (a rep-invariant run checks it)."""
+    return (value.strip() or None) if isinstance(value, str) else None
 
 
 def _opt_str(value: object) -> str:

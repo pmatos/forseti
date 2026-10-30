@@ -9,11 +9,16 @@ from __future__ import annotations
 from pathlib import Path
 
 from forseti.properties import (
+    DEFAULT_INVARIANT_PROMPT,
     HarnessError,
+    InvariantRequest,
     PromptTemplate,
     ProposalRequest,
+    StructParam,
     build_context,
     extract_signature,
+    normalised_type_name,
+    type_name_reason,
 )
 from forseti.properties.prompts import DEFAULT_PROMPT
 from forseti.unit_id import make_unit_id
@@ -57,5 +62,49 @@ def prepare_proposal_request(
         source_text=source_text,
         prompt=prompt,
         signature=signature,
+        context=context,
+    )
+
+
+def prepare_invariant_request(
+    source: Path,
+    *,
+    function: str,
+    type_name: str,
+    recipe: str | None = None,
+    project_root: Path = Path(),
+) -> InvariantRequest:
+    """Read once and prepare a representation-invariant request for `type_name`.
+
+    `function` must take a ``type_name *``: it is the unit the recipe's context is
+    built for and the example the prompt names. `HarnessError` if the type name is
+    not a struct type name, or `function` is not found or takes no such pointer.
+    The type key is ``<source>::<type_name>`` in the raw `source` spelling, like
+    every unit id. `recipe` is as for `prepare_proposal_request`.
+    """
+    type_name = normalised_type_name(type_name)
+    reason = type_name_reason(type_name)
+    if reason is not None:
+        raise HarnessError(reason)
+    source_text = source.read_text()
+    signature = extract_signature(source_text, function, struct_types=(type_name,))
+    if not any(isinstance(p, StructParam) for p in signature.params):
+        raise HarnessError(f"{function!r} takes no {type_name!r} pointer parameter")
+    context = (
+        None
+        if recipe is None
+        else build_context(
+            recipe,
+            unit_id=make_unit_id(source, function),
+            source_text=source_text,
+            project_root=project_root,
+        )
+    )
+    return InvariantRequest(
+        type_key=make_unit_id(source, type_name),
+        type_name=type_name,
+        function=function,
+        source_text=source_text,
+        prompt=DEFAULT_INVARIANT_PROMPT,
         context=context,
     )

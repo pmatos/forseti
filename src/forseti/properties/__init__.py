@@ -48,12 +48,15 @@ from .invariant import (
     build_invariant_harness,
     infer_role,
     invariant_reason,
+    invariant_rejection,
     is_valid_invariant_transition,
     make_invariant,
     normalised_type_name,
     render_invariant_harness,
+    type_name_reason,
     valid_type_name,
 )
+from .invariant_proposer import InvariantRequest, InvariantStore, propose_invariants
 from .llm import ClaudeCliClient, LLMClient, LLMError, LLMUsage
 from .model import (
     CHECKABLE_STATUSES,
@@ -77,9 +80,11 @@ from .pack import (
     store_contracts,
 )
 from .prompts import (
+    DEFAULT_INVARIANT_PROMPT,
     DEFAULT_PROMPT,
     MAX_CANDIDATES_DEFAULT,
     PROMPTS,
+    REP_INVARIANT_V1,
     RESULT_IDENT,
     SEMANTIC_V1,
     PromptTemplate,
@@ -120,6 +125,7 @@ from .store import (
 __all__ = [
     "CHECKABLE_STATUSES",
     "DEFAULT_INCLUDES",
+    "DEFAULT_INVARIANT_PROMPT",
     "DEFAULT_PROMPT",
     "HARNESS_MACROS",
     "INVARIANT_ASSUMPTION_NOTE",
@@ -129,6 +135,7 @@ __all__ = [
     "PROMPTS",
     "RECIPES",
     "REP_INVARIANT_LABEL",
+    "REP_INVARIANT_V1",
     "RESULT_IDENT",
     "SEMANTIC_V1",
     "BlankProvenanceError",
@@ -145,7 +152,9 @@ __all__ = [
     "HarnessError",
     "InvalidStatusTransition",
     "InvariantNotApplicable",
+    "InvariantRequest",
     "InvariantRole",
+    "InvariantStore",
     "LLMClient",
     "LLMError",
     "LLMUsage",
@@ -187,6 +196,7 @@ __all__ = [
     "extract_signature",
     "infer_role",
     "invariant_reason",
+    "invariant_rejection",
     "is_terminal",
     "is_valid_invariant_transition",
     "is_valid_transition",
@@ -197,6 +207,7 @@ __all__ = [
     "parse_candidate_list",
     "parse_candidates",
     "plan_length_bounds",
+    "propose_invariants",
     "propose_properties",
     "render_invariant_harness",
     "render_prompt",
@@ -206,6 +217,7 @@ __all__ = [
     "spec_from_property",
     "store_contracts",
     "submit_candidates",
+    "type_name_reason",
     "valid_type_name",
     "validate_candidate",
 ]

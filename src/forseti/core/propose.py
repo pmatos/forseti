@@ -21,13 +21,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from forseti.core._proposal_request import prepare_proposal_request
+from forseti.core._proposal_request import (
+    prepare_invariant_request,
+    prepare_proposal_request,
+)
 from forseti.core.persistence import persist_proposal
 from forseti.properties import (
     MAX_CANDIDATES_DEFAULT,
     ClaudeCliClient,
     LLMClient,
     ProposalResult,
+    propose_invariants,
     propose_properties,
 )
 
@@ -35,6 +39,30 @@ DEFAULT_MODEL = "sonnet"
 DEFAULT_TIMEOUT_S = 240.0
 DEFAULT_MAX_CANDIDATES = MAX_CANDIDATES_DEFAULT
 DEFAULT_STORE_ROOT = Path(".forseti")
+
+
+PROPOSE_KINDS = ("semantic", "rep-invariant")
+
+
+def invariant_type_name(kind: str, type_name: str | None) -> str | None:
+    """The struct type to propose invariants for, or `None` for a semantic proposal.
+
+    The one kind/type consistency rule the CLI and the MCP tools share. `rep_invariant`
+    (the stored kind a payload echoes) reads as `rep-invariant`. `ValueError` for an
+    unknown kind, a `rep-invariant` without a type, or a type with a semantic kind.
+    """
+    kind = kind.replace("_", "-")
+    if kind not in PROPOSE_KINDS:
+        raise ValueError(
+            f"kind must be one of {', '.join(PROPOSE_KINDS)}, got {kind!r}"
+        )
+    if kind == "rep-invariant":
+        if not type_name:
+            raise ValueError("kind rep-invariant requires a type (--type / type_name)")
+        return type_name
+    if type_name is not None:
+        raise ValueError("a type applies to kind rep-invariant only")
+    return None
 
 
 def propose_source(
@@ -77,6 +105,53 @@ def propose_source(
 
     return persist_proposal(
         lambda store: propose_properties(
+            request, client=llm, store=store, max_candidates=max_candidates
+        ),
+        persist=persist,
+        store_root=store_root,
+        channel="llm",
+    )
+
+
+def propose_invariant_source(
+    source: Path,
+    *,
+    function: str,
+    type_name: str,
+    persist: bool = True,
+    store_root: Path = DEFAULT_STORE_ROOT,
+    model: str = DEFAULT_MODEL,
+    claude_bin: str = "claude",
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+    max_candidates: int = DEFAULT_MAX_CANDIDATES,
+    client: LLMClient | None = None,
+    recipe: str | None = None,
+) -> ProposalResult:
+    """Propose candidate representation invariants for `type_name`; optionally store.
+
+    The invariant counterpart of `propose_source` (RFC-0007 kind 1, #420). `function`
+    is a function of `source` that takes a ``type_name *``: the recipe's context is
+    built for it (``sighted`` shows it with the type definition; ``baseline`` the
+    whole file, i.e. every mutator; ``blind`` only its signature and the type) and the
+    prompt names it as the example. `HarnessError` if the type name or function does
+    not fit. Survivors of the shared static gate (`invariant_rejection`) are stored as
+    ``CANDIDATE`` in the per-type table, keyed ``<source>::<type_name>``; accepting
+    one stays a human act (`set_invariant_status`). A stored invariant is *assumed*
+    at entry by every check, never discharged at the callers that construct the type.
+    The other parameters are `propose_source`'s.
+    """
+    request = prepare_invariant_request(
+        source,
+        function=function,
+        type_name=type_name,
+        recipe=recipe,
+        project_root=store_root.parent,
+    )
+    llm = client or ClaudeCliClient(
+        model=model, claude_bin=claude_bin, timeout_s=timeout_s
+    )
+    return persist_proposal(
+        lambda store: propose_invariants(
             request, client=llm, store=store, max_candidates=max_candidates
         ),
         persist=persist,

@@ -13,7 +13,6 @@ every verdict says so (`INVARIANT_ASSUMPTION_NOTE`).
 from __future__ import annotations
 
 import contextlib
-import re
 from collections.abc import Sequence
 from functools import partial
 from pathlib import Path
@@ -49,10 +48,9 @@ from forseti.properties import (
     ProposalResult,
     Provenance,
     RejectedCandidate,
-    invariant_reason,
+    invariant_rejection,
     make_invariant,
     normalised_type_name,
-    valid_type_name,
 )
 from forseti.unit_id import make_unit_id, unit_id_prefix, unit_id_symbol
 
@@ -86,7 +84,7 @@ def submit_invariant_source(
     type_name = normalised_type_name(type_name)
     type_key = make_unit_id(source, type_name)
     expression = expression.strip()
-    reason = _rejection(source.read_text(), type_name, expression)
+    reason = invariant_rejection(source.read_text(), type_name, expression)
     prop = make_invariant(
         type_key=type_key,
         expression=expression,
@@ -176,15 +174,6 @@ def accepted_invariants(
         ):
             by_type.setdefault(unit_id_symbol(prop.unit_id), []).append(prop.expression)
     return {name: tuple(exprs) for name, exprs in by_type.items()}
-
-
-def _rejection(source_text: str, type_name: str, expression: str) -> str | None:
-    if not valid_type_name(type_name):
-        return f"{type_name!r} is not a struct type name (ring_t or 'struct node')"
-    tag = type_name.split()[-1]
-    if re.search(rf"\b{re.escape(tag)}\b", source_text) is None:
-        return f"type {type_name!r} does not occur in the source"
-    return invariant_reason(expression)
 
 
 def check_invariant_source(
