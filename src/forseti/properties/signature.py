@@ -154,6 +154,11 @@ def extract_signature(
     parameter follows it *and* the body indexes or advances the pointer
     (``(point_t *pts, size_t n)`` with ``pts[i]`` stays the buffer idiom). A struct
     the source does not define keeps the old reading.
+
+    A pointer followed by a ``(lo, hi)`` / ``(start, end)`` / ``(begin, end)`` pair
+    is the range idiom: the buffer is ``hi`` long, and a trailing non-const pointer
+    of the same element type (a scratch buffer, ``msort``'s ``tmp``) is as long and
+    an output, not a single element.
     """
     pattern = re.compile(
         r"([A-Za-z_][\w \t\*]*?[\s\*])" + re.escape(symbol) + r"\s*\(([^)]*)\)\s*\{"
@@ -341,6 +346,7 @@ def _to_params(
     body: str,
 ) -> tuple[Param, ...]:
     params: list[Param] = []
+    scratch_of: tuple[str, str] | None = None
     for i, raw in enumerate(raws):
         if not raw.is_ptr:
             params.append(ScalarParam(ctype=raw.type_str, name=raw.name))
@@ -362,10 +368,15 @@ def _to_params(
                 )
             )
             continue
+        range_upper = _range_upper_bound(raws[i + 1 : i + 3])
         if raw.array_len:
             length, out = raw.array_len, False
+        elif range_upper is not None:
+            length, out = range_upper, False
         elif nxt is not None and not nxt.is_ptr and _is_integer_type(nxt.type_str):
             length, out = nxt.name, False
+        elif nxt is None and scratch_of is not None and scratch_of[0] == pointee:
+            length, out = scratch_of[1], True
         elif nxt is None:
             # a trailing pointer with no length param is a single-element output
             # (e.g. utf8_decode's `uint32_t *cp`); non-const -> written by the unit.
@@ -380,6 +391,8 @@ def _to_params(
                 "not the (buffer, length) idiom nor a trailing output; supply a "
                 "UnitSignature explicitly for multi-buffer signatures"
             )
+        if range_upper is not None and scratch_of is None:
+            scratch_of = (pointee, range_upper)
         params.append(
             BufferParam(
                 elem_ctype=_elem_ctype(raw.type_str),
@@ -390,6 +403,25 @@ def _to_params(
             )
         )
     return tuple(params)
+
+
+_RANGE_BOUNDS = (("lo", "hi"), ("start", "end"), ("begin", "end"))
+
+
+def _range_upper_bound(following: Sequence[_RawParam]) -> str | None:
+    """The upper-bound param when a pointer is followed by a ``(lo, hi)`` pair.
+
+    ``msort(int *a, int lo, int hi, ...)`` addresses ``a[lo..hi)``, so the buffer
+    holds ``hi`` elements; reading ``lo`` as its length (the ``(buf, len)`` idiom)
+    allocates it too short and every property over it fails out of bounds (#425).
+    Matched on the conventional names only, so ``(buf, n, m)`` keeps its reading.
+    """
+    if len(following) < 2 or any(
+        p.is_ptr or not _is_integer_type(p.type_str) for p in following
+    ):
+        return None
+    lower, upper = following
+    return upper.name if (lower.name, upper.name) in _RANGE_BOUNDS else None
 
 
 def _is_buffer_idiom(raw: _RawParam, nxt: _RawParam | None, body: str) -> bool:

@@ -82,6 +82,45 @@ def test_extract_signature_void_param_list_has_no_params() -> None:
     assert sig == UnitSignature("zero", "int", ())
 
 
+MSORT_DEF = "static void msort(int *a, int lo, int hi, int *tmp) { }"
+
+
+def test_extract_signature_range_idiom_sizes_the_buffer_by_its_upper_bound() -> None:
+    # `(a, lo, hi)` addresses a[lo..hi): the buffer holds `hi` elements, not `lo`,
+    # and a trailing scratch pointer of the same element type is as long (#425).
+    sig = extract_signature(MSORT_DEF, "msort")
+    assert sig == UnitSignature(
+        "msort",
+        "void",
+        (
+            BufferParam("int", "a", "hi"),
+            ScalarParam("int", "lo"),
+            ScalarParam("int", "hi"),
+            BufferParam("int", "tmp", "hi", out=True),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("lower", "upper"), [("start", "end"), ("begin", "end"), ("lo", "hi")]
+)
+def test_extract_signature_range_idiom_pairs(lower: str, upper: str) -> None:
+    sig = extract_signature(
+        f"void f(char *s, size_t {lower}, size_t {upper}) {{ }}", "f"
+    )
+    assert sig.params[0] == BufferParam("char", "s", upper)
+
+
+def test_extract_signature_range_idiom_scratch_needs_the_same_element_type() -> None:
+    sig = extract_signature("void f(int *a, int lo, int hi, char *r) { }", "f")
+    assert sig.params[3] == BufferParam("char", "r", "1", out=True)
+
+
+def test_extract_signature_non_range_names_keep_the_length_idiom() -> None:
+    sig = extract_signature("void f(int *a, int n, int m) { }", "f")
+    assert sig.params[0] == BufferParam("int", "a", "n")
+
+
 def test_extract_signature_missing_symbol_is_error() -> None:
     with pytest.raises(HarnessError):
         extract_signature(ABS_SLICE, "not_there")

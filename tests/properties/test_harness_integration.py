@@ -28,6 +28,7 @@ from forseti.properties import (
     ScalarParam,
     SemanticSpec,
     UnitSignature,
+    extract_signature,
     render_semantic_harness,
 )
 
@@ -231,3 +232,33 @@ def test_cap_below_the_unwind_is_needed_to_settle(tmp_path: Path) -> None:
         "result >= 0 && (unsigned)result <= n", tmp_path, max_len=8, unwind=8
     )
     assert isinstance(result, Unknown)
+
+
+def _msort_verdict(post: str, tmp_path: Path) -> EsbmcResult:
+    # #425: `msort(int *a, int lo, int hi, int *tmp)` addresses a[lo..hi), so the
+    # harness must size `a` and `tmp` by `hi`; sized by `lo` and one element, every
+    # property was VIOLATED out of bounds (or UNKNOWN) whatever it claimed.
+    source = (Path(__file__).parents[2] / "examples" / "merge_sort.c").read_text()
+    unit = source[: source.index("int main(void)")]
+    spec = SemanticSpec(post, ("lo >= 0", "lo <= hi", "hi <= 2"))
+    harness = tmp_path / "msort.c"
+    harness.write_text(
+        render_semantic_harness(
+            unit_source=unit,
+            signature=extract_signature(unit, "msort"),
+            spec=spec,
+        )
+    )
+    return verify(harness, unwind=4, timeout_s=120)
+
+
+def test_msort_true_property_verifies_on_the_range_harness(tmp_path: Path) -> None:
+    result = _msort_verdict("hi - lo < 2 || a[lo] <= a[lo + 1]", tmp_path)
+    assert isinstance(result, Verified)
+
+
+def test_msort_false_property_is_violated_on_the_range_harness(
+    tmp_path: Path,
+) -> None:
+    result = _msort_verdict("hi - lo < 2 || a[lo] > a[lo + 1]", tmp_path)
+    assert isinstance(result, Violated)
