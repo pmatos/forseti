@@ -1,0 +1,14 @@
+{
+  "tool_use_id": "toolu_01DGj5agVMgRGWdQvWHUwBx6",
+  "agent_id": "a04ac00399d897809",
+  "task_description": "Efficiency review",
+  "token_usage": {
+    "input_tokens": 10,
+    "cache_creation_tokens": 47374,
+    "cache_read_tokens": 247541,
+    "output_tokens": 2669,
+    "api_call_count": 5
+  },
+  "started_at": "2026-10-30T09:10:09.117469992+01:00",
+  "completed_at": "2026-10-30T09:10:37.34991859+01:00"
+}

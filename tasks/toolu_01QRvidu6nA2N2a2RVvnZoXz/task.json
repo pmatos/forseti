@@ -1,0 +1,14 @@
+{
+  "tool_use_id": "toolu_01QRvidu6nA2N2a2RVvnZoXz",
+  "agent_id": "a157748c63858528c",
+  "task_description": "Simplification review",
+  "token_usage": {
+    "input_tokens": 6,
+    "cache_creation_tokens": 46336,
+    "cache_read_tokens": 128335,
+    "output_tokens": 2446,
+    "api_call_count": 3
+  },
+  "started_at": "2026-10-30T09:10:06.710375642+01:00",
+  "completed_at": "2026-10-30T09:10:29.777097189+01:00"
+}
