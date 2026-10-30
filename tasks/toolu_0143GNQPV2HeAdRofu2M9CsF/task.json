@@ -1,0 +1,14 @@
+{
+  "tool_use_id": "toolu_0143GNQPV2HeAdRofu2M9CsF",
+  "agent_id": "a612cf0b011cdbe65",
+  "task_description": "Review PR 440 delta",
+  "token_usage": {
+    "input_tokens": 8,
+    "cache_creation_tokens": 41174,
+    "cache_read_tokens": 180577,
+    "output_tokens": 1794,
+    "api_call_count": 4
+  },
+  "started_at": "2026-10-30T14:33:01.19215485+01:00",
+  "completed_at": "2026-10-30T14:33:41.692371557+01:00"
+}

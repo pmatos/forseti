@@ -1,0 +1,1093 @@
+/auto-merge-dependabot
+
+---
+
+/vibe 3
+
+---
+
+<task-notification>
+<task-id>a197703d603f419d7</task-id>
+<tool-use-id>toolu_0156RWw8CPucH9rBzF41gokt</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/a197703d603f419d7.output</output-file>
+<status>completed</status>
+<summary>Agent "Triage epic #3 open children" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Triage of the four "W2 remaining" children of epic #3, against origin/main at `ef0eb97`. I changed nothing. None of the four issues has any comments, so the bodies are the whole record. No open PR or branch touches any of this.
+
+**#63 — ESBMC reachability (`--error-label`)**
+- **Status:** open, parked, not started.
+- **Evidence:**
+  - `--error-label` is in ESBMC 8.6.0 (`esbmc --help`, line 710).
+  - Nothing in `src/` or `tests/` uses it.
+  - `runner.py` has no reachability path.
+  - The kind is inert (`properties/model.py:21`).
+  - The harness refuses it, and the check driver returns `SKIPPED` (`orchestrator/check.py:80`).
+- **Related code:** reachability already works another way. The precond stack injects a labelled `__ESBMC_assert(0, ...)` probe (`precond/reachability.py`), and PR #406 reuses it for the post-call vacuity check.
+- **Remaining:**
+  - A runner reachability request and verdict mapping.
+  - Two fixtures, one reachable and one unreachable.
+  - Re-validation on 8.6.0, since the issue's feasibility note was written against 8.3.0.
+- **Implementable by an agent without a ruling:** no. ADR-0009 D2 says it is unparked "by prioritising reachability properties (#63)". The ADR is immutable, so that means an owner decision, and a decision to use the existing probe instead would need a new superseding ADR. Nothing else in the epic needs it.
+- **Priority:** 3.
+- **Files:** `src/forseti/esbmc/runner.py`, `esbmc/result.py`, new `tests/esbmc/` fixtures.
+
+**#387 — Representation invariants (RFC-0007 kind 1)**
+- **Status:** open, no code. Grep found no invariant kind, renderer or per-type store.
+- **Evidence:**
+  - `PropertyKind` has only `SEMANTIC` and `REACHABILITY` (`model.py:17-21`).
+  - `signature.py` handles pointers as buffers, not structs.
+  - The post-call non-vacuity probe from #406 (`orchestrator/check.py`, `ProbeReachability`) is a reusable building block.
+- **Remaining:**
+  - A new `PropertyKind` and a per-type store.
+  - A renderer: nondet struct, `assume(inv)`, the call, then `assert(inv)` for mutators, and initialiser handling.
+  - A non-vacuity probe that rejects an invariant like `0`.
+  - S0 (`synth`/verify gate) running under an accepted invariant.
+  - CLI output reproducing the issue's table on both ring-buffer examples.
+  - Proposer support can be a follow-up, since hand-written submission via `submit-property` is enough to start.
+- **Implementable without a ruling:** yes, but it is large and research-labelled. RFC-0007 open question 6 (invariant per type versus per function) is already answered in the issue as per type. Suggest splitting it into three pieces: renderer and store; S0 context; proposer.
+- **Priority:** 1. It is the only way to get a Tier-0 bug pair for M2, and without it S0 is noise on any struct-pointer function.
+- **Files:** `properties/model.py`, `store.py`, `harness.py`, `signature.py`, `orchestrator/check.py`, `precond/synth.py`, `core/_precond_cli.py`, `core/cli.py`, `core/mcp_server.py`, `core/submit.py`, `adapters/claude_code/property_gate.py`, `properties/proposer.py`.
+
+**#388 — Proposer input seam**
+- **Status:** open, no code.
+- **Evidence:**
+  - `ProposalRequest` has `unit_id`, `source_text`, `prompt` and `signature`, with no `context` (`proposer.py:71-84`).
+  - `prepare_proposal_request` reads the whole file (`core/_proposal_request.py:33`).
+  - `Provenance` has no `recipe` (`model.py:53-66`).
+  - `_MIGRATED_COLUMNS` and `_migrate_columns` exist as the pattern to copy (`store.py:187`).
+- **Remaining:**
+  - `ProposalRequest.context` and `render_prompt` changes, keeping prompts byte-identical when no recipe is given.
+  - A recipe registry with `baseline`, `sighted` and `blind`, and `Provenance.recipe` plus a store column and migration.
+  - `--recipe` on `propose` and `semantic-loop`, and the matching MCP parameter.
+  - Tests for the acceptance list.
+- **Implementable without a ruling:** yes. The issue is fully specified.
+- **Priority:** 1. It blocks #389 and the whole recipe experiment.
+- **Files:** new `properties/recipes.py`, `properties/proposer.py`, `prompts.py`, `model.py`, `store.py`, `__init__.py`, `core/_proposal_request.py`, `core/propose.py`, `core/submit.py`, `core/loop.py`, `core/cli.py`, `core/mcp_server.py`, `grading/discriminate.py` (`_provenance_from`, line 718).
+
+**#389 — E0 runner**
+- **Status:** open, no code, blocked by #388. There is no runner or manifest anywhere in `src/`.
+- **Remaining:**
+  - A manifest-driven runner (recipe × sample × unit) that calls `check_properties` on the clean source and the twin.
+  - JSONL rows, a resumable run directory, a 30 s per-call timeout, a summary table recomputable from the rows, and fake-port tests plus one gated smoke test.
+- **Implementable without a ruling:** the code, yes. Executing the grid is a separate step: about 54 `claude -p` calls and up to about 5.5 hours of ESBMC. Someone should say go, and `msort` should be dropped or run at a smaller `--max-len`.
+- **Priority:** 2. It measures M1 and M5 only, not M2.
+- **Files:** a new module under `src/forseti/` (for example `grading/` or `experiments/`), `core/cli.py`, `core/events.py` and `core/_cli_trace.py`, plus new tests.
+
+**Questions you asked**
+- **#388 and #387 in parallel:** yes, no hard conflicts. They overlap only textually, in `model.py`, `store.py` (the schema and `_MIGRATED_COLUMNS`), `proposer.py`, `core/cli.py`, `core/mcp_server.py` and `properties/__init__.py`. Both rebases are mechanical, but the second to merge will rebase over the first. Keep #387 out of the proposer prompt and parser, and out of `Provenance`.
+- **#389 waiting on #388:** it should wait for #388 to merge. It consumes the recipe registry, `Provenance.recipe` and the `--recipe` request path, and building on an unmerged branch would stack PRs.
+- **#63 and the epic:** implementing #63 needs an owner ruling, because ADR-0009 D2 parks it. The epic's unchecked box "Reachability support (--error-label)" cannot be ticked without either implementing #63 or an explicit decision to defer it. The epic body also predates D2, and #62, #64, #65 and #66 are closed while all four boxes are still unchecked. To close the epic, the owner must either unpark and ship #63, or rule that W2 ships semantic-only and edit the body to say so. That body edit is not an ADR change.</result>
+<usage><subagent_tokens>103282</subagent_tokens><tool_uses>16</tool_uses><duration_ms>73529</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>adcfaf3737d27d6dd</task-id>
+<tool-use-id>toolu_01NxvVERghheje86TYDudVv2</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/adcfaf3737d27d6dd.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix #388 proposer input seam" is waiting on its own background work</summary>
+<note>This agent stopped with background work of its own still running. It may resume on its own when that work completes or reports, and the same task-id notifies again if it does; the result below may be interim.</note>
+<result>#388 is implemented and ready: PR https://github.com/pmatos/forseti/pull/416. CI is green on the final head SHA. I did not merge.
+
+**What shipped**
+- **Context field:** `ProposalRequest.context`, and `render_prompt` shows it in place of the whole file when present. Without `--recipe` the prompt is byte-identical to before. A test pins this with a sha256 of the pre-change prompt.
+- **Recipes:** `baseline`, `sighted` and `blind`, all single-file and deterministic. They live in the new `src/forseti/properties/recipes.py`. `blind` picks its type and macro definitions from the signature only, so nothing in its pack comes from the body. Objects the body reads, such as globals and tables, are out of scope for v1; the module docstring says so.
+- **Provenance:** `Provenance.recipe` defaults to `""` and is stored in a new `recipe` column added through `_migrate_columns`. A pre-existing `forseti.db` migrates and its old rows read back with no recipe.
+- **CLI and MCP:** `--recipe` on `propose` and `semantic-loop`, plus a `recipe` parameter on the MCP `propose` and `semantic_loop` tools. In `semantic-loop` it is accepted only with `--mode propose`; other modes refuse it instead of ignoring it.
+- **Wire shape:** a property's `provenance` dict now carries an extra `"recipe": ""` key. I updated the one existing test that pinned that dict (`tests/properties/test_model.py`).
+- **Other-agent overlap:** the diff touches `model.py`, `store.py`, `proposer.py`, `core/cli.py` and `core/mcp_server.py` as small additive hunks, so the concurrent #387 work may need a textual rebase. No invariant code was touched.
+
+**Acceptance coverage** (new `tests/properties/test_recipes.py` plus additions to the existing test files)
+- `blind` contains no body statement, checked on all 14 `examples/*.c`.
+- `baseline` has no `main` and no header comment on every example.
+- The recipe id round-trips through the store, and a pre-recipe db migrates.
+- The same input always gives the same context.
+
+**Checks on SHA d0b4d66**
+- Passing: `test`, `workflow-lint`, `Validate PR title`, `codecov/patch`, `codecov/project`, CodeQL and the four Analyze jobs.
+- `claude-review` was skipped.
+- `Lint commits` did not run: it triggers only on pushes to main.
+- A local full `pytest` run had one failure, `tests/test_release_preparation.py`, because the worktree venv has no `build` module. CI's `test` job passes.
+
+**Review and simplify**
+- `/code-review high --comment` first ran against the wrong target: it reviewed the last commit on main and applied nothing. I re-ran it as `/code-review high --comment 416` and applied the fixes by hand in the worktree, since the forked review can't be pointed at a worktree.
+- It posted 7 inline comments. Five fixes are in commit 2ed036b, with tests: the doc-comment adjacency rule, multi-line `//` header stripping, multi-declarator typedefs, a macro with no trailing semicolon, and an initialiser ending in `)`. Two more are fixed or documented as noted below. One was deferred and answered in the thread.
+- `/simplify` led to one commit: it removed dead duplicate helpers and a repeated comment-masking pass. I skipped two suggestions: dropping the unused `project_root` argument, because the issue specifies that seam, and reusing `grading.body.masked_view`, because that would make `properties` import `grading`, which already imports `properties`.
+
+**Filed**
+- #418: when the same candidate is re-proposed under a different recipe, the store keeps the first run's provenance, so per-recipe attribution is lost when recipes share a store. I left it as is because provenance staying outside the content id is the existing design, and recorded the options in the issue.
+
+**#388 is done** apart from merging. The PR body says "Part of #3" and "Fixes #388".
+
+**Cleanup:** the worktree at `/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/scratchpad/wt-388` is left in place for a possible rebase.
+
+repo: pmatos/forseti
+issue: 388
+PR: 416
+SHA: d0b4d66254fdc4da90440a800f3ea7a090115453
+checks: test pass; workflow-lint pass; Validate PR title pass; Lint commits not run (triggers on pushes to main only); codecov/patch pass; codecov/project pass; CodeQL pass; Analyze (actions, c-cpp, javascript-typescript, python) pass; claude-review skipped
+needsRuling:
+needsMeasurement:</result>
+<usage><subagent_tokens>244247</subagent_tokens><tool_uses>80</tool_uses><duration_ms>1690486</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>byx1ricz8</task-id>
+<tool-use-id>toolu_01HM9BP1n63dLXS6pfPfN9as</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/byx1ricz8.output</output-file>
+<status>completed</status>
+<summary>Background command "Wait for post-merge CI on 356f71a" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a2eb6147322ab7118</task-id>
+<tool-use-id>toolu_01KSiv8JPAPXWD9NqnwuzwPW</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/a2eb6147322ab7118.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix #387 stage 1 invariants" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Stage 1 of #387 is in PR #417, but I can't report READY. It now conflicts with main, so CI never ran on the final head.
+
+main moved after my last push: #416 (recipes, `356f71a`) merged. The conflict is mechanical, in `src/forseti/properties/__init__.py` (export lists) and `tests/properties/test_store.py` (imports and appended tests). `cli.py`, `store.py` and `model.py` auto-merge. Per instructions I did not rebase, so the orchestrator needs to hand the rebase back.
+
+On the last push, `532588b`, only Lint PR title and the CodeQL jobs ran, all green; `test` and Workflow Lint were not triggered. The earlier head `120c59b` was green on CI (`test`) and Workflow Lint, but that is older than my last push, so I report it as not run for `532588b`. Locally on `532588b`:
+- ruff, format and ty are clean.
+- The core, orchestrator, properties and adapters tests pass (1531 passed, 1 skipped).
+- The full suite passed earlier on the first commit, apart from `tests/test_release_preparation.py`, which fails because the `build` module is missing in this environment.
+
+**What shipped in stage 1**
+- A new `PropertyKind.REP_INVARIANT`. Invariants are stored per type, keyed `path::T`, in a new `type_invariants` table. It is created on open with `CREATE TABLE IF NOT EXISTS`, so an existing `.forseti/forseti.db` gains it in place. A test covers this.
+- The invariant is a C expression over `self` (a `const T *`), written to the harness as `__forseti_inv`. `forseti submit-property --kind rep-invariant --type T` stores one; submission checks the expression is pure and names `self`.
+- The renderer in `properties/invariant.py`:
+  - Method: nondet T, `__ESBMC_assume(inv)` at entry, the call, `__ESBMC_assert(inv, "forseti:rep-invariant")` at exit for each non-const `T *`.
+  - Initialiser: no entry assume.
+  - Const-only method: `skipped` with a reason, never held.
+- The non-vacuity probe reuses `check_properties` and the #406 post-call probe. A vacuous invariant such as `0` or `self-&gt;count &gt; self-&gt;count` comes back `vacuous`, never `held`.
+- Results are labelled as assumed: verdicts that assumed an invariant carry an `assumption` field, and the transcript prints an `Assumed:` line.
+- Core gets `submit_invariant_source` and `check_invariant_source`. `run_check` now holds the check recipe shared with `check_source`.
+- Verified with ESBMC 8.6.0 on `examples/`:
+  - `ring_buffer.c`: `rb_push`, `rb_pop` and `rb_init` all HELD (verified up to k=4, probe reached).
+  - `ring_buffer_bug.c`: `rb_push` VIOLATED, and the counterexample carries the `forseti:rep-invariant` label, so a bounds failure cannot satisfy the test. `rb_pop` and `rb_init` HELD.
+  - The integration test pins this.
+
+**Review outcome:** the `/code-review` agent did not apply fixes itself, so I fixed the real findings by hand: narrower initialiser-role inference, type-name whitespace normalisation, assumption labelling only on verdicts that assumed it, and the shared check recipe. `/simplify` applied the dead-API trim (`get_type_invariant`, `StructParam.type_name` and `INVARIANT_SELF` removed) and carries the assumption on the harness writer's output rather than keying it on kind.
+
+**Remaining for later stages**
+- S0 context under an accepted invariant in `synth` and the verify gate.
+- A status lifecycle for type invariants (nothing moves one to ACCEPTED or REJECTED yet).
+- The CLI that reproduces the full table, plus a `check` entry point for invariants.
+- Proposer prompt and parser support, MCP `submit_property`, and discharge at callers that construct `T`.
+- Deferred review items: a shared harness skeleton with `render_semantic_harness` (needs public helpers in `harness.py`), per-unit render caching, and generalising the store by table.
+
+I filed nothing new. I commented on #387 pointing at #417, and the PR body says "Part of #3" and "Part of #387" with no closing keyword. No new ADR is needed and nothing needs a human ruling. The worktree is kept at `/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/scratchpad/wt-387`.
+
+repo: pmatos/forseti
+issue: 387
+PR: 417
+SHA: 532588b24b43e81d66474a2a2f470dd84ae4c5bb
+checks: Lint PR title success; CodeQL and Analyze (actions, c-cpp, javascript-typescript, python) success; test not run on this SHA (PR conflicts with main after #416); Workflow Lint not run on this SHA; claude-review skipping. Earlier head 120c59b: test, Workflow Lint, Lint PR title success.
+needsRuling:
+needsMeasurement:</result>
+<usage><subagent_tokens>292311</subagent_tokens><tool_uses>96</tool_uses><duration_ms>2058582</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>adcfaf3737d27d6dd</task-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/adcfaf3737d27d6dd.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix #388 proposer input seam" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>That notification is the last background wait finishing. It doesn't change anything in the report above.
+
+PR #416 is READY at head `d0b4d66254fdc4da90440a800f3ea7a090115453`, and the required checks I reported are all green on that SHA (`test`, `workflow-lint`, `Validate PR title`). I did not merge. `Lint commits` did not run on the PR, since it only triggers on pushes to main.
+
+repo: pmatos/forseti
+issue: 388
+PR: 416
+SHA: d0b4d66254fdc4da90440a800f3ea7a090115453
+checks: test pass; workflow-lint pass; Validate PR title pass; Lint commits not run (triggers on pushes to main only); codecov/patch pass; codecov/project pass; CodeQL pass; Analyze (actions, c-cpp, javascript-typescript, python) pass; claude-review skipped
+needsRuling:
+needsMeasurement:</result>
+<usage><subagent_tokens>243517</subagent_tokens><tool_uses>80</tool_uses><duration_ms>2145560</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a26829b27d169da89</task-id>
+<tool-use-id>toolu_01XZL98dqm4DPNiPbGw1zKBX</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/a26829b27d169da89.output</output-file>
+<status>failed</status>
+<summary>Agent "Fix #389 E0 runner" failed: Agent terminated early due to an API error: You've hit your 5-hour limit · resets 1:10pm (Europe/Berlin) (error type rate_limit, HTTP 429, request id req_011CgWCSPmQ6dbMiVQDLUdCi, model sent to the API: claude-sonnet-5-5)</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once. This agent's work so far is saved. The limit resets at 1:10pm (Europe/Berlin). Once its requests are accepted again, send the agent a message (SendMessage) to let it continue from where it stopped instead of starting a new agent.</note>
+<result>Start with the llm.py usage extension (tests first).</result>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>buub3fgus</task-id>
+<tool-use-id>toolu_01FMgerYS8esz3fep5rc179s</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/buub3fgus.output</output-file>
+<status>completed</status>
+<summary>Background command "Wait for post-merge CI on cef48a4" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>byfjubqxh</task-id>
+<tool-use-id>toolu_019PH2SWcU9xiBcgvH8CgXPb</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/byfjubqxh.output</output-file>
+<status>completed</status>
+<summary>Background command "Wait until load drops below core count" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+vibe status report for epic #3 (pmatos/forseti). Report in under 150 words and start NO new feature work: done, in progress, blocked, next, pending rulings. Facts from gh/git/CI only (gh pr list --search '"Part of #3" in:body' --state all; gh issue view 3; main CI). If nothing is running while work remains, report 'idle with work remaining'.
+
+---
+
+vibe status report for epic #3 (pmatos/forseti). Report in under 150 words and start NO new feature work: done, in progress, blocked, next, pending rulings. Facts from gh/git/CI only (gh pr list --search '"Part of #3" in:body' --state all; gh issue view 3; main CI). If nothing is running while work remains, report 'idle with work remaining'.
+
+---
+
+vibe status report for epic #3 (pmatos/forseti). Report in under 150 words and start NO new feature work: done, in progress, blocked, next, pending rulings. Facts from gh/git/CI only (gh pr list --search '"Part of #3" in:body' --state all; gh issue view 3; main CI). If nothing is running while work remains, report 'idle with work remaining'.
+
+---
+
+vibe status report for epic #3 (pmatos/forseti). Report in under 150 words and start NO new feature work: done, in progress, blocked, next, pending rulings. Facts from gh/git/CI only (gh pr list --search '"Part of #3" in:body' --state all; gh issue view 3; main CI). If nothing is running while work remains, report 'idle with work remaining'.
+
+---
+
+Your claude.ai usage limit has reset. Continue the task you were working on when the limit was reached; do not repeat work that is already complete.
+
+---
+
+vibe status report for epic #3 (pmatos/forseti). Report in under 150 words and start NO new feature work: done, in progress, blocked, next, pending rulings. Facts from gh/git/CI only (gh pr list --search '"Part of #3" in:body' --state all; gh issue view 3; main CI). If nothing is running while work remains, report 'idle with work remaining'.
+
+---
+
+<task-notification>
+<task-id>a26829b27d169da89</task-id>
+<tool-use-id>toolu_01MhKD3ANSC3AbYUKnSFx73n</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/a26829b27d169da89.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix #389 E0 runner" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>READY. PR #419 is open and all required checks passed on final head ce5ebb1: `test`, `workflow-lint` and `Validate PR title`. CodeQL and codecov passed too, and `claude-review` was skipped. I did not run the E0 grid and did not merge.
+
+**What shipped**
+- The runner is `python -m forseti.experiments.e0` with `run` and `summary` commands. It lives in `src/forseti/experiments/e0.py`.
+- **Per cell:** for each unit × recipe × sample it builds the #388 request, calls the proposer, and checks each accepted property on the clean source and on the twin.
+- **Rows:** `e0.proposal` and `e0.property` rows go to the run directory's `events.jsonl`. Each proposal is written before any check, so it is never paid for twice. The summary is recomputed from the rows alone.
+- **Resume:** re-running skips every proposal and check that already has a row. Failed proposals and ESBMC errors are redone. A torn last line is repaired, and the run directory is pinned to its manifest and source hashes and locked against a second runner.
+- **ESBMC:** the timeout is per invocation (default 30 s) and is set in the manifest.
+- **Tokens:** `ClaudeCliClient.complete_with_usage` is an additive method on `ClaudeCliClient` that reports token usage and cost. `LLMClient` is unchanged.
+- **Manifest:** `experiments/e0/manifest.toml` holds the 6 non-`abs` kernels × `baseline`/`blind`/`sighted` × 3 samples, which is 54 cells.
+- **Shared code:** /simplify moved `TimedVerify` and `FixedProperties` into `orchestrator/semantic_check.py`. `grading/grade.py` and `grading/discriminate.py` now use them instead of private copies.
+- **Review fixes:** `/code-review` returned its findings without applying anything, so I applied the valid ones myself. That covered redoing ESBMC errors, locking the run directory, source pinning, cache-token counts and manifest validation.
+- **Tests:** the unit tests use fake proposer and verifier ports. There is one ESBMC-gated smoke test on `utf8_decode` (clean held, twin violated). New code covers about 99.8% of branches.
+- **Docs:** I added the `e0.*` row types to the event table in `docs/design/0001-harness-portability.md`.
+
+**#389 is not done.** The acceptance box "The E0 grid runs unattended to completion" cannot be ticked without executing the grid, so the PR says "Part of #389" and "Part of #3". Resume is covered by tests, but the full unattended run is not. The owner runs this from the repo root:
+```
+python -m forseti.experiments.e0 run experiments/e0/manifest.toml --run-dir runs/e0
+python -m forseti.experiments.e0 summary runs/e0
+```
+Exit 0 means every cell is complete, 2 means work remains (re-run to resume), and 1 means the run failed.
+
+**msort:** I kept the unit at `max_len = 2` instead of dropping it. On ESBMC 8.6.0, with a placeholder property, both versions time out at every rung at `max_len` 4 and settle in about 10 s at 2. That was measured with a stand-in property, so the real run should confirm it.
+
+**Not done**
+- **Local suite:** the only local failure is `tests/test_release_preparation.py` (`No module named build` for the system python). It fails the same way on untouched main, and CI `test` passed.
+- **Skipped simplify findings:** I did not move the torn-line reader into `_events.py`, split `e0.py` into several modules, or convert the summary classes to `asdict`.
+- **Filed:** nothing.
+- **Cleanup:** the worktree is kept as instructed, at `/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/scratchpad/wt-389`.
+
+repo: pmatos/forseti
+issue: 389
+PR: 419
+SHA: ce5ebb122304c72a1767c1f1d6063b493794e826
+checks: test pass; workflow-lint pass; Validate PR title pass; CodeQL pass; codecov/patch pass; codecov/project pass; claude-review skipping
+needsRuling:
+needsMeasurement:</result>
+<usage><subagent_tokens>283878</subagent_tokens><tool_uses>35</tool_uses><duration_ms>904515</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>brwhyx5uo</task-id>
+<tool-use-id>toolu_01FzW43BtzXsmnBEtw6YuRSX</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/brwhyx5uo.output</output-file>
+<status>completed</status>
+<summary>Background command "Wait for post-merge CI on 17df0fb" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a002424ccf22958db</task-id>
+<tool-use-id>toolu_0178SK5ZaoevF8NXroyGEEah</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/a002424ccf22958db.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix #387 stage 2" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Stage 2 of #387 is up as PR #421, and every required check passed on its final head 839f2d8. The one non-pass line in the check list is `claude-review` (skipping). `Validate PR title` was re-read at the last poll, not run-verified against the SHA. Nothing is merged.
+
+**What shipped**
+- **Lifecycle:** a type invariant moves candidate to accepted or rejected, and both are final. It skips `graded`, so the shared semantic lifecycle is untouched. A human settles it with `forseti invariant-status &lt;src&gt; --type T --property-id ID accepted|rejected`.
+- **Check entry point:** `forseti check &lt;src&gt; --function F --type T [--role method|initialiser]` runs the inductive check. The MCP `check` tool takes optional `type_name` and `role`. Accepted invariants stay checkable, rejected ones do not.
+- **S0 under the invariant:** `forseti synth` assumes an accepted invariant of `T` for each single-object `T *` parameter, with a non-vacuity probe. Results say *assumed*, and the JSON carries `assumed_invariants`. `--no-invariants` opts out. An initialiser gets no assumption (found in the code review); `--role` overrides the name-based guess. `discharge` is not given any invariant, and a test pins that.
+- **Evidence table through the CLI:** `tests/core/test_invariant_cli_integration.py` pins it with real ESBMC on `ring_buffer.c` and `ring_buffer_bug.c`.
+  - **`synth rb_push`:** VIOLATED before acceptance, VERIFIED (assumed) after, on both files.
+  - **`check --type` on `rb_push`:** clean is held; bug is VIOLATED with the `forseti:rep-invariant` label.
+  - **`rb_pop` and `rb_init`:** held on both.
+  - **Vacuous invariant:** reported `vacuous`, and `synth` gives VACUOUS (exit 4).
+- **Unit tests** cover each piece. Full suite: 2530 passed locally, with one existing failure, `tests/test_release_preparation.py`, which needs the `build` module that is not installed here.
+- **Review rounds:** the code review (high) ran but applied nothing and posted no comments, so I fixed its valid findings myself, posted a summary comment on the PR, and ran /simplify.
+
+**What remains of #387**
+- **Claude Code verify gate under an accepted invariant: not done.** The gate marks every pointer-taking unit `needs_contract` and never runs ESBMC on it (#122). Running `T *` units under an invariant would turn non-blocking units into blocking ones, which changes the gate's exclusion. The Codex and Oh My Pi hooks share the gate. Needs a ruling.
+- **Proposer prompt and parser support, plus the MCP `submit` tool for the kind:** filed as #420, a sub-issue of #3, labelled enhancement and research like #387, with no closing keywords.
+- **Discharge at callers that construct `T`:** still open, so every result stays labelled assumed.
+
+In my judgment the acceptance list is met. All four boxes are covered by this PR and #417, with the unit tests and the integration test. The Scope items still open are the gate, the proposer and discharge, listed above.
+
+**Decisions in the PR body**
+- Accepted is final, so there is no un-accept. Making it revocable would change the lifecycle convention.
+- Accepting does not require a passing `check --type`. Gating it needs a rule for which functions count.
+- Invariants are keyed by the raw source path spelling, so `x.c` and `./x.c` do not share one.
+
+The worktree is left in place at `/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/scratchpad/wt-387b`, and nothing was rebased.
+
+repo: pmatos/forseti
+issue: 387
+PR: 421
+SHA: 839f2d8af9f5827f2a24a05607bad64e66bbee56
+checks: test success; workflow-lint success; Validate PR title success; codecov/patch success; codecov/project success; CodeQL success; Analyze (actions, c-cpp, javascript-typescript, python) success; claude-review skipping
+needsRuling: Should the Claude Code verify gate (and the Codex and Oh My Pi hooks that share it) run `T *` functions under an ACCEPTED invariant? Today every pointer-taking unit is `needs_contract` and never reaches ESBMC (#122). Doing it would make those units blocking, which changes the gate's exclusion. Not implemented. Also: should an ACCEPTED invariant be revocable? The lifecycle convention makes it final, and `synth --no-invariants` is the only per-run escape. Left as is.
+needsMeasurement:</result>
+<usage><subagent_tokens>301751</subagent_tokens><tool_uses>105</tool_uses><duration_ms>1464086</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>b5d3wq2wg</task-id>
+<tool-use-id>toolu_01PTafASoGRohuktdM4CMqNm</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/b5d3wq2wg.output</output-file>
+<status>completed</status>
+<summary>Background command "Wait for post-merge CI on ccfd0b6" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+Ask me about the rulings - provide enough context so I understand what we're doing so we can unblock progress and complete the epic.
+
+---
+
+ask again
+
+---
+
+<task-notification>
+<task-id>b8fefdfr6</task-id>
+<tool-use-id>toolu_016wnzWGmFoL19fJq1aRS1T2</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/b8fefdfr6.output</output-file>
+<status>completed</status>
+<summary>Background command "Notify when E0 pilot finishes" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+Yes, I meant Context as input to the proposer.
+Anyway, lets follow the recommendation for now. And yes, diagnose the 6 errors.
+
+---
+
+1. drop - but add it back with build struct field support (add to exisitng issue or create a new one).
+2. yes
+
+---
+
+<task-notification>
+<task-id>brng8u4mj</task-id>
+<tool-use-id>toolu_01D5HbZBRNPpVCB4oeLDS6sq</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/brng8u4mj.output</output-file>
+<status>completed</status>
+<summary>Background command "Wait for CI on PR 424" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bchqau46w</task-id>
+<tool-use-id>toolu_01AM27maSW9iYVrxhx1VJ1KM</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/bchqau46w.output</output-file>
+<status>completed</status>
+<summary>Background command "Wait for post-merge CI on a65ab70" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+go
+
+---
+
+<task-notification>
+<task-id>bnkqfpinn</task-id>
+<tool-use-id>toolu_011hANryrunhScR3e5YqZBk5</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/bnkqfpinn.output</output-file>
+<status>completed</status>
+<summary>Background command "Start full E0 grid run in background" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bm029ywk1</task-id>
+<summary>Monitor event: "E0 grid progress and completion"</summary>
+<event>[Monitor expired after 30m with no events delivered. Re-arm it if you still need the watch — and widen the filter if silence was unexpected.]</event>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bl92138zo</task-id>
+<summary>Monitor event: "E0 grid progress and completion"</summary>
+<event>progress: 6/36 cells started</event>
+If this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bl92138zo</task-id>
+<summary>Monitor event: "E0 grid progress and completion"</summary>
+<event>[Monitor expired after 30m with 1 event delivered. Re-arm it if you still need the watch.]</event>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bb56512ov</task-id>
+<summary>Monitor event: "E0 grid progress and completion"</summary>
+<event>[Monitor expired after 30m with no events delivered. Re-arm it if you still need the watch — and widen the filter if silence was unexpected.]</event>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>brygnc6n0</task-id>
+<summary>Monitor event: "E0 grid progress and completion"</summary>
+<event>progress: 17/36 cells started</event>
+If this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>brygnc6n0</task-id>
+<summary>Monitor event: "E0 grid progress and completion"</summary>
+<event>progress: 24/36 cells started</event>
+If this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>brygnc6n0</task-id>
+<summary>Monitor event: "E0 grid progress and completion"</summary>
+<event>progress: 31/36 cells started</event>
+If this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>brygnc6n0</task-id>
+<tool-use-id>toolu_01MM5Nskq3odFESCgAEHMwep</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/brygnc6n0.output</output-file>
+<status>completed</status>
+<summary>Monitor "E0 grid progress and completion" stream ended</summary>
+<event>process ended; exit=0
+Verdicts are bounded: no violation found up to k (and len &lt;= max_len). `unknown` and `vacuous` are never held. `rendered` counts checks whose harness was built.</event>
+If this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.
+</task-notification>
+
+---
+
+Lets deal with these questions - ask me the necessary questions and provide me with the required context so that I can make the rulings necessary for us to proceed.
+
+---
+
+<task-notification>
+<task-id>a593c959b3f7a0734</task-id>
+<tool-use-id>toolu_01CymNWQqs5PGbzTj2akH2Pb</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/a593c959b3f7a0734.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix #422 struct-pointer support" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>**READY.** PR #431 is open and its required checks (test, workflow-lint, Validate PR title) passed on the final head 5a2f482. #422 is complete and I have not merged anything.
+
+**What shipped**
+- **Struct pointers as one object.** A pointer to a struct defined in the unit is now one nondet instance, not a `(buffer, length)` pair. It stays a buffer only when an integer follows it and the body indexes or advances the pointer.
+- **Validator.** It resolves `r-&gt;field` against the struct's fields. An unknown field is rejected with its name and the real field list, a bare `count` gets an `r-&gt;count` hint, and `r.count` is rejected. The field check is skipped when the struct definition can't be fully read.
+- **Harness writer.** The struct is rendered as `T r__obj = nondet_T(); T *r = &amp;r__obj;` ahead of the domain clauses.
+- **Verdict labelling.** Every verdict over a nondet struct carries an assumption note (JSON `assumption`, transcript `Assumed:`). Nothing is called a proof.
+- **Prompt.** The `semantic/v1` template text is unchanged. For units with a struct parameter only, a short note lists the fields and says to write `r-&gt;count`. All other prompts are byte-identical, and the existing hash test passes.
+- **E0.** `rb_push` and `sha1_update` are back in the manifest (54 cells, 6 units), with the header comment and `tests/experiments/test_e0.py` counts updated.
+- **Tests.** Hermetic tests are in `tests/properties/test_struct_params.py`. The ESBMC-gated tests are in `tests/orchestrator/test_struct_semantic_integration.py`:
+  - `rb_push` is HELD on `examples/ring_buffer.c` and VIOLATED on its `_bug` twin.
+  - With no domain, the nondet ring is VIOLATED and labelled.
+  - `sha1_update` renders and is checked with no length-inference error.
+- **Changed test.** `test_semantic_verdicts_carry_no_assumption_field` in `tests/orchestrator/test_invariant_check.py` used a struct-taking function. I split it into a scalar case (no assumption) and a struct case (nondet-struct assumption). The issue requires that label.
+- **Smoke.** One E0 cell (`rb_push`, blind recipe, 1 sample): 6 proposed, 6 accepted, 6 of 6 rendered, 0 errors on clean and twin. The grid was not run.
+
+**Review and simplify**
+- **Code review.** The review agent returned its findings without posting comments or applying fixes, so I applied them myself in `bcd0f98` and posted one summary comment on the PR.
+- **Simplify.** The four simplify agents' fixes are in `5a2f482`. I skipped these as too wide or out of scope:
+  - Making `StructParam` a sibling of `BufferParam` rather than a subclass.
+  - Sharing the comment masker (`signature.py` must stay a leaf module, which a test enforces).
+  - Hoisting the duplicated test helper.
+
+**Not green:** nothing. `claude-review` is skipped.
+
+**Filed:** nothing. I commented on #422 pointing at the PR.
+
+**Cleanup:** the worktree `wt-422` and `smoke-run/` are still under the scratchpad.
+
+**Findings:**
+- The validator still rejects a `#define` constant from the source (`CAP`) as an unknown identifier, as it does for every unit. The prompt note tells the model to write the number. Accepting unit macros would be a validator change, so I did not make it.
+- The prompt addendum sits outside the `semantic/v1` versioning. I judged it within scope.
+
+```
+repo: pmatos/forseti
+issue: #422 (Part of #3)
+PR: https://github.com/pmatos/forseti/pull/431
+SHA: 5a2f482f66893051c7ffd03d7d52aff473f959c1
+checks: test, workflow-lint, Validate PR title, CodeQL and Analyze (4) pass; claude-review skipped
+needsRuling: none required; optional — whether the proposer validator should accept macros the unit #defines (e.g. CAP), and whether the struct prompt addendum should become a versioned semantic/v2
+needsMeasurement: the full E0 grid with rb_push and sha1_update (not run, by instruction); acceptance and held rates over the 3 recipes x 3 samples
+```</result>
+<usage><subagent_tokens>238248</subagent_tokens><tool_uses>67</tool_uses><duration_ms>1221682</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ac480964ffdba56f2</task-id>
+<tool-use-id>toolu_0192F7uC1AaeCeLZxzFnmwVt</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/ac480964ffdba56f2.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix #420 invariant proposer" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>PR #433 is open but not READY: it conflicts with main, so the required `test` and `workflow-lint` checks never ran on the final head.
+
+I did not rebase, since that needs the orchestrator to hand the PR back. Main moved to 9a712a2 (#431, struct-pointer parameters in the semantic path) after my push. `git merge-tree` shows content conflicts in `src/forseti/properties/prompts.py` and `src/forseti/properties/proposer.py`; `_proposal_request.py` merges cleanly.
+
+**What shipped (head a5ea289c, three commits)**
+- **Prompt:** a new versioned prompt, `rep-invariant/v1`, asks for a predicate over `self` for one struct type. The semantic prompt is unchanged.
+- **Parser:** `CandidateSpec` gains an optional `type_name`, read from the JSON `type` field. `kind` may be spelled `rep-invariant` or `rep_invariant`.
+- **Proposer:** `propose_invariants` (new `properties/invariant_proposer.py`) gates each candidate with `invariant_rejection`, the check `submit_invariant_source` now shares. Survivors are stored as `candidate` via `PropertyStore.add_type_invariant`.
+- **Rejections:** a malformed, vacuous or mismatched candidate is rejected with a reason and never stored. An invariant already accepted or rejected in the store is not proposed again.
+- **Recipes:** all three recipes are accepted for `--function`, a function that takes `T *`. `sighted` is the useful default, `baseline` shows every mutator, and `blind` shows only the signature and the type. The recipe ref is now stored with each invariant, which needed an additive `recipe` column on `type_invariants`.
+- **Interfaces:** `forseti propose --kind rep-invariant --type T --function F`, `propose_invariant_source`, and `kind`/`type_name` on the MCP `propose` and `submit` tools. A function that does not take `T *` is refused before any LLM call.
+- **Labelling:** an accepted invariant adds an `assumption` note to the payload and a note line to the CLI output. Nothing says "proof".
+- **Tests:** two new test files cover the prompt, parser, routing, recipes, store migration, CLI and MCP with a fake `LLMClient`. I ran `tests/properties`, `tests/core` and `tests/orchestrator` locally. No ESBMC corpus or E0 grid was run.
+
+**Checks on a5ea289c:** only `Validate PR title` passed (plus CodeQL and Analyze). `test` and `workflow-lint` do not appear on this head, which fits the conflict. They passed on the two earlier heads, 9c96a23 and 232be96.
+
+**Review and simplify**
+- **Review:** `/code-review high --fix --comment` returned findings but posted no PR comments and applied no fixes, so I applied the sound ones myself in 232be96. One finding went the opposite way: I left the `function` argument of the MCP `submit` tool unvalidated for invariants and only documented that it is ignored.
+- **Simplify:** the four `/simplify` agents' findings are in a5ea289. Left as is:
+  - the repeated provenance and persist code
+  - the type-checking shim at the end of `invariant_proposer.py`
+  - a few test merges
+
+**#420:** done once it is rebased, green and merged. The PR body says "Fixes #420" and "Part of #3".
+
+**Not in scope:** `semantic-loop` still carries semantic candidates only. Discharge at callers and auto-accept were already out of scope.
+
+**Cleanup:** the worktree is kept for the rebase. I stopped one full-suite pytest run I started by mistake. No other process was touched, and nothing was filed.
+
+```
+repo: pmatos/forseti
+issue: #420 (comment posted)
+PR: https://github.com/pmatos/forseti/pull/433
+SHA: a5ea289c0c0c3239511c4da494333f1ddea32208
+checks: Validate PR title pass; test and workflow-lint did not run (PR conflicts with main); earlier heads green
+needsRuling: none
+needsMeasurement: none
+needsAction: hand #433 back for a rebase onto 9a712a2 (conflicts in properties/prompts.py and properties/proposer.py), then re-wait for checks
+```</result>
+<usage><subagent_tokens>235889</subagent_tokens><tool_uses>79</tool_uses><duration_ms>1395623</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a209823725b86703c</task-id>
+<tool-use-id>toolu_018FCKRVRKtLjip4uqnokTeU</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/a209823725b86703c.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix #423 T1 project index" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Stage 1 of #423 is up as PR #432 and READY: `test`, `workflow-lint` and `Validate PR title` all passed on head `cddefd39`. #423 is not done; stage 2 is still open.
+
+**What shipped**
+- **Project index (`properties/index.py`):** `ProjectIndex` reads a `SourceTree`. `GitTree` pins one commit and reads from the object database, so the working tree and later commits can't leak in. It covers definitions and prototypes, call sites, callees, type and macro definitions (bounded depth), and test-file detection.
+- **Pack builder (`properties/pack.py`):** `build_context_pack(index, unit_id, config)` is deterministic. Its slices are `target` or `signature` (blind), `types`, `callees` (signature, doc and accepted contracts, never bodies), `callers`, `tests` and `siblings`. Entries are ranked, capped per slice and cut to a token budget. `to_context(recipe)` produces the `ProposalContext`.
+- **Reach:** `Reach.FILE` or `Reach.PROJECT` is a parameter. The `PROJECT` default is unmeasured.
+- **Skipped callers:** `main` is skipped as a caller by default, because in `examples/` it holds the answer asserts. A `static` function in a `.c` file only has callers in its own file.
+- **Supporting changes:** the lexical scan moved from `recipes.py` into `cscan.py` unchanged (its own commit), and `unit_id_path` was added to the unit-id module.
+- **Untouched:** no recipe is registered, so existing recipes and prompts are unchanged.
+- **Tests:** `tests/properties/test_pack.py` and `test_unit_id.py` cover the `examples/` packs, a multi-file fixture, determinism, budget and caps, reach, and temporal hygiene. The hygiene test uses a real git repo and shows a later commit, an uncommitted edit and an untracked file never appear in a pack at an earlier commit.
+
+**Review and simplify**
+- **Review fixes pushed:**
+  - Another file's same-named `static` function no longer shadows a callee or counts as a caller.
+  - `static` in a parameter list no longer makes a function file-local.
+  - A `static` function's tests may `#include` its file.
+  - Top-level macro invocations are no longer read as functions.
+  - `GitTree` works when `root` is a subdirectory.
+  - A body-less pack no longer silently turns blind.
+  - The definition scan is cached.
+- **Code-review caveat:** the `/code-review` skill ran against `main` and posted no inline comments, so I applied its findings by hand and left one summary comment on the PR.
+- **Simplify fixes pushed:** a 30s git timeout, definition and file-local lookup caches, and a trimmed index.
+- **Skipped from simplify:** making `SIGNATURE` a `blind` flag, moving `store_contracts` out of `pack.py`, and an O(n²) budget loop that is fine at current pack sizes.
+- **Commit-hook caveat:** the PostToolUse ruff hook failed on every write because `ruff` isn't on PATH in the main checkout. I ran ruff, ty and the targeted tests myself from the worktree venv.
+
+**Filed:** nothing new. I commented on #423 pointing to PR #432.
+
+**Cleanup:** nothing done. The worktree `scratchpad/wt-423` and branch `vibe/423-project-index` remain until merge.
+
+**Stage 2 needs**
+- Register recipes over the slices in `RECIPES` (`callers`, `tests`, `full`), selectable via `--recipe` and recorded in provenance.
+- `Recipe.build(unit_id, source_text, project_root)` carries no commit and `prepare_proposal_request` doesn't pass one. Stage 2 must resolve one (HEAD of `project_root`) or add a seam.
+- The target slice should come from the unit's current text, which is not committed, e.g. via an overlay `SourceTree`.
+- Convert the unit-id path (raw or absolute) to a tree-relative one.
+- Map `store_contracts` keys to the store's unit-id spelling.
+- A temporal-hygiene test at recipe level.
+
+```
+repo: pmatos/forseti
+issue: #423 (stage 1 of 2, still open)
+PR: #432 (https://github.com/pmatos/forseti/pull/432)
+SHA: cddefd39a8ec98f49000bf01fc317dfdbcd2cae4
+checks: test pass, workflow-lint pass, Validate PR title pass (final head)
+needsRuling: none
+needsMeasurement: RFC-0007 open question 1 (Reach.FILE vs PROJECT, default unmeasured); cost of one `git cat-file` per file and per-pack rescans at kernel scale (batch cat-file if it matters); pack token caps and slice caps are unmeasured defaults
+```</result>
+<usage><subagent_tokens>212764</subagent_tokens><tool_uses>65</tool_uses><duration_ms>1469878</duration_ms></usage>
+</task-notification>
+
+---
+
+vibe status report for epic #3 (pmatos/forseti): check the grid re-run (PID 2322028, exit file /home/pmatos/dev/forseti-runs/e0-2026-10-30.exit), fix agents for #420/#422/#423 (verify READY claims from git/gh, merge one green PR at a time per the vibe skill, never --auto), launch #425 once the re-run is done, and report open children, PRs, and anything needing the owner.
+
+---
+
+<task-notification>
+<task-id>ac480964ffdba56f2</task-id>
+<tool-use-id>toolu_0134yzF2UiwmLZUMUx7SnBZN</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/ac480964ffdba56f2.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix #420 invariant proposer" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>PR #433 is READY. I rebased it onto main 9a712a2 and all three required checks passed on the new head, b2a88190.
+
+- **Rebase:** `capture-lease.sh` returned a5ea289c, and `safe-force-push.sh` pushed with that explicit SHA and exited 0. The PR now reports MERGEABLE.
+- **Conflicts:**
+  - In `properties/prompts.py`, `render_prompt` now takes both #431's `note` and my `type_name`. The semantic prompt's struct-field note behaves as #431 left it, and `rep-invariant/v1` is rendered without a note.
+  - In `properties/proposer.py`, only the `collections.abc` import line conflicted, so I merged both import lists.
+  - I diffed both files against main afterwards, and #431's changes are intact.
+- **Tests:** `ruff` and `ty` are clean. `tests/properties`, `tests/core` and `tests/orchestrator` pass locally. No ESBMC corpus or E0 grid was run.
+- **Review and simplify:** I did not re-run `/code-review` or `/simplify`, because nothing changed beyond the conflict resolution.
+- **Checks on b2a88190:** `test` passed in 3m26s, `workflow-lint` in 7s, and `Validate PR title` passed. CodeQL and the four Analyze jobs passed; `claude-review` skipped.
+- **#420:** done on merge. The PR body says "Fixes #420" and "Part of #3".
+- **Not filed:** nothing. `semantic-loop` still carries semantic candidates only, which is noted in the PR body.
+- **Cleanup:** the worktree `wt-420` is kept for a possible further hand-back.
+
+```
+repo: pmatos/forseti
+issue: #420
+PR: https://github.com/pmatos/forseti/pull/433
+SHA: b2a881902da2b4d9418f0338367e44d85366ecd9
+checks: test pass, workflow-lint pass, Validate PR title pass (all on this SHA); CodeQL/Analyze pass; claude-review skipped; mergeable
+needsRuling: none
+needsMeasurement: none
+```</result>
+<usage><subagent_tokens>246885</subagent_tokens><tool_uses>92</tool_uses><duration_ms>1738510</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bccejkmmq</task-id>
+<summary>Monitor event: "E0 grid re-run completion"</summary>
+<event>[Monitor expired after 30m with no events delivered. Re-arm it if you still need the watch — and widen the filter if silence was unexpected.]</event>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a209823725b86703c</task-id>
+<tool-use-id>toolu_01JRwfZjcePnoMFPVRY8WBCH</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/a209823725b86703c.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix #423 T1 project index" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Stage 2 is READY as PR #434, and with it #423 should be complete once the PR merges. `test`, `workflow-lint` and `Validate PR title` all passed on head `b688c02c`. I did not merge.
+
+**What shipped**
+- **New recipes:** `callers` (target, types, call sites), `tests` (target, types, tests that call it) and `full` (every slice) are registered in `RECIPES`. `--recipe` selects them, because its choices come from `RECIPES`. Provenance records `callers/v1`, `tests/v1` and `full/v1`.
+- **Commit and repository:** the pack is built from the git repository that holds the unit's file, at its HEAD. The unit's path is resolved against the working directory and converted to a tree-relative path, and a symlinked unit file keeps its own path. `GitTree.at` now pins the repository top level and lists the whole commit from any subdirectory.
+- **Current text:** the unit's own file comes from its current text through a new `OverlayTree`. Every other file comes from HEAD, so uncommitted and untracked files never reach a pack.
+- **Errors:** a repository with no commit, a file outside any repository, or a missing function raises `RecipeError`.
+- **`store_contracts`:** it now finds a callee's accepted contracts under the tree-relative, cwd-relative or absolute spelling of its unit id. No recipe calls it yet (see needsRuling).
+- **Existing recipes:** `baseline`, `sighted` and `blind` are untouched, so their outputs are byte-identical.
+- **E0 default grid:** it stays the three single-file recipes through a new `SINGLE_FILE_RECIPES` constant. Without this, registering the new recipes would have silently grown the default grid. Naming the new recipes in a manifest still works.
+- **Removed API:** `ContextPack.to_context` is gone, so `pack` no longer depends on `recipes`.
+- **Tests:** the recipe-level temporal-hygiene test commits a later change, shows it appears at HEAD, then checks out the earlier commit and shows it disappears again. Other tests cover:
+  - an uncommitted caller and an untracked test staying out of the pack;
+  - cwd-relative and subdirectory paths;
+  - errors, symlinks, and `store_contracts` spellings;
+  - `prepare_proposal_request` recording `callers/v1`;
+  - the E0 default grid staying single-file.
+
+**Review and simplify**
+- **Review fixes pushed:** the code-review run again returned findings without applying them, so I applied them by hand. The repository now comes from the unit file, not the project root, and a symlinked unit keeps its own path.
+- **Recipes no longer read the store.** The review flagged that `full` would depend on live store state under a fixed ref, and that it ignored `--store-root`. I removed that wiring, so a ref depends only on the tree and HEAD. This also settles the store-location, sqlite-error and hardcoded `.forseti` findings.
+- **Simplify fixes pushed:** the store import is type-only again, a redundant `resolve()` is gone, and the recipe slice sets are `frozenset`s.
+- **Skipped:** folding the repeated `build_context` blocks in the tests into one helper, deriving `SINGLE_FILE_RECIPES` from the registry, and dropping the unwired `store_contracts`. I kept `store_contracts` because the spelling mapping was in your scope.
+- **No inline review comments were posted** on #434.
+
+**Flaky-test risk:** a local run of the `tests/core` suite once failed on a stray `ResourceWarning`. An existing helper in `tests/properties/test_invariant_proposer.py:85` opens an in-memory store and never closes it, so the warning depends on GC timing. It did not recur here or in CI, but it can flake independently of this PR. I did not touch that file.
+
+**Filed:** nothing new.
+
+**Cleanup:** the worktree `scratchpad/wt-423` is still on `vibe/423-recipes-s2`. The stage 1 branch `vibe/423-project-index` is merged; I did not delete it.
+
+```
+repo: pmatos/forseti
+issue: #423 (Fixes #423 on merge; Part of #3)
+PR: #434 (https://github.com/pmatos/forseti/pull/434)
+SHA: b688c02c2c390ff8824110e0eeeea645f250b437
+checks: test pass, workflow-lint pass, Validate PR title pass (final head)
+needsRuling: whether and how callee accepted-contracts from the store should enter a recipe (needs a way to pin the store's state so the recipe ref stays reproducible; store_contracts is ready but unwired)
+needsMeasurement: RFC-0007 open question 1 (Reach.FILE vs PROJECT; default is project, unmeasured); pack token and per-slice caps; cost of one `git cat-file` per file and a fresh index per recipe call at kernel scale
+```</result>
+<usage><subagent_tokens>278693</subagent_tokens><tool_uses>42</tool_uses><duration_ms>1250365</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bnrkikixe</task-id>
+<tool-use-id>toolu_015HhTUYQdYSRMLxhaW2d2k7</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/bnrkikixe.output</output-file>
+<status>completed</status>
+<summary>Monitor "E0 grid re-run completion" stream ended</summary>
+<event>grid re-run ended; exit=0
+Verdicts are bounded: no violation found up to k (and len &lt;= max_len). `unknown` and `vacuous` are never held. `rendered` counts checks whose harness was built.</event>
+If this event is something the user would act on now, send a PushNotification. Routine or benign output doesn't need one.
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ad63ca294f5d5240b</task-id>
+<tool-use-id>toolu_01Wsgrz2SWwbwdQir7fAJXTX</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/ad63ca294f5d5240b.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix #430 invariant discharge at callers" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>READY. PR #435 is open and ready to merge; I did not merge it. Every required check (`test`, `workflow-lint`, `Validate PR title`) passed on the final head SHA b7d1090c, the PR is mergeable, and the `claude-review` job was skipped. The PR says "Fixes #430" and "Part of #3", and #430 is done once it merges.
+
+**What shipped**
+- `forseti invariant-discharge &lt;src&gt; --type T [--initialiser NAME]` is a new command. It is the counterpart of the *assumed* reading of a representation invariant.
+- **Obligation:** the new module `src/forseti/precond/invariant_discharge.py` asserts a type's stored invariant at the entry of every non-initialiser function with a `T *` parameter, in a generated copy of the file. This follows RFC-0003 S3: same-line injection, `#line`, and the existing caller-sweep and fail-closed types.
+- **Callers checked:** each closed caller (one taking no parameters, such as `main`) is verified against that copy, with a probe that the call is actually reached.
+- **Statuses:** there are four per (invariant, function), and the output and JSON say whether each is assumed or discharged.
+  - `discharged`: VERIFIED up to k. This needs a `static` function, every caller closed, reached and passing.
+  - `violated`: a caller reaches the call in a state the invariant does not hold on.
+  - `unknown`: a run was inconclusive.
+  - `incomplete`: the invariant stays assumed, and the reason is printed.
+- **Exit codes:** 0 for discharged, incomplete or empty, 1 for violated, 2 for unknown. Say if you want `incomplete` non-zero.
+- **Behaviour on the example pair** (ESBMC 8.6.0, pinned by the new integration test):
+
+| Case | Result |
+|---|---|
+| `ring_buffer.c`, correct invariant | `main` passes at both calls, but the functions are not `static`, so the invariant stays assumed ("exported") |
+| same file with the functions made `static` (tmp copy) | discharged |
+| `ring_buffer_bug.c`, correct invariant | violated at `main` |
+| over-strong invariant `self-&gt;count &gt;= 1` | violated at `main`'s first call |
+| `rb_init` that forgets a field (tmp copy) | violated |
+
+- **Tests:** hermetic tests cover injection text, aggregation with a fake verifier, rendering, Core and the CLI. The ESBMC-gated test is `tests/core/test_invariant_discharge_integration.py`.
+
+**Review and simplify**
+- **`/code-review high --fix --comment`:** it returned findings but applied no fixes and posted no inline comments. I applied the valid ones myself in a39b658 and posted the disposition as a PR comment.
+  - The caller listing now parses under the same `--timeout` and passthrough esbmc flags the verifier uses.
+  - The obligation is guarded with `!self ||`, so a caller passing NULL to a NULL-tolerant function is not read as an invariant failure.
+- **`/simplify`:** applied in b7d1090.
+  - The private S3 helpers `_self_reachable` and `_line_directive` are now public.
+  - The site-probe injection is split into its own function.
+  - The injection is skipped when a function has no caller.
+  - I did not pursue merging the near-copy of S3's caller check and aggregation, and I did not reduce repeated work when several invariants are stored.
+  - Splitting `--max-len` out of the shared check-phase flags broke existing tests that pin that contract, so I reverted it.
+
+**Decisions to look at (from the PR body)**
+- The caller's own `assert()` calls are compiled out with `NDEBUG` in the generated copy. On `ring_buffer_bug.c`, `main`'s own assertion fires first and hides the invariant obligation, so the verdict is about the invariant only.
+- `ring_buffer.c` is deliberately not "discharged": S3's rule that a non-`static` function only exports its obligation is kept. The examples are untouched.
+- A function that only parameter-taking relays call stays assumed. A caller that faults on its own property reports `unknown`, not `violated`.
+
+Nothing else was filed, and I did not touch the verify gate, ADRs, or the thresholds. Cleanup is not done: the worktree `…/scratchpad/wt-430` and branch `vibe/430-invariant-discharge` are still in place, and the scratch dir `…/scratchpad/exp` is still there.
+
+```
+repo: pmatos/forseti
+issue: #430 (part of epic #3)
+PR: #435 https://github.com/pmatos/forseti/pull/435
+SHA: b7d1090c1fc549a95d9898d1523d95a645077644
+checks: test, workflow-lint, Validate PR title, CodeQL, Analyze x4 all pass; claude-review skipped; none failing
+needsRuling: none required. Optional: should `incomplete` or `empty` exit non-zero for CI?
+needsMeasurement: none
+```</result>
+<usage><subagent_tokens>302087</subagent_tokens><tool_uses>95</tool_uses><duration_ms>1675333</duration_ms></usage>
+</task-notification>
+
+---
+
+vibe status report for epic #3 (pmatos/forseti): check the grid re-run (PID 2322028, exit file /home/pmatos/dev/forseti-runs/e0-2026-10-30.exit), fix agents for #420/#422/#423 (verify READY claims from git/gh, merge one green PR at a time per the vibe skill, never --auto), launch #425 once the re-run is done, and report open children, PRs, and anything needing the owner.
+
+---
+
+<task-notification>
+<task-id>a3c918bf1ab2cbbe3</task-id>
+<tool-use-id>toolu_01PPnBisRUQRhhb7DuKBsjzQ</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/a3c918bf1ab2cbbe3.output</output-file>
+<status>completed</status>
+<summary>Agent "Triage #425 msort E0 results" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Clean-version `msort` now produces held verdicts. The cause was a signature misparse in `extract_signature`, not a finding in `examples/merge_sort.c`. PR #437 fixes it and is at READY: every required check passes on the final head SHA, and review and simplify fixes are pushed.
+
+**Findings**
+- **Violated rows (18 in the re-run):** all are harness artifacts. `extract_signature` read `msort(int *a, int lo, int hi, int *tmp)` as a buffer `a` of length `lo` plus a one-element output `tmp`, so every property failed with an out-of-bounds dereference at k=4 in about 0 s, whatever it claimed. The count changed between runs only because the proposer's samples differ.
+- **Unknown rows:** the same malformed harness, plus the unwind ladder retrying a property that never settles. With `a` and `tmp` sized by `hi`:
+
+  | max_len | unwind | time for one true property |
+  |---|---|---|
+  | 2 | 4 | about 4 s |
+  | 3 | 4 | about 14 s |
+  | 4 | 5 | about 46 s, over the 30 s per-call timeout |
+
+  Unwind 8 did not finish within 120 s on max_len 2 or 3. `max_len = 2` stays right for this unit, so there is no bound change.
+- **Re-run, msort only, one sample over three recipes, in a new run dir:** the clean version went from 0 held / 18 violated / 20 unknown to 4 held / 0 violated / 7 unknown. All 4 held properties are violated on the `_bug` twin, so they do discriminate.
+- **Remaining unknown rows (7):** the proposer's domains allow `hi` up to 4 or 5, above `max_len = 2`, and the cap is not applied to those domains, so each times out at every rung. The sighted recipe proposed only `tmp != 0` domains, which are rejected as constraining an output parameter, so it checked nothing.
+
+**What shipped (PR #437, "Part of #3, Refs #425")**
+- A pointer followed by a `(lo, hi)`, `(start, end)` or `(begin, end)` pair is now sized by `hi`. A same-typed, non-const trailing pointer the body doesn't confine to `*p` or `p[0]` is scratch of that length. No other corpus unit matches.
+- The equivalence filter keeps its refusal of `msort` through a new `range_idiom=False` flag. I did this because lifting that refusal is an exclusion-rule change.
+- Tests: signature unit tests, and ESBMC-gated tests (a true `msort` property is VERIFIED, a false one is VIOLATED). The `manifest.toml` change is a comment only.
+- `/code-review` found problems but did not apply its fixes or post comments, so I fixed them myself. The scratch rule now requires a non-const, same-typed pointer. `/simplify` gated the extra body parsing and folded the scratch rule into the trailing-pointer branch.
+- CI initially failed on the equivalence refusal test, which led to the `range_idiom=False` flag. All required checks (`test`, `workflow-lint`, `Validate PR title`) passed on 375f0ce.
+
+**Is #425 done?** No. The held verdicts are measurable, but 7 clean cells are still UNKNOWN and need rulings. I commented the findings on #425 and filed #438 for those rulings.
+
+**Cleanup:** the experiment process has exited. The scratch dir and worktree `wt-425` remain. The grid's run dir was not touched.
+
+```
+repo: pmatos/forseti
+issue: 425
+PR: 437
+SHA: 375f0ce6125addbbea52dc12245306e5725e70ec
+checks: all required checks pass on that SHA (test, workflow-lint, Validate PR title; CodeQL and Analyze pass; claude-review skipped)
+needsRuling:
+  - apply a hi &lt;= max_len cap on top of a proposer domain, or tell the proposer the bound (#438)
+  - allow a != NULL domain on scratch buffers such as tmp (#438)
+  - should the equivalence filter now accept msort (#438)
+needsMeasurement: none
+```</result>
+<usage><subagent_tokens>179575</subagent_tokens><tool_uses>87</tool_uses><duration_ms>2086862</duration_ms></usage>
+</task-notification>
+
+---
+
+Reask the questions so I can set the rulings.
+
+---
+
+<task-notification>
+<task-id>a745d3fe455bc00cd</task-id>
+<tool-use-id>toolu_01TWKKoyRKiThQneC4wKZwDV</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/a745d3fe455bc00cd.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix #438 ruling 3 equivalence msort" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>The equivalence filter now accepts `msort`, and PR #440 is at READY. `test`, `workflow-lint` and `Validate PR title` all passed on the final head SHA 031dce4. The Analyze checks also passed, and `claude-review` was skipped.
+
+**What shipped**
+- **Refusal removed:** the `range_idiom` flag is gone from `extract_signature`, along with its test. Nothing else used it. `grading/equivalence.py` now reads the corrected signature, so `a` and `tmp` are buffers of length `hi`. Every other refusal is unchanged, and a new test confirms a forwarded trailing pointer outside a range is still refused.
+- **Extra assumption to rule on:** the harness also assumes `0 &lt;= lo &lt;= hi` for a range-idiom unit, via a new `range_lower_bounds` helper in `properties/signature.py`. This goes beyond the ruling.
+  - Without it, a free `lo` makes the reference itself read outside the `hi`-long buffer. `check_equivalence` on `examples/merge_sort.c` (`max_len=2`, `k=4`) then returned `EquivalenceRefused`.
+  - With it, `msort` checked against itself is VERIFIED up to k=4 in about 20 s.
+  - The assumption narrows the compared input domain, and I documented that on `EquivalenceVerified` and in the module docstring.
+- **Tests:**
+  - **Hermetic:** a render test on `merge_sort.c`, the kept-refusal test, a negative test for non-range units, and `range_lower_bounds` unit tests.
+  - **ESBMC-gated:** two tests on `merge_sort.c`. The clean version against itself is VERIFIED up to k, and the clean version against `merge_sort_bug.c` is VIOLATED on `a[..]`.
+
+**Review and simplify**
+- **`/code-review high`:** it returned six findings and posted no PR comments, so I posted my dispositions as a PR comment myself. Two were fixed in a second commit: the `lo`/`hi` domain is now stated on the verdict docstring, and the weak negative test is tightened.
+- **Not fixed, as intended:** `tmp` is still compared as an output, which is what the ruling says. Inclusive-`hi` units such as quicksort get a one-element-short buffer from the #437 name heuristic. That ends as a refusal, not a wrong verdict.
+- **Not fixed, needs follow-up:** the semantic-property and invariant harnesses still draw `lo` freely for range-idiom units. That is outside this PR, so I left it for the sibling PR or the orchestrator.
+- **`/simplify`:** the diff is about 100 lines and I reviewed it directly instead of launching the four agents. It found nothing to change.
+
+Nothing was filed. Cleanup: the worktree is still at `/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/scratchpad/wt-438b`, kept until merge. The scratch files are in the scratchpad.
+
+```
+repo: pmatos/forseti
+issue: #438 (ruling 3 only; epic #3)
+PR: https://github.com/pmatos/forseti/pull/440
+SHA: 031dce4234a6926336e9dbd9960c1a78226f510b
+checks: test pass, workflow-lint pass, Validate PR title pass (final SHA); Analyze x4 pass; claude-review skipping
+needsRuling: (1) Is the added `0 &lt;= lo &lt;= hi` assumption in the equivalence harness acceptable? Without it `msort` always ends as EquivalenceRefused. (2) Should the semantic-property and invariant harnesses assume the same for range-idiom units?
+needsMeasurement: none. Self-check of msort measured at about 20 s (max_len 2, k 4); larger max_len not measured.
+```</result>
+<usage><subagent_tokens>107609</subagent_tokens><tool_uses>27</tool_uses><duration_ms>806681</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a2b4c830fffde9742</task-id>
+<tool-use-id>toolu_0182noq6H8qdjX8NCEC3uuy1</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/a2b4c830fffde9742.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix #436 callee contracts slice" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>PR #439 is ready, and every required check passed on the final head, 773bd7c. I did not merge it. #436 is done once it merges; the PR body says "Fixes #436" and "Part of #3".
+
+**What shipped**
+- A new recipe, `callees`, selectable with `--recipe callees`. It shows the target, its types, and each callee's signature, doc comment and accepted contracts, with no callee bodies.
+- The store is read from the explicit `--store-root`, once, when the request is prepared. Before, `--store-root` was ignored for recipes. The proposal request builders (`propose_source`, `propose_invariant_source`) now pass it through. A root with no store counts as an empty store and is not created.
+- The recipe ref is `callees/v1+&lt;16 hex&gt;`, a SHA-256 digest of the contracts the pack actually shows. That ref is what lands in `Provenance.recipe`.
+- Same tree and store state give an identical pack and ref. Contracts are sorted in the pack, so insertion order and the store directory don't matter. Changing the contracts shown changes the ref.
+- The other six recipes keep their refs, prompts and output; `full` still shows no contracts.
+- Tests in `tests/properties/test_pack.py` cover determinism, ref change, no store, the error without a store, and `propose_source` recording the digest ref from the explicit store.
+- Review and simplify fixes are pushed. Code review moved the contract sort into the callees slice and added `callees` to the MCP and propose docs. Simplify gave every recipe one build contract, so the store recipe is just a registry entry.
+
+**Checks on 773bd7c:** `test`, `workflow-lint` and `Validate PR title` all passed. CodeQL and both Codecov checks also passed.
+
+**Pipeline notes**
+- I opened the PR directly rather than running `/investigate`, since I had already done that work.
+- The code-review skill returned its findings but did not post comments. I posted the disposition as a PR comment.
+- One review finding was wrong: it claimed the E0 grid defaults to every recipe, but it defaults to the single-file ones. Naming `callees` in an E0 manifest fails with a clear `E0Error` before any paid call.
+
+**Left unchanged**
+- A mistyped store path becomes a quiet empty store, the same as `accepted_invariants`. Failing on it would break the first proposal in a fresh project.
+- I skipped three simplify suggestions as too invasive: digesting the pack text instead of the contracts, folding `store_root` into `project_root`, and a shared "open store or empty" helper.
+
+Nothing filed. The scratch worktree is still at `/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/scratchpad/wt-436`.
+
+```
+repo: pmatos/forseti
+issue: #436 (Part of epic #3)
+PR: #439 https://github.com/pmatos/forseti/pull/439
+SHA: 773bd7caec4b9e5c0a7bd08473373dad9929dafa
+checks: test, workflow-lint, Validate PR title all passed on that SHA
+needsRuling: Does the digest cover only the contracts the pack shows (what I implemented) or every accepted property in the store? "Shown only" means refs are equal exactly when packs are, but changes the proposer never sees don't change the ref.
+needsMeasurement: none
+```</result>
+<usage><subagent_tokens>146814</subagent_tokens><tool_uses>42</tool_uses><duration_ms>1077591</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aa4f43cb7cfe18b0d</task-id>
+<tool-use-id>toolu_01Sbx74W8cWqj55AQ7sXCKWG</tool-use-id>
+<output-file>/tmp/claude-1000/-home-pmatos-dev-forseti/b509f435-6492-45cf-806a-b095d0a8617b/tasks/aa4f43cb7cfe18b0d.output</output-file>
+<status>completed</status>
+<summary>Agent "Fix #438 rulings 1+2 domain/scratch" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>Rulings 1 and 2 of #438 are implemented in PR #441, and `test`, `workflow-lint` and `Validate PR title` all passed on the final head SHA. The PR body says "Part of #3" and "Part of #438", with no closing keyword. I did not merge, and `grading/equivalence.py` and the prompts are untouched.
+
+**What shipped**
+- **Ruling 1 (cap):** `plan_length_bounds` now applies `len &lt;= max_len` on top of a domain's upper bound, such as `hi &lt;= 4`. The cap is skipped only when a literal lower bound above `max_len` contradicts it (`n &gt;= 16`, `n == 20`, `n &gt; 8`, hex or octal literals, or inside `&amp;&amp;` conjuncts). Verdicts still report the cap through `length_bounds`.
+- **Ruling 2 (scratch):** a bare non-NULL domain (`tmp != NULL` or `tmp != 0`, either operand order) on a scratch buffer is accepted. That is a malloc-backed output like msort's `tmp`. Both `renderability_reason` and the proposer's unknown-identifier check needed the change. Every other clause on an output, and any domain on a scalar-backed output, is still rejected.
+- **Tests:** written first and seen failing, including an ESBMC-gated msort test (`hi &lt;= 4` plus `tmp != NULL` under `max_len = 2`, VERIFIED). Existing tests that pinned the old suppression were updated to the new behaviour.
+- **Review fixes:**
+  - The scalar-backed rule is now shared as `BufferParam.scalar_backed`, replacing the private `_is_scalar_backed` helper.
+  - Octal floors (`n &gt;= 010`) are read correctly.
+  - The clause helpers `conjuncts` and `unwrap_parens` moved to `cexpr.py`.
+  - The proposer's allowed-identifier set is built once per candidate.
+- **Review pass:** the high review's fix mode applied nothing, so I applied its fixes by hand and posted a summary comment on PR #441. The simplify review's remaining suggestions were skipped (details under "Not changed").
+
+**Checks:** head `9bada5709c134c1c750a666652f7319b99841bd2`. `test`, `workflow-lint` and `Validate PR title` all succeeded; the CodeQL jobs passed and `claude-review` was skipped. The PR is mergeable. Locally I ran only the targeted suites (`tests/properties`, `tests/core/test_core_check.py`, `tests/grading`).
+
+**Not changed, on purpose**
+- A floor written as a macro, a disjunction or `hi - lo &gt;= 20` is not read, so the cap can make the assumes unsatisfiable. The vacuity probe reports that as VACUOUS, not a held property.
+- `length_bounds` reports the cap even when the domain's own bound is tighter.
+- A domain of only `tmp != NULL` is accepted as a no-op, as the ruling allows.
+- I skipped three simplify suggestions: sharing `unwrap_parens` with the private `_strip_literal_parens` in `esbmc/preprocessor.py` (crosses a layer boundary), flattening the `conjuncts` recursion, and inlining the `_is_scalar_backed` indirection.
+
+**Filed:** nothing.
+
+**Cleanup:** the worktree `wt-438a` and branch `vibe/438-domain-cap-scratch` remain in place for the orchestrator. No stray processes. I stopped one accidental full-suite pytest run, which left no side effects.
+
+```
+repo: pmatos/forseti
+issue: #438 (rulings 1 and 2; ruling 3 is another PR; not closed by this PR)
+PR: https://github.com/pmatos/forseti/pull/441
+SHA: 9bada5709c134c1c750a666652f7319b99841bd2
+checks: test, workflow-lint, Validate PR title all SUCCESS on this SHA
+needsRuling: none
+needsMeasurement: none (no E0 cell was run; an msort-only E0 re-run would show whether the cap and `tmp != NULL` change the held/unknown counts)
+```</result>
+<usage><subagent_tokens>151705</subagent_tokens><tool_uses>44</tool_uses><duration_ms>1319546</duration_ms></usage>
+</task-notification>
+
+---
+
+vibe status report for epic #3 (pmatos/forseti): check the grid re-run (PID 2322028, exit file /home/pmatos/dev/forseti-runs/e0-2026-10-30.exit), fix agents for #420/#422/#423 (verify READY claims from git/gh, merge one green PR at a time per the vibe skill, never --auto), launch #425 once the re-run is done, and report open children, PRs, and anything needing the owner.
+
+---
+
+vibe status report for epic #3 (pmatos/forseti): check the grid re-run (PID 2322028, exit file /home/pmatos/dev/forseti-runs/e0-2026-10-30.exit), fix agents for #420/#422/#423 (verify READY claims from git/gh, merge one green PR at a time per the vibe skill, never --auto), launch #425 once the re-run is done, and report open children, PRs, and anything needing the owner.
+
+---
+
+vibe status report for epic #3 (pmatos/forseti): check the grid re-run (PID 2322028, exit file /home/pmatos/dev/forseti-runs/e0-2026-10-30.exit), fix agents for #420/#422/#423 (verify READY claims from git/gh, merge one green PR at a time per the vibe skill, never --auto), launch #425 once the re-run is done, and report open children, PRs, and anything needing the owner.
+
+---
+
+What's the question on 440?
+
+---
+
+Get a second opinion from the advisor on this.
+
+---
+
+vibe status report for epic #3 (pmatos/forseti): check the grid re-run (PID 2322028, exit file /home/pmatos/dev/forseti-runs/e0-2026-10-30.exit), fix agents for #420/#422/#423 (verify READY claims from git/gh, merge one green PR at a time per the vibe skill, never --auto), launch #425 once the re-run is done, and report open children, PRs, and anything needing the owner.
+
+---
+
+Accept the suggestions of the advisor on 440
+
+---
+
+go for the re-run.

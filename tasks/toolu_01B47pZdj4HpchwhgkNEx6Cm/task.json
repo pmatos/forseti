@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "toolu_01B47pZdj4HpchwhgkNEx6Cm",
+  "agent_id": "a4e157ed12c35bf4d",
+  "subagent_type": "general-purpose",
+  "task_description": "Record assumption in equivalence verdict",
+  "token_usage": {
+    "input_tokens": 54,
+    "cache_creation_tokens": 99278,
+    "cache_read_tokens": 2025556,
+    "output_tokens": 13905,
+    "api_call_count": 26
+  },
+  "started_at": "2026-10-30T14:22:48.701434265+01:00",
+  "completed_at": "2026-10-30T14:33:03.612720341+01:00"
+}
