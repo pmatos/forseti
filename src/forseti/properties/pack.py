@@ -4,20 +4,23 @@ The proposer-input half of RFC-0007 T1. `build_context_pack` is a deterministic
 function from ``(project index, unit id, config)`` to a `ContextPack`: the unit's
 target text and the slices that explain how it is used, each ranked and cut to fit a
 token budget. Given the same tree it returns the same bytes every run, and because the
-index reads one commit (`GitTree`) nothing written after it can leak in.
+index reads one commit (`GitTree`) nothing written after it can leak in. The one input
+that is not from the tree is the `contracts` seam: whatever it returns is shown, so the
+caller owns its temporal validity (`store_contracts` reads the store as it is now, and
+keys by the tree-relative path, which may differ from the spelling in stored unit ids).
 
 Slices, in the order the budget is spent:
 
-- ``target``: the function and its doc comment (``signature``: without the body, for a
-  blind pack). Always included; it is never dropped for the budget.
-  Types come from the signature alone when only ``signature`` is selected; callees
-  are read from the body either way (RFC-0007's blind recipe hides the body text).
+- ``target``: the function and its doc comment, or (``signature``) without the body,
+  for a blind pack. When selected it is never dropped for the budget. A blind pack
+  takes its types from the signature alone; callees are read from the body either way.
 - ``types``: struct/union/enum/typedef/macro definitions the target uses, to
   `PackConfig.type_depth` levels of nesting.
 - ``callees``: signature and doc comment of each function the target calls, plus any
   accepted contract the `contracts` seam knows for it. Never bodies.
 - ``callers``: the lines around each call site, within the calling function. A
-  ``static`` function in a ``.c`` file is file-local, so only its own file is searched.
+  ``static`` function in a ``.c`` file is file-local, so only its own file is searched,
+  and another file's own function of the same name is not a caller.
 - ``tests``: functions in test files that call the target.
 - ``siblings``: signature and doc comment of other functions in the unit's file.
 
@@ -261,9 +264,13 @@ def _call_entries(
     want_tests = kind is SliceKind.TESTS
     skipped = set(config.skip_callers)
     found: dict[tuple[str, str], list[int]] = {}
-    reach = Reach.FILE if index.is_file_local(target) else config.reach
+    reach = config.reach
+    if not want_tests and index.is_file_local(target):
+        reach = Reach.FILE
     for path in index.files_in_reach(target.path, reach):
-        if is_test_path(path) is not want_tests:
+        if is_test_path(path) is not want_tests or (
+            path != target.path and index.has_local(path, target.name)
+        ):
             continue
         for site in index.call_sites(path, target.name):
             own = (path, site.caller) == (target.path, target.name)
@@ -347,7 +354,9 @@ def build_context_pack(
         if kind in (SliceKind.TARGET, SliceKind.SIGNATURE):
             ranked += _target_entries(index, unit_id, target, kind)
         elif kind is SliceKind.TYPES:
-            ranked += _type_entries(index, target, config, SliceKind.TARGET in kinds)
+            ranked += _type_entries(
+                index, target, config, SliceKind.SIGNATURE not in kinds
+            )
         elif kind is SliceKind.CALLEES:
             ranked += _callee_entries(index, target, config, contracts)
         elif kind is SliceKind.SIBLINGS:

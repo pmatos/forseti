@@ -315,6 +315,61 @@ def test_static_functions_only_have_callers_in_their_own_file() -> None:
     assert "d.c::k" in build(only, files, "c.h::s")
 
 
+def test_a_same_named_static_elsewhere_is_neither_callee_nor_caller() -> None:
+    files = {
+        "a.c": "int f(void) { return helper(); }\n",
+        "b.c": (
+            "static int helper(void) { return 1; }\nint g(void) { return helper(); }\n"
+        ),
+        "c.h": "int helper(void);\n",
+        "z.c": "int helper(void) { return 2; }\n",
+    }
+    callees = build(PackConfig(slices={SliceKind.CALLEES}), files, "a.c::f")
+    assert "z.c::helper" in callees and "b.c::helper" not in callees
+    callers = build(PackConfig(slices={SliceKind.CALLERS}), files, "z.c::helper")
+    assert "a.c::f" in callers and "b.c::g" not in callers
+
+
+def test_static_in_a_parameter_does_not_make_a_function_file_local() -> None:
+    files = {
+        "a.c": "int sum(const int a[static 4]) { return a[0]; }\n",
+        "b.c": (
+            "int sum(const int a[static 4]);\n"
+            "int use(const int *p) { return sum(p); }\n"
+        ),
+    }
+    text = build(PackConfig(slices={SliceKind.CALLERS}), files, "a.c::sum")
+    assert "b.c::use" in text
+
+
+def test_a_static_functions_tests_may_include_its_file() -> None:
+    files = {
+        "src/ring.c": "static int advance(int x) { return x + 1; }\n",
+        "tests/test_ring.c": (
+            '#include "../src/ring.c"\nstatic void test_advance(void) { advance(1); }\n'
+        ),
+    }
+    text = build(PackConfig(slices={SliceKind.TESTS}), files, "src/ring.c::advance")
+    assert "tests/test_ring.c::test_advance" in text
+
+
+def test_top_level_macro_invocations_are_not_functions() -> None:
+    src = (
+        "int rb_push(int);\n"
+        "EXPORT_SYMBOL(rb_push);\n"
+        'MODULE_LICENSE("GPL");\n'
+        "static DEFINE_MUTEX(lock);\n"
+        "module_init(foo_init);\n"
+    )
+    index = ProjectIndex(MappingTree({"a.c": src}))
+    assert [r.name for r in index.functions("a.c")] == ["rb_push"]
+
+
+def test_a_blind_pack_is_chosen_by_signature_not_by_a_missing_target() -> None:
+    bodyless = build(PackConfig(slices={SliceKind.TYPES}))
+    assert "#define SLOTS" in bodyless
+
+
 def test_tests_slice_truncates_long_tests() -> None:
     long_test = "static void test_long(void) {\n" + "    rb_push(0, 1);\n" * 50 + "}\n"
     files = {"src/ring.c": RING_C, "tests/ring_test.c": long_test}
@@ -357,34 +412,40 @@ def test_contracts_seam_adds_accepted_lines() -> None:
 
 
 def test_store_contracts_reads_accepted_properties_only() -> None:
-    store = PropertyStore(sqlite3.connect(":memory:"))
     unit = "src/ring.c::advance"
+    with PropertyStore(sqlite3.connect(":memory:")) as store:
 
-    def prop(expression: str, status: PropertyStatus, domain: tuple[str, ...]) -> None:
-        store.add(
-            Property(
-                property_id=make_property_id(
-                    unit, PropertyKind.SEMANTIC, expression, domain
-                ),
-                unit_id=unit,
-                kind=PropertyKind.SEMANTIC,
-                expression=expression,
-                status=status,
-                provenance=Provenance("p", "1"),
-                domain=domain,
+        def prop(
+            expression: str, status: PropertyStatus, domain: tuple[str, ...]
+        ) -> None:
+            store.add(
+                Property(
+                    property_id=make_property_id(
+                        unit, PropertyKind.SEMANTIC, expression, domain
+                    ),
+                    unit_id=unit,
+                    kind=PropertyKind.SEMANTIC,
+                    expression=expression,
+                    status=status,
+                    provenance=Provenance("p", "1"),
+                    domain=domain,
+                )
             )
-        )
 
-    prop("tail < SLOTS", PropertyStatus.ACCEPTED, ("count < SLOTS", "tail < SLOTS"))
-    prop("tail == 0", PropertyStatus.ACCEPTED, ())
-    prop("head == 7", PropertyStatus.CANDIDATE, ())
-    contracts = store_contracts(store)
-    assert contracts(unit) == [
-        "tail < SLOTS (given count < SLOTS; tail < SLOTS)",
-        "tail == 0",
-    ]
-    assert contracts("src/ring.c::rb_init") == []
-    text = build(PackConfig(slices={SliceKind.CALLEES}), contracts=contracts)
+        prop(
+            "tail < SLOTS",
+            PropertyStatus.ACCEPTED,
+            ("count < SLOTS", "tail < SLOTS"),
+        )
+        prop("tail == 0", PropertyStatus.ACCEPTED, ())
+        prop("head == 7", PropertyStatus.CANDIDATE, ())
+        contracts = store_contracts(store)
+        assert contracts(unit) == [
+            "tail < SLOTS (given count < SLOTS; tail < SLOTS)",
+            "tail == 0",
+        ]
+        assert contracts("src/ring.c::rb_init") == []
+        text = build(PackConfig(slices={SliceKind.CALLEES}), contracts=contracts)
     assert "// accepted: tail == 0" in text
 
 
@@ -602,6 +663,13 @@ def test_git_tree_pins_the_revision_to_a_sha(repo: Path) -> None:
     assert tree.commit == first
     assert "src/extra.c" not in tree.paths()
     assert tree.read("src/app.c") == APP_C
+
+
+def test_git_tree_in_a_subdirectory_reads_the_whole_commit(repo: Path) -> None:
+    commit(repo, PROJECT, "v1")
+    tree = GitTree.at(repo / "src", "HEAD")
+    assert "src/ring.c" in tree.paths() and "include/ring.h" in tree.paths()
+    assert tree.read("src/ring.c") == RING_C
 
 
 def test_git_tree_rejects_a_bad_revision(repo: Path) -> None:

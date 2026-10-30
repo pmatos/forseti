@@ -180,6 +180,7 @@ class Scan:
         self.code = code_view(self.no_comments)
         self.items = _top_level_items(self.code)
         self.comments = _comment_spans(source)
+        self._definitions: list[Definition] | None = None
 
     def function(self, symbol: str) -> tuple[Item, int] | None:
         """The definition of `symbol` and the offset of its body's ``{``."""
@@ -236,6 +237,11 @@ class Scan:
 
     def definitions(self) -> list[Definition]:
         """Type and macro definitions of the file, in source order."""
+        if self._definitions is None:
+            self._definitions = self._scan_definitions()
+        return self._definitions
+
+    def _scan_definitions(self) -> list[Definition]:
         defs: list[Definition] = []
         for item in self.items:
             text = self.code[item.start : item.end]

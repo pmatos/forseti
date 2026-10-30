@@ -57,7 +57,22 @@ _NOT_CALLS = frozenset(
         "defined",
     }
 )
-_STATIC_RE = re.compile(r"\bstatic\b")
+_SPECIFIER_RE = re.compile(r"\w+|\*")
+_NOT_TYPES = frozenset(
+    {
+        "static",
+        "extern",
+        "inline",
+        "__inline",
+        "__inline__",
+        "register",
+        "const",
+        "volatile",
+        "_Noreturn",
+        "__extension__",
+    }
+)
+_PARENS_RE = re.compile(r"\([^()]*\)")
 _TEST_DIRS = frozenset({"test", "tests", "unittest", "unittests", "kunit"})
 _TEST_STEM_RE = re.compile(r"^(?:test|kunit)[_-]|[_-](?:tests?|kunit)$")
 
@@ -125,7 +140,9 @@ class GitTree:
         return cls(root, sha.decode().strip())
 
     def paths(self) -> Sequence[str]:
-        out = _git(self.root, "ls-tree", "-r", "-z", "--name-only", self.commit)
+        out = _git(
+            self.root, "ls-tree", "-r", "-z", "--name-only", "--full-tree", self.commit
+        )
         return sorted(p for p in out.decode(errors="replace").split("\0") if p)
 
     def read(self, path: str) -> str:
@@ -169,7 +186,9 @@ def _trailing_call_name(head: str) -> str | None:
     """The function name in `head` (``<decl-specifiers> name(params)``), or None.
 
     The name before the *last* top-level parenthesised group, so a leading macro
-    such as ``__printf(1, 2) int log(...)`` does not capture the name.
+    such as ``__printf(1, 2) int log(...)`` does not capture the name. Something
+    must name a type before it, which keeps top-level macro invocations
+    (``EXPORT_SYMBOL(f);``, ``static DEFINE_MUTEX(m);``) from reading as functions.
     """
     text = _ATTRIBUTE_RE.sub(" ", head).rstrip()
     if not text.endswith(")"):
@@ -180,7 +199,10 @@ def _trailing_call_name(head: str) -> str | None:
         if depth <= 0:
             break
     found = _TRAILING_IDENT_RE.search(text[:i])
-    return found.group(1) if found else None
+    if found is None:
+        return None
+    specifiers = _SPECIFIER_RE.findall(text[: found.start()])
+    return found.group(1) if set(specifiers) - _NOT_TYPES else None
 
 
 def line_of(source: str, offset: int) -> int:
@@ -196,6 +218,7 @@ class ProjectIndex:
     ) -> None:
         self.tree = tree
         self.files = tuple(p for p in tree.paths() if p.endswith(tuple(suffixes)))
+        self._file_set = frozenset(self.files)
         self._sources: dict[str, str] = {}
         self._scans: dict[str, Scan] = {}
         self._refs: dict[str, tuple[FunctionRef, ...]] = {}
@@ -203,7 +226,7 @@ class ProjectIndex:
 
     def source(self, path: str) -> str:
         if path not in self._sources:
-            if path not in self.files:
+            if path not in self._file_set:
                 raise ProjectIndexError(f"{path!r} is not a source file of the tree")
             self._sources[path] = self.tree.read(path)
         return self._sources[path]
@@ -248,7 +271,7 @@ class ProjectIndex:
 
     def definition(self, path: str, name: str) -> FunctionRef | None:
         """The definition of `name` in `path`, or None (also for an unknown path)."""
-        if path not in self.files:
+        if path not in self._file_set:
             return None
         return next(
             (r for r in self.functions(path) if r.name == name and r.is_definition),
@@ -257,15 +280,25 @@ class ProjectIndex:
 
     def is_file_local(self, ref: FunctionRef) -> bool:
         """A ``static`` function of a ``.c`` file: no other file can call it."""
-        head = self.scan(ref.path).code[ref.start : ref.brace]
-        return ref.path.endswith(".c") and _STATIC_RE.search(head) is not None
+        if not ref.path.endswith(".c"):
+            return False
+        head = self.scan(ref.path).code[ref.start : ref.brace or ref.end]
+        while (flat := _PARENS_RE.sub(" ", head)) != head:
+            head = flat
+        return "static" in IDENT_RE.findall(head)
+
+    def has_local(self, path: str, name: str) -> bool:
+        """Whether `path` holds its own file-local function called `name`."""
+        return any(
+            r.name == name and self.is_file_local(r) for r in self.functions(path)
+        )
 
     def find(self, name: str, origin: str, reach: Reach) -> FunctionRef | None:
         """The definition of `name` (else a prototype), the unit's own file first."""
         found: FunctionRef | None = None
         for path in self.files_in_reach(origin, reach):
             for ref in self.functions(path):
-                if ref.name != name:
+                if ref.name != name or (path != origin and self.is_file_local(ref)):
                     continue
                 if ref.is_definition:
                     return ref
