@@ -74,7 +74,9 @@ def test_preparation_propagates_unexpected_parser_errors(
     source.write_text(_SCALAR_SOURCE)
     failure = RuntimeError("unexpected parser failure")
 
-    def broken_parser(source_text: str, function: str) -> UnitSignature:
+    def broken_parser(
+        source_text: str, function: str, **kwargs: object
+    ) -> UnitSignature:
         raise failure
 
     monkeypatch.setattr(

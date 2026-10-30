@@ -31,6 +31,7 @@ from .signature import (
     HarnessError,
     Param,
     ScalarParam,
+    StructParam,
     UnitSignature,
     extract_signature,
 )
@@ -136,6 +137,7 @@ class PropertyHarness:
     source_text: str
     length_bounds: LengthBounds = ()
     probe_source_text: str | None = None
+    assumption: str | None = None
 
 
 @dataclass(frozen=True)
@@ -192,6 +194,11 @@ def render_semantic_harness(
     ``__ESBMC_assert(0, NON_VACUITY_LABEL)``. Verified at the same k, a probe that
     fires (VIOLATED carrying the label) shows some path reaches the post-call
     point; a VERIFIED probe shows the postcondition was never evaluated.
+
+    A `StructParam` is one nondet ``T`` object (``T p__obj = nondet_T();``) with the
+    parameter bound to its address (``T *p = &p__obj;``), declared before the
+    domain so a clause may read ``p->field``. Nothing constrains it except the
+    domain: it can be a state no caller builds (`nondet_struct_note`).
     """
     # The source-level guard needs `unit_source`, so it stays here; every
     # `(signature, spec)` guard -- empty postcondition, `result_var` clash, void
@@ -211,10 +218,13 @@ def render_semantic_harness(
     returns_void = signature.return_ctype.strip() == "void"
 
     scalars: list[ScalarParam] = []
+    structs: list[StructParam] = []
     buffers: list[BufferParam] = []
     for param in signature.params:
         if isinstance(param, ScalarParam):
             scalars.append(param)
+        elif isinstance(param, StructParam):
+            structs.append(param)
         elif isinstance(param, BufferParam):
             buffers.append(param)
         else:
@@ -239,6 +249,8 @@ def render_semantic_harness(
         lines.append(
             f"    {scalar.ctype} {scalar.name} = {_nondet_slug(scalar.ctype)}();"
         )
+    for struct in structs:
+        lines += _render_struct(struct)
     pre_buffer, post_buffer = _split_assumptions(spec.preconditions, buffers)
     for pre in pre_buffer:
         lines.append(f"    __ESBMC_assume(({pre}));")
@@ -299,7 +311,7 @@ def build_property_harness(
     is the vacuity-probe twin of `source_text` (`render_semantic_harness`
     ``probe=True``), checked at the same k after a HELD.
     """
-    signature = extract_signature(unit_source, symbol)
+    signature = extract_signature(unit_source, symbol, infer_structs=True)
     spec = spec_from_property(prop)
     return PropertyHarness(
         source_text=render_semantic_harness(
@@ -313,6 +325,25 @@ def build_property_harness(
             max_len=max_len,
             probe=True,
         ),
+        assumption=nondet_struct_note(signature),
+    )
+
+
+def nondet_struct_note(signature: UnitSignature) -> str | None:
+    """What a verdict over a nondet struct parameter assumes, or None without one.
+
+    The struct starts as an arbitrary ``T``, including states no caller can build,
+    and the harness never discharges that at a caller that does build one, so a
+    result is conditional on the domain and is *assumed*, not unconditional.
+    """
+    structs = [p for p in signature.params if isinstance(p, StructParam)]
+    if not structs:
+        return None
+    subjects = ", ".join(f"{p.name} ({p.elem_ctype})" for p in structs)
+    return (
+        f"{subjects} start as nondet struct values: any field contents, including "
+        "states no caller can build; a result holds only under the domain and is "
+        "not discharged at the callers that construct the type"
     )
 
 
@@ -414,7 +445,7 @@ def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | 
                 )
     return _mixed_buffer_length_reason(
         spec.preconditions,
-        [p for p in signature.params if isinstance(p, BufferParam)],
+        _plain_buffers(signature.params),
     )
 
 
@@ -449,7 +480,7 @@ def plan_length_bounds(
     if max_len < 0:
         raise HarnessError(f"max_len must be >= 0, got {max_len}")
     scalar_names = {p.name for p in signature.params if isinstance(p, ScalarParam)}
-    buffers = [p for p in signature.params if isinstance(p, BufferParam)]
+    buffers = _plain_buffers(signature.params)
     buffer_names = {buf.name for buf in buffers}
     constraining = [
         _strip_buffer_subscripts(pre, buffer_names) for pre in spec.preconditions
@@ -579,6 +610,24 @@ def _render_buffer(buf: BufferParam) -> list[str]:
             f"{buf.name}[_i] = {_nondet_slug(buf.elem_ctype)}();"
         )
     return lines
+
+
+def _plain_buffers(params: Sequence[Param]) -> list[BufferParam]:
+    """The buffer params that are not a single struct instance (`StructParam`)."""
+    return [
+        p
+        for p in params
+        if isinstance(p, BufferParam) and not isinstance(p, StructParam)
+    ]
+
+
+def _render_struct(struct: StructParam) -> list[str]:
+    """One nondet object for a struct parameter, bound as a pointer to it."""
+    obj = f"{struct.name}__obj"
+    return [
+        f"    {struct.elem_ctype} {obj} = {_nondet_slug(struct.elem_ctype)}();",
+        f"    {struct.elem_ctype} *{struct.name} = &{obj};",
+    ]
 
 
 def _call_arg(param: Param) -> str:

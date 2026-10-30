@@ -53,22 +53,48 @@ _CLOSING_CAST = re.compile(
 )
 
 
-def identifiers(expr: str) -> list[str]:
-    """Identifier tokens in `expr`, in first-seen order, numeric literals removed.
+# A member name after `->` or `.`: a field, not a variable, so it never counts as a
+# reference to a parameter of the same spelling (`ctx->data` does not name `data`).
+_MEMBER = re.compile(r"(->|\.)\s*[A-Za-z_]\w*")
+# `base->field` / `base.field` where `base` is a bare identifier, not itself a member
+# access or the tail of a call/subscript/cast (`a->b->c` yields only `a->b`).
+_MEMBER_ACCESS = re.compile(r"(?<![\w.>)\]])([A-Za-z_]\w*)\s*(->|\.)\s*([A-Za-z_]\w*)")
 
-    Stripping literals first keeps a hex constant like ``0x1F`` from being misread
-    as an identifier ``x1F``.
+
+def _without_members(expr: str) -> str:
+    return _MEMBER.sub(lambda m: " " * len(m.group(0)), expr)
+
+
+def identifiers(expr: str) -> list[str]:
+    """Variable-like identifier tokens in `expr`, first-seen order.
+
+    Numeric literals are stripped first, so a hex constant like ``0x1F`` is not
+    misread as an identifier ``x1F``; member names after ``->``/``.`` are stripped
+    too, so ``r->count`` names ``r`` only.
     """
-    return _IDENT.findall(_NUMERIC_LITERAL.sub(" ", expr))
+    return _IDENT.findall(_without_members(_NUMERIC_LITERAL.sub(" ", expr)))
 
 
 def references(expr: str, ident: str) -> bool:
     """True if `expr` names the identifier `ident` as a whole word.
 
     Word-boundary matching, so ``result`` does not match ``result2`` and the ``u``
-    suffix inside ``10u`` is not read as a reference to an output named ``u``.
+    suffix inside ``10u`` is not read as a reference to an output named ``u``. A
+    member name does not count: ``ctx->len`` does not reference ``len``.
     """
-    return re.search(rf"\b{re.escape(ident)}\b", expr) is not None
+    return re.search(rf"\b{re.escape(ident)}\b", _without_members(expr)) is not None
+
+
+def member_accesses(expr: str) -> list[tuple[str, str, str]]:
+    """``(base, operator, member)`` per ``base->member`` / ``base.member`` in `expr`.
+
+    Only a bare identifier counts as a base, so the first hop of ``r->a.b`` is
+    reported and the nested ``.b`` is not: what ``a`` is cannot be told lexically.
+    """
+    return [
+        (m.group(1), m.group(2), m.group(3))
+        for m in _MEMBER_ACCESS.finditer(_NUMERIC_LITERAL.sub(" ", expr))
+    ]
 
 
 def unsafe_reason(expr: str) -> str | None:

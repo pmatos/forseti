@@ -67,6 +67,7 @@ def render_prompt(
     result_ident: str = RESULT_IDENT,
     max_candidates: int = MAX_CANDIDATES_DEFAULT,
     context: str | None = None,
+    note: str | None = None,
 ) -> str:
     """Fill a template's sentinels for one unit; return the ready-to-send prompt.
 
@@ -74,15 +75,19 @@ def render_prompt(
     present; `None` keeps the prompt byte-identical to the whole-file one. The
     rendered source/context is substituted *last*: the unit's C source may itself
     contain text that looks like a sentinel's replacement, and substituting it
-    last means such text is never re-scanned for further tokens.
+    last means such text is never re-scanned for further tokens. `note` is a
+    unit-specific addendum appended after the template (a struct-pointer
+    parameter's reading); `None` leaves the template's text untouched, so a unit
+    without one is byte-identical to before.
     """
-    return (
+    rendered = (
         template.template.replace(_UNIT, unit_id)
         .replace(_SYMBOL, symbol)
         .replace(_RESULT, result_ident)
         .replace(_MAX, str(max_candidates))
         .replace(_SOURCE, source_text if context is None else context)
     )
+    return rendered if note is None else f"{rendered}\n{note}"
 
 
 _SEMANTIC_V1_TEXT = """\

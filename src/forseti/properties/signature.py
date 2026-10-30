@@ -17,7 +17,7 @@ the only alternative. No libclang/pycparser: the base install is dependency-free
 from __future__ import annotations
 
 import re
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 
 
@@ -63,8 +63,12 @@ class StructParam(BufferParam):
     and binds one nondet instance passed by address. `elem_ctype` is the type
     (``ring_t`` or ``struct node``); `const` is about the *pointee*
     (``const T *p``), the only thing that decides whether the unit can mutate it --
-    ``T *const p`` is still a mutator.
+    ``T *const p`` is still a mutator. `fields` are the member names the unit's
+    own definition of the struct declares (empty when it is not visible), so a
+    property can be checked for naming a member that does not exist.
     """
+
+    fields: tuple[str, ...] = ()
 
 
 Param = ScalarParam | BufferParam  # sealed union (repo style)
@@ -116,7 +120,11 @@ _FLOAT_TYPE_RE = re.compile(r"\b(?:float|double)\b")
 
 
 def extract_signature(
-    unit_source: str, symbol: str, *, struct_types: Collection[str] = ()
+    unit_source: str,
+    symbol: str,
+    *,
+    struct_types: Collection[str] = (),
+    infer_structs: bool = False,
 ) -> UnitSignature:
     """Best-effort regex parse of `symbol`'s signature from `unit_source`.
 
@@ -135,6 +143,11 @@ def extract_signature(
     ``ring_t`` or ``struct node``) is a `StructParam` instead, whatever follows it:
     ``(ring_t *r, int v)`` is not a buffer of length ``v``. Empty by default, so
     every existing caller parses exactly as before.
+
+    `infer_structs=True` additionally treats a pointer to any struct *defined in
+    `unit_source`* (`struct_definitions`) as a `StructParam`, unless an integer
+    parameter named like a length follows it (``(point_t *pts, size_t n)`` stays
+    the buffer idiom). A struct the source does not define keeps the old reading.
     """
     pattern = re.compile(
         r"([A-Za-z_][\w \t\*]*?[\s\*])" + re.escape(symbol) + r"\s*\(([^)]*)\)\s*\{"
@@ -148,11 +161,102 @@ def extract_signature(
     if not return_ctype:
         raise HarnessError(f"could not parse the return type of {symbol!r}")
     raws = [_parse_fragment(frag, symbol) for frag in _split_params(match.group(2))]
+    defined = struct_definitions(unit_source) if infer_structs or struct_types else {}
     return UnitSignature(
         symbol=symbol,
         return_ctype=return_ctype,
-        params=_to_params(raws, frozenset(struct_types)),
+        params=_to_params(
+            raws,
+            frozenset(struct_types),
+            defined,
+            infer=defined if infer_structs else {},
+        ),
     )
+
+
+_COMMENT = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
+_STRUCT_HEAD = re.compile(r"\bstruct\b\s*(\w+)?\s*\{")
+_FIELD_FUNCTION_POINTER = re.compile(r"\(\s*\*\s*(\w+)")
+_FIELD_NOISE = re.compile(r"\[[^\]]*\]|:\s*\w+\s*$|=.*$|\*")
+_TYPEDEF_TAIL = re.compile(r"\s*([^;{}]*);")
+
+
+def struct_definitions(unit_source: str) -> dict[str, tuple[str, ...]]:
+    """Member names of every struct `unit_source` defines, keyed by spelling.
+
+    ``typedef struct {...} ring_t;`` is keyed ``ring_t``; ``struct node {...}`` is
+    keyed ``struct node``; ``typedef struct node {...} node_t;`` gets both. Regex,
+    comment-aware and best-effort like the rest of this parser: a member of a
+    nested struct is not listed (the nested member is named, not its contents), a
+    struct only reachable through an ``#include`` is not seen, and a definition it
+    cannot read is left out rather than guessed.
+    """
+    text = _COMMENT.sub(" ", unit_source)
+    found: dict[str, tuple[str, ...]] = {}
+    for head in _STRUCT_HEAD.finditer(text):
+        close = _matching_brace(text, head.end() - 1)
+        if close is None:
+            continue
+        fields = _struct_fields(text[head.end() : close])
+        if not fields:
+            continue
+        if head.group(1):
+            found.setdefault(f"struct {head.group(1)}", fields)
+        if re.search(r"\btypedef\s*$", text[: head.start()]):
+            tail = _TYPEDEF_TAIL.match(text, close + 1)
+            for declarator in (tail.group(1) if tail else "").split(","):
+                name = declarator.strip()
+                if re.fullmatch(r"[A-Za-z_]\w*", name):
+                    found.setdefault(name, fields)
+    return found
+
+
+def _matching_brace(text: str, open_at: int) -> int | None:
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
+def _struct_fields(body: str) -> tuple[str, ...]:
+    flat: list[str] = []
+    depth = 0
+    for ch in body:
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        elif depth == 0:
+            flat.append(ch)
+    names: list[str] = []
+    for declaration in "".join(flat).split(";"):
+        names += _declared_names(declaration)
+    return tuple(dict.fromkeys(names))
+
+
+def _declared_names(declaration: str) -> list[str]:
+    if pointer := _FIELD_FUNCTION_POINTER.search(declaration):
+        return [pointer.group(1)]
+    names: list[str] = []
+    for index, declarator in enumerate(_split_params(declaration)):
+        words = _FIELD_NOISE.sub(" ", declarator).split()
+        # the first declarator carries the type, so a lone word there is an
+        # unnamed bit-field (``int : 3``) or a bare type, not a member
+        if len(words) > (1 if index == 0 else 0) and re.fullmatch(r"\w+", words[-1]):
+            names.append(words[-1])
+    return names
+
+
+_LENGTH_NAME = re.compile(
+    r"(?:n|len|length|size|count|num|nmemb|cap|capacity)|.*_(?:len|length|size|count|n)"
+    r"|(?:n|num)_.*",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -209,7 +313,10 @@ def _parse_fragment(frag: str, symbol: str) -> _RawParam:
 
 
 def _to_params(
-    raws: Sequence[_RawParam], struct_types: frozenset[str]
+    raws: Sequence[_RawParam],
+    struct_types: frozenset[str],
+    defined: Mapping[str, tuple[str, ...]],
+    infer: Mapping[str, tuple[str, ...]],
 ) -> tuple[Param, ...]:
     params: list[Param] = []
     for i, raw in enumerate(raws):
@@ -217,10 +324,10 @@ def _to_params(
             params.append(ScalarParam(ctype=raw.type_str, name=raw.name))
             continue
         pointee = _elem_ctype(raw.type_str)
-        if (
-            raw.array_len is None
-            and raw.type_str.count("*") == 1
-            and pointee in struct_types
+        nxt = raws[i + 1] if i + 1 < len(raws) else None
+        single = raw.array_len is None and raw.type_str.count("*") == 1
+        if single and (
+            pointee in struct_types or (pointee in infer and not _is_length_param(nxt))
         ):
             params.append(
                 StructParam(
@@ -228,10 +335,10 @@ def _to_params(
                     name=raw.name,
                     length="1",
                     const=_pointee_is_const(raw.type_str),
+                    fields=defined.get(pointee, ()),
                 )
             )
             continue
-        nxt = raws[i + 1] if i + 1 < len(raws) else None
         if raw.array_len:
             length, out = raw.array_len, False
         elif nxt is not None and not nxt.is_ptr and _is_integer_type(nxt.type_str):
@@ -260,6 +367,16 @@ def _to_params(
             )
         )
     return tuple(params)
+
+
+def _is_length_param(raw: _RawParam | None) -> bool:
+    """An integer parameter named like a count: the (buffer, length) idiom's tail."""
+    return (
+        raw is not None
+        and not raw.is_ptr
+        and _is_integer_type(raw.type_str)
+        and _LENGTH_NAME.fullmatch(raw.name) is not None
+    )
 
 
 def _elem_ctype(type_str: str) -> str:

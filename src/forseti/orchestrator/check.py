@@ -319,6 +319,7 @@ class SemanticHarnessWriter:
             source_text=harness.source_text,
             length_bounds=harness.length_bounds,
             probe_source_text=harness.probe_source_text,
+            assumption=harness.assumption,
         )
 
 
