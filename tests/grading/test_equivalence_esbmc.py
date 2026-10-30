@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import shutil
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
@@ -119,6 +120,7 @@ def test_in_place_buffer_difference_is_found_in_the_buffer() -> None:
     )
     assert isinstance(got, EquivalenceViolated)
     assert got.witness.diverging.startswith("a[")
+    assert got.assumptions == ()
     assert any(label.startswith("a[") for label, _ in got.witness.inputs)
 
 
@@ -230,3 +232,32 @@ def test_faulting_original_is_refused_once_by_the_filter() -> None:
     )
     assert got.skipped == 0
     assert got.original_refusal is not None
+
+
+def _example_kernel(name: str) -> str:
+    text = (Path(__file__).resolve().parents[2] / "examples" / name).read_text()
+    return text[: text.index("int main(void)")]
+
+
+def test_merge_sort_against_itself_is_verified_up_to_k() -> None:
+    src = _example_kernel("merge_sort.c")
+    got = check_equivalence(
+        reference=src, candidate=src, symbol="msort", k=4, max_len=2, timeout_s=120
+    )
+    assert isinstance(got, EquivalenceVerified)
+    assert got.length_bounds == (("hi", 2),)
+    assert got.assumptions == ("0 <= lo <= hi",)
+
+
+def test_merge_sort_without_its_tail_drain_is_violated() -> None:
+    got = check_equivalence(
+        reference=_example_kernel("merge_sort.c"),
+        candidate=_example_kernel("merge_sort_bug.c"),
+        symbol="msort",
+        k=4,
+        max_len=2,
+        timeout_s=120,
+    )
+    assert isinstance(got, EquivalenceViolated)
+    assert got.witness.diverging.startswith("a[")
+    assert got.assumptions == ("0 <= lo <= hi",)

@@ -186,10 +186,85 @@ def test_ring_buffer_example_is_refused() -> None:
     assert "file-scope" in reason
 
 
-def test_merge_sort_example_is_refused_for_its_mistyped_output() -> None:
-    reason = refusal(example_slice("merge_sort.c"), symbol="msort")
-    assert "`tmp`" in reason
+def test_merge_sort_example_is_modelled_with_hi_long_buffers() -> None:
+    src = example_slice("merge_sort.c")
+    harness = render_equivalence_harness(
+        reference_source=src, candidate_source=src, symbol="msort", max_len=2
+    )
+    text = harness.source_text
+    assert harness.length_bounds == (("hi", 2),)
+    assert "int *a = malloc((hi) * sizeof(int));" in text
+    assert "int *tmp = malloc((hi) * sizeof(int));" in text
+    assert "__ESBMC_assume((lo >= 0 && lo <= hi));" in text
+    assert "msort__ref(__forseti_ref_a, lo, hi, __forseti_ref_tmp);" in text
+    labels = {label for label, _ in harness.input_vars}
+    assert {"a[0]", "a[1]", "tmp[0]", "tmp[1]"} <= labels
+
+
+def test_forwarded_trailing_pointer_outside_a_range_is_still_refused() -> None:
+    src = "void g(int *t);\nvoid f(int *a, int n, int *t) { g(t); }\n"
+    reason = refusal(src, symbol="f")
+    assert "`t`" in reason
     assert "dereference" in reason
+
+
+def test_non_range_buffer_gets_no_lower_bound_assumption() -> None:
+    text = render(SUM, SUM, "sum")
+    assert text.count(">= 0 &&") == 1
+
+
+def test_harness_records_the_range_domain_it_assumes() -> None:
+    src = example_slice("merge_sort.c")
+    ranged = render_equivalence_harness(
+        reference_source=src, candidate_source=src, symbol="msort", max_len=2
+    )
+    assert ranged.assumptions == ("0 <= lo <= hi",)
+    plain = render_equivalence_harness(
+        reference_source=SUM, candidate_source=SUM, symbol="sum"
+    )
+    assert plain.assumptions == ()
+
+
+def test_range_idiom_verdicts_carry_the_assumed_domain() -> None:
+    src = example_slice("merge_sort.c")
+    verified = check_equivalence(
+        reference=src,
+        candidate=src,
+        symbol="msort",
+        k=4,
+        max_len=2,
+        verify_port=RecordingPort(Verified(META)),
+    )
+    assert isinstance(verified, EquivalenceVerified)
+    assert verified.assumptions == ("0 <= lo <= hi",)
+    cex = counterexample("forseti:equivalence:a[0]", "main")
+    violated = check_equivalence(
+        reference=src,
+        candidate=src,
+        symbol="msort",
+        k=4,
+        max_len=2,
+        verify_port=RecordingPort(Violated(META, "raw", cex)),
+    )
+    assert isinstance(violated, EquivalenceViolated)
+    assert violated.assumptions == ("0 <= lo <= hi",)
+
+
+def test_non_range_verdicts_carry_no_assumption() -> None:
+    verified = check_equivalence(
+        reference=SUM,
+        candidate=SUM,
+        symbol="sum",
+        k=5,
+        verify_port=RecordingPort(Verified(META)),
+    )
+    assert isinstance(verified, EquivalenceVerified)
+    assert verified.assumptions == ()
+    violated = run(
+        Violated(META, "raw", counterexample("forseti:equivalence:return", "main"))
+    )
+    assert isinstance(violated, EquivalenceViolated)
+    assert violated.assumptions == ()
 
 
 @pytest.mark.parametrize(
@@ -461,6 +536,49 @@ def test_filter_skips_only_verified_mutants() -> None:
         "m3": "refused",
     }
     assert (report["k"], report["max_len"]) == (4, 8)
+
+
+def test_filter_reports_the_assumed_domain() -> None:
+    domain = ("0 <= lo <= hi",)
+    table: dict[str, EquivalenceResult] = {
+        "eq": EquivalenceVerified(4, (), META, domain),
+        "unk": EquivalenceUnknown(4, (), EqUnknownReason.TIMEOUT, "timeout", META),
+    }
+    got = filter_equivalent(
+        DOUBLE,
+        [FakeMutant("m1", "eq"), FakeMutant("m2", "unk")],
+        4,
+        symbol="f",
+        checker=scripted(table),
+    )
+    assert got.assumptions == domain
+    assert got.to_dict()["assumed"] == ["0 <= lo <= hi"]
+
+
+def test_filter_assumptions_dedupe_and_include_violated() -> None:
+    domain = ("0 <= lo <= hi",)
+    table: dict[str, EquivalenceResult] = {
+        "a": EquivalenceVerified(4, (), META, domain),
+        "b": EquivalenceVerified(4, (), META, domain),
+        "c": EquivalenceViolated(4, (), counterexample_witness(), "raw", META, domain),
+    }
+    got = filter_equivalent(
+        DOUBLE,
+        [FakeMutant("m1", "a"), FakeMutant("m2", "b"), FakeMutant("m3", "c")],
+        4,
+        symbol="f",
+        checker=scripted(table),
+    )
+    assert got.assumptions == domain
+
+
+def test_filter_without_a_range_idiom_reports_no_assumption() -> None:
+    table: dict[str, EquivalenceResult] = {"eq": EquivalenceVerified(4, (), META)}
+    got = filter_equivalent(
+        DOUBLE, [FakeMutant("m1", "eq")], 4, symbol="f", checker=scripted(table)
+    )
+    assert got.assumptions == ()
+    assert got.to_dict()["assumed"] == []
 
 
 def test_filter_keeps_divergent_mutants() -> None:

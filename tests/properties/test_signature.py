@@ -22,6 +22,7 @@ from forseti.properties.signature import (
     ScalarParam,
     UnitSignature,
     extract_signature,
+    range_lower_bounds,
 )
 
 ABS_SLICE = "int64_t my_abs(int64_t x) { return (x < 0) ? -x : x; }"
@@ -142,10 +143,23 @@ def test_extract_signature_declared_array_length_is_not_a_range_buffer() -> None
     assert sig.params[3] == BufferParam("int", "r", "1", out=True)
 
 
-def test_extract_signature_range_idiom_can_be_disabled() -> None:
-    sig = extract_signature(MSORT_DEF, "msort", range_idiom=False)
-    assert sig.params[0] == BufferParam("int", "a", "lo")
-    assert sig.params[3] == BufferParam("int", "tmp", "1", out=True)
+def test_range_lower_bounds_names_each_applied_range_idiom() -> None:
+    assert range_lower_bounds(extract_signature(MSORT_DEF, "msort")) == (("lo", "hi"),)
+    assert range_lower_bounds(
+        extract_signature("void f(char *s, size_t start, size_t end) { }", "f")
+    ) == (("start", "end"),)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "void f(int *a, int n, int m) { }",
+        "void f(int lo, int hi) { }",
+        "void f(int a[4], int lo, int hi) { }",
+    ],
+)
+def test_range_lower_bounds_is_empty_without_a_range_buffer(source: str) -> None:
+    assert range_lower_bounds(extract_signature(source, "f")) == ()
 
 
 def test_extract_signature_non_range_names_keep_the_length_idiom() -> None:

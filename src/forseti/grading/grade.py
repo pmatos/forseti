@@ -223,6 +223,7 @@ class GradeRun:
     equivalence_max_len: int | None = None
     equivalent: tuple[str, ...] = ()
     equivalence_undecided: tuple[str, ...] = ()
+    equivalence_assumed: tuple[str, ...] = ()
     original_refusal: str | None = None
     baseline_esbmc_time_s: float = 0.0
     equivalence_esbmc_time_s: float = 0.0
@@ -285,6 +286,7 @@ class GradeRun:
                 "skipped": len(self.equivalent),
                 "skipped_equivalent": list(self.equivalent),
                 "undecided": list(self.equivalence_undecided),
+                "assumed": list(self.equivalence_assumed),
                 "original_refusal": self.original_refusal,
             },
             "esbmc_time_s": {
@@ -611,6 +613,7 @@ def grade_unit(
         equivalence_max_len=eq_max_len,
         equivalent=tuple(s.id for s in filtered.skipped_equivalent),
         equivalence_undecided=filtered.undecided,
+        equivalence_assumed=filtered.assumptions,
         original_refusal=filtered.original_refusal,
         equivalence_esbmc_time_s=checker.seconds,
     )
@@ -667,6 +670,7 @@ def trace_rows(run: GradeRun) -> list[tuple[str, dict[str, Any]]]:
                 "mutants_dropped": run.dropped,
                 "mutants_equivalent": len(run.equivalent),
                 "equivalence_k": run.equivalence_k,
+                "equivalence_assumed": list(run.equivalence_assumed),
                 "esbmc_time_s": run.esbmc_time_s,
             },
         )
@@ -728,6 +732,8 @@ def grade_transcript(run: GradeRun) -> str:
         f"mutants: {run.generated} generated, {run.dropped} dropped as invalid, "
         f"{len(run.equivalent)} skipped as equivalent (k={run.equivalence_k})"
     )
+    if run.equivalence_assumed:
+        lines.append("equivalence check assumed: " + ", ".join(run.equivalence_assumed))
     if run.original_refusal:
         lines.append(
             f"equivalence filter off: original not modelled ({run.original_refusal})"

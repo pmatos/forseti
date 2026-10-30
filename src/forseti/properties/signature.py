@@ -19,6 +19,7 @@ from __future__ import annotations
 import re
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
+from itertools import pairwise
 
 
 class HarnessError(ValueError):
@@ -149,7 +150,6 @@ def extract_signature(
     *,
     struct_types: Collection[str] = (),
     infer_structs: bool = False,
-    range_idiom: bool = True,
 ) -> UnitSignature:
     """Best-effort regex parse of `symbol`'s signature from `unit_source`.
 
@@ -181,8 +181,6 @@ def extract_signature(
     scratch buffer, ``msort``'s ``tmp``) is as long and an output, not a single
     element.
     The upper bound is read as exclusive (``a[lo..hi)``) and matched by name only.
-    `range_idiom=False` keeps the plain ``(buf, len)`` reading for a caller whose
-    behaviour is pinned to it (the equivalence filter refuses such a unit).
     """
     pattern = re.compile(
         r"([A-Za-z_][\w \t\*]*?[\s\*])" + re.escape(symbol) + r"\s*\(([^)]*)\)\s*\{"
@@ -196,7 +194,7 @@ def extract_signature(
     if not return_ctype:
         raise HarnessError(f"could not parse the return type of {symbol!r}")
     raws = [_parse_fragment(frag, symbol) for frag in _split_params(match.group(2))]
-    ranged = range_idiom and any(
+    ranged = any(
         raw.is_ptr and _range_upper_bound(raws[i + 1 : i + 3]) is not None
         for i, raw in enumerate(raws)
     )
@@ -211,9 +209,7 @@ def extract_signature(
     return UnitSignature(
         symbol=symbol,
         return_ctype=return_ctype,
-        params=_to_params(
-            raws, frozenset(struct_types), defined, infer_structs, body, range_idiom
-        ),
+        params=_to_params(raws, frozenset(struct_types), defined, infer_structs, body),
     )
 
 
@@ -378,7 +374,6 @@ def _to_params(
     defined: Mapping[str, tuple[str, ...]],
     infer: bool,
     body: str,
-    range_idiom: bool,
 ) -> tuple[Param, ...]:
     params: list[Param] = []
     scratch_of: tuple[str, str] | None = None
@@ -403,7 +398,7 @@ def _to_params(
                 )
             )
             continue
-        range_upper = _range_upper_bound(raws[i + 1 : i + 3]) if range_idiom else None
+        range_upper = _range_upper_bound(raws[i + 1 : i + 3])
         if raw.array_len:
             length, out = raw.array_len, False
         elif range_upper is not None:
@@ -465,6 +460,24 @@ def _range_upper_bound(following: Sequence[_RawParam]) -> str | None:
         return None
     lower, upper = following
     return upper.name if (lower.name, upper.name) in _RANGE_BOUNDS else None
+
+
+def range_lower_bounds(signature: UnitSignature) -> tuple[tuple[str, str], ...]:
+    """The ``(lower, upper)`` names of each range idiom `extract_signature` applied.
+
+    A buffer sized by an upper bound is only addressable for ``0 <= lower <=
+    upper``; a harness that draws ``lower`` freely would read outside it.
+    """
+    params = signature.params
+    buffer_lengths = {p.length for p in params if isinstance(p, BufferParam)}
+    return tuple(
+        (lower.name, upper.name)
+        for lower, upper in pairwise(params)
+        if isinstance(lower, ScalarParam)
+        and isinstance(upper, ScalarParam)
+        and (lower.name, upper.name) in _RANGE_BOUNDS
+        and upper.name in buffer_lengths
+    )
 
 
 def _is_single_element(name: str, body: str) -> bool:

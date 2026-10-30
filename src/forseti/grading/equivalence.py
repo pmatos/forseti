@@ -25,6 +25,9 @@ reported alongside the filter's result.
 Scope of the shared translation unit (v1, fail closed): sources that define a
 file-scope object, a file-scope aggregate, ``main``, or function-local ``static``
 state are refused, as are non-arithmetic parameters and mismatched signatures.
+A ``(buf, lo, hi)`` range-idiom unit is modelled with ``buf`` (and a trailing
+scratch pointer) as ``hi`` long and ``0 <= lo <= hi`` assumed, since a free ``lo``
+addresses outside the buffer in the reference itself (``examples/merge_sort.c``).
 Conditional directives and ``#pragma`` are refused. State hidden behind an
 ``#include``, and calls to functions defined in neither source (each draws an
 independent nondet), are not visible to this text-level analysis.
@@ -66,6 +69,7 @@ from forseti.properties import (
     UnitSignature,
     extract_signature,
     plan_length_bounds,
+    range_lower_bounds,
     renderability_reason,
 )
 
@@ -133,11 +137,17 @@ class Witness:
 
 @dataclass(frozen=True)
 class EquivalenceVerified:
-    """No divergence found up to `k` and `length_bounds` (not for all inputs)."""
+    """No divergence found up to `k` and `length_bounds` (not for all inputs).
+
+    `assumptions` lists the input domain the harness assumed (``0 <= lo <= hi``
+    for a range-idiom unit, empty otherwise); a divergence only outside it is not
+    looked for, so the verdict holds under those assumptions.
+    """
 
     k: int
     length_bounds: LengthBounds
     meta: RunMeta
+    assumptions: tuple[str, ...] = ()
 
     @property
     def verdict(self) -> EquivalenceVerdict:
@@ -146,13 +156,14 @@ class EquivalenceVerified:
 
 @dataclass(frozen=True)
 class EquivalenceViolated:
-    """The versions disagree on `witness`."""
+    """The versions disagree on `witness`, an input within `assumptions`."""
 
     k: int
     length_bounds: LengthBounds
     witness: Witness
     raw_counterexample: str = field(repr=False)
     meta: RunMeta = field(repr=False)
+    assumptions: tuple[str, ...] = ()
 
     @property
     def verdict(self) -> EquivalenceVerdict:
@@ -205,6 +216,7 @@ class EquivalenceHarness:
     length_bounds: LengthBounds
     input_vars: tuple[tuple[str, str], ...]
     outputs: tuple[_Output, ...]
+    assumptions: tuple[str, ...] = ()
 
 
 def render_equivalence_harness(
@@ -255,6 +267,9 @@ def render_equivalence_harness(
         inputs.append((p.name, p.name))
     for name, bound in bounds:
         body.append(f"    __ESBMC_assume(({name} >= 0 && {name} <= {bound}));")
+    ranges = range_lower_bounds(signature)
+    for lower, upper in ranges:
+        body.append(f"    __ESBMC_assume(({lower} >= 0 && {lower} <= {upper}));")
 
     ref_args: dict[str, str] = {p.name: p.name for p in scalars}
     cand_args: dict[str, str] = dict(ref_args)
@@ -349,6 +364,7 @@ def render_equivalence_harness(
         length_bounds=bounds,
         input_vars=tuple(inputs),
         outputs=tuple(outputs),
+        assumptions=tuple(f"0 <= {lower} <= {upper}" for lower, upper in ranges),
     )
 
 
@@ -413,7 +429,7 @@ def _classify(
 ) -> EquivalenceResult:
     bounds = harness.length_bounds
     if isinstance(result, Verified):
-        return EquivalenceVerified(k, bounds, result.meta)
+        return EquivalenceVerified(k, bounds, result.meta, harness.assumptions)
     if isinstance(result, EsbmcUnknown):
         reason = UnknownReason.__members__.get(
             result.reason.name, UnknownReason.UNCLASSIFIED
@@ -433,6 +449,7 @@ def _classify(
             _witness(cex, harness, description),
             result.raw_counterexample,
             result.meta,
+            harness.assumptions,
         )
     function = cex.violated_property.loc.function if cex else None
     where = function or "unknown location"
@@ -504,6 +521,18 @@ class EquivalenceFilter[M: MutantLike]:
         return len(self.skipped_equivalent)
 
     @property
+    def assumptions(self) -> tuple[str, ...]:
+        """The input domain assumed by the decided checks (``()`` if none)."""
+        return tuple(
+            dict.fromkeys(
+                a
+                for _, r in self.results
+                if isinstance(r, EquivalenceVerified | EquivalenceViolated)
+                for a in r.assumptions
+            )
+        )
+
+    @property
     def undecided(self) -> tuple[str, ...]:
         """Ids kept because the check was UNKNOWN or refused."""
         return tuple(
@@ -521,6 +550,7 @@ class EquivalenceFilter[M: MutantLike]:
             "kept": [m.id for m in self.kept],
             "undecided": list(self.undecided),
             "original_refusal": self.original_refusal,
+            "assumed": list(self.assumptions),
             "verdicts": {i: r.verdict.value for i, r in self.results},
         }
 
@@ -758,8 +788,8 @@ def _out_param_refusal(signature: UnitSignature, body: str, label: str) -> str |
     """A single-element output must only be dereferenced.
 
     `extract_signature` types a trailing non-const pointer as a one-element output;
-    a pointer forwarded, indexed or advanced is really a buffer of unknown extent
-    (e.g. ``msort``'s ``tmp``), so the harness would model it wrongly.
+    a pointer forwarded, indexed or advanced is really a buffer of unknown extent,
+    so the harness would model it wrongly.
     """
     for p in signature.params:
         if not (isinstance(p, BufferParam) and _is_cell(p)):
@@ -806,9 +836,7 @@ def _prepare(reference: str, candidate: str, symbol: str) -> tuple[UnitSignature
             raise EquivalenceRefusal(f"{label} source does not define `{symbol}`")
         scans[label] = scan
         try:
-            sigs[label] = extract_signature(
-                mask_comments(source), symbol, range_idiom=False
-            )
+            sigs[label] = extract_signature(mask_comments(source), symbol)
         except HarnessError as exc:
             raise EquivalenceRefusal(f"{label} signature not modelled: {exc}") from exc
         reason = _fragment_refusal(view, symbol) or _signature_refusal(sigs[label])
