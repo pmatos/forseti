@@ -39,6 +39,7 @@ from .harness import (
     UnitSignature,
     renderability_reason,
 )
+from .invariant import INVARIANT_ASSUMPTION_NOTE
 from .llm import LLMClient
 from .model import (
     Property,
@@ -99,7 +100,8 @@ class CandidateSpec:
 
     Mirrors the JSON contract the prompt asks for. `kind` is captured only so a
     stray non-semantic candidate can be rejected (ADR-0009 D2); the prompt never
-    asks for it, so it is usually `None`.
+    asks for it, so it is usually `None`. `type_name` (the JSON ``type``) names the
+    struct type of a ``rep-invariant`` candidate (#420); a semantic candidate has none.
     """
 
     expression: str
@@ -107,6 +109,7 @@ class CandidateSpec:
     referenced_params: tuple[str, ...] = ()
     rationale: str = ""
     kind: str | None = None
+    type_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -135,6 +138,8 @@ class ProposalResult:
     `to_dict` is the JSON shape #44 serialises (mirrors `core/verify.py`'s
     payload style). `provider`/`model` record the backend for telemetry; the
     persisted `Property.provenance` carries only prompt id/version by design.
+    An accepted representation invariant adds an `assumption` note: it is assumed,
+    never discharged at the callers that construct the type.
     """
 
     unit_id: str
@@ -147,7 +152,7 @@ class ProposalResult:
     model_raw: str
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "unit_id": self.unit_id,
             "prompt_id": self.prompt_id,
             "prompt_version": self.prompt_version,
@@ -156,6 +161,9 @@ class ProposalResult:
             "accepted": [prop.to_dict() for prop in self.accepted],
             "rejected": [rej.to_dict() for rej in self.rejected],
         }
+        if any(prop.kind is PropertyKind.REP_INVARIANT for prop in self.accepted):
+            payload["assumption"] = INVARIANT_ASSUMPTION_NOTE
+        return payload
 
 
 class ProposalParseError(ValueError):
@@ -352,8 +360,8 @@ def parse_candidates(model_text: str) -> tuple[CandidateSpec, ...]:
     Tolerates a markdown ```` ```json ... ``` ```` fence and either a
     ``{"candidates":[...]}`` object or a bare top-level list. Every element must
     be an object with a non-empty string ``expression``; ``domain`` /
-    ``referenced_params`` (string lists) and ``rationale`` / ``kind`` (strings)
-    are optional. Anything else fails loud -- never a silent empty result.
+    ``referenced_params`` (string lists) and ``rationale`` / ``kind`` / ``type``
+    (strings) are optional. Anything else fails loud -- never a silent empty result.
     """
     text = _strip_fences(model_text)
     try:
@@ -545,6 +553,7 @@ def parse_candidate(elem: object, index: int) -> CandidateSpec:
         ),
         rationale=_opt_str(elem.get("rationale")),
         kind=elem.get("kind") if isinstance(elem.get("kind"), str) else None,
+        type_name=_opt_type_name(elem.get("type"), index),
     )
 
 
@@ -556,6 +565,16 @@ def _str_tuple(value: object, index: int, field: str) -> tuple[str, ...]:
             f"candidate {index} field {field!r} must be a list of strings"
         )
     return tuple(v.strip() for v in value if v.strip())
+
+
+def _opt_type_name(value: object, index: int) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ProposalParseError(
+            f"candidate {index} field 'type' must be a non-empty string"
+        )
+    return value.strip()
 
 
 def _opt_str(value: object) -> str:

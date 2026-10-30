@@ -21,7 +21,7 @@ from .invariant import (
     set_invariant_status,
     submit_invariant_source,
 )
-from .propose import propose_source
+from .propose import propose_invariant_source, propose_source
 from .submit import submit_source
 from .verify import Payload, result_to_payload, verify_source
 
@@ -35,6 +35,7 @@ __all__ = [
     "accepted_invariants",
     "check_invariant_source",
     "check_source",
+    "propose_invariant_source",
     "propose_source",
     "result_to_payload",
     "set_invariant_status",

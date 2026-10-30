@@ -25,6 +25,9 @@ Subcommands:
   for candidate properties over that unit and persist the survivors (``--json``
   emits the same payload the MCP tool returns). Exit 0 on a completed run,
   1 when the run itself fails (LLM/parse/store/IO) — never a silent empty run.
+  ``--kind rep-invariant --type TYPE`` asks for representation invariants of a
+  struct type instead (RFC-0007 kind 1, #420), with ``--function`` naming a function
+  that takes ``TYPE *``; survivors land as candidates and stay *assumed*.
 - ``forseti submit-property <source> --function NAME --expression EXPR
   --provider NAME --model NAME`` — ingest one already-formed candidate property
   through the exact same static validation `propose` applies, with no LLM call
@@ -126,13 +129,16 @@ from forseti.grading import GradeRun, MutationError, grade_transcript
 from forseti.orchestrator import PropertyCheckRun, property_check_transcript
 from forseti.precond import DEFAULT_MAX_LEN
 from forseti.properties import (
+    INVARIANT_ASSUMPTION_NOTE,
     RECIPES,
     BlankProvenanceError,
     CandidateSpec,
+    HarnessError,
     InvalidStatusTransition,
     InvariantRole,
     LLMError,
     Property,
+    PropertyKind,
     PropertyStatus,
     PropertyStoreError,
     ProposalParseError,
@@ -183,6 +189,7 @@ from .propose import (
     DEFAULT_MAX_CANDIDATES,
     DEFAULT_MODEL,
     DEFAULT_STORE_ROOT,
+    propose_invariant_source,
     propose_source,
 )
 from .propose import (
@@ -353,10 +360,30 @@ def _add_propose_parser(
         description=(
             "Ask the property proposer (an LLM) for candidate properties over "
             "<source>::<function>, statically validate them, and store the "
-            "survivors as CANDIDATE."
+            "survivors as CANDIDATE. With --kind rep-invariant, ask for "
+            "representation invariants of a struct type instead (--type); "
+            "--function then names a function taking TYPE * (the prompt's "
+            "context). Accepting one stays a human act (`forseti "
+            "invariant-status`) and it is *assumed*, never discharged at callers."
         ),
     )
     _add_unit_store_arguments(p)
+    p.add_argument(
+        "--kind",
+        choices=("semantic", "rep-invariant"),
+        default="semantic",
+        help="what to propose (default: semantic)",
+    )
+    p.add_argument(
+        "--type",
+        dest="type_name",
+        metavar="TYPE",
+        help=(
+            "--kind rep-invariant: the struct type (ring_t or 'struct node') to "
+            "propose invariants for; stored once per type, shared by every "
+            "function taking TYPE *"
+        ),
+    )
     p.add_argument(
         "--no-store",
         action="store_true",
@@ -406,6 +433,8 @@ def _render_proposal(result: ProposalResult) -> str:
     for prop in result.accepted:
         domain = f"  [domain: {', '.join(prop.domain)}]" if prop.domain else ""
         lines.append(f"  + [{prop.property_id}] {prop.expression}{domain}")
+    if any(prop.kind is PropertyKind.REP_INVARIANT for prop in result.accepted):
+        lines.append(f"Note: {INVARIANT_ASSUMPTION_NOTE}.")
     if result.rejected:
         lines.append(f"Rejected {len(result.rejected)}:")
         lines.extend(
@@ -414,20 +443,48 @@ def _render_proposal(result: ProposalResult) -> str:
     return "\n".join(lines)
 
 
+def _propose_usage_error(args: argparse.Namespace) -> str | None:
+    """Why `propose`'s flags are inconsistent for its --kind, or None."""
+    if args.kind == "rep-invariant" and not args.type_name:
+        return "--kind rep-invariant requires --type"
+    if args.kind == "semantic" and args.type_name:
+        return "--type applies to --kind rep-invariant only"
+    return None
+
+
 def _run_propose(args: argparse.Namespace) -> int:
+    usage = _propose_usage_error(args)
+    if usage is not None:
+        print(f"forseti propose: {usage}", file=sys.stderr)
+        return 2
     try:
-        result = propose_source(
-            args.source,
-            function=args.function,
-            persist=not args.no_store,
-            store_root=args.store_root,
-            model=args.model,
-            claude_bin=args.claude_bin,
-            timeout_s=args.timeout,
-            max_candidates=args.max_candidates,
-            recipe=args.recipe,
-        )
+        if args.kind == "rep-invariant":
+            result = propose_invariant_source(
+                args.source,
+                function=args.function,
+                type_name=args.type_name,
+                persist=not args.no_store,
+                store_root=args.store_root,
+                model=args.model,
+                claude_bin=args.claude_bin,
+                timeout_s=args.timeout,
+                max_candidates=args.max_candidates,
+                recipe=args.recipe,
+            )
+        else:
+            result = propose_source(
+                args.source,
+                function=args.function,
+                persist=not args.no_store,
+                store_root=args.store_root,
+                model=args.model,
+                claude_bin=args.claude_bin,
+                timeout_s=args.timeout,
+                max_candidates=args.max_candidates,
+                recipe=args.recipe,
+            )
     except (
+        HarnessError,
         LLMError,
         ProposalParseError,
         PropertyStoreError,

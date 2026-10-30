@@ -67,7 +67,8 @@ BEGIN SELECT RAISE(ABORT, 'a graded property requires a grading'); END;
 # Representation invariants (#387) are keyed by a *type* (`path::T`), not a unit,
 # and live in their own table: `properties.kind` carries a CHECK that cannot be
 # widened on an existing database without rebuilding the table. `CREATE TABLE IF
-# NOT EXISTS` is the whole migration -- an older `forseti.db` simply gains it.
+# NOT EXISTS` gives an older `forseti.db` the table; a column added since is
+# migrated in place (`_MIGRATED_INVARIANT_COLUMNS`).
 _TYPE_INVARIANT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS type_invariants (
     property_id    TEXT PRIMARY KEY,
@@ -80,6 +81,7 @@ CREATE TABLE IF NOT EXISTS type_invariants (
     prompt_version TEXT NOT NULL,
     provider       TEXT NOT NULL DEFAULT '',
     model          TEXT NOT NULL DEFAULT '',
+    recipe         TEXT NOT NULL DEFAULT '',
     created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_type_invariants_type
@@ -106,6 +108,10 @@ INSERT INTO properties (
 _MIGRATED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("provider", "TEXT NOT NULL DEFAULT ''"),
     ("model", "TEXT NOT NULL DEFAULT ''"),
+    ("recipe", "TEXT NOT NULL DEFAULT ''"),
+)
+
+_MIGRATED_INVARIANT_COLUMNS: tuple[tuple[str, str], ...] = (
     ("recipe", "TEXT NOT NULL DEFAULT ''"),
 )
 
@@ -215,6 +221,7 @@ def _row_to_invariant(row: sqlite3.Row) -> Property:
             prompt_version=str(row["prompt_version"]),
             provider=str(row["provider"]),
             model=str(row["model"]),
+            recipe=str(row["recipe"]),
         ),
         description=row["description"],
     )
@@ -238,10 +245,15 @@ class PropertyStore:
         with self._conn:
             self._conn.executescript(_SCHEMA + _TYPE_INVARIANT_SCHEMA)
             self._migrate_columns()
+            self._migrate_columns("type_invariants", _MIGRATED_INVARIANT_COLUMNS)
             self._conn.execute("PRAGMA user_version = 1")
 
-    def _migrate_columns(self) -> None:
-        """Add any column in `_MIGRATED_COLUMNS` missing from an existing table.
+    def _migrate_columns(
+        self,
+        table: str = "properties",
+        columns: tuple[tuple[str, str], ...] = _MIGRATED_COLUMNS,
+    ) -> None:
+        """Add any of `columns` missing from the existing `table`.
 
         `CREATE TABLE IF NOT EXISTS` above is a no-op against a table a prior
         forseti version already created, so a column added since then (e.g.
@@ -261,19 +273,19 @@ class PropertyStore:
         there now; anything else (a genuinely broken DDL, a disk error) still
         raises (issue #252 review).
         """
-        existing = self._existing_columns()
-        for name, ddl in _MIGRATED_COLUMNS:
+        existing = self._existing_columns(table)
+        for name, ddl in columns:
             if name in existing:
                 continue
             try:
-                self._conn.execute(f"ALTER TABLE properties ADD COLUMN {name} {ddl}")
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
             except sqlite3.OperationalError:
-                if name not in self._existing_columns():
+                if name not in self._existing_columns(table):
                     raise
 
-    def _existing_columns(self) -> set[str]:
+    def _existing_columns(self, table: str = "properties") -> set[str]:
         return {
-            str(row[1]) for row in self._conn.execute("PRAGMA table_info(properties)")
+            str(row[1]) for row in self._conn.execute(f"PRAGMA table_info({table})")
         }
 
     def close(self) -> None:
@@ -358,8 +370,8 @@ class PropertyStore:
             with self._conn:
                 self._conn.execute(
                     "INSERT INTO type_invariants (property_id, type_id, expression, "
-                    "description, status, prompt_id, prompt_version, provider, model) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "description, status, prompt_id, prompt_version, provider, model, "
+                    "recipe) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         prop.property_id,
                         prop.unit_id,
@@ -370,6 +382,7 @@ class PropertyStore:
                         prop.provenance.prompt_version,
                         prop.provenance.provider,
                         prop.provenance.model,
+                        prop.provenance.recipe,
                     ),
                 )
         except sqlite3.IntegrityError as exc:

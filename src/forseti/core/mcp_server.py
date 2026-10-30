@@ -33,12 +33,13 @@ from .check import (
 )
 from .check import check_source
 from .grade import grade_source
-from .invariant import check_invariant_source
+from .invariant import check_invariant_source, submit_invariant_source
 from .loop import parse_loop_mode, run_semantic_loop
 from .propose import (
     DEFAULT_MAX_CANDIDATES,
     DEFAULT_MODEL,
     DEFAULT_STORE_ROOT,
+    propose_invariant_source,
     propose_source,
 )
 from .propose import (
@@ -52,6 +53,22 @@ from .verify import (
     result_to_payload,
     verify_source,
 )
+
+_KINDS = ("semantic", "rep-invariant")
+
+
+def _check_kind(kind: str, type_name: str | None) -> bool:
+    """True for a representation invariant; `ValueError` on an inconsistent pair."""
+    if kind not in _KINDS:
+        raise ValueError(f"kind must be one of {', '.join(_KINDS)}, got {kind!r}")
+    if kind == "rep-invariant":
+        if not type_name:
+            raise ValueError("kind rep-invariant requires type_name")
+        return True
+    if type_name is not None:
+        raise ValueError("type_name applies to kind rep-invariant only")
+    return False
+
 
 _INSTRUCTIONS = (
     "Forseti Core: bounded verification with ESBMC plus LLM property proposal. "
@@ -111,6 +128,8 @@ def propose_tool(
     timeout_s: float = PROPOSE_TIMEOUT_S,
     max_candidates: int = DEFAULT_MAX_CANDIDATES,
     recipe: str | None = None,
+    kind: str = "semantic",
+    type_name: str | None = None,
 ) -> dict[str, object]:
     """Propose candidate properties for a unit and (optionally) store them.
 
@@ -128,11 +147,33 @@ def propose_tool(
             comment), "sighted" (the function, its doc comment and the
             types/macros it uses) or "blind" (sighted without the body).
             Omitted: the whole file. Recorded on each stored property.
+        kind: "semantic" (default) or "rep-invariant": propose representation
+            invariants of the struct type `type_name` instead, over `self`, a
+            `const T *`. `function` then names a function taking `T *` (the
+            prompt's context). Survivors are stored as candidates; accepting one
+            is a human act (`forseti invariant-status`) and it is *assumed*,
+            never discharged at the callers that construct the type.
+        type_name: With kind "rep-invariant", the struct type (`ring_t`,
+            `struct node`).
 
     Returns:
-        A JSON object with the unit id, prompt/backend provenance, and the
-        `accepted` and `rejected` candidate lists.
+        A JSON object with the unit id (the type id for an invariant),
+        prompt/backend provenance, and the `accepted` and `rejected` candidate
+        lists.
     """
+    if _check_kind(kind, type_name):
+        assert type_name is not None
+        return propose_invariant_source(
+            Path(source),
+            function=function,
+            type_name=type_name,
+            persist=persist,
+            store_root=Path(store_root),
+            model=model,
+            timeout_s=timeout_s,
+            max_candidates=max_candidates,
+            recipe=recipe,
+        ).to_dict()
     result = propose_source(
         Path(source),
         function=function,
@@ -160,6 +201,8 @@ def submit_tool(
     persist: bool = True,
     store_root: str = str(DEFAULT_STORE_ROOT),
     max_candidates: int = DEFAULT_MAX_CANDIDATES,
+    kind: str = "semantic",
+    type_name: str | None = None,
 ) -> dict[str, object]:
     """Ingest one host-generated candidate property -- no LLM call.
 
@@ -180,11 +223,39 @@ def submit_tool(
         store_root: The `.forseti` store directory to persist into.
         max_candidates: Cap on the number of accepted candidates (this call
             submits one, so this only matters via a shared batch caller).
+        kind: "semantic" (default) or "rep-invariant": store `expression` as a
+            representation invariant of the struct type `type_name`, a C
+            predicate over `self` (a `const T *`), e.g. `self->count <= CAP`.
+            It is per type, so `function`, `domain` and `referenced_params` do
+            not apply to it; it is *assumed*, never discharged at the callers
+            that construct the type.
+        type_name: With kind "rep-invariant", the struct type (`ring_t`,
+            `struct node`).
 
     Returns:
-        The same JSON shape `propose` returns: unit id, prompt/backend
-        provenance, and the `accepted`/`rejected` candidate lists.
+        The same JSON shape `propose` returns: unit id (the type id for an
+        invariant), prompt/backend provenance, and the `accepted`/`rejected`
+        candidate lists.
     """
+    if _check_kind(kind, type_name):
+        assert type_name is not None
+        if domain or referenced_params:
+            raise ValueError(
+                "kind rep-invariant is per type: domain and referenced_params "
+                "do not apply"
+            )
+        return submit_invariant_source(
+            Path(source),
+            type_name=type_name,
+            expression=expression,
+            provider=provider,
+            model=model,
+            rationale=rationale,
+            prompt_id=prompt_id,
+            prompt_version=prompt_version,
+            persist=persist,
+            store_root=Path(store_root),
+        ).to_dict()
     result = submit_source(
         Path(source),
         function=function,
