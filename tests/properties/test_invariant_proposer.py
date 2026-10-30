@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -148,6 +149,22 @@ def test_rerunning_is_idempotent() -> None:
     assert len(store.list_for_type(TYPE_KEY)) == 1
 
 
+@pytest.mark.parametrize("status", [PropertyStatus.ACCEPTED, PropertyStatus.REJECTED])
+def test_an_invariant_already_settled_is_not_proposed_again(
+    status: PropertyStatus,
+) -> None:
+    store = _store()
+    client = FakeLLMClient(_reply({"expression": INV}))
+    (first,) = propose_invariants(_request(), client=client, store=store).accepted
+    store.update_type_invariant_status(first.property_id, status)
+
+    again = propose_invariants(_request(), client=client, store=store)
+
+    assert again.accepted == ()
+    assert again.rejected[0].reason == f"already stored as {status.value}"
+    assert store.list_for_type(TYPE_KEY)[0].status is status
+
+
 def test_a_recipe_context_replaces_the_source_and_its_ref_is_stored() -> None:
     client = FakeLLMClient(_reply({"expression": INV}))
     store = _store()
@@ -268,12 +285,12 @@ def test_the_parser_reads_a_kind_and_a_type_and_keeps_them_apart_from_semantic()
 
 
 @pytest.mark.parametrize("bad", [3, "", "  ", ["ring_t"]])
-def test_a_non_string_type_is_a_parse_error(bad: object) -> None:
-    with pytest.raises(ProposalParseError, match="'type'"):
-        parse_candidate_list([{"expression": INV, "type": bad}])
+def test_a_malformed_type_is_ignored_not_a_parse_error(bad: object) -> None:
+    (spec,) = parse_candidate_list([{"expression": INV, "type": bad}])
+    assert spec.type_name is None
 
 
-def test_a_type_invariant_row_keeps_its_recipe_across_reopen(tmp_path) -> None:  # noqa: ANN001
+def test_a_type_invariant_row_keeps_its_recipe_across_reopen(tmp_path: Path) -> None:
     context = ProposalContext(recipe="blind/v1", text=SOURCE)
     root = tmp_path / ".forseti"
     with PropertyStore.open(root) as store:
@@ -287,7 +304,9 @@ def test_a_type_invariant_row_keeps_its_recipe_across_reopen(tmp_path) -> None: 
     assert stored.provenance.recipe == "blind/v1"
 
 
-def test_a_pre_recipe_type_table_gains_the_column_and_keeps_its_rows(tmp_path) -> None:  # noqa: ANN001
+def test_a_pre_recipe_type_table_gains_the_column_and_keeps_its_rows(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / ".forseti"
     with PropertyStore.open(root) as store:
         propose_invariants(

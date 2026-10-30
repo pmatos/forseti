@@ -19,20 +19,24 @@ one effect, behind the injected `client` seam.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 from .invariant import invariant_rejection, make_invariant, normalised_type_name
 from .llm import LLMClient
-from .model import Property, PropertyKind, Provenance
+from .model import Property, PropertyKind, PropertyStatus, Provenance, make_property_id
 from .prompts import (
     DEFAULT_INVARIANT_PROMPT,
     MAX_CANDIDATES_DEFAULT,
     PromptTemplate,
     render_prompt,
 )
-from .proposer import CandidateSpec, ProposalResult, RejectedCandidate, parse_candidates
+from .proposer import (
+    CandidateSpec,
+    ProposalResult,
+    accept_candidates,
+    parse_candidates,
+)
 from .recipes import ProposalContext
 from .store import DuplicateProperty
 
@@ -104,14 +108,21 @@ def propose_invariants(
         model=client.model,
         recipe="" if request.context is None else request.context.recipe,
     )
-    accepted, rejected = _accept_reject(
-        specs, request=request, provenance=provenance, max_candidates=max_candidates
+    accepted, rejected = accept_candidates(
+        specs,
+        reason_for=lambda spec: _spec_reason(spec, request, store),
+        build=lambda spec: make_invariant(
+            type_key=request.type_key,
+            expression=spec.expression,
+            provenance=provenance,
+            description=spec.rationale or None,
+        ),
+        max_candidates=max_candidates,
     )
     if store is not None:
         for prop in accepted:
-            if store.get_type_invariant(prop.property_id) is None:
-                with contextlib.suppress(DuplicateProperty):
-                    store.add_type_invariant(prop)
+            with contextlib.suppress(DuplicateProperty):
+                store.add_type_invariant(prop)
     return ProposalResult(
         unit_id=request.type_key,
         prompt_id=template.prompt_id,
@@ -124,7 +135,9 @@ def propose_invariants(
     )
 
 
-def _spec_reason(spec: CandidateSpec, request: InvariantRequest) -> str | None:
+def _spec_reason(
+    spec: CandidateSpec, request: InvariantRequest, store: InvariantStore | None
+) -> str | None:
     if spec.kind is not None and spec.kind not in _INVARIANT_KINDS:
         return f"non-invariant kind {spec.kind!r} (this run proposes invariants only)"
     if spec.type_name is not None and (
@@ -133,39 +146,17 @@ def _spec_reason(spec: CandidateSpec, request: InvariantRequest) -> str | None:
         return f"candidate type {spec.type_name!r} is not {request.type_name!r}"
     if spec.domain or spec.referenced_params:
         return "domain and referenced_params do not apply to an invariant (per type)"
-    return invariant_rejection(request.source_text, request.type_name, spec.expression)
-
-
-def _accept_reject(
-    specs: Sequence[CandidateSpec],
-    *,
-    request: InvariantRequest,
-    provenance: Provenance,
-    max_candidates: int,
-) -> tuple[list[Property], list[RejectedCandidate]]:
-    accepted: list[Property] = []
-    rejected: list[RejectedCandidate] = []
-    seen: set[str] = set()
-    for spec in specs:
-        if len(accepted) >= max_candidates:
-            rejected.append(RejectedCandidate(spec, "over max_candidates"))
-            continue
-        reason = _spec_reason(spec, request)
-        if reason is not None:
-            rejected.append(RejectedCandidate(spec, reason))
-            continue
-        prop = make_invariant(
-            type_key=request.type_key,
-            expression=spec.expression,
-            provenance=provenance,
-            description=spec.rationale or None,
-        )
-        if prop.property_id in seen:
-            rejected.append(RejectedCandidate(spec, "duplicate in batch"))
-            continue
-        seen.add(prop.property_id)
-        accepted.append(prop)
-    return accepted, rejected
+    reason = invariant_rejection(
+        request.source_text, request.type_name, spec.expression
+    )
+    if reason is not None or store is None:
+        return reason
+    stored = store.get_type_invariant(
+        make_property_id(request.type_key, PropertyKind.REP_INVARIANT, spec.expression)
+    )
+    if stored is not None and stored.status is not PropertyStatus.CANDIDATE:
+        return f"already stored as {stored.status.value}"
+    return None
 
 
 if TYPE_CHECKING:

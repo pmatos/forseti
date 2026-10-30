@@ -58,7 +58,11 @@ _KINDS = ("semantic", "rep-invariant")
 
 
 def _check_kind(kind: str, type_name: str | None) -> bool:
-    """True for a representation invariant; `ValueError` on an inconsistent pair."""
+    """True for a representation invariant; `ValueError` on an inconsistent pair.
+
+    `rep_invariant` (the stored kind a payload echoes) is read as `rep-invariant`.
+    """
+    kind = kind.replace("_", "-")
     if kind not in _KINDS:
         raise ValueError(f"kind must be one of {', '.join(_KINDS)}, got {kind!r}")
     if kind == "rep-invariant":
@@ -159,7 +163,8 @@ def propose_tool(
     Returns:
         A JSON object with the unit id (the type id for an invariant),
         prompt/backend provenance, and the `accepted` and `rejected` candidate
-        lists.
+        lists. For an invariant, a `function` that does not take `type_name *`
+        (or an unusable `type_name`) is an error, not a rejected candidate.
     """
     if _check_kind(kind, type_name):
         assert type_name is not None
@@ -227,8 +232,8 @@ def submit_tool(
             representation invariant of the struct type `type_name`, a C
             predicate over `self` (a `const T *`), e.g. `self->count <= CAP`.
             It is per type, so `function`, `domain` and `referenced_params` do
-            not apply to it; it is *assumed*, never discharged at the callers
-            that construct the type.
+            not apply to it (`function` is not read); it is *assumed*, never
+            discharged at the callers that construct the type.
         type_name: With kind "rep-invariant", the struct type (`ring_t`,
             `struct node`).
 

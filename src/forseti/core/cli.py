@@ -102,6 +102,7 @@ import json
 import sys
 from collections.abc import Callable
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal
 
@@ -458,31 +459,22 @@ def _run_propose(args: argparse.Namespace) -> int:
         print(f"forseti propose: {usage}", file=sys.stderr)
         return 2
     try:
-        if args.kind == "rep-invariant":
-            result = propose_invariant_source(
-                args.source,
-                function=args.function,
-                type_name=args.type_name,
-                persist=not args.no_store,
-                store_root=args.store_root,
-                model=args.model,
-                claude_bin=args.claude_bin,
-                timeout_s=args.timeout,
-                max_candidates=args.max_candidates,
-                recipe=args.recipe,
-            )
-        else:
-            result = propose_source(
-                args.source,
-                function=args.function,
-                persist=not args.no_store,
-                store_root=args.store_root,
-                model=args.model,
-                claude_bin=args.claude_bin,
-                timeout_s=args.timeout,
-                max_candidates=args.max_candidates,
-                recipe=args.recipe,
-            )
+        propose = (
+            partial(propose_invariant_source, type_name=args.type_name)
+            if args.kind == "rep-invariant"
+            else propose_source
+        )
+        result = propose(
+            args.source,
+            function=args.function,
+            persist=not args.no_store,
+            store_root=args.store_root,
+            model=args.model,
+            claude_bin=args.claude_bin,
+            timeout_s=args.timeout,
+            max_candidates=args.max_candidates,
+            recipe=args.recipe,
+        )
     except (
         HarnessError,
         LLMError,

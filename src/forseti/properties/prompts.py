@@ -137,8 +137,10 @@ SEMANTIC_V1 = PromptTemplate(
 
 _REP_INVARIANT_V1_TEXT = """\
 You propose a REPRESENTATION INVARIANT for ONE C struct type. An ESBMC bounded
-model checker will ASSUME it at the entry of every function that takes a
-`<<TYPE>> *` and ASSERT it again at exit, up to a loop bound k. You are NOT
+model checker will ASSUME it on entry to each function that takes a mutable
+`<<TYPE>> *` and ASSERT it again when that function returns, up to a loop bound k.
+An initialiser (init/initialise/initialize in its name) gets no entry assumption:
+it is checked to establish the invariant from an arbitrary instance. You are NOT
 proving anything -- you propose a checkable predicate and ESBMC returns verdicts.
 
 Type: <<TYPE>>   (type id: <<UNIT_ID>>)
