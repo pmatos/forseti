@@ -8,6 +8,7 @@ index reads one commit (`GitTree`) nothing written after it can leak in. The one
 that is not from the tree is the `contracts` seam: whatever it returns is shown, so the
 caller owns its temporal validity (`store_contracts` reads the store as it is now, and
 keys by the tree-relative path, which may differ from the spelling in stored unit ids).
+`ContextPack.contracts_digest` fingerprints what the seam contributed, for a recipe ref.
 
 Slices, in the order the budget is spent:
 
@@ -36,6 +37,8 @@ sibling slices are also capped in count, so one slice cannot starve the rest.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import posixpath
 import re
@@ -63,6 +66,7 @@ if TYPE_CHECKING:
     from .store import PropertyStore
 
 Contracts = Callable[[str], Sequence[str]]
+ContractSource = Callable[[Path], Contracts]
 
 
 class SliceKind(StrEnum):
@@ -108,6 +112,7 @@ class PackEntry:
     kind: SliceKind
     label: str
     text: str
+    contracts: tuple[str, ...] = ()
 
     def render(self) -> str:
         return f"// {self.label}\n{self.text.strip(chr(10))}\n"
@@ -154,6 +159,18 @@ class ContextPack:
         ]
         return "\n".join(sections)
 
+    @property
+    def contracts_digest(self) -> str:
+        """A digest of the accepted contracts this pack shows, and for which callee.
+
+        Equal for equal contracts, so a recipe ref carrying it changes exactly when
+        the contracts the proposer sees change; a pack that shows none has the digest
+        of the empty set.
+        """
+        shown = [[e.label, list(e.contracts)] for e in self.entries if e.contracts]
+        encoded = json.dumps(shown, separators=(",", ":")).encode()
+        return hashlib.sha256(encoded).hexdigest()[:16]
+
 
 def _unit_spellings(root: Path, cwd: Path, path: str) -> list[str]:
     """The ways a store may have spelled the tree-relative `path` of a unit id.
@@ -173,7 +190,8 @@ def store_contracts(
 
     `root` is the tree's root, so a tree-relative callee id also finds the
     properties the store keyed under its working-directory-relative or absolute
-    spelling. The store is read as it is now, not as of the pinned commit.
+    spelling. The store is read as it is now, not as of the pinned commit, and the
+    contracts of a callee come back sorted, so equal stores give equal text.
     """
     here = cwd or Path.cwd()
 
@@ -186,14 +204,23 @@ def store_contracts(
                 make_unit_id(spelling, symbol), {PropertyStatus.ACCEPTED}
             )
         }
-        return [
+        return sorted(
             f"{p.expression} (given {'; '.join(p.domain)})"
             if p.domain
             else p.expression
             for p in accepted.values()
-        ]
+        )
 
     return contracts
+
+
+def store_contract_source(store: PropertyStore | None) -> ContractSource:
+    """`store_contracts` for a tree root known only once the tree is; no store, none."""
+
+    def source(root: Path) -> Contracts:
+        return (lambda _: ()) if store is None else store_contracts(store, root=root)
+
+    return source
 
 
 def _one_line(text: str) -> str:
@@ -251,10 +278,14 @@ def _callee_entries(
         if callee is None:
             continue
         unit = make_unit_id(callee.path, name)
-        known = contracts(unit) if contracts is not None else ()
+        known = (
+            tuple(_one_line(c) for c in contracts(unit))
+            if contracts is not None
+            else ()
+        )
         lines = [_signature(index, callee)]
-        lines += [f"// accepted: {_one_line(c)}" for c in known]
-        entries.append(PackEntry(SliceKind.CALLEES, unit, "\n".join(lines)))
+        lines += [f"// accepted: {c}" for c in known]
+        entries.append(PackEntry(SliceKind.CALLEES, unit, "\n".join(lines), known))
     return entries
 
 
@@ -408,7 +439,11 @@ def _select(unit_id: str, ranked: list[PackEntry], max_tokens: int) -> ContextPa
 
 
 def build_project_pack(
-    unit_id: str, source_text: str, config: PackConfig | None = None
+    unit_id: str,
+    source_text: str,
+    config: PackConfig | None = None,
+    *,
+    contracts_for: ContractSource | None = None,
 ) -> ContextPack:
     """The pack for a unit of the git repository holding its file, at HEAD.
 
@@ -417,11 +452,18 @@ def build_project_pack(
     being worked on. The unit's path is resolved against the working directory (the
     file's directory is resolved, the file itself is not followed if it is a
     symlink). `ProjectIndexError` for anything that stops the pack: no repository or
-    commit, no such function.
+    commit, no such function. `contracts_for` maps the repository's root to the
+    `Contracts` seam of the callees slice.
     """
     named = Path(unit_id_path(unit_id))
     path = named.parent.resolve() / named.name
     tree = GitTree.at(path.parent)
     rel = path.relative_to(tree.root).as_posix()
     index = ProjectIndex(OverlayTree(tree, {rel: source_text}))
-    return build_context_pack(index, make_unit_id(rel, unit_id_symbol(unit_id)), config)
+    contracts = None if contracts_for is None else contracts_for(tree.root)
+    return build_context_pack(
+        index,
+        make_unit_id(rel, unit_id_symbol(unit_id)),
+        config,
+        contracts=contracts,
+    )

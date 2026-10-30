@@ -94,10 +94,16 @@ def propose_source(
 
     `recipe` selects what the prompt shows instead of the whole file (`baseline`,
     `sighted`, `blind`; `RecipeError` if unknown or it cannot be built); `None`
-    sends the whole file. The recipe's project root is `store_root`'s parent.
+    sends the whole file. The recipe's project root is `store_root`'s parent, and
+    `callees` shows the accepted contracts `store_root`'s store holds when the
+    request is prepared (its digest is in the recorded recipe ref).
     """
     request = prepare_proposal_request(
-        source, function=function, recipe=recipe, project_root=store_root.parent
+        source,
+        function=function,
+        recipe=recipe,
+        project_root=store_root.parent,
+        store_root=store_root,
     )
     llm = client or ClaudeCliClient(
         model=model, claude_bin=claude_bin, timeout_s=timeout_s
@@ -146,6 +152,7 @@ def propose_invariant_source(
         type_name=type_name,
         recipe=recipe,
         project_root=store_root.parent,
+        store_root=store_root,
     )
     llm = client or ClaudeCliClient(
         model=model, claude_bin=claude_bin, timeout_s=timeout_s

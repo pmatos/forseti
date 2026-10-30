@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import subprocess
 from collections.abc import Mapping
@@ -9,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from forseti.core import propose_source
 from forseti.core._proposal_request import prepare_proposal_request
 from forseti.properties import (
     RECIPES,
@@ -17,6 +19,7 @@ from forseti.properties import (
     PropertyKind,
     PropertyStatus,
     PropertyStore,
+    ProposalContext,
     Provenance,
     RecipeError,
     build_context,
@@ -699,6 +702,7 @@ def test_project_recipes_are_registered_beside_the_single_file_ones() -> None:
         "callers": "callers/v1",
         "tests": "tests/v1",
         "full": "full/v1",
+        "callees": "callees/v1",
     }
 
 
@@ -884,3 +888,161 @@ def test_a_project_recipe_flows_into_the_proposal_request(repo: Path) -> None:
     assert request.context is not None
     assert request.context.recipe == "callers/v1"
     assert "src/app.c::enqueue_all" in request.context.text
+
+
+ADVANCE = "src/ring.c::advance"
+LOG_FULL = "include/ring.h::log_full"
+
+
+def record(
+    store_root: Path,
+    unit: str,
+    expression: str,
+    status: PropertyStatus = PropertyStatus.ACCEPTED,
+) -> None:
+    with PropertyStore.open(store_root) as store:
+        store.add(
+            Property(
+                property_id=make_property_id(
+                    unit, PropertyKind.SEMANTIC, expression, ()
+                ),
+                unit_id=unit,
+                kind=PropertyKind.SEMANTIC,
+                expression=expression,
+                status=status,
+                provenance=Provenance("p", "1"),
+            )
+        )
+
+
+def callee_context(repo: Path, store_root: Path | None = None) -> ProposalContext:
+    request = prepare_proposal_request(
+        repo / "src/ring.c",
+        function="rb_push",
+        recipe="callees",
+        project_root=repo,
+        store_root=repo / ".forseti" if store_root is None else store_root,
+    )
+    assert request.context is not None
+    return request.context
+
+
+def test_callees_recipe_shows_the_stores_accepted_contracts(repo: Path) -> None:
+    commit(repo, PROJECT, "v1")
+    record(repo / ".forseti", ADVANCE, "r->tail < SLOTS")
+    record(repo / ".forseti", ADVANCE, "r->head == 7", PropertyStatus.CANDIDATE)
+    context = callee_context(repo)
+    assert "// accepted: r->tail < SLOTS" in context.text
+    assert "r->head == 7" not in context.text
+    assert "secret_body_marker" not in context.text
+    assert "enqueue_all" not in context.text
+    assert re.fullmatch(r"callees/v1\+[0-9a-f]{16}", context.recipe)
+
+
+def test_the_same_tree_and_store_state_give_the_same_pack_and_ref(
+    repo: Path, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    commit(repo, PROJECT, "v1")
+    first, second = repo / ".forseti", tmp_path_factory.mktemp("other") / ".forseti"
+    for expression in ("r->tail < SLOTS", "r->count <= SLOTS"):
+        record(first, ADVANCE, expression)
+    for expression in ("r->count <= SLOTS", "r->tail < SLOTS"):
+        record(second, ADVANCE, expression)
+    context = callee_context(repo)
+    assert callee_context(repo) == context
+    assert callee_context(repo, second) == context
+
+
+def test_a_changed_store_state_changes_the_ref(repo: Path) -> None:
+    commit(repo, PROJECT, "v1")
+    store_root = repo / ".forseti"
+    empty = callee_context(repo)
+    assert not store_root.exists()
+
+    record(store_root, ADVANCE, "r->tail < SLOTS")
+    one = callee_context(repo)
+    record(store_root, LOG_FULL, "count >= 0")
+    two = callee_context(repo)
+    record(store_root, ADVANCE, "r->head == 7", PropertyStatus.REJECTED)
+    unchanged = callee_context(repo)
+
+    assert len({empty.recipe, one.recipe, two.recipe}) == 3
+    assert empty.recipe.startswith("callees/v1+")
+    assert "accepted:" not in empty.text
+    assert one.text != two.text and "// accepted: count >= 0" in two.text
+    assert unchanged == two
+
+
+def test_contracts_of_a_unit_the_pack_does_not_show_leave_the_ref_alone(
+    repo: Path,
+) -> None:
+    commit(repo, PROJECT, "v1")
+    record(repo / ".forseti", ADVANCE, "r->tail < SLOTS")
+    before = callee_context(repo)
+    record(repo / ".forseti", "src/app.c::enqueue_all", "result >= 0")
+    assert callee_context(repo) == before
+
+
+def test_callees_recipe_needs_a_store(repo: Path) -> None:
+    commit(repo, PROJECT, "v1")
+    with pytest.raises(RecipeError, match="store"):
+        build_context(
+            "callees",
+            unit_id=UNIT,
+            source_text=RING_C,
+            project_root=repo,
+        )
+    with pytest.raises(RecipeError, match="store"):
+        prepare_proposal_request(
+            repo / "src/ring.c", function="rb_push", recipe="callees", project_root=repo
+        )
+
+
+def test_store_recipe_does_not_change_the_other_recipes(repo: Path) -> None:
+    commit(repo, PROJECT, "v1")
+    record(repo / ".forseti", ADVANCE, "r->tail < SLOTS")
+    for name in ("callers", "tests", "full", "sighted", "blind", "baseline"):
+        request = prepare_proposal_request(
+            repo / "src/ring.c",
+            function="rb_push",
+            recipe=name,
+            project_root=repo,
+            store_root=repo / ".forseti",
+        )
+        assert request.context is not None
+        assert request.context.recipe == RECIPES[name].ref
+        assert "accepted:" not in request.context.text
+
+
+class CannedClient:
+    provider, model = "fake", "fake-1"
+
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    def complete(self, prompt: str) -> str:
+        self.prompts.append(prompt)
+        return '{"candidates": [{"expression": "result >= 0"}]}'
+
+
+def test_propose_records_the_digest_ref_and_reads_the_explicit_store(
+    repo: Path, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    commit(repo, PROJECT, "v1")
+    here, elsewhere = repo / ".forseti", tmp_path_factory.mktemp("s") / ".forseti"
+    record(elsewhere, ADVANCE, "r->tail < SLOTS")
+    client = CannedClient()
+
+    result = propose_source(
+        repo / "src/ring.c",
+        function="rb_push",
+        store_root=elsewhere,
+        client=client,
+        recipe="callees",
+    )
+
+    assert "// accepted: r->tail < SLOTS" in client.prompts[0]
+    expected = callee_context(repo, elsewhere).recipe
+    assert {p.provenance.recipe for p in result.accepted} == {expected}
+    assert callee_context(repo, here).recipe != expected
+    assert not here.exists()
