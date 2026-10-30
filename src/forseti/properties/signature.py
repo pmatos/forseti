@@ -111,6 +111,20 @@ class UnitSignature:
         )
 
     @property
+    def scratch_param_names(self) -> frozenset[str]:
+        """Names of the output buffers the harness `malloc`s (not scalar-backed).
+
+        A scratch buffer is the one output a domain may name, and only to say it is
+        not NULL (`renderability_reason`): the harness already allocates it non-NULL
+        and leaves its contents for the unit to write.
+        """
+        return frozenset(
+            p.name
+            for p in self.params
+            if isinstance(p, BufferParam) and p.out and p.length.strip() != "1"
+        )
+
+    @property
     def input_param_names(self) -> frozenset[str]:
         """Names of the input parameters -- every parameter that is not an output."""
         return self.param_names - self.output_param_names

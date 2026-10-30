@@ -346,6 +346,86 @@ def test_renderability_reason_flags_domain_over_output() -> None:
     assert reason is not None and "output parameter 'cp'" in reason
 
 
+def _scratch_sig() -> UnitSignature:
+    # A range-idiom unit with a scratch buffer, like msort's `tmp`: a malloc-backed
+    # output as long as the range's upper bound.
+    return UnitSignature(
+        "sortish",
+        "void",
+        (
+            BufferParam("int", "a", "hi"),
+            ScalarParam("int", "lo"),
+            ScalarParam("int", "hi"),
+            BufferParam("int", "tmp", "hi", out=True),
+        ),
+    )
+
+
+_SCRATCH_SLICE = "void sortish(int *a, int lo, int hi, int *tmp) { }"
+
+
+@pytest.mark.parametrize(
+    "pre",
+    [
+        "tmp != NULL",
+        "tmp != 0",
+        "NULL != tmp",
+        "0 != tmp",
+        "(tmp != NULL)",
+        "tmp!=NULL",
+    ],
+)
+def test_non_null_domain_on_a_scratch_buffer_is_renderable(pre: str) -> None:
+    spec = SemanticSpec("hi - lo < 2 || a[lo] == a[lo]", ("lo >= 0", pre))
+    assert renderability_reason(_scratch_sig(), spec) is None
+    out = render_semantic_harness(
+        unit_source=_SCRATCH_SLICE, signature=_scratch_sig(), spec=spec
+    )
+    assert out.index("int *tmp = malloc") < out.index(f"__ESBMC_assume(({pre}));")
+
+
+@pytest.mark.parametrize(
+    "pre",
+    [
+        "tmp == NULL",
+        "tmp[0] > 0",
+        "tmp != NULL && hi > 0",
+        "tmp != NULL && tmp[0] > 0",
+        "tmp > 0",
+        "tmp != a",
+        "tmp != 1",
+        "tmp != NULL || hi == 0",
+    ],
+)
+def test_other_domains_on_a_scratch_buffer_stay_rejected(pre: str) -> None:
+    spec = SemanticSpec("hi - lo < 2 || a[lo] == a[lo]", (pre,))
+    reason = renderability_reason(_scratch_sig(), spec)
+    assert reason is not None and "tmp" in reason
+
+
+@pytest.mark.parametrize("pre", ["cp != NULL", "cp != 0"])
+def test_non_null_domain_on_a_scalar_backed_output_stays_rejected(pre: str) -> None:
+    reason = renderability_reason(_out_sig(), SemanticSpec("result >= 0", (pre,)))
+    assert reason is not None and "output parameter 'cp'" in reason
+
+
+def test_non_null_domain_does_not_license_a_second_output() -> None:
+    sig = UnitSignature(
+        "f",
+        "int",
+        (
+            BufferParam("int", "tmp", "hi", out=True),
+            ScalarParam("int", "hi"),
+            BufferParam("int", "cp", "1", out=True),
+        ),
+    )
+    reason = renderability_reason(sig, SemanticSpec("result >= 0", ("cp != NULL",)))
+    assert reason is not None and "output parameter 'cp'" in reason
+    assert (
+        renderability_reason(sig, SemanticSpec("result >= 0", ("tmp != NULL",))) is None
+    )
+
+
 def _suffix_out_sig() -> UnitSignature:
     # An output named like a C integer suffix (`u`/`L`/`UL`): a precondition over an
     # input that carries a suffixed literal (e.g. `x < 10u`) must not be misread as
@@ -917,17 +997,39 @@ def test_max_len_caps_an_unconstrained_length_before_the_allocation() -> None:
         "n >= 1 && n <= 4",
         "n == 3",
         "n < 100",
+        "(n >= 1) && (n >= 2)",
+        "n >= 1 || n == 20",
+        "n != 0 && n <= 100",
+    ],
+)
+def test_domain_upper_bound_gets_the_cap_on_top(domain: str) -> None:
+    # #438: an upper bound above `max_len` (`n < 100`) used to suppress the cap and
+    # leave the length unbounded in practice (UNKNOWN at every rung). The cap now
+    # applies whenever the domain's floor leaves room, narrowing what is checked.
+    out = _render_first(domain, max_len=8)
+    assert _CAP_N in out
+    assert out.index(_CAP_N) < out.index(_ALLOC_A_N)
+    assert plan_length_bounds(_BUF_SIG, SemanticSpec("result == 0", (domain,)), 8) == (
+        ("n", 8),
+    )
+
+
+@pytest.mark.parametrize(
+    "domain",
+    [
         "n >= 16",
         "n >= 0x10",
         "n > 8",
-        "(n >= 1) && (n >= 2)",
-        "n >= 1 || n == 20",
+        "n == 20",
+        "16 <= n",
+        "n >= 16 && n <= 20",
+        "(n >= 1) && (n >= 16)",
+        "((n >= 16))",
     ],
 )
-def test_domain_clause_naming_the_length_suppresses_the_cap(domain: str) -> None:
-    # The domain is authoritative: `n >= 16` under a cap of 8 would assume
-    # `false` and settle every property vacuously HELD, and `n <= 100` capped to
-    # 8 would silently narrow an explicit bound.
+def test_domain_floor_above_the_cap_suppresses_it(domain: str) -> None:
+    # `n >= 16` under a cap of 8 would assume `false` and settle every property
+    # vacuously HELD, so a floor the cap contradicts stays authoritative.
     out = _render_first(domain, max_len=8)
     assert _CAP_N not in out
     assert plan_length_bounds(_BUF_SIG, SemanticSpec("result == 0", (domain,)), 8) == ()
@@ -964,7 +1066,7 @@ def test_length_used_only_as_an_index_does_not_suppress_the_cap() -> None:
     assert plan_length_bounds(_BUF_SIG, spec, 8) == (("n", 8),)
 
 
-def test_cap_is_scoped_to_the_length_the_domain_leaves_open() -> None:
+def test_cap_is_scoped_to_the_length_the_cap_does_not_contradict() -> None:
     sig = UnitSignature(
         "f",
         "int",
@@ -975,7 +1077,7 @@ def test_cap_is_scoped_to_the_length_the_domain_leaves_open() -> None:
             ScalarParam("unsigned", "m"),
         ),
     )
-    spec = SemanticSpec("result == 0", ("m <= 2",))
+    spec = SemanticSpec("result == 0", ("m >= 16",))
     assert plan_length_bounds(sig, spec, 8) == (("n", 8),)
 
 
@@ -1063,10 +1165,10 @@ def test_build_property_harness_reports_the_bounds_it_applied() -> None:
     )
 
 
-def test_build_property_harness_reports_no_bounds_when_domain_bounds_the_length() -> (
+def test_build_property_harness_reports_no_bounds_when_floor_contradicts_the_cap() -> (
     None
 ):
-    prop = _semantic_property("result >= 0", ("n <= 4",))
+    prop = _semantic_property("result >= 0", ("n >= 16",))
     built = build_property_harness(
         unit_source=_FIRST_SRC, symbol="first", prop=prop, max_len=8
     )

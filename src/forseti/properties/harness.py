@@ -389,7 +389,9 @@ def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | 
     * a **precondition constraining an output parameter** -- emitted as
       ``__ESBMC_assume(...)`` *before* the call, it would preconstrain a would-be
       result on uninitialized storage, masking a unit that never writes it; domains
-      constrain inputs only.
+      constrain inputs only. The one exception is a bare non-NULL check
+      (``tmp != NULL``) on a scratch buffer (`UnitSignature.scratch_param_names`),
+      which constrains no contents and holds by construction (#438).
     * a **precondition mixing a buffer and its length** -- a single clause naming
       both a buffer and a buffer-length identifier *outside a subscript index*
       (``n >= 1 && a[0] >= 0``) has no correct emission point: the length bound must
@@ -420,6 +422,7 @@ def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | 
         )
 
     output_params = signature.output_param_names
+    scratch = signature.scratch_param_names
     scalar_outputs = {
         p.name
         for p in signature.params
@@ -439,7 +442,9 @@ def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | 
         # naming several outputs reports the same one every run (reproducible
         # verdicts -- salted hashing would otherwise vary the message).
         for name in sorted(output_params):
-            if references(pre, name):
+            if references(pre, name) and not (
+                name in scratch and _is_non_null_check(pre, name)
+            ):
                 return (
                     f"domain expr {pre!r} constrains output parameter "
                     f"{name!r} (preconditions apply to inputs only)"
@@ -447,6 +452,16 @@ def renderability_reason(signature: UnitSignature, spec: SemanticSpec) -> str | 
     return _mixed_buffer_length_reason(
         spec.preconditions,
         _plain_buffers(signature.params),
+    )
+
+
+def _is_non_null_check(clause: str, name: str) -> bool:
+    """Whether `clause` is exactly ``name != NULL`` (or ``!= 0``, either order)."""
+    text = _unwrap_parens(clause)
+    ident, null = re.escape(name), r"(?:NULL|0)"
+    return bool(
+        re.fullmatch(rf"{ident}\s*!=\s*{null}", text)
+        or re.fullmatch(rf"{null}\s*!=\s*{ident}", text)
     )
 
 
@@ -463,14 +478,15 @@ def plan_length_bounds(
 
     Only a *scalar parameter* named in a buffer's length expression is capped (a
     macro or literal length is not nondet, and assuming a bound on it could make
-    the harness vacuous), and only when the domain leaves the cap room: every
-    clause mentioning it outside a buffer subscript must be a plain literal lower
-    bound the cap can still satisfy (``len >= 1``, ``len > 0``, ``len != 0``;
-    `_length_floor`). Any other clause is the property's own size constraint and
-    stays authoritative -- capping on top could contradict it (``len >= 16`` with
-    a cap of 8 assumes ``false``) and silently turn the check into a vacuous HELD.
-    The trade-off is that such a domain stays unbounded above and reports UNKNOWN
-    until it names its own upper bound.
+    the harness vacuous). The cap applies on top of whatever the domain says about
+    that length, an upper bound included (``hi <= 4``, ``hi == lo + 3``): a bound
+    above `max_len` is narrowed to it, so the check stays decidable and the
+    verdict reads as scoped to ``len <= max_len`` (#438). The one exception is a
+    domain whose literal *floor* the cap contradicts (``len >= 16`` with a cap of
+    8, `_contradicts_cap`): assuming both is ``false`` and would silently turn the
+    check into a vacuous HELD, so that domain stays authoritative and uncapped.
+    A floor not readable as a literal (``hi - lo >= 20``) cannot be detected here;
+    the vacuity probe (`build_property_harness`) catches a HELD that went vacuous.
 
     Deduplicated in first-seen order, so two buffers sharing one length emit one
     assume. ``max_len=None`` plans nothing; a negative one is a `HarnessError`
@@ -494,46 +510,90 @@ def plan_length_bounds(
             if (
                 ident in scalar_names
                 and ident not in capped
-                and all(_leaves_room(pre, ident, max_len) for pre in constraining)
+                and not any(
+                    _contradicts_cap(pre, ident, max_len) for pre in constraining
+                )
             ):
                 capped.append(ident)
     return tuple((ident, max_len) for ident in capped)
 
 
-def _leaves_room(clause: str, ident: str, max_len: int) -> bool:
-    """Whether `clause` is compatible with capping `ident` at `max_len`.
+def _contradicts_cap(clause: str, ident: str, max_len: int) -> bool:
+    """Whether a conjunct of `clause` forces `ident` above `max_len`.
 
-    True if it does not mention `ident`, or is a plain literal lower bound whose
-    smallest satisfying length still fits under the cap.
+    Reads each top-level ``&&`` conjunct as a literal lower bound
+    (`_length_floor`); a clause with a top-level ``||``, or a conjunct that is not
+    a plain literal bound, is not read and so never contradicts the cap.
     """
-    if not references(clause, ident):
-        return True
-    floor = _length_floor(clause, ident)
-    return floor is not None and floor <= max_len
+    return any(
+        (floor := _length_floor(conjunct, ident)) is not None and floor > max_len
+        for conjunct in _conjuncts(clause)
+    )
+
+
+def _conjuncts(clause: str) -> list[str]:
+    """The top-level ``&&`` operands of `clause`, or `[clause]` if it has a ``||``."""
+    text = _unwrap_parens(clause)
+    parts: list[str] = []
+    depth, start, i = 0, 0, 0
+    while i < len(text):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+        elif depth == 0 and text.startswith("||", i):
+            return [text]
+        elif depth == 0 and text.startswith("&&", i):
+            parts.append(text[start:i])
+            start = i + 2
+            i += 1
+        i += 1
+    parts.append(text[start:])
+    if len(parts) == 1:
+        return parts
+    return [c for part in parts for c in _conjuncts(part)]
+
+
+def _unwrap_parens(clause: str) -> str:
+    """`clause` without redundant outer parentheses (``((a))`` -> ``a``).
+
+    Only a ``(`` that closes at the very end counts, so ``(a) && (b)`` is intact.
+    """
+    text = clause.strip()
+    while text.startswith("(") and text.endswith(")"):
+        depth, closes_at = 0, -1
+        for pos, char in enumerate(text):
+            depth += (char == "(") - (char == ")")
+            if depth == 0:
+                closes_at = pos
+                break
+        if closes_at != len(text) - 1:
+            break
+        text = text[1:-1].strip()
+    return text
 
 
 def _length_floor(clause: str, ident: str) -> int | None:
     """The smallest length a literal lower-bound `clause` on `ident` allows.
 
-    Recognises only ``ident >= N``, ``ident > N``, ``ident != N`` and their
-    mirrored forms (``N <= ident``), with a decimal literal `N` and optional
-    integer suffix; returns None for anything else (a conjunction, an upper bound,
-    a hex literal, an expression), which the caller treats as authoritative. The
-    fullmatch keeps it conservative: ``(a >= 1) && (b >= 1)`` loses its outer
-    parentheses to a non-match rather than being misread as one bound.
+    Recognises only ``ident >= N``, ``ident > N``, ``ident == N``, ``ident != N``
+    and their mirrored forms (``N <= ident``), with a decimal or hex literal `N`
+    and optional integer suffix; returns None for anything else (a conjunction, an
+    upper bound, an expression), which the caller does not read as a floor. The
+    fullmatch keeps it conservative: ``(a >= 1) && (b >= 1)`` is a non-match
+    rather than being misread as one bound.
     """
-    text = clause.strip()
-    while text.startswith("(") and text.endswith(")"):
-        text = text[1:-1].strip()
+    text = _unwrap_parens(clause)
     name = re.escape(ident)
-    literal = r"(\d+)[uUlL]*"
-    if match := re.fullmatch(rf"{name}\s*(>=|>|!=)\s*{literal}", text):
-        op, value = match.group(1), int(match.group(2))
-    elif match := re.fullmatch(rf"{literal}\s*(<=|<|!=)\s*{name}", text):
-        op, value = match.group(2), int(match.group(1))
+    literal = r"(0[xX][0-9a-fA-F]+|\d+)[uUlL]*"
+    if match := re.fullmatch(rf"{name}\s*(>=|>|==|!=)\s*{literal}", text):
+        op, digits = match.group(1), match.group(2)
+    elif match := re.fullmatch(rf"{literal}\s*(<=|<|==|!=)\s*{name}", text):
+        op, digits = match.group(2), match.group(1)
     else:
         return None
-    return {">=": value, ">": value + 1, "<=": value, "<": value + 1}.get(
+    value = int(digits, 16) if digits[:2] in ("0x", "0X") else int(digits)
+    return {">=": value, ">": value + 1, "<=": value, "<": value + 1, "==": value}.get(
         op, 1 if value == 0 else 0
     )
 
