@@ -24,6 +24,7 @@ from dataclasses import dataclass
 
 from forseti.esbmc import find_definition_brace
 
+from ._harness_parameters import prepare_parameters
 from .cexpr import (
     conjuncts,
     derefs_or_subscripts,
@@ -35,11 +36,13 @@ from .model import Property, PropertyKind
 from .signature import (
     BufferParam,
     HarnessError,
-    Param,
     ScalarParam,
     StructParam,
     UnitSignature,
     extract_signature,
+)
+from .signature import (
+    Param as Param,
 )
 
 # Standard headers the semantic harness emits by default. Every macro a pure
@@ -223,50 +226,24 @@ def render_semantic_harness(
     postcondition = spec.postcondition.strip()
     returns_void = signature.return_ctype.strip() == "void"
 
-    scalars: list[ScalarParam] = []
-    structs: list[StructParam] = []
-    buffers: list[BufferParam] = []
-    for param in signature.params:
-        if isinstance(param, ScalarParam):
-            scalars.append(param)
-        elif isinstance(param, StructParam):
-            structs.append(param)
-        elif isinstance(param, BufferParam):
-            buffers.append(param)
-        else:
-            raise HarnessError(f"unknown Param subtype: {type(param).__name__}")
+    prepared = prepare_parameters(signature.params, includes=includes)
+    buffers = _plain_buffers(signature.params)
 
-    # The buffers `_render_buffer` will `malloc`/`free`, computed once and
-    # reused for both: whether the harness needs `<stdlib.h>` and which names
-    # need a matching `free()` at the end are the same question.
-    malloc_buffers = [buf for buf in buffers if not buf.scalar_backed]
-
-    lines: list[str] = [f"#include <{inc}>" for inc in includes]
-    if malloc_buffers and "stdlib.h" not in includes:
-        lines.append("#include <stdlib.h>")
-    lines.append("")
-    lines.append(unit_source.strip("\n"))
-    lines.append("")
-    for ctype in _nondet_ctypes(signature.params):
-        lines.append(f"{ctype} {_nondet_slug(ctype)}(void);")
-    lines.append("")
-    lines.append("int main(void) {")
-    for scalar in scalars:
-        lines.append(
-            f"    {scalar.ctype} {scalar.name} = {_nondet_slug(scalar.ctype)}();"
-        )
-    for struct in structs:
-        lines += _render_struct(struct)
+    lines = [*prepared.headers, "", unit_source.strip("\n"), ""]
+    lines += prepared.prototypes
+    lines += ["", "int main(void) {"]
+    lines += prepared.scalar_declarations
+    for _, declaration in prepared.struct_declarations:
+        lines += declaration
     pre_buffer, post_buffer = _split_assumptions(spec.preconditions, buffers)
     for pre in pre_buffer:
         lines.append(f"    __ESBMC_assume(({pre}));")
     for name, bound in plan_length_bounds(signature, spec, max_len):
         lines.append(f"    __ESBMC_assume(({name} >= 0 && {name} <= {bound}));")
-    for buf in buffers:
-        lines += _render_buffer(buf)
+    lines += prepared.buffer_setup
     for pre in post_buffer:
         lines.append(f"    __ESBMC_assume(({pre}));")
-    call = f"{signature.symbol}({', '.join(_call_arg(p) for p in signature.params)})"
+    call = f"{signature.symbol}({prepared.arguments})"
     if returns_void:
         lines.append(f"    {call};")
     else:
@@ -275,8 +252,7 @@ def render_semantic_harness(
         lines.append(f"    {non_vacuity_probe()}")
     else:
         lines.append(f'    __ESBMC_assert(({postcondition}), "forseti:semantic");')
-    for buf in malloc_buffers:
-        lines.append(f"    free({buf.name});")
+    lines += prepared.cleanup
     lines.append("    return 0;")
     lines.append("}")
     return "\n".join(lines) + "\n"
@@ -562,81 +538,6 @@ def _length_floor(clause: str, ident: str) -> int | None:
     )
 
 
-def _nondet_slug(ctype: str) -> str:
-    """Nondet generator name for a C type: ``int64_t`` -> ``nondet_int64_t``.
-
-    ESBMC models any *undefined* function named ``nondet_*`` as returning a fresh
-    unconstrained value of its return type, so the mapping is general -- no fixed
-    type enum.
-    """
-    return "nondet_" + re.sub(r"[^A-Za-z0-9_]", "_", ctype.strip())
-
-
-def _nondet_ctypes(params: Sequence[Param]) -> list[str]:
-    """The distinct nondet-source ctypes, in first-seen order (one prototype each).
-
-    Only nondet-*filled* inputs contribute: scalars always, and non-out buffers
-    (their element type); an output buffer is allocated, never filled, so it
-    needs no generator.
-    """
-    ordered: list[str] = []
-    for param in params:
-        if isinstance(param, ScalarParam):
-            ctype = param.ctype.strip()
-        elif isinstance(param, BufferParam) and not param.out:
-            ctype = param.elem_ctype.strip()
-        else:
-            continue
-        if ctype not in ordered:
-            ordered.append(ctype)
-    return ordered
-
-
-def _render_buffer(buf: BufferParam) -> list[str]:
-    """Decl (+ nondet fill for inputs) for one buffer param.
-
-    A single-element output is a plain scalar (passed by address at the call
-    site); everything else is heap-allocated via `malloc` and sized to the
-    *logical* length, so a read past it is a genuine out-of-bounds rather than a
-    read into slack. `malloc` here, not a stack VLA: a VLA's size must be > 0
-    under ESBMC's model, so an unconstrained nondet `length` (no domain entry
-    excludes 0) made *every* property over such a buffer spuriously VIOLATE at
-    `length == 0`, regardless of what the property actually asserted (#297).
-    `malloc(0)` is well-defined C, so the length-can-be-zero case is now sound.
-    The caller (`render_semantic_harness`) `free`s every such buffer after the
-    call, for the same reason: an unfreed one reports VIOLATED ("forgotten
-    memory") under `--memory-leak-check`, independent of the checked property.
-
-    A leading `__ESBMC_assume` guards the allocation's own size arithmetic:
-    `length * sizeof(elem_ctype)`, computed in `length`'s type, can wrap when
-    that type is as wide as `size_t` (nothing here restricts against a
-    `size_t`/`unsigned long` length param) -- the same failure class relocated
-    into the size computation, confirmed with `esbmc`. `precond/synth.py`
-    sidesteps this by bounding every length to a small `max_len` before it ever
-    reaches `malloc` (`_length_bound`), and the check path does the same by
-    default (`plan_length_bounds`); but this renderer must still support a
-    genuinely unconstrained length (`max_len=None`, the point of #297), so it
-    guards the multiplication itself as well, the same shape `precond/synth.py`'s
-    `obligation_expr` uses to guard its own count-based allocation. Input buffers
-    are nondet-filled element by element; output buffers are left for the unit to
-    write.
-    """
-    if buf.scalar_backed:
-        return [f"    {buf.elem_ctype} {buf.name};"]
-    lines = [
-        f"    __ESBMC_assume(({buf.length}) <= SIZE_MAX / sizeof({buf.elem_ctype}));",
-        f"    {buf.elem_ctype} *{buf.name} = "
-        f"malloc(({buf.length}) * sizeof({buf.elem_ctype}));",
-        f"    __ESBMC_assume({buf.name} != NULL);",
-    ]
-    if not buf.out:
-        lines.append(
-            f"    for (size_t _i = 0; _i < ({buf.length}); _i++) "
-            f"{buf.name}[_i] = {_nondet_slug(buf.elem_ctype)}();"
-        )
-    return lines
-
-
 def _plain_buffers(params: Sequence[Param]) -> list[BufferParam]:
     """The buffer params that are not a single struct instance (`StructParam`)."""
     return [
@@ -644,25 +545,6 @@ def _plain_buffers(params: Sequence[Param]) -> list[BufferParam]:
         for p in params
         if isinstance(p, BufferParam) and not isinstance(p, StructParam)
     ]
-
-
-def _render_struct(struct: StructParam) -> list[str]:
-    """One nondet object for a struct parameter, bound as a pointer to it."""
-    obj = f"{struct.name}__obj"
-    return [
-        f"    {struct.elem_ctype} {obj} = {_nondet_slug(struct.elem_ctype)}();",
-        f"    {struct.elem_ctype} *{struct.name} = &{obj};",
-    ]
-
-
-def _call_arg(param: Param) -> str:
-    """The call-site argument for a param: name, or ``&name`` for a scalar-backed
-    output buffer (every other buffer is already a `malloc`-allocated pointer)."""
-    if isinstance(param, ScalarParam):
-        return param.name
-    if isinstance(param, BufferParam):
-        return f"&{param.name}" if param.scalar_backed else param.name
-    raise HarnessError(f"unknown Param subtype: {type(param).__name__}")
 
 
 def _strip_buffer_subscripts(expr: str, buffer_names: Collection[str]) -> str:
@@ -738,8 +620,9 @@ def _split_assumptions(
 
     A precondition over buffer *contents* (e.g. ``a[0] >= 0``, ``a[n - 1] >= 0``)
     can only be emitted once the buffer is declared and nondet-filled, so it goes
-    *after* `_render_buffer` -- including when its index names the length, which by
-    then is a bound scalar. A length/scalar-only precondition (e.g. ``len <= 4``)
+    *after* parameter storage is prepared -- including when its index names the
+    length, which by then is a bound scalar. A length/scalar-only precondition
+    (e.g. ``len <= 4``)
     must stay *before* the allocation it sizes. Blank entries are dropped.
     Returns ``(pre_buffer, post_buffer)``.
 
