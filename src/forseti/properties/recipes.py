@@ -72,23 +72,27 @@ class ProposalContext:
     text: str
 
 
+Build = Callable[[str, str, Path, ContractSource | None], tuple[str, str]]
+
+
 @dataclass(frozen=True)
 class Recipe:
+    """A named, versioned context builder.
+
+    `build` maps ``(unit id, source text, project root, contract source)`` to the
+    context text and a suffix for the ref (``""``, or ``"+<digest>"`` for a recipe
+    that reads a store, which sets `reads_store`).
+    """
+
     name: str
     version: str
-    build: Callable[[str, str, Path], str]
-    build_from_store: Callable[[str, str, ContractSource], tuple[str, str]] | None = (
-        None
-    )
+    build: Build
+    reads_store: bool = False
 
     @property
     def ref(self) -> str:
         """The provenance label, e.g. ``"blind/v1"`` (a store recipe adds a digest)."""
         return f"{self.name}/v{self.version}"
-
-    @property
-    def reads_store(self) -> bool:
-        return self.build_from_store is not None
 
 
 def _target(scan: Scan, symbol: str) -> tuple[Item, int]:
@@ -148,43 +152,44 @@ def _baseline(unit_id: str, source: str, project_root: Path) -> str:
     return "".join(out).strip("\n") + "\n"
 
 
-def _project_recipe(name: str, slices: frozenset[SliceKind]) -> Recipe:
-    config = PackConfig(slices=slices)
-
-    def build(unit_id: str, source: str, project_root: Path) -> str:
-        del project_root
-        try:
-            return build_project_pack(unit_id, source, config).text
-        except ProjectIndexError as exc:
-            raise RecipeError(f"recipe {name!r}: {exc}") from exc
-
-    return Recipe(name, "1", build)
-
-
-def _needs_store(name: str) -> RecipeError:
-    return RecipeError(
-        f"recipe {name!r} reads accepted contracts from a store; give it one"
-    )
-
-
-def _store_recipe(name: str, slices: frozenset[SliceKind]) -> Recipe:
-    config = PackConfig(slices=slices)
-
-    def build(unit_id: str, source: str, project_root: Path) -> str:
-        raise _needs_store(name)
-
-    def build_from_store(
-        unit_id: str, source: str, contracts_for: ContractSource
+def _plain(build: Callable[[str, str, Path], str]) -> Build:
+    def run(
+        unit_id: str, source: str, project_root: Path, contracts_for: object
     ) -> tuple[str, str]:
+        del contracts_for
+        return build(unit_id, source, project_root), ""
+
+    return run
+
+
+def _project_recipe(
+    name: str, slices: frozenset[SliceKind], *, reads_store: bool = False
+) -> Recipe:
+    config = PackConfig(slices=slices)
+
+    def build(
+        unit_id: str,
+        source: str,
+        project_root: Path,
+        contracts_for: ContractSource | None,
+    ) -> tuple[str, str]:
+        del project_root
+        if reads_store and contracts_for is None:
+            raise RecipeError(
+                f"recipe {name!r} reads accepted contracts from a store; give it one"
+            )
         try:
             pack = build_project_pack(
-                unit_id, source, config, contracts_for=contracts_for
+                unit_id,
+                source,
+                config,
+                contracts_for=contracts_for if reads_store else None,
             )
         except ProjectIndexError as exc:
             raise RecipeError(f"recipe {name!r}: {exc}") from exc
-        return pack.text, pack.contracts_digest
+        return pack.text, f"+{pack.contracts_digest}" if reads_store else ""
 
-    return Recipe(name, "1", build, build_from_store)
+    return Recipe(name, "1", build, reads_store)
 
 
 _SIGHTED = frozenset({SliceKind.TARGET, SliceKind.TYPES})
@@ -194,13 +199,13 @@ SINGLE_FILE_RECIPES = ("baseline", "sighted", "blind")
 RECIPES: dict[str, Recipe] = {
     recipe.name: recipe
     for recipe in (
-        Recipe("baseline", "1", _baseline),
-        Recipe("sighted", "1", _sighted),
-        Recipe("blind", "1", _blind),
+        Recipe("baseline", "1", _plain(_baseline)),
+        Recipe("sighted", "1", _plain(_sighted)),
+        Recipe("blind", "1", _plain(_blind)),
         _project_recipe("callers", _SIGHTED | {SliceKind.CALLERS}),
         _project_recipe("tests", _SIGHTED | {SliceKind.TESTS}),
         _project_recipe("full", ALL_SLICES),
-        _store_recipe("callees", _SIGHTED | {SliceKind.CALLEES}),
+        _project_recipe("callees", _SIGHTED | {SliceKind.CALLEES}, reads_store=True),
     )
 }
 
@@ -224,12 +229,5 @@ def build_context(
         raise RecipeError(
             f"unknown recipe {recipe!r}; choose one of {', '.join(RECIPES)}"
         ) from None
-    if selected.build_from_store is not None:
-        if contracts_for is None:
-            raise _needs_store(recipe)
-        text, digest = selected.build_from_store(unit_id, source_text, contracts_for)
-        return ProposalContext(recipe=f"{selected.ref}+{digest}", text=text)
-    return ProposalContext(
-        recipe=selected.ref,
-        text=selected.build(unit_id, source_text, project_root),
-    )
+    text, suffix = selected.build(unit_id, source_text, project_root, contracts_for)
+    return ProposalContext(recipe=selected.ref + suffix, text=text)
