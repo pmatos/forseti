@@ -137,7 +137,11 @@ class Witness:
 
 @dataclass(frozen=True)
 class EquivalenceVerified:
-    """No divergence found up to `k` and `length_bounds` (not for all inputs)."""
+    """No divergence found up to `k` and `length_bounds` (not for all inputs).
+
+    For a range-idiom unit the inputs also satisfy ``0 <= lo <= hi``; a divergence
+    only outside that domain is not looked for.
+    """
 
     k: int
     length_bounds: LengthBounds

@@ -210,7 +210,7 @@ def test_forwarded_trailing_pointer_outside_a_range_is_still_refused() -> None:
 
 def test_non_range_buffer_gets_no_lower_bound_assumption() -> None:
     text = render(SUM, SUM, "sum")
-    assert text.count("__ESBMC_assume((n") == 1
+    assert text.count(">= 0 &&") == 1
 
 
 @pytest.mark.parametrize(
