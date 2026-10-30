@@ -45,6 +45,7 @@ from .invariant import (
     make_invariant,
     normalised_type_name,
     render_invariant_harness,
+    type_name_reason,
     valid_type_name,
 )
 from .invariant_proposer import InvariantRequest, InvariantStore, propose_invariants
@@ -188,6 +189,7 @@ __all__ = [
     "renderability_reason",
     "spec_from_property",
     "submit_candidates",
+    "type_name_reason",
     "valid_type_name",
     "validate_candidate",
 ]

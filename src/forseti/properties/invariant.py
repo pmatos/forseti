@@ -147,6 +147,13 @@ def invariant_reason(expression: str) -> str | None:
     return None
 
 
+def type_name_reason(type_name: str) -> str | None:
+    """None if `type_name` is a struct type name, else why not."""
+    if valid_type_name(type_name):
+        return None
+    return f"{type_name!r} is not a struct type name (ring_t or 'struct node')"
+
+
 def invariant_rejection(
     source_text: str, type_name: str, expression: str
 ) -> str | None:
@@ -156,8 +163,9 @@ def invariant_rejection(
     proposed one alike): `type_name` is a struct type name that occurs in
     `source_text`, and `expression` passes `invariant_reason`.
     """
-    if not valid_type_name(type_name):
-        return f"{type_name!r} is not a struct type name (ring_t or 'struct node')"
+    reason = type_name_reason(type_name)
+    if reason is not None:
+        return reason
     tag = type_name.split()[-1]
     if re.search(rf"\b{re.escape(tag)}\b", source_text) is None:
         return f"type {type_name!r} does not occur in the source"

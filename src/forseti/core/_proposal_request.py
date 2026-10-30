@@ -18,7 +18,7 @@ from forseti.properties import (
     build_context,
     extract_signature,
     normalised_type_name,
-    valid_type_name,
+    type_name_reason,
 )
 from forseti.properties.prompts import DEFAULT_PROMPT
 from forseti.unit_id import make_unit_id
@@ -83,10 +83,9 @@ def prepare_invariant_request(
     every unit id. `recipe` is as for `prepare_proposal_request`.
     """
     type_name = normalised_type_name(type_name)
-    if not valid_type_name(type_name):
-        raise HarnessError(
-            f"{type_name!r} is not a struct type name (ring_t or 'struct node')"
-        )
+    reason = type_name_reason(type_name)
+    if reason is not None:
+        raise HarnessError(reason)
     source_text = source.read_text()
     signature = extract_signature(source_text, function, struct_types=(type_name,))
     if not any(isinstance(p, StructParam) for p in signature.params):

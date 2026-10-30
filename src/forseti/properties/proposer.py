@@ -151,6 +151,13 @@ class ProposalResult:
     rejected: tuple[RejectedCandidate, ...]
     model_raw: str
 
+    @property
+    def assumption(self) -> str | None:
+        """The note an accepted representation invariant carries, else `None`."""
+        if any(prop.kind is PropertyKind.REP_INVARIANT for prop in self.accepted):
+            return INVARIANT_ASSUMPTION_NOTE
+        return None
+
     def to_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
             "unit_id": self.unit_id,
@@ -161,8 +168,8 @@ class ProposalResult:
             "accepted": [prop.to_dict() for prop in self.accepted],
             "rejected": [rej.to_dict() for rej in self.rejected],
         }
-        if any(prop.kind is PropertyKind.REP_INVARIANT for prop in self.accepted):
-            payload["assumption"] = INVARIANT_ASSUMPTION_NOTE
+        if self.assumption is not None:
+            payload["assumption"] = self.assumption
         return payload
 
 
@@ -591,7 +598,7 @@ def _str_tuple(value: object, index: int, field: str) -> tuple[str, ...]:
 def _opt_type_name(value: object) -> str | None:
     """The candidate's struct type, or `None`: lenient like ``kind``, so a stray
     ``type`` never fails a semantic batch (a rep-invariant run checks it)."""
-    return value.strip() or None if isinstance(value, str) else None
+    return (value.strip() or None) if isinstance(value, str) else None
 
 
 def _opt_str(value: object) -> str:

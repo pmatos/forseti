@@ -276,7 +276,7 @@ def test_cli_json_is_the_proposal_payload_with_the_assumption(
 @pytest.mark.parametrize(
     ("extra", "fragment"),
     [
-        (("--kind", "rep-invariant"), "requires --type"),
+        (("--kind", "rep-invariant"), "requires a type"),
         (("--type", "ring_t"), "rep-invariant only"),
     ],
 )
@@ -393,7 +393,7 @@ def _submit(source: str, **kw: Any) -> object:
 @pytest.mark.parametrize(
     ("call", "kwargs", "fragment"),
     [
-        (_propose, {"kind": "rep-invariant"}, "requires type_name"),
+        (_propose, {"kind": "rep-invariant"}, "requires a type"),
         (_propose, {"type_name": "ring_t"}, "rep-invariant only"),
         (_propose, {"kind": "reachability"}, "kind must be one of"),
         (
@@ -401,7 +401,7 @@ def _submit(source: str, **kw: Any) -> object:
             {"kind": "rep-invariant", "type_name": "ring_t", "domain": ["x"]},
             "per type",
         ),
-        (_submit, {"kind": "rep-invariant"}, "requires type_name"),
+        (_submit, {"kind": "rep-invariant"}, "requires a type"),
     ],
 )
 def test_mcp_kind_misuse_is_a_value_error(

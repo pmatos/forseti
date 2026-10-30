@@ -130,7 +130,6 @@ from forseti.grading import GradeRun, MutationError, grade_transcript
 from forseti.orchestrator import PropertyCheckRun, property_check_transcript
 from forseti.precond import DEFAULT_MAX_LEN
 from forseti.properties import (
-    INVARIANT_ASSUMPTION_NOTE,
     RECIPES,
     BlankProvenanceError,
     CandidateSpec,
@@ -139,7 +138,6 @@ from forseti.properties import (
     InvariantRole,
     LLMError,
     Property,
-    PropertyKind,
     PropertyStatus,
     PropertyStoreError,
     ProposalParseError,
@@ -190,6 +188,8 @@ from .propose import (
     DEFAULT_MAX_CANDIDATES,
     DEFAULT_MODEL,
     DEFAULT_STORE_ROOT,
+    PROPOSE_KINDS,
+    invariant_type_name,
     propose_invariant_source,
     propose_source,
 )
@@ -371,7 +371,7 @@ def _add_propose_parser(
     _add_unit_store_arguments(p)
     p.add_argument(
         "--kind",
-        choices=("semantic", "rep-invariant"),
+        choices=PROPOSE_KINDS,
         default="semantic",
         help="what to propose (default: semantic)",
     )
@@ -434,8 +434,8 @@ def _render_proposal(result: ProposalResult) -> str:
     for prop in result.accepted:
         domain = f"  [domain: {', '.join(prop.domain)}]" if prop.domain else ""
         lines.append(f"  + [{prop.property_id}] {prop.expression}{domain}")
-    if any(prop.kind is PropertyKind.REP_INVARIANT for prop in result.accepted):
-        lines.append(f"Note: {INVARIANT_ASSUMPTION_NOTE}.")
+    if result.assumption is not None:
+        lines.append(f"Note: {result.assumption}.")
     if result.rejected:
         lines.append(f"Rejected {len(result.rejected)}:")
         lines.extend(
@@ -444,26 +444,18 @@ def _render_proposal(result: ProposalResult) -> str:
     return "\n".join(lines)
 
 
-def _propose_usage_error(args: argparse.Namespace) -> str | None:
-    """Why `propose`'s flags are inconsistent for its --kind, or None."""
-    if args.kind == "rep-invariant" and not args.type_name:
-        return "--kind rep-invariant requires --type"
-    if args.kind == "semantic" and args.type_name:
-        return "--type applies to --kind rep-invariant only"
-    return None
-
-
 def _run_propose(args: argparse.Namespace) -> int:
-    usage = _propose_usage_error(args)
-    if usage is not None:
-        print(f"forseti propose: {usage}", file=sys.stderr)
-        return 2
     try:
-        propose = (
-            partial(propose_invariant_source, type_name=args.type_name)
-            if args.kind == "rep-invariant"
-            else propose_source
-        )
+        type_name = invariant_type_name(args.kind, args.type_name)
+    except ValueError as exc:
+        print(f"forseti propose: {exc}", file=sys.stderr)
+        return 2
+    propose = (
+        propose_source
+        if type_name is None
+        else partial(propose_invariant_source, type_name=type_name)
+    )
+    try:
         result = propose(
             args.source,
             function=args.function,

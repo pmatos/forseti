@@ -41,6 +41,30 @@ DEFAULT_MAX_CANDIDATES = MAX_CANDIDATES_DEFAULT
 DEFAULT_STORE_ROOT = Path(".forseti")
 
 
+PROPOSE_KINDS = ("semantic", "rep-invariant")
+
+
+def invariant_type_name(kind: str, type_name: str | None) -> str | None:
+    """The struct type to propose invariants for, or `None` for a semantic proposal.
+
+    The one kind/type consistency rule the CLI and the MCP tools share. `rep_invariant`
+    (the stored kind a payload echoes) reads as `rep-invariant`. `ValueError` for an
+    unknown kind, a `rep-invariant` without a type, or a type with a semantic kind.
+    """
+    kind = kind.replace("_", "-")
+    if kind not in PROPOSE_KINDS:
+        raise ValueError(
+            f"kind must be one of {', '.join(PROPOSE_KINDS)}, got {kind!r}"
+        )
+    if kind == "rep-invariant":
+        if not type_name:
+            raise ValueError("kind rep-invariant requires a type (--type / type_name)")
+        return type_name
+    if type_name is not None:
+        raise ValueError("a type applies to kind rep-invariant only")
+    return None
+
+
 def propose_source(
     source: Path,
     *,

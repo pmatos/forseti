@@ -39,6 +39,7 @@ from .propose import (
     DEFAULT_MAX_CANDIDATES,
     DEFAULT_MODEL,
     DEFAULT_STORE_ROOT,
+    invariant_type_name,
     propose_invariant_source,
     propose_source,
 )
@@ -53,26 +54,6 @@ from .verify import (
     result_to_payload,
     verify_source,
 )
-
-_KINDS = ("semantic", "rep-invariant")
-
-
-def _check_kind(kind: str, type_name: str | None) -> bool:
-    """True for a representation invariant; `ValueError` on an inconsistent pair.
-
-    `rep_invariant` (the stored kind a payload echoes) is read as `rep-invariant`.
-    """
-    kind = kind.replace("_", "-")
-    if kind not in _KINDS:
-        raise ValueError(f"kind must be one of {', '.join(_KINDS)}, got {kind!r}")
-    if kind == "rep-invariant":
-        if not type_name:
-            raise ValueError("kind rep-invariant requires type_name")
-        return True
-    if type_name is not None:
-        raise ValueError("type_name applies to kind rep-invariant only")
-    return False
-
 
 _INSTRUCTIONS = (
     "Forseti Core: bounded verification with ESBMC plus LLM property proposal. "
@@ -166,12 +147,12 @@ def propose_tool(
         lists. For an invariant, a `function` that does not take `type_name *`
         (or an unusable `type_name`) is an error, not a rejected candidate.
     """
-    if _check_kind(kind, type_name):
-        assert type_name is not None
+    invariant_type = invariant_type_name(kind, type_name)
+    if invariant_type is not None:
         return propose_invariant_source(
             Path(source),
             function=function,
-            type_name=type_name,
+            type_name=invariant_type,
             persist=persist,
             store_root=Path(store_root),
             model=model,
@@ -242,8 +223,8 @@ def submit_tool(
         invariant), prompt/backend provenance, and the `accepted`/`rejected`
         candidate lists.
     """
-    if _check_kind(kind, type_name):
-        assert type_name is not None
+    invariant_type = invariant_type_name(kind, type_name)
+    if invariant_type is not None:
         if domain or referenced_params:
             raise ValueError(
                 "kind rep-invariant is per type: domain and referenced_params "
@@ -251,7 +232,7 @@ def submit_tool(
             )
         return submit_invariant_source(
             Path(source),
-            type_name=type_name,
+            type_name=invariant_type,
             expression=expression,
             provider=provider,
             model=model,
