@@ -1,0 +1,14 @@
+{
+  "tool_use_id": "toolu_01EGdWSiAXWbL7CbvjJSJDgm",
+  "agent_id": "a0b05e939b2ca7956",
+  "task_description": "Simplify review: efficiency",
+  "token_usage": {
+    "input_tokens": 4,
+    "cache_creation_tokens": 38300,
+    "cache_read_tokens": 64990,
+    "output_tokens": 1193,
+    "api_call_count": 2
+  },
+  "started_at": "2026-10-30T11:06:24.900827233+01:00",
+  "completed_at": "2026-10-30T11:06:37.717160258+01:00"
+}
