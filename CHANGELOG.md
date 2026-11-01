@@ -1,3 +1,31 @@
+# [1.12.0](https://github.com/pmatos/forseti/compare/v1.11.0...v1.12.0) (2026-11-01)
+
+
+### Bug Fixes
+
+* **properties:** cap lengths over a domain upper bound, allow non-NULL scratch domains ([#441](https://github.com/pmatos/forseti/issues/441)) ([3676869](https://github.com/pmatos/forseti/commit/36768690fd852d8ea6a11c87f4d614e86361e311))
+* **properties:** size range-idiom buffers by their upper bound ([#437](https://github.com/pmatos/forseti/issues/437)) ([b172c1e](https://github.com/pmatos/forseti/commit/b172c1e2fc80e6f8482fbfeac837f067517b5c80))
+
+
+### Features
+
+* **check:** hold a semantic property only if its post-call point is reachable ([#406](https://github.com/pmatos/forseti/issues/406)) ([de8356f](https://github.com/pmatos/forseti/commit/de8356f66df9cb3cf7b8a50bb8a176645da75ebd))
+* **experiments:** add the E0 recipe x sample proposer runner ([#419](https://github.com/pmatos/forseti/issues/419)) ([17df0fb](https://github.com/pmatos/forseti/commit/17df0fb3d024a3a3ecdef998c6009b940bae4519))
+* **grading:** add bug-pair discrimination scorer ([#407](https://github.com/pmatos/forseti/issues/407)) ([fed651c](https://github.com/pmatos/forseti/commit/fed651c5d14fb6911a2f92bd419fd3fcae637a3e))
+* **grading:** add kill-rate scorer and forseti grade command ([#408](https://github.com/pmatos/forseti/issues/408)) ([e82bd48](https://github.com/pmatos/forseti/commit/e82bd48db4bc04405365da5d8ea635f717fcfd87))
+* **grading:** add mutation operator kit ([#404](https://github.com/pmatos/forseti/issues/404)) ([5d5a79f](https://github.com/pmatos/forseti/commit/5d5a79f8d618974d46db75e0bbd367df6c2117c3))
+* **grading:** equivalence harness and equivalent-mutant filter ([#405](https://github.com/pmatos/forseti/issues/405)) ([7bab65b](https://github.com/pmatos/forseti/commit/7bab65b5dfc142d3baa47d2ae09d239bca31bdc9))
+* **grading:** let the equivalence filter accept range-idiom units such as msort ([#440](https://github.com/pmatos/forseti/issues/440)) ([c5808ea](https://github.com/pmatos/forseti/commit/c5808ea9c807edaf454acb215ec3191df14264df))
+* **properties:** accept representation invariants and run S0 under them ([#421](https://github.com/pmatos/forseti/issues/421)) ([ccfd0b6](https://github.com/pmatos/forseti/commit/ccfd0b65cf63a335677859ce4ca80422da33378d))
+* **properties:** accept struct-pointer parameters in the semantic path ([#431](https://github.com/pmatos/forseti/issues/431)) ([9a712a2](https://github.com/pmatos/forseti/commit/9a712a2c7840f9ab0adcea2b1c1cb0c54b0f2f74))
+* **properties:** add proposer input recipes and recipe provenance ([#416](https://github.com/pmatos/forseti/issues/416)) ([356f71a](https://github.com/pmatos/forseti/commit/356f71a7a0628ea1b66b4f8b2954153d2aa10527))
+* **properties:** add the callees recipe over the store's accepted contracts ([#439](https://github.com/pmatos/forseti/issues/439)) ([51c3aad](https://github.com/pmatos/forseti/commit/51c3aad6b3fc55e338c3bd8860922cc6bd7d2e56))
+* **properties:** add the callers, tests and full context recipes ([#434](https://github.com/pmatos/forseti/issues/434)) ([527e158](https://github.com/pmatos/forseti/commit/527e15881e02638b832b8ef45d85e7a050611f88))
+* **properties:** add the project index and context-pack builder ([#432](https://github.com/pmatos/forseti/issues/432)) ([59652c2](https://github.com/pmatos/forseti/commit/59652c2f1318a2fa007602594fa5c98cdd2f0acc))
+* **properties:** check functions under a per-type representation invariant ([#417](https://github.com/pmatos/forseti/issues/417)) ([cef48a4](https://github.com/pmatos/forseti/commit/cef48a42f4c3dbad28d773989ce70782e597221e))
+* **properties:** discharge representation invariants at constructing callers ([#435](https://github.com/pmatos/forseti/issues/435)) ([a5f50a5](https://github.com/pmatos/forseti/commit/a5f50a572713ab28c39ffd31986ea0496336780e))
+* **properties:** propose representation invariants ([#433](https://github.com/pmatos/forseti/issues/433)) ([ca3606e](https://github.com/pmatos/forseti/commit/ca3606e4e92d0e678db6a7c87a692193274b9d34))
+
 # [1.11.0](https://github.com/pmatos/forseti/compare/v1.10.1...v1.11.0) (2026-10-11)
 
 
