@@ -166,6 +166,34 @@ class SemanticSpec:
     result_var: str = "result"
 
 
+@dataclass(frozen=True)
+class _PreparedSemanticHarness:
+    """One immutable preparation for both obligations and their reported scope.
+
+    The prefix includes all domain assumptions, length caps and the call. Only
+    the obligation varies between the real harness and its vacuity probe; both
+    retain the same cleanup suffix and the bounds used to build the prefix.
+    """
+
+    prefix: tuple[str, ...]
+    assertion: str
+    suffix: tuple[str, ...]
+    length_bounds: LengthBounds
+    assumption: str | None
+
+    def render(self, *, probe: bool = False) -> str:
+        obligation = f"    {non_vacuity_probe()}" if probe else self.assertion
+        return "\n".join((*self.prefix, obligation, *self.suffix)) + "\n"
+
+    def build(self) -> PropertyHarness:
+        return PropertyHarness(
+            source_text=self.render(),
+            length_bounds=self.length_bounds,
+            probe_source_text=self.render(probe=True),
+            assumption=self.assumption,
+        )
+
+
 def render_semantic_harness(
     *,
     unit_source: str,
@@ -209,6 +237,29 @@ def render_semantic_harness(
     domain so a clause may read ``p->field``. Nothing constrains it except the
     domain: it can be a state no caller builds (`nondet_struct_note`).
     """
+    return _prepare_semantic_harness(
+        unit_source=unit_source,
+        signature=signature,
+        spec=spec,
+        includes=includes,
+        max_len=max_len,
+    ).render(probe=probe)
+
+
+def _prepare_semantic_harness(
+    *,
+    unit_source: str,
+    signature: UnitSignature,
+    spec: SemanticSpec,
+    includes: Sequence[str] = DEFAULT_INCLUDES,
+    max_len: int | None = None,
+) -> _PreparedSemanticHarness:
+    """Validate and plan storage, domain stages and length caps exactly once.
+
+    Source and renderability errors retain their precedence over storage and
+    cap errors. The returned module owns the real/probe rendering and metadata
+    relationship, so no caller needs to derive the reported bounds separately.
+    """
     # The source-level guard needs `unit_source`, so it stays here; every
     # `(signature, spec)` guard -- empty postcondition, `result_var` clash, void
     # return, the two emission rules, and a precondition mixing a buffer with its
@@ -238,7 +289,8 @@ def render_semantic_harness(
     pre_buffer, post_buffer = _split_assumptions(spec.preconditions, buffers)
     for pre in pre_buffer:
         lines.append(f"    __ESBMC_assume(({pre}));")
-    for name, bound in plan_length_bounds(signature, spec, max_len):
+    length_bounds = plan_length_bounds(signature, spec, max_len)
+    for name, bound in length_bounds:
         lines.append(f"    __ESBMC_assume(({name} >= 0 && {name} <= {bound}));")
     lines += prepared.buffer_setup
     for pre in post_buffer:
@@ -248,14 +300,13 @@ def render_semantic_harness(
         lines.append(f"    {call};")
     else:
         lines.append(f"    {signature.return_ctype} {spec.result_var} = {call};")
-    if probe:
-        lines.append(f"    {non_vacuity_probe()}")
-    else:
-        lines.append(f'    __ESBMC_assert(({postcondition}), "forseti:semantic");')
-    lines += prepared.cleanup
-    lines.append("    return 0;")
-    lines.append("}")
-    return "\n".join(lines) + "\n"
+    return _PreparedSemanticHarness(
+        prefix=tuple(lines),
+        assertion=f'    __ESBMC_assert(({postcondition}), "forseti:semantic");',
+        suffix=(*prepared.cleanup, "    return 0;", "}"),
+        length_bounds=length_bounds,
+        assumption=nondet_struct_note(signature),
+    )
 
 
 def render_property_harness(
@@ -291,24 +342,14 @@ def build_property_harness(
     The check phase reports those bounds on each verdict so a result scoped to
     ``len <= N`` is never mistaken for one over every length. `probe_source_text`
     is the vacuity-probe twin of `source_text` (`render_semantic_harness`
-    ``probe=True``), checked at the same k after a HELD.
+    ``probe=True``), checked at the same k after a HELD. Both twins and their
+    reported bounds come from one preparation of the storage and domain.
     """
     signature = extract_signature(unit_source, symbol, infer_structs=True)
     spec = spec_from_property(prop)
-    return PropertyHarness(
-        source_text=render_semantic_harness(
-            unit_source=unit_source, signature=signature, spec=spec, max_len=max_len
-        ),
-        length_bounds=plan_length_bounds(signature, spec, max_len),
-        probe_source_text=render_semantic_harness(
-            unit_source=unit_source,
-            signature=signature,
-            spec=spec,
-            max_len=max_len,
-            probe=True,
-        ),
-        assumption=nondet_struct_note(signature),
-    )
+    return _prepare_semantic_harness(
+        unit_source=unit_source, signature=signature, spec=spec, max_len=max_len
+    ).build()
 
 
 def nondet_struct_note(signature: UnitSignature) -> str | None:
