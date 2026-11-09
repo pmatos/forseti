@@ -1173,3 +1173,74 @@ def test_build_property_harness_reports_no_bounds_when_floor_contradicts_the_cap
     )
     assert built.length_bounds == ()
     assert "<= 8" not in built.source_text
+
+
+@pytest.mark.parametrize("floor", [1, 16])
+def test_built_twins_preserve_domain_stages_and_reported_scope(floor: int) -> None:
+    source = "int first(const int *a, unsigned n) { return a[0]; }"
+    prop = _semantic_property(
+        "result == a[0]", (f" n >= {floor} ", " ", "a[n - 1] >= 0")
+    )
+    built = build_property_harness(
+        unit_source=source, symbol="first", prop=prop, max_len=8
+    )
+    cap = "    __ESBMC_assume((n >= 0 && n <= 8));\n" if floor <= 8 else ""
+    expected = (
+        "#include <stdint.h>\n"
+        "#include <stddef.h>\n"
+        "#include <limits.h>\n"
+        "#include <stdlib.h>\n\n"
+        f"{source}\n\n"
+        "int nondet_int(void);\n"
+        "unsigned nondet_unsigned(void);\n\n"
+        "int main(void) {\n"
+        "    unsigned n = nondet_unsigned();\n"
+        f"    __ESBMC_assume((n >= {floor}));\n"
+        f"{cap}"
+        "    __ESBMC_assume((n) <= SIZE_MAX / sizeof(int));\n"
+        "    int *a = malloc((n) * sizeof(int));\n"
+        "    __ESBMC_assume(a != NULL);\n"
+        "    for (size_t _i = 0; _i < (n); _i++) a[_i] = nondet_int();\n"
+        "    __ESBMC_assume((a[n - 1] >= 0));\n"
+        "    int result = first(a, n);\n"
+        '    __ESBMC_assert((result == a[0]), "forseti:semantic");\n'
+        "    free(a);\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    assert built.source_text == expected
+    assert built.probe_source_text == expected.replace(
+        '__ESBMC_assert((result == a[0]), "forseti:semantic");',
+        '__ESBMC_assert(0, "forseti:non-vacuity");',
+    )
+    assert built.length_bounds == ((("n", 8),) if floor <= 8 else ())
+
+
+def test_rendering_error_precedence_is_source_then_spec_then_cap() -> None:
+    with pytest.raises(HarnessError, match="unit_source defines main"):
+        render_semantic_harness(
+            unit_source="int main(void) { return 0; }",
+            signature=ABS_SIG,
+            spec=SemanticSpec(""),
+            max_len=-1,
+        )
+    with pytest.raises(HarnessError, match="empty postcondition"):
+        render_semantic_harness(
+            unit_source=ABS_SLICE,
+            signature=ABS_SIG,
+            spec=SemanticSpec(""),
+            max_len=-1,
+        )
+    with pytest.raises(HarnessError, match="constrains both a buffer"):
+        render_semantic_harness(
+            unit_source=_FIRST_SRC,
+            signature=_BUF_SIG,
+            spec=SemanticSpec("result == 0", ("n >= 1 && a[0] >= 0",)),
+            max_len=-1,
+        )
+
+
+def test_length_query_does_not_validate_the_rest_of_the_spec() -> None:
+    spec = SemanticSpec("", ("n >= 1 && a[0] >= 0",))
+    assert plan_length_bounds(_BUF_SIG, spec, 8) == (("n", 8),)
+    assert plan_length_bounds(_BUF_SIG, spec, None) == ()
