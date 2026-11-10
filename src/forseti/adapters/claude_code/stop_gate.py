@@ -35,7 +35,7 @@ from typing import Any
 from forseti.core.events import GATE_DECISION
 from forseti.core.events import record_event as record_core_event
 
-from . import event_log, property_gate
+from . import _stop_trace, event_log, property_gate
 from . import forseti_gate as gate
 
 _CEX_CLIP = 1200
@@ -378,28 +378,9 @@ def main() -> int:
         notes.append(_semantic_message(semantic))
 
     if not outstanding:
+        _stop_trace.record_allow(project_dir, semantic, n_needs_contract=len(needs))
         if notes:
-            # "allow_needs_contract" only when a NEEDS_CONTRACT unit is actually
-            # among the notes -- a turn with zero of those but a semantic-only
-            # note must not be mislabeled as one, or anything filtering
-            # events.jsonl by decision gets a false positive (issue #95 review).
-            decision = "allow_needs_contract" if needs else "allow_semantic_check"
-            event_log.log_event(
-                project_dir,
-                event_log.STOP,
-                decision=decision,
-                n_needs_contract=len(needs),
-                n_semantic_violations=len(semantic.violations),
-                n_semantic_unresolved=len(semantic.unresolved),
-                n_semantic_failed=semantic.failed,
-                n_semantic_skipped=len(semantic.skipped),
-                n_semantic_vacuous=len(semantic.vacuous),
-                attempt=0,
-            )
             return _emit({"systemMessage": "\n\n".join(notes)})
-        event_log.log_event(
-            project_dir, event_log.STOP, decision="allow", n_unverified=0, attempt=0
-        )
         return 0  # nothing outstanding — allow the turn to end
 
     # Fold the recorded-blocking residual, any out-of-band files, any divergent
@@ -421,20 +402,15 @@ def main() -> int:
         # Allow the turn to end by OMITTING `decision` — the Stop schema only
         # recognizes "block", so emit just the loud residual as a systemMessage
         # (a top-level field) rather than risk an unrecognized "approve" dropping it.
-        event_log.log_event(
+        _stop_trace.record_outstanding(
             project_dir,
-            event_log.STOP,
+            semantic,
             decision="residual",
             n_unverified=len(blocking),
             n_oob=len(oob),
             n_blob=len(blob),
             attempt=attempts,
             n_needs_contract=len(needs),
-            n_semantic_violations=len(semantic.violations),
-            n_semantic_unresolved=len(semantic.unresolved),
-            n_semantic_failed=semantic.failed,
-            n_semantic_skipped=len(semantic.skipped),
-            n_semantic_vacuous=len(semantic.vacuous),
         )
         if semantic_blocking:
             _record_semantic_gate_decision(project_dir, semantic, "residual")
@@ -448,20 +424,15 @@ def main() -> int:
             }
         )
 
-    event_log.log_event(
+    _stop_trace.record_outstanding(
         project_dir,
-        event_log.STOP,
+        semantic,
         decision="block",
         n_unverified=len(blocking),
         n_oob=len(oob),
         n_blob=len(blob),
         attempt=attempts,
         n_needs_contract=len(needs),
-        n_semantic_violations=len(semantic.violations),
-        n_semantic_unresolved=len(semantic.unresolved),
-        n_semantic_failed=semantic.failed,
-        n_semantic_skipped=len(semantic.skipped),
-        n_semantic_vacuous=len(semantic.vacuous),
     )
     if semantic_blocking:
         _record_semantic_gate_decision(project_dir, semantic, "block")
