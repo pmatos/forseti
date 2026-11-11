@@ -62,7 +62,8 @@ def _opens_block(line: str) -> bool:
 def _parse_state(lines: list[str], i: int) -> tuple[Step, int]:
     """Parse a `State` block starting at line `i`; return the Step and next index."""
     m = _STATE_RE.match(lines[i].strip())
-    number, file, ln, col, fn, _thread = m.groups()  # ty: ignore[unresolved-attribute]
+    assert m is not None
+    number, file, ln, col, fn, _thread = m.groups()
     assignments: list[Assignment] = []
     i += 1
     while i < len(lines) and not _opens_block(lines[i]):
