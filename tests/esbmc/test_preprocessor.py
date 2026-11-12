@@ -13,6 +13,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 from forseti.esbmc import preprocessor as pp
 
 
@@ -118,3 +120,95 @@ def test_presumed_line_offsets_from_breakpoint() -> None:
     assert pp._presumed_line(3, breakpoints) == 101
     # No directive at or before the line: presumed == physical.
     assert pp._presumed_line(1, breakpoints) == 1
+
+
+def test_guard_order_and_line_walk_share_definedness_grammar() -> None:
+    source = (
+        "#if defined(EARLY)\n#line 10\n"
+        "#elif !defined(ALT)\n#line 20\n#endif\n"
+        "#ifndef LATE\n#line 30\n#endif\n"
+        "#if 0\n#elifdef MID\n#line 40\n#endif\n"
+        "#ifdef EARLY\n#line 50\n#endif\n"
+    )
+    # Probe names keep their legacy spelling-group order, not source order.
+    assert pp._guard_macro_names(source) == ("LATE", "EARLY", "MID", "ALT")
+    assert pp._line_breakpoints(
+        source,
+        predefined=(("EARLY", False), ("ALT", False), ("LATE", False), ("MID", True)),
+    ) == [(4, 20), (7, 30), (11, 40)]
+
+
+@pytest.mark.parametrize("premasked", [False, True])
+@pytest.mark.parametrize("defined, expected", [(True, [(8, 11)]), (False, [(11, 22)])])
+def test_both_projections_read_spliced_text_with_original_physical_lines(
+    premasked: bool, defined: bool, expected: list[tuple[int, int]]
+) -> None:
+    source = (
+        "/\\\n* #ifdef HIDDEN\n#line 900\n*/\n"
+        "#ifde\\\nf W\\\nIDE\n#line \\\n11\n#else\n#line 22\n#endif\n"
+    )
+    if premasked:
+        source = pp._stripped_for_scan(source)
+    assert pp._guard_macro_names(source) == ("WIDE",)
+    assert pp._line_breakpoints(source, predefined=(("WIDE", defined),)) == expected
+
+
+@pytest.mark.parametrize(
+    "directive, kind, names, verdict",
+    [
+        ("#if ((0))", "if0", (), None),
+        ("#elif (1)", "elif1", (), None),
+        ("#if 0 || FEATURE", "ifop", (), None),
+        ("#elif defined(GUARD) && OTHER", "elifop", (), None),
+        ("#if !(defined(GUARD))", "ifop", (), None),
+        ("#ifdef GUARD", "ifdef", ("GUARD",), "1"),
+        ("#ifndef GUARD", "ifdef", ("GUARD",), "0"),
+        ("#elifdef GUARD", "elifdef", ("GUARD",), "1"),
+        ("#elifndef GUARD", "elifdef", ("GUARD",), "0"),
+        ("#if ((defined GUARD))", "ifdef", ("GUARD",), "1"),
+        ("#elif !defined(GUARD)", "elifdef", ("GUARD",), "0"),
+        ("%:\vif!defined(GUARD)", "ifdef", ("GUARD",), "0"),
+        ("#ifdef", "ifdef", (), "op"),
+        ("#elifndef", "elifdef", (), "op"),
+    ],
+)
+def test_directive_reading_classifies_without_resolving_macro_state(
+    directive: str, kind: str, names: tuple[str, ...], verdict: str | None
+) -> None:
+    reading = pp._read_directives(f"{directive}\n#line 50\n#endif\n")
+    assert reading.guard_names == names
+    assert [(line, event_kind) for line, event_kind, _ in reading.events] == [
+        (1, kind),
+        (2, "line"),
+        (3, "endif"),
+    ]
+    if verdict is not None:
+        # A defined test stays unresolved until the walker supplies state.
+        predicate = reading.events[0][2]
+        assert pp._macro_verdict(predicate, {"GUARD": True}) == verdict
+        assert pp._macro_verdict(predicate, {}) == "op"
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_directive_reading_keeps_event_order_within_a_spliced_line(
+    newline: str,
+) -> None:
+    source = '#define RESTORE \\\n_Pragma("pop_macro")\n#line RESTORE\n'
+    reading = pp._read_directives(source.replace("\n", newline))
+    assert reading.guard_names == ()
+    assert [(line, kind) for line, kind, _ in reading.events] == [
+        (1, "define"),
+        (1, "pragma_operator"),
+        (3, "line_macro"),
+    ]
+
+
+def test_directive_reading_ignores_comments_and_spliced_literals() -> None:
+    source = (
+        "/\\\n*\n#ifdef COMMENT\n*/\n"
+        'char *s = "\\\n#ifdef STRING";\n'
+        "// #if defined(LINE_COMMENT)\n"
+    )
+    reading = pp._read_directives(source)
+    assert reading.guard_names == ()
+    assert reading.events == ()
