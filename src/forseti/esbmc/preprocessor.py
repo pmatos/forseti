@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 # Line (`// ...`) and block (`/* ... */`) comments, blanked before harvesting an
 # array extent so a `[N]` inside a comment can never be misread as a declarator.
@@ -575,6 +576,116 @@ _RESOLVED_IFDEF_KINDS = {
 }
 
 
+@dataclass(frozen=True)
+class _DirectiveReading:
+    """Source-ordered events and stable probe names from the same grammar.
+
+    Each event carries its 1-based physical line, classified kind and operand
+    match. Definedness stays unresolved until the line walker supplies macro
+    state. Guard names include tests in every arm, in legacy spelling-group
+    order rather than source order, deduplicated by first insertion.
+    """
+
+    events: tuple[tuple[int, str, re.Match[str]], ...]
+    guard_names: tuple[str, ...]
+
+
+def _read_directives(source_no_comments: str) -> _DirectiveReading:
+    """Read directive syntax once for line mapping and predefined-guard probing.
+
+    Owns splicing, masking, conditional recognition and physical-line mapping;
+    macro state and branch reachability remain the line walker's policy.
+    """
+    spliced, physical_line_of = _splice_continuations(source_no_comments)
+    # Masked again, on the *spliced* text and with exactly the pass the callers
+    # use. Two reasons (PR #225 review). Phase 2 can *create* a delimiter phase 3
+    # then honours — `/\` + newline + `*`, and its string-literal twin — which
+    # the caller's own pass, run before splicing as it must be, cannot have seen.
+    # And running the *same* pass the callers do means this function sees one
+    # text whether its caller pre-masked or not, so a pattern cannot pass its
+    # tests on raw source while matching nothing in production — exactly how the
+    # `_Pragma` latch first shipped as a no-op. That is not only a guard rail:
+    # blanking literals is what stops a `_Pragma(` merely *mentioned* in a string
+    # from latching, since `_PRAGMA_OPERATOR_RE` matches the operator rather than
+    # its (already unreadable) argument. Blanking preserves offsets and newlines,
+    # so `physical_line_of` still holds.
+    spliced = _stripped_for_scan(spliced)
+    names: dict[str, None] = {}
+
+    def _events(
+        pattern: re.Pattern[str], kind: str
+    ) -> list[tuple[int, str, re.Match[str]]]:
+        found = [(m.start(), kind, m) for m in pattern.finditer(spliced)]
+        if kind in _RESOLVED_IFDEF_KINDS:
+            for _, _, match in found:
+                name = match.group("name")
+                if name is not None:
+                    names[name] = None
+        return found
+
+    def _cond_events(
+        pattern: re.Pattern[str],
+        kinds_by_literal: dict[str, str],
+        opaque_kind: str,
+        defined_kind: str,
+    ) -> list[tuple[int, str, re.Match[str]]]:
+        """`pattern`'s conditionals, classified by what their condition says.
+
+        A literal `0`/`1` classifies here and for good, into `kinds_by_literal`.
+        A ``defined``-shaped condition classifies as `defined_kind`, which is
+        deliberately *not* yet a verdict: it stays unresolved until the walk
+        reaches it, because its answer depends on macro state built along the
+        way (`_RESOLVED_IFDEF_KINDS`). Anything else is `opaque_kind`.
+        """
+        found: list[tuple[int, str, re.Match[str]]] = []
+        for m in pattern.finditer(spliced):
+            condition = _strip_literal_parens(m.group(1))
+            kind = kinds_by_literal.get(condition)
+            if kind is not None:
+                found.append((m.start(), kind, m))
+                continue
+            test = _macro_test(condition)
+            if test is None:
+                found.append((m.start(), opaque_kind, m))
+            else:
+                found.append((m.start(), defined_kind, test))
+                names[test.group("name")] = None
+        return found
+
+    # Collect guards in their legacy spelling-group order, while events
+    # retain the walker's source order after sorting below.
+    ifdef_events = _events(_IFDEF_RE, "ifdef")
+    elifdef_events = _events(_ELIFDEF_RE, "elifdef")
+    if_events = _cond_events(_IF_RE, {"0": "if0", "1": "if1"}, "ifop", "ifdef")
+    elif_events = _cond_events(
+        _ELIF_RE, {"0": "elif0", "1": "elif1"}, "elifop", "elifdef"
+    )
+    events = sorted(
+        if_events
+        + ifdef_events
+        + elif_events
+        + elifdef_events
+        + _events(_ELSE_RE, "else")
+        + _events(_ENDIF_RE, "endif")
+        + _events(_INCLUDE_RE, "include")
+        + _events(_PRAGMA_MACRO_RE, "pragma_macro")
+        + _events(_PRAGMA_OPERATOR_RE, "pragma_operator")
+        + _events(_LINE_DIRECTIVE_RE, "line")
+        + _events(_LINE_DIRECTIVE_MACRO_RE, "line_macro")
+        + _events(_DEFINE_RE, "define")
+        + _events(_UNDEF_RE, "undef"),
+        key=lambda event: event[0],
+    )
+    physical_events: list[tuple[int, str, re.Match[str]]] = []
+    logical_line = last_pos = 0
+    for pos, kind, match in events:
+        # Events are sorted, so map lines without rescanning every prefix.
+        logical_line += spliced.count("\n", last_pos, pos)
+        physical_events.append((physical_line_of[logical_line], kind, match))
+        last_pos = pos
+    return _DirectiveReading(tuple(physical_events), tuple(names))
+
+
 def _line_breakpoints(
     source_no_comments: str, predefined: Sequence[tuple[str, bool]] = ()
 ) -> list[tuple[int, int]]:
@@ -647,70 +758,7 @@ def _line_breakpoints(
     is normalized to the bare digit before the ``"0"``/``"1"`` comparison (see
     `_strip_literal_parens`), the same issue's second follow-up.
     """
-    spliced, physical_line_of = _splice_continuations(source_no_comments)
-    # Masked again, on the *spliced* text and with exactly the pass the callers
-    # use. Two reasons (PR #225 review). Phase 2 can *create* a delimiter phase 3
-    # then honours — `/\` + newline + `*`, and its string-literal twin — which
-    # the caller's own pass, run before splicing as it must be, cannot have seen.
-    # And running the *same* pass the callers do means this function sees one
-    # text whether its caller pre-masked or not, so a pattern cannot pass its
-    # tests on raw source while matching nothing in production — exactly how the
-    # `_Pragma` latch first shipped as a no-op. That is not only a guard rail:
-    # blanking literals is what stops a `_Pragma(` merely *mentioned* in a string
-    # from latching, since `_PRAGMA_OPERATOR_RE` matches the operator rather than
-    # its (already unreadable) argument. Blanking preserves offsets and newlines,
-    # so `physical_line_of` still holds.
-    spliced = _stripped_for_scan(spliced)
-
-    def _events(
-        pattern: re.Pattern[str], kind: str
-    ) -> list[tuple[int, str, re.Match[str]]]:
-        return [(m.start(), kind, m) for m in pattern.finditer(spliced)]
-
-    def _cond_events(
-        pattern: re.Pattern[str],
-        kinds_by_literal: dict[str, str],
-        opaque_kind: str,
-        defined_kind: str,
-    ) -> list[tuple[int, str, re.Match[str]]]:
-        """`pattern`'s conditionals, classified by what their condition says.
-
-        A literal `0`/`1` classifies here and for good, into `kinds_by_literal`.
-        A ``defined``-shaped condition classifies as `defined_kind`, which is
-        deliberately *not* yet a verdict: it stays unresolved until the walk
-        reaches it, because its answer depends on macro state built along the
-        way (`_RESOLVED_IFDEF_KINDS`). Anything else is `opaque_kind`.
-        """
-        found: list[tuple[int, str, re.Match[str]]] = []
-        for m in pattern.finditer(spliced):
-            condition = _strip_literal_parens(m.group(1))
-            kind = kinds_by_literal.get(condition)
-            if kind is not None:
-                found.append((m.start(), kind, m))
-                continue
-            test = _macro_test(condition)
-            if test is None:
-                found.append((m.start(), opaque_kind, m))
-            else:
-                found.append((m.start(), defined_kind, test))
-        return found
-
-    events = sorted(
-        _cond_events(_IF_RE, {"0": "if0", "1": "if1"}, "ifop", "ifdef")
-        + _events(_IFDEF_RE, "ifdef")
-        + _cond_events(_ELIF_RE, {"0": "elif0", "1": "elif1"}, "elifop", "elifdef")
-        + _events(_ELIFDEF_RE, "elifdef")
-        + _events(_ELSE_RE, "else")
-        + _events(_ENDIF_RE, "endif")
-        + _events(_INCLUDE_RE, "include")
-        + _events(_PRAGMA_MACRO_RE, "pragma_macro")
-        + _events(_PRAGMA_OPERATOR_RE, "pragma_operator")
-        + _events(_LINE_DIRECTIVE_RE, "line")
-        + _events(_LINE_DIRECTIVE_MACRO_RE, "line_macro")
-        + _events(_DEFINE_RE, "define")
-        + _events(_UNDEF_RE, "undef"),
-        key=lambda event: event[0],
-    )
+    events = _read_directives(source_no_comments).events
     # One `(dead, decided)` pair per open conditional. `dead` is whether the
     # *current* arm is known-dead; `decided` is whether some earlier arm in
     # this same chain was already known-taken (a literal `1`) — once true, cpp
@@ -745,16 +793,7 @@ def _line_breakpoints(
     macro_stack_opaque = False
     breakpoints: list[tuple[int, int]] = []
 
-    def _physical(pos: int) -> int:
-        """The 1-based physical line of `source_no_comments` holding `pos`.
-
-        `pos` indexes the *spliced* text, so the line it sits on there may span
-        several physical lines — this names the one the logical line starts on
-        (see `_splice_continuations`).
-        """
-        return physical_line_of[spliced.count("\n", 0, pos)]
-
-    for pos, kind, match in events:
+    for physical_line, kind, match in events:
         dead = any(is_dead for is_dead, _ in stack)
         if kind in _RESOLVED_IFDEF_KINDS:
             # Resolved here, not when the event was built: a `#ifdef`'s verdict
@@ -847,9 +886,9 @@ def _line_breakpoints(
             if not dead:
                 name = match.group(1)
                 if name in macros:
-                    breakpoints.append((_physical(pos), macros[name]))
+                    breakpoints.append((physical_line, macros[name]))
         elif kind == "line" and not dead:
-            breakpoints.append((_physical(pos), int(match.group(1))))
+            breakpoints.append((physical_line, int(match.group(1))))
     return breakpoints
 
 
@@ -876,20 +915,7 @@ def _guard_macro_names(source_no_comments: str) -> tuple[str, ...]:
     be probed under the name cpp actually tests, and a ``#ifdef`` mentioned
     inside a string literal must not be probed at all.
     """
-    spliced, _ = _splice_continuations(source_no_comments)
-    spliced = _stripped_for_scan(spliced)
-    names: dict[str, None] = {}
-    for pattern in (_IFDEF_RE, _ELIFDEF_RE):
-        for match in pattern.finditer(spliced):
-            name = match.group("name")
-            if name is not None:
-                names[name] = None
-    for pattern in (_IF_RE, _ELIF_RE):
-        for match in pattern.finditer(spliced):
-            test = _macro_test(_strip_literal_parens(match.group(1)))
-            if test is not None:
-                names[test.group("name")] = None
-    return tuple(names)
+    return _read_directives(source_no_comments).guard_names
 
 
 def _presumed_line(physical_line: int, breakpoints: list[tuple[int, int]]) -> int:
