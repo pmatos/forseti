@@ -1,3 +1,10 @@
+## [1.12.1](https://github.com/pmatos/forseti/compare/v1.12.0...v1.12.1) (2026-11-15)
+
+
+### Bug Fixes
+
+* **esbmc:** replace ty ignore with an assert in cex_parser ([#461](https://github.com/pmatos/forseti/issues/461)) ([73613ee](https://github.com/pmatos/forseti/commit/73613ee02dd427ca007e3a5f39b7408f9de05cfb))
+
 # [1.12.0](https://github.com/pmatos/forseti/compare/v1.11.0...v1.12.0) (2026-11-01)
 
 
