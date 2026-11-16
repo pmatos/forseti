@@ -22,7 +22,7 @@ from forseti.grading import (
     generate_mutants,
     mutate_function,
 )
-from forseti.grading.body import locate_body, masked_view
+from forseti.grading.body import BodyNotFound, OutputParam, locate_body, masked_view
 
 EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
 needs_esbmc = pytest.mark.skipif(
@@ -273,6 +273,75 @@ class TestEdgeShapes:
         src = "static inline const unsigned f(unsigned a) { return a; }\n"
         [m] = _only(src, "output-havoc")
         assert "unsigned nondet_unsigned(void);" in m.source
+
+
+class TestBodyReading:
+    @pytest.mark.parametrize(
+        ("source", "return_ctype"),
+        [
+            (
+                "/* f(void) { decoy } */\nint f(int);\n"
+                "static inline unsigned f(unsigned x, int *out) "
+                "__attribute__((aligned(8))) { *out = x; return x; }\n",
+                "unsigned",
+            ),
+            (
+                "int f(\nint x,\n#if CHOICE\nint *out\n#endif\n) "
+                "{ *out = x; return x; }\n",
+                "int",
+            ),
+            (
+                "int f(int /* f(void) */ x, int *out) { *out = x; return x; }\n",
+                "int",
+            ),
+        ],
+    )
+    def test_definition_facts_use_the_grading_masked_view(
+        self, source: str, return_ctype: str
+    ) -> None:
+        body = locate_body(source, "f")
+        assert source[body.open_brace : body.close_brace + 1] == (
+            "{ *out = x; return x; }"
+        )
+        assert body.return_ctype == return_ctype
+        assert body.output_params == (OutputParam("out", "int"),)
+        assert [token.text for token in body.tokens] == [
+            "*",
+            "out",
+            "=",
+            "x",
+            ";",
+            "return",
+            "x",
+            ";",
+        ]
+
+    def test_unanchored_reading_keeps_the_first_definition(self) -> None:
+        source = (
+            "#if 0\nint f(int *out) { *out = 1; return 1; }\n#endif\nvoid f(void) {}\n"
+        )
+        body = locate_body(source, "f")
+        assert body.open_brace == source.index("{ *out")
+        assert body.return_ctype == "int"
+        assert body.output_params == (OutputParam("out", "int"),)
+
+    def test_unbalanced_body_stays_a_grading_error(self) -> None:
+        with pytest.raises(BodyNotFound, match="unbalanced braces"):
+            locate_body("int f(int x) { return x;", "f")
+
+    def test_suffix_expression_cannot_replace_the_selected_declarator(self) -> None:
+        source = (
+            "int f(int x, int *out);\n"
+            "int f(int x, int *out) __attribute__((aligned(sizeof(f(0, (int *)0))))) "
+            "{ *out = x; return x; }\n"
+        )
+        body = locate_body(source, "f")
+        assert body.return_ctype == "int"
+        assert body.output_params == (OutputParam("out", "int"),)
+        [mutant] = [
+            m for m in _only(source, "output-havoc") if "write through" in m.description
+        ]
+        assert "*out = nondet_int();" in mutant.source
 
 
 class TestContainment:
