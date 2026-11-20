@@ -12,8 +12,9 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from forseti.esbmc import find_definition_brace, mask_comments
+from forseti.esbmc import mask_comments
 from forseti.esbmc.preprocessor import mask_string_literals
+from forseti.esbmc.units import _find_definition
 
 _DIRECTIVE_RE = re.compile(r"^[ \t]*#(?:\\\n|[^\n])*", re.MULTILINE)
 
@@ -111,19 +112,6 @@ def _match_close(masked: str, open_idx: int, open_ch: str, close_ch: str) -> int
     return None
 
 
-def _param_list(masked: str, symbol: str, brace: int) -> tuple[int, str] | None:
-    """``(name_start, params_text)`` of the last ``symbol (`` before `brace`."""
-    found = None
-    for match in re.finditer(rf"\b{re.escape(symbol)}\s*\(", masked[:brace]):
-        found = match
-    if found is None:
-        return None
-    close = _match_close(masked, found.end() - 1, "(", ")")
-    if close is None or close > brace:
-        return None
-    return found.start(), masked[found.end() : close]
-
-
 def _normalize_type(text: str) -> str:
     text = _ATTRIBUTE_RE.sub(" ", text)
     words = [w for w in re.split(r"\s+", text.replace("*", " * ")) if w]
@@ -186,17 +174,17 @@ def locate_body(source: str, symbol: str) -> FunctionBody:
     Raises `BodyNotFound` when no definition is isolable or its braces do not
     balance on the masked text.
     """
-    brace = find_definition_brace(source, symbol)
-    if brace is None:
+    definition = _find_definition(source, symbol)
+    if definition is None:
         raise BodyNotFound(f"no definition of {symbol!r} found")
+    brace = definition.brace
     masked = masked_view(source)
     close = _match_close(masked, brace, "{", "}")
     if close is None:
         raise BodyNotFound(f"unbalanced braces in the body of {symbol!r}")
-    located = _param_list(masked, symbol, brace)
-    if located is None:
-        raise BodyNotFound(f"cannot read the signature of {symbol!r}")
-    name_start, params = located
+    params = masked[
+        definition.params_start : definition.params_start + len(definition.params)
+    ]
     outputs = tuple(
         out for p in _split_params(params) if (out := _output_param(p)) is not None
     )
@@ -204,7 +192,7 @@ def locate_body(source: str, symbol: str) -> FunctionBody:
         open_brace=brace,
         close_brace=close,
         tokens=tokenize(masked, brace + 1, close),
-        return_ctype=_return_ctype(masked, name_start),
+        return_ctype=_return_ctype(masked, definition.name_start),
         output_params=outputs,
     )
 

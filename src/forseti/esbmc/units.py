@@ -821,14 +821,19 @@ class _DefinitionMatch:
     token itself (the regex match's own start -- not re-derived by a later,
     independent search, which is what let a string literal mentioning `fn_name`
     after the real token, e.g. an ``__attribute__((annotate("main")))`` suffix,
-    get renamed instead of it). A body opener and a parameter list are the same
-    occurrence seen two ways, so both entry points read them off this.
+    get renamed instead of it). ``params_start`` indexes the first character
+    inside the parameter list; its span has length ``len(params)`` even when
+    comments/literals were masked. A caller with another offset-preserving view
+    can project that same span without rediscovering the declarator. A body
+    opener and a parameter list are the same occurrence seen two ways, so both
+    entry points read them off this.
     """
 
     line: int
     brace: int
     params: str
     name_start: int
+    params_start: int
 
 
 def _preceded_by_member_access(text: str, start: int) -> bool:
@@ -907,7 +912,11 @@ def _definition_candidates(
             line = source_no_comments.count("\n", 0, match.start()) + 1
             matches.append(
                 _DefinitionMatch(
-                    line, k, source_no_comments[match.end() : j], match.start()
+                    line=line,
+                    brace=k,
+                    params=source_no_comments[match.end() : j],
+                    name_start=match.start(),
+                    params_start=match.end(),
                 )
             )
     return matches
@@ -989,6 +998,27 @@ def _select_definition(
     )
 
 
+def _find_definition(
+    source_text: str,
+    fn_name: str,
+    def_line: int | None = None,
+    predefined: Sequence[tuple[str, bool]] = (),
+) -> _DefinitionMatch | None:
+    """Read one definition's correlated offsets and masked parameter text.
+
+    All offsets index `source_text`. Missing or unusable declarators return
+    ``None``; body-brace balancing remains the caller's responsibility. Selection
+    uses `_select_definition`'s compiled-line/guard anchor, or the first textual
+    candidate when no anchor is supplied. Directives remain in the masked text;
+    callers that also blank them can slice their own view using `params_start`
+    and ``len(params)`` without changing which occurrence was selected.
+    """
+    masked = _stripped_for_scan(source_text)
+    return _select_definition(
+        _definition_candidates(masked, fn_name), masked, def_line, predefined
+    )
+
+
 def find_definition_brace(
     source_text: str,
     fn_name: str,
@@ -1014,10 +1044,7 @@ def find_definition_brace(
     builtins had already defined (issue #226). Omitting it is safe but weaker:
     every such guard reads live, exactly as it did before that field existed.
     """
-    masked = _stripped_for_scan(source_text)
-    chosen = _select_definition(
-        _definition_candidates(masked, fn_name), masked, def_line, predefined
-    )
+    chosen = _find_definition(source_text, fn_name, def_line, predefined)
     return None if chosen is None else chosen.brace
 
 
