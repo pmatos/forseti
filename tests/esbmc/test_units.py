@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import forseti.esbmc.units as units_module
 from forseti.esbmc.preprocessor import (
     _guard_macro_names,
     _line_breakpoints,
@@ -1996,6 +1997,66 @@ def test_mask_comments_preserves_offsets_and_lines() -> None:
     assert masked.startswith("int a; ")
 
 
+def test_definition_reading_keeps_declarator_facts_together() -> None:
+    source = (
+        "/* f(int *fake) { } */\nint f(int *p);\n"
+        "static int f(int a[4], int (*cb)(int)) "
+        "__attribute__((aligned(8))) { return cb(a[0]); }\n"
+    )
+    chosen = units_module._find_definition(source, "f")
+    assert chosen is not None
+    assert chosen.line == 3
+    assert chosen.name_start == source.index("f(int a")
+    assert chosen.brace == source.index("{ return")
+    assert chosen.params == "int a[4], int (*cb)(int)"
+    assert source[chosen.params_start : chosen.params_start + len(chosen.params)] == (
+        "int a[4], int (*cb)(int)"
+    )
+
+
+def test_definition_reading_preserves_parameter_offsets_when_masking() -> None:
+    source = "int f(int /* ignored\ncomment */ *p) { return *p; }\n"
+    chosen = units_module._find_definition(source, "f")
+    assert chosen is not None
+    assert chosen.params_start == source.index("int /*")
+    original_params = source[chosen.params_start : source.index(")")]
+    assert len(chosen.params) == len(original_params)
+    assert chosen.params == mask_comments(original_params)
+    assert chosen.brace == source.index("{ return")
+
+
+@pytest.mark.parametrize("def_line", [None, 4])
+def test_definition_reading_uses_the_same_occurrence_for_all_facts(
+    def_line: int | None,
+) -> None:
+    source = "#if 0\nint f(int *out) {}\n#endif\nvoid f(void) {}\n"
+    chosen = units_module._find_definition(source, "f", def_line)
+    assert chosen is not None
+    expected_params = "int *out" if def_line is None else "void"
+    assert chosen.params == expected_params
+    assert chosen.params_start == source.index(f"({expected_params})") + 1
+    assert chosen.name_start == source.index(f"f({expected_params})")
+    assert chosen.brace == source.index("{", chosen.name_start)
+    assert chosen.line == (2 if def_line is None else 4)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "int f(int);\n",
+        "int g(int x) { return f(x); }\n",
+        "int f(int x { return x; }\n",
+        "int f(int x) __attribute__((used) { return x; }\n",
+        'const char *s = "int f(int x) { return x; }";\n',
+        "int g(void) { object.f(1); pointer->f(1); }\n",
+    ],
+)
+def test_definition_reading_returns_none_without_a_usable_definition(
+    source: str,
+) -> None:
+    assert units_module._find_definition(source, "f") is None
+
+
 def test_find_definition_brace_indexes_the_body_opener() -> None:
     source = "/* f(int *p) { decoy } */\nvoid f(int *p) { *p = 0; }\n"
     index = find_definition_brace(source, "f")
@@ -2813,6 +2874,22 @@ def test_guard_macro_names_reads_the_text_the_walk_reads() -> None:
 
 def test_guard_macro_names_ignores_an_operandless_ifdef() -> None:
     assert _guard_macro_names("#ifdef\n#endif\n#ifdef W\n#endif\n") == ("W",)
+
+
+@pytest.mark.parametrize(
+    ("defined", "expected_params"), [(False, "int *p"), (True, "int p[20]")]
+)
+def test_definition_reading_uses_the_predefined_guard_seed(
+    defined: bool, expected_params: str
+) -> None:
+    chosen = units_module._find_definition(
+        _GUARD_TIE_SOURCE, "f", 100, (("WIDGET", defined),)
+    )
+    assert chosen is not None
+    assert chosen.params == expected_params
+    assert chosen.name_start == _GUARD_TIE_SOURCE.index(f"f({expected_params})")
+    assert chosen.params_start == _GUARD_TIE_SOURCE.index(expected_params)
+    assert chosen.brace == _GUARD_TIE_SOURCE.index("{", chosen.name_start)
 
 
 def test_find_definition_brace_uses_the_predefined_guard_seed() -> None:
